@@ -1,7 +1,11 @@
 import json
 import urllib.request
+import sys
+from pathlib import Path
+from lib.parms import JsonIniParser
 
-def consult_isolated_analyst(market_data_snapshot):
+
+def consult_isolated_analyst(market_data_snapshot, config_obj):
     system_prompt = (
         "You are the automated Market Analyst Agent for an algorithmic options trading desk. "
         "Your sole task is to evaluate raw options chain data and determine a risk-defined options strategy.\n\n"
@@ -37,10 +41,9 @@ def consult_isolated_analyst(market_data_snapshot):
 
     # Convert the Python dictionary into a string of bytes
     data = json.dumps(payload).encode('utf-8')
+    NUC_IP = config_obj.NUC_IP
     
-    # Point this to your NUC's local LAN IP address
-    nuc_ip = "192.168.0.162"  # Swap with your actual local NUC IP
-    url = f"http://{nuc_ip}:11434/api/chat"
+    url = f"http://{NUC_IP}:11434/api/chat"
     
     # Configure the standard library request container
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
@@ -60,10 +63,19 @@ def consult_isolated_analyst(market_data_snapshot):
 
 if __name__ == "__main__":
     test_data = "{'ticker': 'SPY', 'price': 510}"
+    # Initialize the parser with the file path
+    config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
     
+    try:
+        # Load the configuration variables into the instance
+        config.load_globals()
+    except Exception as ce:
+        print(f"? Failed to parse configuration file: {ce}")
+        sys.exit(1)
     # ?? THIS IS YOUR NATIVE BREAKPOINT:
-    import pdb; pdb.set_trace() 
+    #import pdb; pdb.set_trace() 
     
-    print("Debugger is starting...") 
-    result = consult_isolated_analyst(test_data)
+    #print("Debugger is starting...") 
+    result = consult_isolated_analyst(test_data, config)
+
     print("Model response:", result)

@@ -1,18 +1,23 @@
 import sys
 from datetime import datetime
+from pathlib import Path
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetStatus
+from lib.parms import JsonIniParser
 
-# 1. Initialize the Trading Client (Using Paper Trading Environment)
-ALPACA_KEY = "PK3IWXWY7AMSJRBAX3AOGMHNU4"
-ALPACA_SECRET = "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
- 
 try:
-    trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
-except Exception as e:
-    print(f"? Critical Error initializing Alpaca Client: {e}")
+    # Initialize the parser with the file path
+    config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
+
+except Exception as ce:
+    print(f"? Failed to parse configuration file: {ce}")
     sys.exit(1)
+try:
+    trading_client = config.make_alpaca_client()
+except Exception as e:
+    print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+    sys.exit(2)
 
 # 2. Find a specific Option Call Contract
 underlying_symbol = "AAPL"

@@ -1,6 +1,12 @@
 import json
 import urllib.request
 from datetime import datetime, timedelta
+import sys
+from pathlib import Path
+
+from alpaca.trading import TradingClient
+from lib.parms import JsonIniParser
+
 
 def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
     """
@@ -8,8 +14,11 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
     fit inside a local LLM's context window.
     """
     # 1. Alpaca Live Options Snapshot Endpoint (returns greeks + quotes)
-    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative"
-    
+    #url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative"
+    expiration_date = "2026-11-06"  # Must use YYYY-MM-DD format
+    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}"
+    #expiration_date = "2026-11-06"
+    #url = f"https://alpaca.markets{underlying_ticker}&expiration_dates={expiration_date}"
     req = urllib.request.Request(url)
     req.add_header("APCA-API-KEY-ID", api_key)
     req.add_header("APCA-API-SECRET-KEY", api_secret)
@@ -22,6 +31,7 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
         return f"Error fetching from Alpaca: {str(e)}"
     
     snapshots = raw_data.get("snapshots", {})
+    print(f"?? Retrieved {len(snapshots)} contracts from Alpaca for {underlying_ticker}.")
     if not snapshots:
         return "No snapshot data returned from Alpaca."
 
@@ -40,16 +50,16 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
         latest_quote = details.get("latestQuote", {})
         
         # Pull delta to measure distance from the money
-        delta = greeks.get("delta")
-        if delta is None:
-            continue
+        #delta = greeks.get("delta")
+        #if delta is None:
+        #    continue
             
         # Target liquid Near-The-Money options (Delta between 0.15 and 0.65)
-        if not (0.15 <= abs(float(delta)) <= 0.65):
-            continue
+        #if not (0.15 <= abs(float(delta)) <= 0.65):
+        #    continue
             
         # Extract contract details safely
-        implied_vol = details.get("impliedVolatility", 0)
+        #implied_vol = details.get("impliedVolatility", 0)
         bid = latest_quote.get("bp", 0)
         ask = latest_quote.get("ap", 0)
         
@@ -58,8 +68,8 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
         
         pruned_chain.append({
             "contract": contract_symbol,
-            "delta": round(float(delta), 2),
-            "iv": round(float(implied_vol), 3),
+        #    "delta": round(float(delta), 2),
+        #    "iv": round(float(implied_vol), 3),
             "bid": bid,
             "ask": ask,
             "gamma": round(float(greeks.get("gamma", 0)), 4),
@@ -115,8 +125,6 @@ def consult_isolated_analyst(market_data_snapshot):
     # Convert the Python dictionary into a string of bytes
     data = json.dumps(payload).encode('utf-8')
     
-    # Point this to your NUC's local LAN IP address
-    nuc_ip = "192.168.0.162"  # Swap with your actual local NUC IP
     url = f"http://{nuc_ip}:11434/api/chat"
     
     # Configure the standard library request container
@@ -136,22 +144,29 @@ def consult_isolated_analyst(market_data_snapshot):
 
 
 if __name__ == "__main__":
-    # Test credentials placeholder - use Alpaca Dashboard paper configurations
-    ALPACA_KEY = "PK3IWXWY7AMSJRBAX3AOGMHNU4"
-    ALPACA_SECRET = "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+    try:
+        # Initialize the parser with the file path
+        config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
+
+        # Load the configuration variables into the instance
+        config.load_globals()
+    except Exception as ce:
+        print(f"? Failed to parse configuration file: {ce}")
+        sys.exit(1)
+    environment = config.ENVIRONMENT
+    credentials = config.CREDENTIALS
+    nuc_ip = config.NUC_IP
+
+    if not credentials or "api_key" not in credentials or "secret_key" not in credentials:
+        print("? Error: Missing credentials dictionary in your config.json.ini file.")
+        sys.exit(1)
+
     
-    print("Fetching and pruning live chain data for SPY...")
-    clean_payload = get_pruned_option_chain("SPY", ALPACA_KEY, ALPACA_SECRET)
+    print("Fetching and pruning live chain data for MU...")
+    clean_payload = get_pruned_option_chain("MU", config.ALPACA_KEY, config.ALPACA_SECRET)
+    print("Pruned Option Chain Payload:")
     print(clean_payload)
 
-    print("Analyzing pruned live option chain data for SPY...")
+    print("Analyzing pruned live option chain data for MU...")
     result = consult_isolated_analyst(clean_payload)
-    print("SPY Model response:", result)
-
-    print("Fetching and pruning live chain data for IBM...")
-    clean_payload = get_pruned_option_chain("IBM", ALPACA_KEY, ALPACA_SECRET)
-    print(clean_payload)
-
-    print("Analyzing pruned live option chain data for IBM...")
-    result = consult_isolated_analyst(clean_payload)
-    print("IBM Model response:", result)
+    print("MU Model response:", result)

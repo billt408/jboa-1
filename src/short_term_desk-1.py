@@ -1,6 +1,9 @@
 import json
 import urllib.request
+from pathlib import Path
+import sys
 from datetime import datetime, timedelta
+from lib.parms import JsonIniParser
 
 def get_5day_hold_candidates(underlying_ticker, api_key, api_secret):
     """
@@ -116,11 +119,26 @@ def consult_5day_strategist(candidates_json):
 
 # --- RUNNING THE INTEGRATED LOOP ---
 if __name__ == "__main__":
-    ALPACA_KEY = "PK3IWXWY7AMSJRBAX3AOGMHNU4"
-    ALPACA_SECRET = "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
-    
+    try:
+        # Initialize the parser with the file path
+        config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
+
+        # Load the configuration variables into the instance
+        config.load_globals()
+    except Exception as ce:
+        print(f"? Failed to parse configuration file: {ce}")
+        sys.exit(1)
+
+    environment = config.ENVIRONMENT
+    credentials = config.CREDENTIALS
+    nuc_ip = config.NUC_IP
+
+    if not credentials or "api_key" not in credentials or "secret_key" not in credentials:
+        print("? Error: Missing credentials dictionary in your config.json.ini file.")
+        sys.exit(1)
+
     print("Executing mathematical pre-filtering for 5-day hold windows...")
-    short_list = get_5day_hold_candidates("SPY", ALPACA_KEY, ALPACA_SECRET)
+    short_list = get_5day_hold_candidates("SPY", config.ALPACA_KEY, config.ALPACA_SECRET)
     
     if short_list:
         print("Piping candidates to isolated local LLM strategist...")
