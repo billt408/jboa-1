@@ -4,7 +4,7 @@ from pathlib import Path
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetStatus
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 try:
     # Initialize the parser with the file path

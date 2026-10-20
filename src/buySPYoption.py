@@ -5,7 +5,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 
 # Import your custom configuration parser library
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 try:
     # Initialize the parser with the file path

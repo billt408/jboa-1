@@ -3,7 +3,7 @@ import urllib.request
 from pathlib import Path
 import sys
 from datetime import datetime, timedelta
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 
 def get_5day_hold_candidates(underlying_ticker, api_key, api_secret):

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from alpaca.trading import TradingClient
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 
 def get_pruned_option_chain(underlying_ticker, api_key, api_secret):
