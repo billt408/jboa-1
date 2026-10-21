@@ -2,7 +2,6 @@ from datetime import datetime
 import pytz
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.enums import DataFeed
 
 from lib.utils import JsonIniParser

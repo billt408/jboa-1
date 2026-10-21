@@ -147,7 +147,7 @@ class JsonIniParser:
         # 2. INITIALIZE ALPACA HISTORICAL CLIENT
         # ==========================================
         try:
-            stock_historical_data_client = StockHistoricalDataClient(api_key=self.ALPACA_KEY, secret_key=self.ALPACA_SECRET)
+            stock_historical_data_client = StockHistoricalDataClient(api_key=self.ALPACA_KEY, secret_key=self.ALPACA_SECRET, raw_data=False)
         except Exception as e:
             print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
             sys.exit(1)
