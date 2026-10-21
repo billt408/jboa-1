@@ -5,7 +5,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
 
 # Import your custom configuration parser library
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 try:
     # Initialize the parser with the file path
@@ -15,7 +15,7 @@ except Exception as ce:
     print(f"? Failed to parse configuration file: {ce}")
     sys.exit(1)
 try:
-    trading_client = config.make_alpaca_client()
+    trading_client = config.mk_alpaca_trading_client()
 except Exception as e:
     print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
     sys.exit(2)

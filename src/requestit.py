@@ -2,7 +2,7 @@ import json
 import urllib.request
 import sys
 from pathlib import Path
-from lib.parms import JsonIniParser
+from lib.utils import JsonIniParser
 
 
 def consult_isolated_analyst(market_data_snapshot, config_obj):

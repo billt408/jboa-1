@@ -1,15 +1,14 @@
 import json
-from typing import Any, Dict, Optional
 import sys
-from pathlib import Path
-
+from typing import Any, Dict, Optional
 from alpaca.trading import TradingClient
-from pydantic import config
+from alpaca.data.historical import StockHistoricalDataClient
+
 
 class JsonIniParser:
     def __init__(self, filepath: str):
         """Initializes the parser with a path to the configuration file."""
-        print(f"--? Initializing JsonIniParser with file: {filepath}")
+        #print(f"--? Initializing JsonIniParser with file: {filepath}")
         self.filepath = filepath
         # Internal structure: { "section_name": { "key": value } }
         self.data: Dict[str, Dict[str, Any]] = {}
@@ -18,18 +17,18 @@ class JsonIniParser:
         """Reads and parses the custom JSON-INI file from disk."""
         self.data = {}
         current_section: Optional[str] = None
-        print(f"!!? Loading configuration from: {self.filepath}")
+        #print(f"!!? Loading configuration from: {self.filepath}")
         try:
             with open(self.filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-                print(f"? Successfully read {len(lines)} lines from configuration file.")
+                #print(f"? Successfully read {len(lines)} lines from configuration file.")
         except FileNotFoundError:
             # If the file doesn't exist yet, we start with an empty configuration
             return
-        print(f"? Successfully read {len(lines)} lines from configuration file.")
+        #print(f"? Successfully read {len(lines)} lines from configuration file.")
         for line_num, line in enumerate(lines, 1):
             line = line.strip()
-            print(f"Line {line_num}: Processing: '{line}'")
+            #print(f"Line {line_num}: Processing: '{line}'")
             # Skip empty lines or lines that are pure comments
             if not line or line.startswith(';') or line.startswith('#'):
                 continue
@@ -64,7 +63,7 @@ class JsonIniParser:
                     )
                 
                 self.data[current_section][key] = parsed_value
-                print(f"Line {line_num}: Parsed [{current_section}] {key} = {parsed_value}")
+                #print(f"Line {line_num}: Parsed [{current_section}] {key} = {parsed_value}")
             else:
                 raise ValueError(f"Line {line_num}: Invalid syntax. Expected a [section] or a key=value pair. Got: '{line}'")
 
@@ -100,7 +99,7 @@ class JsonIniParser:
         """Loads and binds configuration parameters directly to this instance."""
         # Force a load of the file path passed during initialization
         self.load() 
-        print(f"? Configuration loaded successfully:\n{json.dumps(self.data, indent=4)}")
+        #print(f"? Configuration loaded successfully:\n{json.dumps(self.data, indent=4)}")
         self.ENVIRONMENT = self.get("alpaca_api", "environment", default="paper")
         self.CREDENTIALS = self.get("alpaca_api", "credentials")
         
@@ -113,12 +112,10 @@ class JsonIniParser:
         self.ALPACA_SECRET = self.CREDENTIALS["secret_key"]
         self.IS_PAPER = (self.ENVIRONMENT == "paper")
         self.NUC_IP = self.get("llm_configuration", "ip_address", default="192.168.0.178")
-        print(f"? Configuration loaded successfully.   {self}")
+        #print(f"? Configuration loaded successfully.   {self}")
 
-    def make_alpaca_client(self) -> 'TradingClient':
+    def mk_alpaca_trading_client(self) -> 'TradingClient':
         try:
-            # Initialize the parser with the file path
-            #config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
             # Load the configuration variables into the instance
             self.load_globals()
         except Exception as ce:
@@ -137,3 +134,22 @@ class JsonIniParser:
 
         return trading_client
 
+    def mk_alpaca_historical_client(self) -> 'StockHistoricalDataClient':
+        try:
+            # Load the configuration variables into the instance
+            self.load_globals()
+        except Exception as ce:
+            print(f"? Failed to parse configuration file: {ce}")
+            sys.exit(1)
+
+        print(f"Paper Trading Mode: {self.IS_PAPER}")
+        # ==========================================
+        # 2. INITIALIZE ALPACA HISTORICAL CLIENT
+        # ==========================================
+        try:
+            stock_historical_data_client = StockHistoricalDataClient(api_key=self.ALPACA_KEY, secret_key=self.ALPACA_SECRET)
+        except Exception as e:
+            print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+            sys.exit(1)
+
+        return stock_historical_data_client
