@@ -164,34 +164,23 @@ class JsonIniParser:
 
         return stock_historical_data_client
 
-def get_three_fridays_away(start_date: datetime.date = None) -> datetime.date:
-    """Calculates and returns a date that is exactly 3 Fridays away
 
-    from the start date (defaults to today).
-    """
+def get_three_fridays_away(start_date=None) -> datetime:
+    """Accurately calculates the date exactly 3 Fridays away from the start date."""
     if start_date is None:
-        start_date = datetime.date.today()
-
-    # weekday() returns 0 for Monday, 4 for Friday, 6 for Sunday
-    current_weekday = start_date.weekday()
-
-    # Target is Friday (index 4)
+        start_date = datetime.today().date()
+    
+    current_weekday = start_date.weekday() # 0=Mon, 4=Fri, 6=Sun
     target_weekday = 4
-
-    # Calculate days needed to reach the *first* upcoming Friday
+    
+    # Calculate days to the very next Friday
     days_until_next_friday = (target_weekday - current_weekday) % 7
-
-    # Critical Strategy Edge Case: If today IS Friday, 'days_until_next_friday' evaluates to 0.
-    # To get 3 Fridays *away* from today, we must push forward to next week's Friday instead of tracking today.
     if days_until_next_friday == 0:
         days_until_next_friday = 7
+        
+    # Push out an additional 14 days to make it exactly 3 Fridays away
+    return start_date + datetime.timedelta(days=days_until_next_friday + 14)
 
-    # 1st Friday away = days_until_next_friday
-    # 2nd Friday away = days_until_next_friday + 7 days
-    # 3rd Friday away = days_until_next_friday + 14 days
-    total_days_to_add = days_until_next_friday + 14
-
-    return start_date + datetime.timedelta(days=total_days_to_add)
 
 def extract_strike_price(option_symbol: str) -> float:
     """Extracts the float strike price from a standard OCC option symbol string."""
@@ -221,7 +210,7 @@ def get_current_ask_price(symbol: str, client=None) -> float:
 
         # 3. Target the latest daily quote container
         latest_quote = snapshot[ticker].latest_quote
-
+        print(f"?? Latest Quote for {ticker}: Bid={latest_quote.bid_price}, Ask={latest_quote.ask_price}")
         if latest_quote is None:
             print(f"? Live quote currently unavailable for ticker: {ticker}")
             return 0.0

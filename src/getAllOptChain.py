@@ -1,8 +1,6 @@
 import sys
 from pathlib import Path
-from lib.getOptChain import get_pruned_option_chain
-
-
+from lib.getOptionsContracts import get_pruned_option_chain
 
 # ==============================================================================
 # ENVIRONMENT PATH PATCH
@@ -32,8 +30,8 @@ try:
 except Exception as e:
     print(f"Critical Error loading Alpaca configuration or initializing symbols: {e}")
     sys.exit(2)        
-
-print(f"?? Collect option chain data for {len(target_symbols)} symbols...\n")
+print("*" * 40)
+print(f" Collect option chain data for {len(target_symbols)} symbols...")
 
 for symbol in target_symbols:
     #print(f"config contents: {config.__dict__}")
@@ -41,7 +39,6 @@ for symbol in target_symbols:
     ticker = symbol.upper()
     
     # Visual Header Separator
-    print("?" * 40)
     print(f" PROCESSING DATA FOR TICKER: {ticker} ")
     
     try:

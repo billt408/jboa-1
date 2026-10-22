@@ -32,7 +32,9 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
 #==========================
     all_snapshots = {}
     page_token = None
-    base_url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}&type=call&limit=1000"
+    #base_url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}&type=call&limit=1000"
+    base_url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}&limit=1000"
+    stk_ask_price = get_current_ask_price(underlying_ticker,client)
     while True:
         # Append the pagination token to the URL if it exists
         url = base_url if not page_token else f"{base_url}&page_token={page_token}"
@@ -70,10 +72,11 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         all_snapshots.items(), 
         key=lambda item: int(item[0][-8:])
     )        
-    stk_ask_price = get_current_ask_price(underlying_ticker,client)
     pruned_chain = []
     # 3. Parse and Filter the Chain
     for contract_symbol, details in sorted_snapshots:
+        if "C" not in contract_symbol:
+            continue
         # Parsing string formatting logic out of Alpaca contract strings
         # Example format: AAPL261016C00230000 -> Symbol, Expiry, Type, Strike
         greeks = details.get("greeks", {})
