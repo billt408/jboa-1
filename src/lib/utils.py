@@ -1,8 +1,12 @@
 import json
 import sys
+import datetime
 from typing import Any, Dict, Optional
 from alpaca.trading import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockSnapshotRequest
+from pathlib import Path
+
 
 
 class JsonIniParser:
@@ -100,6 +104,12 @@ class JsonIniParser:
         # Force a load of the file path passed during initialization
         self.load() 
         #print(f"? Configuration loaded successfully:\n{json.dumps(self.data, indent=4)}")
+         # DEBUG CHECK: If the internal dictionary is totally empty, the file wasn't read or is empty
+        if not self.data:
+            raise FileNotFoundError(
+                f"\n? CRITICAL: The configuration file at '{self.filepath}' was either not found, "
+                f"could not be opened, or parsed completely empty. Please verify this path matches your file."
+            )
         self.ENVIRONMENT = self.get("alpaca_api", "environment", default="paper")
         self.CREDENTIALS = self.get("alpaca_api", "credentials")
         
@@ -153,3 +163,72 @@ class JsonIniParser:
             sys.exit(1)
 
         return stock_historical_data_client
+
+def get_three_fridays_away(start_date: datetime.date = None) -> datetime.date:
+    """Calculates and returns a date that is exactly 3 Fridays away
+
+    from the start date (defaults to today).
+    """
+    if start_date is None:
+        start_date = datetime.date.today()
+
+    # weekday() returns 0 for Monday, 4 for Friday, 6 for Sunday
+    current_weekday = start_date.weekday()
+
+    # Target is Friday (index 4)
+    target_weekday = 4
+
+    # Calculate days needed to reach the *first* upcoming Friday
+    days_until_next_friday = (target_weekday - current_weekday) % 7
+
+    # Critical Strategy Edge Case: If today IS Friday, 'days_until_next_friday' evaluates to 0.
+    # To get 3 Fridays *away* from today, we must push forward to next week's Friday instead of tracking today.
+    if days_until_next_friday == 0:
+        days_until_next_friday = 7
+
+    # 1st Friday away = days_until_next_friday
+    # 2nd Friday away = days_until_next_friday + 7 days
+    # 3rd Friday away = days_until_next_friday + 14 days
+    total_days_to_add = days_until_next_friday + 14
+
+    return start_date + datetime.timedelta(days=total_days_to_add)
+
+def extract_strike_price(option_symbol: str) -> float:
+    """Extracts the float strike price from a standard OCC option symbol string."""
+    # Slice out the final 8 characters of the string
+    raw_strike = option_symbol[-8:]
+
+    # Convert to a float and shift the decimal place 3 spots to the left
+    strike_price = float(raw_strike) / 1000.0
+
+    return strike_price
+
+def get_current_ask_price(symbol: str, client=None) -> float:
+    """Fetches the real-time ask price for a given stock symbol using the Alpaca API.
+
+    If no pre-initialized client is passed, it loads one via parms.ini.
+    """
+    ticker = symbol.upper()
+
+    try:
+        # 2. Query the live asset snapshot endpoint
+        request_params = StockSnapshotRequest(symbol_or_symbols=ticker)
+        snapshot = client.get_stock_snapshot(request_params)
+
+        if ticker not in snapshot:
+            print(f"? No snapshot data found for symbol: {ticker}")
+            return 0.0
+
+        # 3. Target the latest daily quote container
+        latest_quote = snapshot[ticker].latest_quote
+
+        if latest_quote is None:
+            print(f"? Live quote currently unavailable for ticker: {ticker}")
+            return 0.0
+
+        # 4. Extract and return the raw ask price ('ap')
+        return float(latest_quote.ask_price)
+
+    except Exception as e:
+        print(f"? Error retrieving live market ask for {ticker}: {e}")
+        return 0.0

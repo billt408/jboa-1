@@ -1,17 +1,21 @@
-#from lib.indicators import run_rsi_analysis
-
-# This executes the calculation, outputs the charts to terminal, and unpacks the raw underlying dataframes
-#hourly, daily, monthly = run_rsi_analysis("MSFT", verbose=True)
-
-# You can now cleanly inspect values programmatically in downstream services:
-# current_daily_rsi = daily['RSI'].iloc[-1]
-
-
 import time
 from lib.indicators import run_rsi_analysis
+from lib.utils import JsonIniParser
+import sys
+from pathlib import Path
 
-# Your target tickers
-target_symbols = ["nvda", "mu", "crwv", "amzn", "amd", "tsla", "klac", "dell", "intc", "spcx", "AAPL", "MSFT", "GOOG"]
+try:
+    # Initialize the parser with the file path
+    config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
+    config.load()
+except Exception as ce:
+    print(f"? Failed to parse configuration file: {ce}")
+    sys.exit(1)
+try:
+    target_symbols = config.get("symbols", "target_symbols")
+except Exception as e:
+    print(f"Critical Error loading Alpaca configuration or initializing symbols: {e}")
+    sys.exit(2)        
 
 print(f"?? Starting batch RSI analysis for {len(target_symbols)} symbols...\n")
 
