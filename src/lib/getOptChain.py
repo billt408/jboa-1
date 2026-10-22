@@ -29,34 +29,48 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
     print(f"Result (3 Fridays away): {target_friday}")
     print(f"Target Friday (3 Fridays from today): {target_friday_str}")
     expiration_date = target_friday_str  # Must use YYYY-MM-DD format
-    url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}"
+#==========================
+    all_snapshots = {}
+    page_token = None
+    base_url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}&type=call&limit=1000"
+    while True:
+        # Append the pagination token to the URL if it exists
+        url = base_url if not page_token else f"{base_url}&page_token={page_token}"
+        
+        req = urllib.request.Request(url)
+        req.add_header("APCA-API-KEY-ID", api_key)
+        req.add_header("APCA-API-SECRET-KEY", api_secret)
+        req.add_header("accept", "application/json")
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                raw_data = json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            return f"Error fetching from Alpaca: {str(e)}"
+        
+        # Merge this page's snapshots into our master dictionary
+        page_snapshots = raw_data.get("snapshots", {})
+        all_snapshots.update(page_snapshots)
+        
+        # Look for the pagination token at the root of the response payload
+        page_token = raw_data.get("next_page_token")
+        
+        # If next_page_token is null or missing, we have collected every page
+        if not page_token:
+            break
 
-    #expiration_date = "2026-11-06"
-    #url = f"https://alpaca.markets{underlying_ticker}&expiration_dates={expiration_date}"
-    req = urllib.request.Request(url)
-    req.add_header("APCA-API-KEY-ID", api_key)
-    req.add_header("APCA-API-SECRET-KEY", api_secret)
-    req.add_header("accept", "application/json")
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            raw_data = json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        return f"Error fetching from Alpaca: {str(e)}"
-    
-    snapshots = raw_data.get("snapshots", {})
-    print(f"?? Retrieved {len(snapshots)} contracts from Alpaca for {underlying_ticker}.")
-    if not snapshots:
+    print(f"?? Total contracts collected after pagination: {len(all_snapshots)} for {underlying_ticker}.")
+    if not all_snapshots:
         return "No snapshot data returned from Alpaca."
-
-    # 2. Configure Pruning Targets (e.g., standard 30 to 45 day swing cycle)
+    
     today = datetime.now()
     min_expiry = today + timedelta(days=30)
     max_expiry = today + timedelta(days=45)
     sorted_snapshots = sorted(
-        snapshots.items(), 
+        all_snapshots.items(), 
         key=lambda item: int(item[0][-8:])
-    )
+    )        
+    stk_ask_price = get_current_ask_price(underlying_ticker,client)
     pruned_chain = []
     # 3. Parse and Filter the Chain
     for contract_symbol, details in sorted_snapshots:
@@ -78,7 +92,6 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         #implied_vol = details.get("impliedVolatility", 0)
         bid = latest_quote.get("bp", 0)
         ask = latest_quote.get("ap", 0)
-        stk_ask_price = get_current_ask_price(underlying_ticker,client)
         if stk_ask_price > 0:
             print(f"? Real-time Ask Price for {underlying_ticker}: ${stk_ask_price:.2f} -- ${ask:.2f}")
         else:
@@ -115,3 +128,25 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         "timestamp": today.strftime("%Y-%m-%d %H:%M:%S"),
         "chain_snapshot": pruned_chain
     }, indent=2)
+
+
+""" url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying_ticker}?feed=indicative&expiration_date={expiration_date}"
+
+    #expiration_date = "2026-11-06"
+    #url = f"https://alpaca.markets{underlying_ticker}&expiration_dates={expiration_date}"
+    req = urllib.request.Request(url)
+    req.add_header("APCA-API-KEY-ID", api_key)
+    req.add_header("APCA-API-SECRET-KEY", api_secret)
+    req.add_header("accept", "application/json")
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            raw_data = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        return f"Error fetching from Alpaca: {str(e)}"
+    
+    snapshots = raw_data.get("snapshots", {})
+    print(f"?? Retrieved {len(snapshots)} contracts from Alpaca for {underlying_ticker}.")
+    if not snapshots:
+        return "No snapshot data returned from Alpaca."
+ """
