@@ -2,3 +2,5 @@
 .venv-ORIG/
 **/__pycache__/
 *.pyc
+src/lib/parms.ini
+src/jboa.log
