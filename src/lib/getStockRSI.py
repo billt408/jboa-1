@@ -1,6 +1,5 @@
 import time
 import requests
-
 class TwelveData:
     BASE_URL = "https://api.twelvedata.com"
 
@@ -75,7 +74,7 @@ class TwelveData:
     def close(self):
         self.session.close()
 
-    def make_twelevedata_client(self, api_key, min_interval=8.0):
-        return TwelveData(api_key, min_interval)
+def make_twelvedata_client(self, api_key, min_interval=8.0):
+    return TwelveData(api_key, min_interval)
         
 

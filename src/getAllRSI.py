@@ -2,7 +2,7 @@ import time
 from lib.utils import JsonIniParser
 import sys
 from pathlib import Path
-from lib.getStockRSI import daily_monthly_rsi, make_twelvedata_client
+from lib.getStockRSI import make_twelvedata_client
 
 try:
     # Initialize the parser with the file path

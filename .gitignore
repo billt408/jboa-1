@@ -1,1 +1,4 @@
 .venv/
+.venv-ORIG/
+**/__pycache__/
+*.pyc
