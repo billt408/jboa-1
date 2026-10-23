@@ -39,7 +39,7 @@ class TwelveData:
         response.raise_for_status()
         return data
 
-    def rsi(self, symbol, interval="1day", period=14, outputsize=1):
+    def rsi(self, symbol, interval="1day", period=30, outputsize=1):
         data = self._get(
             "rsi",
             symbol=symbol,
@@ -63,7 +63,7 @@ class TwelveData:
             for row in values
         ]
 
-    def daily_monthly_rsi(self, symbol, period=14):
+    def daily_monthly_rsi(self, symbol, period=30):
         return {
             "symbol": symbol,
             "period": period,
