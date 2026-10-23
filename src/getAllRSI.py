@@ -7,7 +7,7 @@ import requests
 from lib.logger_init import initialize_logging
 initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 from pathlib import Path
-from lib.getStockRSI import make_twelvedata_client
+from lib.getStockRSI import mk_twelvedata_client
 from lib.utils import JsonIniParser
 
 try:
@@ -33,8 +33,8 @@ except Exception as e:
 if not api_key:
     raise SystemExit("Set the TWELVEDATA_API_KEY environment variable first.")
 
-logging.debug("DEBUG SIGNATURE: %s", inspect.signature(make_twelvedata_client))
-client = make_twelvedata_client(api_key)
+logging.debug("DEBUG SIGNATURE: %s", inspect.signature(mk_twelvedata_client))
+client = mk_twelvedata_client(api_key)
 
 logging.info("?" * 40) 
 try:
