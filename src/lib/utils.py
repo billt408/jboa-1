@@ -1,38 +1,41 @@
 import json
 import sys
 import datetime
+import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 from alpaca.trading import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
-from pathlib import Path
 
-
+logger = logging.getLogger(__name__)
 
 class JsonIniParser:
     def __init__(self, filepath: str):
         """Initializes the parser with a path to the configuration file."""
-        #print(f"--? Initializing JsonIniParser with file: {filepath}")
+        logger.debug(f"--? Initializing JsonIniParser with file: {filepath}")
+        logging.getLogger("urllib3").setLevel(logging.INFO)
         self.filepath = filepath
         # Internal structure: { "section_name": { "key": value } }
         self.data: Dict[str, Dict[str, Any]] = {}
+
 
     def load(self) -> None:
         """Reads and parses the custom JSON-INI file from disk."""
         self.data = {}
         current_section: Optional[str] = None
-        #print(f"!!? Loading configuration from: {self.filepath}")
+        logger.debug(f"!!? Loading configuration from: {self.filepath}")
         try:
             with open(self.filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-                #print(f"? Successfully read {len(lines)} lines from configuration file.")
+                logger.debug(f"? Successfully read {len(lines)} lines from configuration file.")
         except FileNotFoundError:
             # If the file doesn't exist yet, we start with an empty configuration
             return
-        #print(f"? Successfully read {len(lines)} lines from configuration file.")
+        logger.debug(f"? Successfully read {len(lines)} lines from configuration file.")
         for line_num, line in enumerate(lines, 1):
             line = line.strip()
-            #print(f"Line {line_num}: Processing: '{line}'")
+            logger.debug(f"Line {line_num}: Processing: '{line}'")
             # Skip empty lines or lines that are pure comments
             if not line or line.startswith(';') or line.startswith('#'):
                 continue
@@ -67,7 +70,7 @@ class JsonIniParser:
                     )
                 
                 self.data[current_section][key] = parsed_value
-                #print(f"Line {line_num}: Parsed [{current_section}] {key} = {parsed_value}")
+                logger.debug(f"Line {line_num}: Parsed [{current_section}] {key} = {parsed_value}")
             else:
                 raise ValueError(f"Line {line_num}: Invalid syntax. Expected a [section] or a key=value pair. Got: '{line}'")
 
@@ -98,12 +101,69 @@ class JsonIniParser:
             del self.data[section][key]
             return True
         return False
-
+        
     def load_globals(self) -> None:
         """Loads and binds configuration parameters directly to this instance."""
         # Force a load of the file path passed during initialization
         self.load() 
-        #print(f"? Configuration loaded successfully:\n{json.dumps(self.data, indent=4)}")
+        if not self.data:
+            raise FileNotFoundError(
+                logging.error(f"Configuration file at '{self.filepath}' was empty or not found.")
+            )
+
+        # 3. Parse and configure the [logging] block
+        logging_section = self.data.get("logging", {})
+
+        # Bind log file if configured
+        log_file = logging_section.get("log_file")
+        if log_file:
+            # Resolves log file relative to script parent directory
+            log_path = str(Path(self.filepath).parent.parent / log_file)
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+                )
+            )
+            logging.getLogger().addHandler(file_handler)
+
+        # Apply target module logging levels dynamically
+        for key, value in logging_section.items():
+            if key.endswith(".level"):
+                module_name = key.replace(".level", "")
+                level_string = str(value).upper()
+
+                # Get the name of the script that is currently running (e.g., 'getAllRSI')
+                running_script_stem = Path(sys.argv[0]).stem
+                
+                # Check if this configuration line belongs to the currently executing file
+                if module_name == running_script_stem:
+                    logger_target = "__main__"
+                    
+                elif module_name == "utils":
+                    logger_target = "lib.utils"
+                    
+                elif module_name == "__main__":
+                    # Skip generic '__main__' rules if we are explicitly naming files instead
+                    continue
+                    
+                else:
+                    logger_target = f"lib.{module_name}"
+
+                try:
+                    level_const = getattr(logging, level_string)
+                    logging.getLogger(logger_target).setLevel(level_const)
+                    
+                    # CRITICAL: If this is the current active script, update the root log level 
+                    # as well so it doesn't filter out its own lower-level logs
+                    if logger_target == "__main__":
+                        logging.getLogger().setLevel(level_const)
+                        
+                    logger.info(f"Dynamically configured level for script context [{module_name}] to {level_string}")
+                except AttributeError:
+                    logger.warning(f"Warning: Invalid log level identifier string parsed: {level_string}")
+
+        logger.debug(f"? Configuration loaded successfully:\n{json.dumps(self.data, indent=4)}")
          # DEBUG CHECK: If the internal dictionary is totally empty, the file wasn't read or is empty
         if not self.data:
             raise FileNotFoundError(
@@ -114,7 +174,7 @@ class JsonIniParser:
         self.CREDENTIALS = self.get("alpaca_api", "credentials")
         
         if not self.CREDENTIALS or "api_key" not in self.CREDENTIALS or "secret_key" not in self.CREDENTIALS:
-            print("? Error: Missing credentials dictionary in your config file.")
+            logger.error(f"? Error: Missing credentials dictionary in your config file.")
             sys.exit(1)
             
         # Bind them directly to the object instance
@@ -122,24 +182,25 @@ class JsonIniParser:
         self.ALPACA_SECRET = self.CREDENTIALS["secret_key"]
         self.IS_PAPER = (self.ENVIRONMENT == "paper")
         self.NUC_IP = self.get("llm_configuration", "ip_address", default="192.168.0.178")
-        #print(f"? Configuration loaded successfully.   {self}")
+        self.LOG_LEVEL = self.get("logging", "log_level", default="INFO").upper()
+        logger.debug(f"? Configuration loaded successfully.   {self}")
 
     def mk_alpaca_trading_client(self) -> 'TradingClient':
         try:
             # Load the configuration variables into the instance
             self.load_globals()
         except Exception as ce:
-            print(f"? Failed to parse configuration file: {ce}")
+            logger.error(f"? Failed to parse configuration file: {ce}")
             sys.exit(1)
 
-        print(f"Paper Trading Mode: {self.IS_PAPER}")
+        logger.info(f"Paper Trading Mode: {self.IS_PAPER}")
         # ==========================================
         # 2. INITIALIZE ALPACA TRADING CLIENT
         # ==========================================
         try:
             trading_client = TradingClient(self.ALPACA_KEY, self.ALPACA_SECRET, paper={self.IS_PAPER})
         except Exception as e:
-            print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+            logger.error(f"Critical Error loading Alpaca configuration or initializing client: {e}")
             sys.exit(1)
 
         return trading_client
@@ -149,17 +210,17 @@ class JsonIniParser:
             # Load the configuration variables into the instance
             self.load_globals()
         except Exception as ce:
-            print(f"? Failed to parse configuration file: {ce}")
+            logger.error(f"? Failed to parse configuration file: {ce}")
             sys.exit(1)
 
-        print(f"Paper Trading Mode: {self.IS_PAPER}")
+        logger.info(f"Paper Trading Mode: {self.IS_PAPER}")
         # ==========================================
         # 2. INITIALIZE ALPACA HISTORICAL CLIENT
         # ==========================================
         try:
             stock_historical_data_client = StockHistoricalDataClient(api_key=self.ALPACA_KEY, secret_key=self.ALPACA_SECRET, raw_data=False)
         except Exception as e:
-            print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+            logger.error(f"Critical Error loading Alpaca configuration or initializing client: {e}")
             sys.exit(1)
 
         return stock_historical_data_client
@@ -204,7 +265,7 @@ def get_current_ask_price(symbol: str, client=None) -> float:
             snapshot = client.get_stock_snapshot(request_params)
 
             if ticker not in snapshot:
-                print(f"? No snapshot data found for symbol: {ticker}")
+                logger.info(f"? No snapshot data found for symbol: {ticker}")
                 return 0.0
 
             ticker_snapshot = snapshot[ticker]
@@ -223,16 +284,35 @@ def get_current_ask_price(symbol: str, client=None) -> float:
             # 3. Strategy Plan B (THE FIX): If the IEX quote returned 0, fallback to the latest real trade execution price
             if ask_price == 0.0 and latest_trade and hasattr(latest_trade, 'price') and latest_trade.price is not None:
                 ask_price = float(latest_trade.price)
-                print(f"? Free-tier quote was thin (0.0). Successfully fell back to Latest Trade Price: ${ask_price:.2f}")
+                logger.info(f"? Free-tier quote was thin (0.0). Successfully fell back to Latest Trade Price: ${ask_price:.2f}")
 
             # 4. Strategy Plan C: Absolute baseline fallback to the last daily candle close if everything else is dry
             if ask_price == 0.0 and daily_bar and hasattr(daily_bar, 'close') and daily_bar.close is not None:
                 ask_price = float(daily_bar.close)
-                print(f"? Quote and trade data empty. Falling back to Daily Candle Close: ${ask_price:.2f}")
+                logger.info(f"? Quote and trade data empty. Falling back to Daily Candle Close: ${ask_price:.2f}")
 
-            print(f"?? Reference Price Used for {ticker}: ${ask_price:.2f}")
+            logger.info(f"?? Reference Price Used for {ticker}: ${ask_price:.2f}")
             return ask_price
 
     except Exception as e:
-        print(f"? Error retrieving baseline market valuation for {ticker}: {e}")
+        logger.error(f"? Error retrieving baseline market valuation for {ticker}: {e}")
         return 0.0
+
+def get_logger(name: str, level=logging.INFO) -> logging.Logger:
+    """Creates and returns a logger with the specified name and level."""
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    # Create console handler with the specified log level
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    
+    # Create formatter and add it to the handler
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    
+    # Add the handler to the logger
+    if not logger.handlers:
+        logger.addHandler(ch)
+    
+    return logger

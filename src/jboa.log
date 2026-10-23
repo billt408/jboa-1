@@ -1,0 +1,1043 @@
+2026-10-23 11:19:46,881 [INFO] lib.utils: Set logger level for [lib.getOptionsContracts] to INFO
+2026-10-23 11:19:46,881 [INFO] lib.utils: Set logger level for [lib.getStockRSI] to INFO
+2026-10-23 11:19:46,882 [INFO] lib.utils: Set logger level for [lib.indicators] to INFO
+2026-10-23 11:19:46,882 [INFO] lib.utils: Set logger level for [lib.utils] to DEBUG
+2026-10-23 11:19:46,882 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:19:46,882 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:19:46,882 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:19:46,882 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "INFO",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:19:46,882 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7efc58ab7c50>
+2026-10-23 11:19:46,884 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:19:47,085 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:19:54,995 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:27:03,059 [INFO] lib.utils: Set logger level for [lib.getOptionsContracts] to INFO
+2026-10-23 11:27:03,059 [INFO] lib.utils: Set logger level for [lib.getStockRSI] to INFO
+2026-10-23 11:27:03,059 [INFO] lib.utils: Set logger level for [lib.indicators] to INFO
+2026-10-23 11:27:03,059 [INFO] lib.utils: Set logger level for [lib.utils] to DEBUG
+2026-10-23 11:27:03,059 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:27:03,060 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:27:03,060 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:27:03,060 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "INFO",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:27:03,060 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7f6c313fb9e0>
+2026-10-23 11:27:03,061 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:27:03,314 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:27:11,170 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [lib.getOptionsContracts] to INFO
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [lib.getStockRSI] to INFO
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [lib.indicators] to INFO
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [lib.utils] to DEBUG
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:31:40,894 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:31:40,894 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "INFO",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:31:40,894 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7fc6a7d407d0>
+2026-10-23 11:31:40,894 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:31:40,895 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:31:40,895 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:31:40,896 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:31:41,125 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:31:49,017 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:31:49,018 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.10875
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.47023
+  }
+}
+2026-10-23 11:31:49,018 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [lib.getOptionsContracts] to INFO
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [lib.getStockRSI] to INFO
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [lib.indicators] to INFO
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [lib.utils] to DEBUG
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:31:59,513 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:31:59,514 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "INFO",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:31:59,514 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7f286d20a960>
+2026-10-23 11:31:59,514 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:31:59,515 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:31:59,515 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:31:59,515 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:31:59,699 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:32:07,639 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:32:07,640 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.10875
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.47023
+  }
+}
+2026-10-23 11:32:07,640 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [lib.getOptionsContracts] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [lib.getStockRSI] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [lib.indicators] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [lib.utils] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:32:40,660 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:32:40,660 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:32:40,661 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:32:40,661 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:32:40,662 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:32:40,870 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:32:48,779 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:32:48,780 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.019729
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.4757
+  }
+}
+2026-10-23 11:32:48,780 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:40:37,108 [INFO] lib.utils: Set logger level for [lib.utils] to INFO
+2026-10-23 11:40:37,108 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:40:37,108 [INFO] lib.utils: Set logger level for [__main__] to INFO
+2026-10-23 11:40:37,108 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:40:37,108 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:40:37,108 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:40:45,230 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:41:47,721 [INFO] lib.utils: Set logger level for [lib.utils] to INFO
+2026-10-23 11:41:47,721 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:41:47,721 [INFO] lib.utils: Set logger level for [__main__] to DEBUG
+2026-10-23 11:41:47,721 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:41:47,722 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:41:47,722 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:41:55,831 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:42:31,489 [INFO] lib.utils: Set logger level for [lib.utils] to DEBUG
+2026-10-23 11:42:31,489 [INFO] lib.utils: Set logger level for [getAllOptChain] to INFO
+2026-10-23 11:42:31,489 [INFO] lib.utils: Set logger level for [__main__] to DEBUG
+2026-10-23 11:42:31,489 [INFO] lib.utils: Set logger level for [getMondayOpen] to INFO
+2026-10-23 11:42:31,489 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "DEBUG",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:42:31,489 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7fe0fbc72a50>
+2026-10-23 11:42:31,489 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:42:31,489 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:42:39,600 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:50:03,442 [INFO] lib.utils: Dynamically configured level for script context [utils] to DEBUG
+2026-10-23 11:50:03,442 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 11:50:03,442 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 11:50:03,442 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 11:50:03,442 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "DEBUG",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:50:03,442 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7f10ea7c2150>
+2026-10-23 11:50:03,442 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:50:03,444 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:50:03,444 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:50:03,445 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:50:03,650 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:50:11,556 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:50:11,557 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.51252
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.49486
+  }
+}
+2026-10-23 11:50:11,558 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:52:17,786 [INFO] lib.utils: Dynamically configured level for script context [utils] to DEBUG
+2026-10-23 11:52:17,786 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 11:52:17,786 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 11:52:17,786 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 11:52:17,786 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "DEBUG",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:52:17,786 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7f2129819c40>
+2026-10-23 11:52:17,786 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:52:17,786 [DEBUG] root: DEBUG SIGNATURE: (api_key, min_interval=8.0)
+2026-10-23 11:52:17,787 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:52:17,787 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:52:17,788 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): api.twelvedata.com:443
+2026-10-23 11:52:18,026 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1day&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:52:25,915 [DEBUG] urllib3.connectionpool: https://api.twelvedata.com:443 "GET /rsi?symbol=SQQQ&interval=1month&time_period=14&series_type=close&outputsize=1&order=desc&format=JSON&apikey=db25ae900027469b848d8fdd38802011 HTTP/1.1" 200 None
+2026-10-23 11:52:25,916 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.37735
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.48391
+  }
+}
+2026-10-23 11:52:25,916 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:57:28,667 [INFO] lib.utils: Dynamically configured level for script context [utils] to DEBUG
+2026-10-23 11:57:28,667 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 11:57:28,667 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 11:57:28,667 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 11:57:28,667 [DEBUG] lib.utils: ? Configuration loaded successfully:
+{
+    "alpaca_api": {
+        "environment": "paper",
+        "timeout_seconds": 30,
+        "credentials": {
+            "api_key": "PK3IWXWY7AMSJRBAX3AOGMHNU4",
+            "secret_key": "AszALSMzQfAXRm1ADpAatfjjmfuC6ULtT9PrASvhT9YP"
+        }
+    },
+    "twelvedata_api": {
+        "twelvedata_api_key": "db25ae900027469b848d8fdd38802011"
+    },
+    "financialmodelingprep_api": {
+        "api_key": "Jvlua1CKwp1L5kpzaCh4IWpZHCgOfeDh"
+    },
+    "risk_management": {
+        "max_contracts_per_order": 5,
+        "target_underlyings": [
+            "AAPL",
+            "MSFT",
+            "GOOG"
+        ]
+    },
+    "llm_configuration": {
+        "model_name": "qwen2.5:3b",
+        "ip_address": "192.168.0.178"
+    },
+    "symbols": {
+        "target_symbols": [
+            "SQQQ"
+        ]
+    },
+    "logging": {
+        "log_file": "jboa.log",
+        "getOptionsContracts.level": "INFO",
+        "getStockRSI.level": "INFO",
+        "indicators.level": "INFO",
+        "utils.level": "DEBUG",
+        "getAllOptChain.level": "INFO",
+        "getAllRSI.level": "DEBUG",
+        "getMondayOpen.level": "INFO"
+    }
+}
+2026-10-23 11:57:28,667 [DEBUG] lib.utils: ? Configuration loaded successfully.   <lib.utils.JsonIniParser object at 0x7fdf858c1640>
+2026-10-23 11:57:28,667 [DEBUG] root: Using API key: db25ae900027469b848d8fdd38802011
+2026-10-23 11:57:28,667 [DEBUG] root: DEBUG SIGNATURE: (api_key, min_interval=8.0)
+2026-10-23 11:57:28,668 [INFO] root: ????????????????????????????????????????
+2026-10-23 11:57:28,668 [INFO] root:  Getting RSI for: SQQQ 
+2026-10-23 11:57:36,786 [DEBUG] root: {
+  "symbol": "SQQQ",
+  "period": 14,
+  "daily": {
+    "datetime": "2026-10-23",
+    "rsi": 62.42234
+  },
+  "monthly": {
+    "datetime": "2026-10-01",
+    "rsi": 26.48939
+  }
+}
+2026-10-23 11:57:36,786 [INFO] root: ????????????????????????????????????????
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:04:29,256 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:04:29,257 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:04:29,257 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:04:29,257 [INFO] root: ****************************************
+2026-10-23 12:04:29,257 [INFO] root: ****************************************
+2026-10-23 12:04:29,257 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:04:29,257 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:04:29,257 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:04:29,257 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:04:29,257 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:04:29,257 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:04:30,008 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:04:30,008 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:04:30,431 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.57
+2026-10-23 12:04:30,431 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.57
+2026-10-23 12:04:30,431 [INFO] root:  Current Spot Ask Price for SQQQ: 39.57
+2026-10-23 12:04:30,431 [INFO] root:  Current Spot Ask Price for SQQQ: 39.57
+2026-10-23 12:04:30,431 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,431 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,431 [INFO] root: Option Symbol: SQQQ261113C00020000 | Strike: 20.0 | Bid: 17.3 | Ask: 21.29
+2026-10-23 12:04:30,431 [INFO] root: Option Symbol: SQQQ261113C00020000 | Strike: 20.0 | Bid: 17.3 | Ask: 21.29
+2026-10-23 12:04:30,431 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,431 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00022000 | Strike: 22.0 | Bid: 15.56 | Ask: 19.35
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00022000 | Strike: 22.0 | Bid: 15.56 | Ask: 19.35
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00023000 | Strike: 23.0 | Bid: 14.71 | Ask: 18.68
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00023000 | Strike: 23.0 | Bid: 14.71 | Ask: 18.68
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00024000 | Strike: 24.0 | Bid: 13.7 | Ask: 17.7
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00024000 | Strike: 24.0 | Bid: 13.7 | Ask: 17.7
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00025000 | Strike: 25.0 | Bid: 12.42 | Ask: 16.48
+2026-10-23 12:04:30,432 [INFO] root: Option Symbol: SQQQ261113C00025000 | Strike: 25.0 | Bid: 12.42 | Ask: 16.48
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00026000 | Strike: 26.0 | Bid: 11.67 | Ask: 15.42
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00026000 | Strike: 26.0 | Bid: 11.67 | Ask: 15.42
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00027000 | Strike: 27.0 | Bid: 10.73 | Ask: 14.69
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00027000 | Strike: 27.0 | Bid: 10.73 | Ask: 14.69
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00028000 | Strike: 28.0 | Bid: 9.57 | Ask: 13.61
+2026-10-23 12:04:30,433 [INFO] root: Option Symbol: SQQQ261113C00028000 | Strike: 28.0 | Bid: 9.57 | Ask: 13.61
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00029000 | Strike: 29.0 | Bid: 8.72 | Ask: 12.29
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00029000 | Strike: 29.0 | Bid: 8.72 | Ask: 12.29
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00029500 | Strike: 29.5 | Bid: 8.26 | Ask: 11.8
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00029500 | Strike: 29.5 | Bid: 8.26 | Ask: 11.8
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00030000 | Strike: 30.0 | Bid: 7.88 | Ask: 11.75
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00030000 | Strike: 30.0 | Bid: 7.88 | Ask: 11.75
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00030500 | Strike: 30.5 | Bid: 7.09 | Ask: 11.19
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00030500 | Strike: 30.5 | Bid: 7.09 | Ask: 11.19
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00031000 | Strike: 31.0 | Bid: 6.53 | Ask: 10.72
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00031000 | Strike: 31.0 | Bid: 6.53 | Ask: 10.72
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00031500 | Strike: 31.5 | Bid: 6.31 | Ask: 9.92
+2026-10-23 12:04:30,434 [INFO] root: Option Symbol: SQQQ261113C00031500 | Strike: 31.5 | Bid: 6.31 | Ask: 9.92
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00032000 | Strike: 32.0 | Bid: 6.27 | Ask: 9.55
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00032000 | Strike: 32.0 | Bid: 6.27 | Ask: 9.55
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00032500 | Strike: 32.5 | Bid: 5.37 | Ask: 9.13
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00032500 | Strike: 32.5 | Bid: 5.37 | Ask: 9.13
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00033000 | Strike: 33.0 | Bid: 5.16 | Ask: 8.78
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00033000 | Strike: 33.0 | Bid: 5.16 | Ask: 8.78
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00033500 | Strike: 33.5 | Bid: 4.39 | Ask: 8.32
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00033500 | Strike: 33.5 | Bid: 4.39 | Ask: 8.32
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00034000 | Strike: 34.0 | Bid: 4.25 | Ask: 7.9
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00034000 | Strike: 34.0 | Bid: 4.25 | Ask: 7.9
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00034500 | Strike: 34.5 | Bid: 3.8 | Ask: 7.6
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00034500 | Strike: 34.5 | Bid: 3.8 | Ask: 7.6
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00035000 | Strike: 35.0 | Bid: 3.43 | Ask: 7.02
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00035000 | Strike: 35.0 | Bid: 3.43 | Ask: 7.02
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00035500 | Strike: 35.5 | Bid: 3.36 | Ask: 6.74
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00035500 | Strike: 35.5 | Bid: 3.36 | Ask: 6.74
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00036000 | Strike: 36.0 | Bid: 4.37 | Ask: 4.89
+2026-10-23 12:04:30,435 [INFO] root: Option Symbol: SQQQ261113C00036000 | Strike: 36.0 | Bid: 4.37 | Ask: 4.89
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,435 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00036500 | Strike: 36.5 | Bid: 3.73 | Ask: 4.78
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00036500 | Strike: 36.5 | Bid: 3.73 | Ask: 4.78
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00037000 | Strike: 37.0 | Bid: 3.97 | Ask: 4.28
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00037000 | Strike: 37.0 | Bid: 3.97 | Ask: 4.28
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00037500 | Strike: 37.5 | Bid: 3.34 | Ask: 4.13
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00037500 | Strike: 37.5 | Bid: 3.34 | Ask: 4.13
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00038000 | Strike: 38.0 | Bid: 3.21 | Ask: 3.79
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00038000 | Strike: 38.0 | Bid: 3.21 | Ask: 3.79
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00038500 | Strike: 38.5 | Bid: 2.58 | Ask: 3.78
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00038500 | Strike: 38.5 | Bid: 2.58 | Ask: 3.78
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00039000 | Strike: 39.0 | Bid: 2.76 | Ask: 3.52
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00039000 | Strike: 39.0 | Bid: 2.76 | Ask: 3.52
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00039500 | Strike: 39.5 | Bid: 2.92 | Ask: 3.22
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00039500 | Strike: 39.5 | Bid: 2.92 | Ask: 3.22
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00040000 | Strike: 40.0 | Bid: 2.53 | Ask: 2.83
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00040000 | Strike: 40.0 | Bid: 2.53 | Ask: 2.83
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:04:30,436 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00041000 | Strike: 41.0 | Bid: 2.24 | Ask: 2.64
+2026-10-23 12:04:30,436 [INFO] root: Option Symbol: SQQQ261113C00041000 | Strike: 41.0 | Bid: 2.24 | Ask: 2.64
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,436 [INFO] root: Strike Price: 39.57 | Spot Price: 39.57
+2026-10-23 12:04:30,437 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:04:30,437 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:04:30,437 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:04:30,437 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:06:09,625 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:06:09,625 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:06:09,625 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:06:09,625 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:06:09,626 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:06:09,626 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:06:09,626 [INFO] root: ****************************************
+2026-10-23 12:06:09,626 [INFO] root: ****************************************
+2026-10-23 12:06:09,626 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:06:09,626 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:06:09,626 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:06:09,626 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:06:09,626 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:06:09,626 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:06:10,097 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:06:10,097 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:06:10,429 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.61
+2026-10-23 12:06:10,429 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.61
+2026-10-23 12:06:10,429 [INFO] root:  Current Spot Ask Price for SQQQ: 39.61
+2026-10-23 12:06:10,429 [INFO] root:  Current Spot Ask Price for SQQQ: 39.61
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,430 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,431 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,432 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   IN-THE-MONEY (ITM)
+2026-10-23 12:06:10,433 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:06:10,433 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:06:10,434 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:06:10,434 [INFO] root:   OUT-OF-THE-MONEY (OTM)
+2026-10-23 12:06:10,434 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:06:10,434 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:07:03,388 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:07:03,389 [INFO] lib.utils: Dynamically configured level for script context [indicators] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:07:03,390 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:07:03,390 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:07:03,390 [INFO] root: ****************************************
+2026-10-23 12:07:03,390 [INFO] root: ****************************************
+2026-10-23 12:07:03,390 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:07:03,390 [INFO] root:  Collect option chain data for 1 symbols...
+2026-10-23 12:07:03,390 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:07:03,390 [INFO] root:  PROCESSING DATA FOR TICKER: SQQQ 
+2026-10-23 12:07:03,390 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:07:03,390 [INFO] root:  Target Expiration Date (3 Fridays Away): 2026-11-13
+2026-10-23 12:07:03,922 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:07:03,922 [INFO] root:  Target Master Contracts returned by Alpaca: 38 Call options.
+2026-10-23 12:07:04,245 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.62
+2026-10-23 12:07:04,245 [INFO] lib.utils: ?? Reference Price Used for SQQQ: $39.62
+2026-10-23 12:07:04,245 [INFO] root:  Current Spot Ask Price for SQQQ: 39.62
+2026-10-23 12:07:04,245 [INFO] root:  Current Spot Ask Price for SQQQ: 39.62
+2026-10-23 12:07:04,246 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:07:04,246 [INFO] root:   This is the second OTM contract, stopping further logging.
+2026-10-23 12:07:04,246 [INFO] root: Option Symbol: SQQQ261113C00041000 | Strike: 41.0 | Bid: 2.24 | Ask: 2.65
+2026-10-23 12:07:04,246 [INFO] root: Option Symbol: SQQQ261113C00041000 | Strike: 41.0 | Bid: 2.24 | Ask: 2.65
+2026-10-23 12:13:43,974 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:13:43,974 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:13:43,975 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:13:43,975 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getOptionsContracts] to DEBUG
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:19:14,925 [INFO] lib.utils: Dynamically configured level for script context [getStockRSI] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [utils] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getAllOptChain] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getAllRSI] to DEBUG
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Dynamically configured level for script context [getMondayOpen] to INFO
+2026-10-23 12:19:14,926 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:19:14,926 [INFO] lib.utils: Paper Trading Mode: True
+2026-10-23 12:19:14,926 [INFO] root: ?? Alpaca Historical Data Client initialized successfully.
+2026-10-23 12:19:14,926 [INFO] root: ?? Alpaca Historical Data Client initialized successfully.
+2026-10-23 12:19:14,933 [INFO] root: Querying Alpaca for pre-market data between:
+2026-10-23 12:19:14,933 [INFO] root: Querying Alpaca for pre-market data between:
+2026-10-23 12:19:14,933 [INFO] root: Start: 2026-10-20 08:00:00 LMT
+2026-10-23 12:19:14,933 [INFO] root: Start: 2026-10-20 08:00:00 LMT
+2026-10-23 12:19:14,933 [INFO] root: End:   2026-10-20 16:00:00 LMT
+
+2026-10-23 12:19:14,933 [INFO] root: End:   2026-10-20 16:00:00 LMT
+
+2026-10-23 12:19:15,443 [INFO] root: ?? Successfully retrieved historical bar data for QQQ and SPY.
+2026-10-23 12:19:15,443 [INFO] root: ?? Successfully retrieved historical bar data for QQQ and SPY.
+2026-10-23 12:19:15,460 [INFO] root: 
+=== QQQ Premarket Data ===
+2026-10-23 12:19:15,460 [INFO] root: 
+=== QQQ Premarket Data ===
+2026-10-23 12:19:15,461 [INFO] root: 4:00 AM Open:     $715.24
+2026-10-23 12:19:15,461 [INFO] root: 4:00 AM Open:     $715.24
+2026-10-23 12:19:15,461 [INFO] root: 4:00 PM Close:  $721.63
+2026-10-23 12:19:15,461 [INFO] root: 4:00 PM Close:  $721.63
+2026-10-23 12:19:15,461 [INFO] root: Percent Change:   +0.89%
+2026-10-23 12:19:15,461 [INFO] root: Percent Change:   +0.89%
+2026-10-23 12:19:15,461 [INFO] root: Absolute Change:  [UP] $+6.39
+2026-10-23 12:19:15,461 [INFO] root: Absolute Change:  [UP] $+6.39
+2026-10-23 12:19:15,461 [INFO] root: Premarket High:   $722.74
+2026-10-23 12:19:15,461 [INFO] root: Premarket High:   $722.74
+2026-10-23 12:19:15,461 [INFO] root: Premarket Low:    $710.42
+2026-10-23 12:19:15,461 [INFO] root: Premarket Low:    $710.42
+2026-10-23 12:19:15,461 [INFO] root: 
+=== SPY Premarket Data ===
+2026-10-23 12:19:15,461 [INFO] root: 
+=== SPY Premarket Data ===
+2026-10-23 12:19:15,461 [INFO] root: 4:00 AM Open:     $765.67
+2026-10-23 12:19:15,461 [INFO] root: 4:00 AM Open:     $765.67
+2026-10-23 12:19:15,461 [INFO] root: 4:00 PM Close:  $770.63
+2026-10-23 12:19:15,461 [INFO] root: 4:00 PM Close:  $770.63
+2026-10-23 12:19:15,462 [INFO] root: Percent Change:   +0.65%
+2026-10-23 12:19:15,462 [INFO] root: Percent Change:   +0.65%
+2026-10-23 12:19:15,462 [INFO] root: Absolute Change:  [UP] $+4.96
+2026-10-23 12:19:15,462 [INFO] root: Absolute Change:  [UP] $+4.96
+2026-10-23 12:19:15,462 [INFO] root: Premarket High:   $772.29
+2026-10-23 12:19:15,462 [INFO] root: Premarket High:   $772.29
+2026-10-23 12:19:15,462 [INFO] root: Premarket Low:    $764.34
+2026-10-23 12:19:15,462 [INFO] root: Premarket Low:    $764.34

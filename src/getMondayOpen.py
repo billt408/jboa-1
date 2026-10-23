@@ -1,13 +1,34 @@
 from datetime import datetime
 import pytz
+import logging
+import sys
+from lib.logger_init import initialize_logging
+initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
+
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
-
-from lib.utils import JsonIniParser
-import sys
 from pathlib import Path
 
+# ==============================================================================
+# ENVIRONMENT PATH PATCH
+# Guarantees that 'src' is always in the path so 'from lib.utils' works seamlessly
+# regardless of whether this script is called directly or imported.
+# ==============================================================================
+src_path = str(Path(__file__).resolve().parent.parent)
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
+# Import your parser from the sibling utils module
+from lib.utils import JsonIniParser
+try:
+    # Initialize the parser with the file path
+    config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
+    config.load()
+    config.load_globals()
+except Exception as ce:
+    logging.error(f"? Failed to parse configuration file: {ce}")
+    sys.exit(1)
 
 def get_monday_premarket_data(client):
     # 2. Set up the timezone structures explicitly to handle EST vs UTC
@@ -20,9 +41,9 @@ def get_monday_premarket_data(client):
     #end_time = datetime(now_est.year, now_est.month, now_est.day, 5, 0, 0, tzinfo=est_tz)
     start_time = datetime(2026, 10, 20, 8, 0, 0, tzinfo=est_tz)
     end_time = datetime(2026, 10, 20, 16, 0, 0, tzinfo=est_tz)
-    print(f"Querying Alpaca for pre-market data between:")
-    print(f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"End:   {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+    logging.info(f"Querying Alpaca for pre-market data between:")
+    logging.info(f"Start: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logging.info(f"End:   {end_time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
     
     try:
         # 4. Formulate the explicit bar request
@@ -38,17 +59,16 @@ def get_monday_premarket_data(client):
         
         # 5. Fetch the historical bars array
         bars_data = client.get_stock_bars(request_params)
-        print(f"?? Successfully retrieved historical bar data for QQQ and SPY.")
+        logging.info(f"?? Successfully retrieved historical bar data for QQQ and SPY.")
         # Convert the raw data block directly into a pandas DataFrame for simple slicing
         df = bars_data.df
-        print(f"?? DataFrame shape: {df.shape} | Columns: {list(df.columns)}")
+        logging.debug(f"?? DataFrame shape: {df.shape} | Columns: {list(df.columns)}")
     
-
         if not df.empty:
             for symbol in ["QQQ", "SPY"]:
                 if symbol in df.index.levels[0]:
                     symbol_df = df.xs(symbol)
-                    print(f"\n=== {symbol} Premarket Data ===")
+                    logging.info(f"\n=== {symbol} Premarket Data ===")
                     
                     # FIXED: Changed keys to lowercase ('open', 'close', 'high', 'low')
                     open_at_4am = symbol_df['open'].iloc[0]
@@ -61,35 +81,26 @@ def get_monday_premarket_data(client):
                     percentage_change = (absolute_change / open_at_4am) * 100
                     direction = "[UP]" if absolute_change >= 0 else "[DOWN]"
                     
-                    # Add print block to complete the logic loop
-                    print(f"4:00 AM Open:     ${open_at_4am:,.2f}")
-                    print(f"4:00 PM Close:  ${price_at_4pm:,.2f}")
-                    print(f"Percent Change:   {percentage_change:+.2f}%")   
-                    print(f"Absolute Change:  {direction} ${absolute_change:+,.2f}")         
-                    print(f"Premarket High:   ${high_premarket:,.2f}")
-                    print(f"Premarket Low:    ${low_premarket:,.2f}")
+                    # Add information block to complete the logic loop
+                    logging.info(f"4:00 AM Open:     ${open_at_4am:,.2f}")
+                    logging.info(f"4:00 PM Close:  ${price_at_4pm:,.2f}")
+                    logging.info(f"Percent Change:   {percentage_change:+.2f}%")   
+                    logging.info(f"Absolute Change:  {direction} ${absolute_change:+,.2f}")         
+                    logging.info(f"Premarket High:   ${high_premarket:,.2f}")
+                    logging.info(f"Premarket Low:    ${low_premarket:,.2f}")
                 else:   
-                    print(f"No trading data available for symbol {symbol} yet.")
+                    logging.info(f"No trading data available for symbol {symbol} yet.")
         else:
-            print("Alpaca data frame returned empty. Ensure the market is open.")
+            logging.info("Alpaca data frame returned empty. Ensure the market is open.")
             
     except Exception as e:
-        print(f"An unexpected data client error occurred: {e}")
+        logging.error(f"An unexpected data client error occurred: {e}")
 
-if __name__ == "__main__":
-
-    try:
-        # Initialize the parser with the file path
-        config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
-
-    except Exception as ce:
-        print(f"? Failed to parse configuration file: {ce}")
-        sys.exit(1)
-    try:
-        client = config.mk_alpaca_historical_client()
-    except Exception as e:
-        print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
-        sys.exit(2)        
-    print(f"?? Alpaca Historical Data Client initialized successfully.")
-    get_monday_premarket_data(client)    
+try:
+    client = config.mk_alpaca_historical_client()
+except Exception as e:
+    logging.error(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+    sys.exit(2)        
+logging.info(f"?? Alpaca Historical Data Client initialized successfully.")
+get_monday_premarket_data(client)    
 

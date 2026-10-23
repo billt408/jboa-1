@@ -74,7 +74,7 @@ class TwelveData:
     def close(self):
         self.session.close()
 
-def make_twelvedata_client(self, api_key, min_interval=8.0):
+def make_twelvedata_client(api_key, min_interval=8.0):
     return TwelveData(api_key, min_interval)
         
 

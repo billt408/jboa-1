@@ -1,4 +1,7 @@
 import sys
+import logging
+from lib.logger_init import initialize_logging
+initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 from pathlib import Path
 from lib.getOptionsContracts import get_pruned_option_chain
 
@@ -23,34 +26,34 @@ try:
     nuc_ip = config.NUC_IP
     client = config.mk_alpaca_historical_client()
 except Exception as ce:
-    print(f"? Failed to parse configuration file: {ce}")
+    logging.error(f"? Failed to parse configuration file: {ce}")
     sys.exit(1)
 try:
     target_symbols = config.get("symbols", "target_symbols")
 except Exception as e:
-    print(f"Critical Error loading Alpaca configuration or initializing symbols: {e}")
+    logging.error(f"Critical Error loading Alpaca configuration or initializing symbols: {e}")
     sys.exit(2)        
-print("*" * 40)
-print(f" Collect option chain data for {len(target_symbols)} symbols...")
+logging.info("*" * 40)
+logging.info(f" Collect option chain data for {len(target_symbols)} symbols...")
 
 for symbol in target_symbols:
-    #print(f"config contents: {config.__dict__}")
+    logging.debug(f"config contents: {config.__dict__}")
     # Normalize ticker to uppercase for the Alpaca API
     ticker = symbol.upper()
     
     # Visual Header Separator
-    print(f" PROCESSING DATA FOR TICKER: {ticker} ")
+    logging.info(f" PROCESSING DATA FOR TICKER: {ticker} ")
     
     try:
         clean_payload = get_pruned_option_chain(ticker, config.ALPACA_KEY, config.ALPACA_SECRET, client)
-        print(f"Pruned Option Chain Payload for {ticker}:")
-        print(clean_payload)
+        logging.debug(f"Pruned Option Chain Payload for {ticker}:")
+        logging.debug(clean_payload)
     except Exception as e:
-        print(f"Error processing symbol {ticker}: {e}")
+        logging.error(f"Error processing symbol {ticker}: {e}")
 
 
-    #print("Analyzing pruned live option chain data for MU...")
+    #logging.info("Analyzing pruned live option chain data for MU...")
     #result = consult_isolated_analyst(clean_payload)
-    #print("MU Model response:", result)
+    #logging.info(f"MU Model response: {result}")
 
 

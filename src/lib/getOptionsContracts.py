@@ -1,4 +1,5 @@
 import json
+import logging
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -18,7 +19,7 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
     target_friday = get_three_fridays_away(start_date=current_date_var)
     expiration_date = target_friday.strftime("%Y-%m-%d")
 
-    print(f" Target Expiration Date (3 Fridays Away): {expiration_date}")
+    logging.info(f" Target Expiration Date (3 Fridays Away): {expiration_date}")
 
     # ==========================================================================
     # ONE-STEP: Call the native option-chain snapshot endpoint directly
@@ -59,13 +60,13 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         if not page_token:
             break
 
-    print(f" Target Master Contracts returned by Alpaca: {len(all_snapshots)} Call options.")
+    logging.info(f" Target Master Contracts returned by Alpaca: {len(all_snapshots)} Call options.")
     if not all_snapshots:
         return f"No snapshot data returned from Alpaca for {ticker}."
     
     # Fetch your shared baseline spot asset ask price
     stk_ask_price = get_current_ask_price(ticker, client)
-    print(f" Current Spot Ask Price for {ticker}: {stk_ask_price}")
+    logging.info(f" Current Spot Ask Price for {ticker}: {stk_ask_price}")
     # ==========================================================================
     # PROCESS, CENTER AND PRUNE AROUND SPOT PRICE
     # ==========================================================================
@@ -97,21 +98,22 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
     else:
         sorted_by_strike = sorted(parsed_contracts, key=lambda x: x["strike"])
         pruned_chain = sorted_by_strike[:20]
-    print(f" pruned chain length: {len(pruned_chain)}")
+    logging.debug(f" pruned chain length: {len(pruned_chain)}")
     otm=0
     # Clear terminal logging format
     for contract in pruned_chain:
-        print("^" * 40)
-        print(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
-        print(f"Strike Price: {stk_ask_price} | Spot Price: {stk_ask_price}")
+        logging.debug("^" * 40)
+        logging.debug(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
+        logging.debug(f"Strike Price: {stk_ask_price} | Spot Price: {stk_ask_price}")
         if stk_ask_price > 0:
             if contract['strike'] <= stk_ask_price:
-                print(f"  IN-THE-MONEY (ITM)")
+                logging.debug(f"  IN-THE-MONEY (ITM)")
             else:
-                print(f"  OUT-OF-THE-MONEY (OTM)")
+                logging.debug(f"  OUT-OF-THE-MONEY (OTM)")
                 otm += 1
                 if otm == 2:
-                    print(f"  This is the second OTM contract, stopping further logging.")
+                    logging.info(f"  This is the second OTM contract, stopping further logging.")
+                    logging.info(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
                     break
 
     return json.dumps({
