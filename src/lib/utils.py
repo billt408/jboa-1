@@ -200,24 +200,39 @@ def get_current_ask_price(symbol: str, client=None) -> float:
     ticker = symbol.upper()
 
     try:
-        # 2. Query the live asset snapshot endpoint
-        request_params = StockSnapshotRequest(symbol_or_symbols=ticker)
-        snapshot = client.get_stock_snapshot(request_params)
+            request_params = StockSnapshotRequest(symbol_or_symbols=ticker)
+            snapshot = client.get_stock_snapshot(request_params)
 
-        if ticker not in snapshot:
-            print(f"? No snapshot data found for symbol: {ticker}")
-            return 0.0
+            if ticker not in snapshot:
+                print(f"? No snapshot data found for symbol: {ticker}")
+                return 0.0
 
-        # 3. Target the latest daily quote container
-        latest_quote = snapshot[ticker].latest_quote
-        print(f"?? Latest Quote for {ticker}: Bid={latest_quote.bid_price}, Ask={latest_quote.ask_price}")
-        if latest_quote is None:
-            print(f"? Live quote currently unavailable for ticker: {ticker}")
-            return 0.0
+            ticker_snapshot = snapshot[ticker]
+            
+            # 1. Gather our potential price anchors from the snapshot object wrapper
+            latest_quote = getattr(ticker_snapshot, 'latest_quote', None)
+            latest_trade = getattr(ticker_snapshot, 'latest_trade', None)
+            daily_bar = getattr(ticker_snapshot, 'daily_bar', None)
+            
+            ask_price = 0.0
+            
+            # 2. Strategy Plan A: Try extracting the standard live inside Ask price
+            if latest_quote and hasattr(latest_quote, 'ask_price') and latest_quote.ask_price is not None:
+                ask_price = float(latest_quote.ask_price)
 
-        # 4. Extract and return the raw ask price ('ap')
-        return float(latest_quote.ask_price)
+            # 3. Strategy Plan B (THE FIX): If the IEX quote returned 0, fallback to the latest real trade execution price
+            if ask_price == 0.0 and latest_trade and hasattr(latest_trade, 'price') and latest_trade.price is not None:
+                ask_price = float(latest_trade.price)
+                print(f"? Free-tier quote was thin (0.0). Successfully fell back to Latest Trade Price: ${ask_price:.2f}")
+
+            # 4. Strategy Plan C: Absolute baseline fallback to the last daily candle close if everything else is dry
+            if ask_price == 0.0 and daily_bar and hasattr(daily_bar, 'close') and daily_bar.close is not None:
+                ask_price = float(daily_bar.close)
+                print(f"? Quote and trade data empty. Falling back to Daily Candle Close: ${ask_price:.2f}")
+
+            print(f"?? Reference Price Used for {ticker}: ${ask_price:.2f}")
+            return ask_price
 
     except Exception as e:
-        print(f"? Error retrieving live market ask for {ticker}: {e}")
+        print(f"? Error retrieving baseline market valuation for {ticker}: {e}")
         return 0.0

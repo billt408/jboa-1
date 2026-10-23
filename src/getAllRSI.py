@@ -1,8 +1,8 @@
 import time
-from lib.indicators import run_rsi_analysis
 from lib.utils import JsonIniParser
 import sys
 from pathlib import Path
+from lib.getStockRSI import daily_monthly_rsi, make_twelvedata_client
 
 try:
     # Initialize the parser with the file path
@@ -14,32 +14,28 @@ except Exception as ce:
 try:
     target_symbols = config.get("symbols", "target_symbols")
 except Exception as e:
-    print(f"Critical Error loading Alpaca configuration or initializing symbols: {e}")
+    print(f"Critical Error initializing symbols: {e}")
     sys.exit(2)        
 
-print(f"?? Starting batch RSI analysis for {len(target_symbols)} symbols...\n")
-
-for symbol in target_symbols:
-    # Normalize ticker to uppercase for the Alpaca API
-    ticker = symbol.upper()
-    
-    # Visual Header Separator
-    print("?" * 40)
-    print(f" PROCESSING DATA FOR TICKER: {ticker} ")
-    print("?" * 40)
-    
     try:
-        # Call the wrapped library function
-        # verbose=True automatically prints out the hourly, daily, and monthly tables
-        hourly, daily, monthly = run_rsi_analysis(ticker, verbose=True)
-        
+        api_key = config.get("twelvedata_api", "twelvedata_api_key")
     except Exception as e:
-        print(f"? Error processing {ticker}: {e}")
-    
-    # Clean spacing trailing separator
-    print("\n" + "??" * 40 + "\n")
-    
-    # Optional short delay to avoid overwhelming free tier IEX data feeds
-    time.sleep(0.5)
+        print(f"Critical Error loading Alpaca configuration or initializing twelvedata api: {e}")
+        sys.exit(2)        
+    if not api_key:
+        raise SystemExit("Set the TWELVEDATA_API_KEY environment variable first.")
 
-print("? All stock analyses completed successfully.")
+    client = make_twelvedata_client(api_key)
+    
+    print("?" * 40) 
+    try:
+        for symbol in target_symbols:
+            print(f" Getting RSI for: {ticker} ")
+            try:
+                result = client.daily_monthly_rsi(symbol)
+                print(json.dumps(result, indent=2))
+                print("?" * 40) 
+            except (requests.RequestException, RuntimeError) as exc:
+                print(f"{symbol}: {exc}")
+    finally:
+        client.close()

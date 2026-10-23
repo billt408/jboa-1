@@ -98,6 +98,7 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         sorted_by_strike = sorted(parsed_contracts, key=lambda x: x["strike"])
         pruned_chain = sorted_by_strike[:20]
     print(f" pruned chain length: {len(pruned_chain)}")
+    otm=0
     # Clear terminal logging format
     for contract in pruned_chain:
         print("^" * 40)
@@ -105,9 +106,13 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         print(f"Strike Price: {stk_ask_price} | Spot Price: {stk_ask_price}")
         if stk_ask_price > 0:
             if contract['strike'] <= stk_ask_price:
-                print(f"  ? ?? IN-THE-MONEY (ITM)")
+                print(f"  IN-THE-MONEY (ITM)")
             else:
-                print(f"  ? ?? OUT-OF-THE-MONEY (OTM)")
+                print(f"  OUT-OF-THE-MONEY (OTM)")
+                otm += 1
+                if otm == 2:
+                    print(f"  This is the second OTM contract, stopping further logging.")
+                    break
 
     return json.dumps({
         "underlying": ticker,
