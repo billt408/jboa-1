@@ -1,19 +1,26 @@
+import math
 import time
+
 import requests
+
+
 class TwelveData:
     BASE_URL = "https://api.twelvedata.com"
 
     def __init__(self, api_key, min_interval=8.0):
+        if not api_key:
+            raise ValueError("A Twelve Data API key is required")
+
         self.api_key = api_key
-        self.min_interval = min_interval
+        self.min_interval = max(0.0, float(min_interval))
         self.session = requests.Session()
         self._last_request = None
 
     def _get(self, endpoint, **params):
-        # Pace all requests made by this client.
+        # Pace requests made by this client.
         if self._last_request is not None:
             elapsed = time.monotonic() - self._last_request
-            time.sleep(max(0, self.min_interval - elapsed))
+            time.sleep(max(0.0, self.min_interval - elapsed))
 
         self._last_request = time.monotonic()
 
@@ -23,23 +30,50 @@ class TwelveData:
             timeout=30,
         )
 
-        # Twelve Data may return an API error in a JSON response.
         try:
             data = response.json()
-        except ValueError:
+        except ValueError as exc:
             response.raise_for_status()
-            raise RuntimeError("Twelve Data returned a non-JSON response")
-
-        if data.get("status") == "error":
             raise RuntimeError(
-                f"Twelve Data error {data.get('code', response.status_code)}: "
+                "Twelve Data returned a non-JSON response"
+            ) from exc
+
+        if isinstance(data, dict) and data.get("status") == "error":
+            raise RuntimeError(
+                f"Twelve Data error "
+                f"{data.get('code', response.status_code)}: "
                 f"{data.get('message', 'Unknown error')}"
             )
 
         response.raise_for_status()
+
+        if not isinstance(data, dict):
+            raise RuntimeError("Twelve Data returned an unexpected response")
+
         return data
 
-    def rsi(self, symbol, interval="1day", period=30, outputsize=1):
+    def rsi(self, symbol, interval="1day", period=30, outputsize=30):
+        """
+        Return RSI observations, oldest first.
+
+        period: RSI calculation length, measured in candles.
+        outputsize: Number of RSI observations requested.
+        """
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a nonempty string")
+
+        if isinstance(period, bool) or not isinstance(period, int) or period < 2:
+            raise ValueError("period must be an integer >= 2")
+
+        if (
+            isinstance(outputsize, bool)
+            or not isinstance(outputsize, int)
+            or not 1 <= outputsize <= 5000
+        ):
+            raise ValueError("outputsize must be an integer from 1 to 5000")
+
+        symbol = symbol.strip()
+
         data = self._get(
             "rsi",
             symbol=symbol,
@@ -47,34 +81,78 @@ class TwelveData:
             time_period=period,
             series_type="close",
             outputsize=outputsize,
-            order="desc",
+            order="asc",
             format="JSON",
         )
 
         values = data.get("values")
-        if not values:
-            raise RuntimeError(f"No RSI values returned for {symbol}: {data}")
+        if not isinstance(values, list) or not values:
+            raise RuntimeError(f"No RSI values returned for {symbol}")
 
-        return [
-            {
-                "datetime": row["datetime"],
-                "rsi": float(row["rsi"]),
-            }
-            for row in values
-        ]
+        observations = []
+
+        for row in values:
+            try:
+                timestamp = row["datetime"]
+                value = float(row["rsi"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid RSI observation for {symbol}: {row!r}"
+                ) from exc
+
+            if (
+                not isinstance(timestamp, str)
+                or not math.isfinite(value)
+                or not 0.0 <= value <= 100.0
+            ):
+                raise RuntimeError(
+                    f"Invalid RSI observation for {symbol}: {row!r}"
+                )
+
+            observations.append({
+                "datetime": timestamp,
+                "rsi": value,
+            })
+
+        # Explicit sorting also makes latest selection unambiguous.
+        observations.sort(key=lambda row: row["datetime"])
+        return observations
+
+    def daily_rsi_history(self, symbol, period=30, sessions=30):
+        """Return daily RSI for the latest available trading sessions."""
+        history = self.rsi(
+            symbol=symbol,
+            interval="1day",
+            period=period,
+            outputsize=sessions,
+        )
+
+        return {
+            "symbol": symbol.strip(),
+            "interval": "1day",
+            "period": period,
+            "requested_sessions": sessions,
+            "returned_sessions": len(history),
+            "latest": history[-1],
+            "history": history,
+        }
 
     def daily_monthly_rsi(self, symbol, period=30):
-        return {
-            "symbol": symbol,
-            "period": period,
-            "daily": self.rsi(symbol, interval="1day", period=period)[0],
-            "monthly": self.rsi(symbol, interval="1month", period=period)[0],
-        }
+        """
+        Backward-compatible entry point for the existing caller.
+
+        Now returns 30 daily observations, not a monthly-candle RSI.
+        The returned dictionary has a new structure.
+        """
+        return self.daily_rsi_history(
+            symbol=symbol,
+            period=period,
+            sessions=30,
+        )
 
     def close(self):
         self.session.close()
 
-def mk_twelvedata_client(api_key, min_interval=8.0):
-    return TwelveData(api_key, min_interval)
-        
 
+def mk_twelvedata_client(api_key, min_interval=8.0):
+    return TwelveData(api_key, min_interval=min_interval)

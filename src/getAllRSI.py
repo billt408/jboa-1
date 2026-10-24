@@ -36,13 +36,20 @@ if not api_key:
 logging.debug("DEBUG SIGNATURE: %s", inspect.signature(mk_twelvedata_client))
 client = mk_twelvedata_client(api_key)
 
-logging.info("?" * 40) 
 try:
     for symbol in target_symbols:
         logging.info(f" Getting RSI for: {symbol} ")
         try:
             result = client.daily_monthly_rsi(symbol)
-            logging.debug(json.dumps(result, indent=2))
+            #logging.info(json.dumps(result, indent=2))
+            logging.info(
+                "%s-%s for %s on %s is %.2f",
+                result["interval"],
+                result["period"],
+                symbol,
+                result["latest"]["datetime"],
+                result["latest"]["rsi"],
+            )
             logging.info("?" * 40) 
         except (requests.RequestException, RuntimeError) as exc:
             logging.error(f"{symbol}: {exc}")
