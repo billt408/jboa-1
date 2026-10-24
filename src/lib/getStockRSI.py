@@ -118,18 +118,18 @@ class TwelveData:
         observations.sort(key=lambda row: row["datetime"])
         return observations
 
-    def daily_rsi_history(self, symbol, period=30, sessions=30):
+    def daily_rsi_history(self, symbol, period=30, sessions=30, interval="1day"):
         """Return daily RSI for the latest available trading sessions."""
         history = self.rsi(
             symbol=symbol,
-            interval="1day",
+            interval=interval,
             period=period,
             outputsize=sessions,
         )
 
         return {
             "symbol": symbol.strip(),
-            "interval": "1day",
+            "interval": interval,
             "period": period,
             "requested_sessions": sessions,
             "returned_sessions": len(history),
@@ -137,17 +137,14 @@ class TwelveData:
             "history": history,
         }
 
-    def daily_monthly_rsi(self, symbol, period=30):
-        """
-        Backward-compatible entry point for the existing caller.
+    def daily_rsi(self, symbol, period=30, sessions=30, interval="1day"):
 
-        Now returns 30 daily observations, not a monthly-candle RSI.
-        The returned dictionary has a new structure.
-        """
+
         return self.daily_rsi_history(
             symbol=symbol,
             period=period,
-            sessions=30,
+            sessions=sessions,
+            interval=interval,
         )
 
     def close(self):
