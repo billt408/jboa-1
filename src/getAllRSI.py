@@ -38,19 +38,19 @@ client = mk_twelvedata_client(api_key)
 
 try:
     for symbol in target_symbols:
-        logging.info(f" Getting RSI for: {symbol} ")
+        logging.debug(f" Analyzing: {symbol} ")
         try:
             result = client.daily_monthly_rsi(symbol)
-            #logging.info(json.dumps(result, indent=2))
+            logging.debug(json.dumps(result, indent=2))
             logging.info(
-                "%s-%s for %s on %s is %.2f",
+                "%s-%s - RSI, interval %s for %s days is %.2f",
+                result["latest"]["datetime"],
+                symbol,
                 result["interval"],
                 result["period"],
-                symbol,
-                result["latest"]["datetime"],
                 result["latest"]["rsi"],
             )
-            logging.info("?" * 40) 
+            logging.debug("?" * 40) 
         except (requests.RequestException, RuntimeError) as exc:
             logging.error(f"{symbol}: {exc}")
 finally:
