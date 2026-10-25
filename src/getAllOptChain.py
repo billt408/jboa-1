@@ -45,9 +45,12 @@ for symbol in target_symbols:
     logging.info(f" PROCESSING DATA FOR TICKER: {ticker} ")
     
     try:
-        clean_payload = get_pruned_option_chain(ticker, config.ALPACA_KEY, config.ALPACA_SECRET, client)
+        contract, clean_payload = get_pruned_option_chain(ticker, config.ALPACA_KEY, config.ALPACA_SECRET, client)
         logging.debug(f"Pruned Option Chain Payload for {ticker}:")
         logging.debug(clean_payload)
+        logging.debug(f"  This is the second OTM contract, stopping further logging.")
+        logging.debug(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
+
     except Exception as e:
         logging.error(f"Error processing symbol {ticker}: {e}")
 
