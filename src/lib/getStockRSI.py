@@ -52,7 +52,7 @@ class TwelveData:
 
         return data
 
-    def rsi(self, symbol, interval="1day", period=30, outputsize=30):
+    def rsi(self, symbol, interval="1day", period=30, outputsize=30, date=None):
         """
         Return RSI observations, oldest first.
 
@@ -74,17 +74,31 @@ class TwelveData:
 
         symbol = symbol.strip()
 
-        data = self._get(
-            "rsi",
-            symbol=symbol,
-            interval=interval,
-            time_period=period,
-            series_type="close",
-            outputsize=outputsize,
-            order="asc",
-            format="JSON",
-        )
+        #data = self._get(
+        #    "rsi",
+        #    symbol=symbol,
+        #    interval=interval,
+        #    time_period=period,
+        #    series_type="close",
+        #    outputsize=outputsize,
+        #    order="asc",
+        #    format="JSON",
+        #)
+        
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "time_period": period,
+            "series_type": "close",
+            "outputsize": outputsize,
+            "order": "asc",
+            "format": "JSON",
+        }
 
+        if date is not None:
+            params["date"] = date
+
+        data = self._get("rsi", **params)
         values = data.get("values")
         if not isinstance(values, list) or not values:
             raise RuntimeError(f"No RSI values returned for {symbol}")
