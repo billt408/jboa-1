@@ -259,6 +259,8 @@ def get_current_ask_price(symbol: str, client=None) -> float:
     If no pre-initialized client is passed, it loads one via parms.ini.
     """
     ticker = symbol.upper()
+    if client is None:
+        logger.debug(f"The client is not initialized")
 
     try:
             request_params = StockSnapshotRequest(symbol_or_symbols=ticker)
@@ -284,14 +286,14 @@ def get_current_ask_price(symbol: str, client=None) -> float:
             # 3. Strategy Plan B (THE FIX): If the IEX quote returned 0, fallback to the latest real trade execution price
             if ask_price == 0.0 and latest_trade and hasattr(latest_trade, 'price') and latest_trade.price is not None:
                 ask_price = float(latest_trade.price)
-                logger.info(f"? Free-tier quote was thin (0.0). Successfully fell back to Latest Trade Price: ${ask_price:.2f}")
+                logger.debug(f"? Free-tier quote was thin (0.0). Successfully fell back to Latest Trade Price: ${ask_price:.2f}")
 
             # 4. Strategy Plan C: Absolute baseline fallback to the last daily candle close if everything else is dry
             if ask_price == 0.0 and daily_bar and hasattr(daily_bar, 'close') and daily_bar.close is not None:
                 ask_price = float(daily_bar.close)
-                logger.info(f"? Quote and trade data empty. Falling back to Daily Candle Close: ${ask_price:.2f}")
+                logger.debug(f"? Quote and trade data empty. Falling back to Daily Candle Close: ${ask_price:.2f}")
 
-            logger.info(f"?? Reference Price Used for {ticker}: ${ask_price:.2f}")
+            logger.debug(f"?? Reference Price Used for {ticker}: ${ask_price:.2f}")
             return ask_price
 
     except Exception as e:

@@ -19,7 +19,7 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
     target_friday = get_three_fridays_away(start_date=current_date_var)
     expiration_date = target_friday.strftime("%Y-%m-%d")
 
-    logging.info(f" Target Expiration Date (3 Fridays Away): {expiration_date}")
+    logging.debug(f" Target Expiration Date (3 Fridays Away): {expiration_date}")
 
     # ==========================================================================
     # ONE-STEP: Call the native option-chain snapshot endpoint directly
@@ -60,13 +60,13 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         if not page_token:
             break
 
-    logging.info(f" Target Master Contracts returned by Alpaca: {len(all_snapshots)} Call options.")
+    logging.debug(f" Target Master Contracts returned by Alpaca: {len(all_snapshots)} Call options.")
     if not all_snapshots:
         return f"No snapshot data returned from Alpaca for {ticker}."
     
     # Fetch your shared baseline spot asset ask price
     stk_ask_price = get_current_ask_price(ticker, client)
-    logging.info(f" Current Spot Ask Price for {ticker}: {stk_ask_price}")
+    logging.debug(f" Current Spot Ask Price for {ticker}: {stk_ask_price}")
     # ==========================================================================
     # PROCESS, CENTER AND PRUNE AROUND SPOT PRICE
     # ==========================================================================
@@ -112,11 +112,11 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
                 logging.debug(f"  OUT-OF-THE-MONEY (OTM)")
                 otm += 1
                 if otm == 2:
-                    logging.info(f"  This is the second OTM contract, stopping further logging.")
-                    logging.info(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
+                    logging.debug(f"  This is the second OTM contract, stopping further logging.")
+                    logging.debug(f"Option Symbol: {contract['contract']} | Strike: {contract['strike']} | Bid: {contract['bid']} | Ask: {contract['ask']}")
                     break
 
-    return json.dumps({
+    return contract, json.dumps({
         "underlying": ticker,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "chain_snapshot": pruned_chain
