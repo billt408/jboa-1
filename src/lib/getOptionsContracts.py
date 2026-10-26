@@ -12,7 +12,6 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
     """
     if "," in underlying_ticker:
         underlying_ticker = underlying_ticker.split(",")[0].strip()
-
     ticker = underlying_ticker.upper().strip()
 
     current_date_var = datetime.today().date()
@@ -65,6 +64,7 @@ def get_pruned_option_chain(underlying_ticker, api_key, api_secret, client):
         return f"No snapshot data returned from Alpaca for {ticker}."
     
     # Fetch your shared baseline spot asset ask price
+    logging.debug("Using \n%s", json.dumps(vars(client), indent=2, default=str))
     stk_ask_price = get_current_ask_price(ticker, client)
     logging.debug(f" Current Spot Ask Price for {ticker}: {stk_ask_price}")
     # ==========================================================================
