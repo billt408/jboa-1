@@ -80,36 +80,35 @@ try:
                 result["period"],
                 result["latest"]["rsi"],
             )
-            for row in result["history"]:
-                logging.info(
-                    "%s %s RSI=%.6f",
-                    symbol,
-                    row["datetime"],
-                    row["rsi"],
-                )
+#            for row in result["history"]:
+#                logging.info(
+#                    "%s %s RSI=%.6f",
+#                    symbol,
+#                    row["datetime"],
+#                    row["rsi"],
+#                )
 
-            old_alpaca_history = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
-            for row in old_alpaca_history["history"]:
-                logging.info(
-                    "%s %s RSI=%.6f",
-                    symbol,
-                    row["datetime"],
-                    row["rsi"],
-                )
-            logging.info("here")
-            alpaca_history = alpaca_client.rsi(symbol, period=14, outputsize=5, interval="1min",
-                date="2026-10-23T15:59:00-04:00",
-            )
-            for row in alpaca_history:
-                logging.info(
-                    "%s %s RSI=%.6f",
-                    symbol,
-                    row["datetime"],
-                    row["rsi"],
-                )
-            alpaca_latest = alpaca_history[-1]
-            daily_rsi_value = result["latest"]["rsi"]
-            logging.info("alpaca_latest=%s, daily_rsi_value=%s", alpaca_latest, daily_rsi_value)
+#            old_alpaca_history = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
+#            for row in old_alpaca_history["history"]:
+#                logging.info(
+#                    "%s %s RSI=%.6f",
+#                    symbol,
+#                    row["datetime"],
+#                    row["rsi"],
+#                )
+#            alpaca_history = alpaca_client.rsi(symbol, period=14, outputsize=5, interval="1min",
+#                date="2026-10-23T15:59:00-04:00",
+#            )
+#            for row in alpaca_history:
+#                logging.info(
+#                    "%s %s RSI=%.6f",
+#                    symbol,
+#                    row["datetime"],
+#                    row["rsi"],
+#                )
+#            alpaca_latest = alpaca_history[-1]
+#            daily_rsi_value = result["latest"]["rsi"]
+#            logging.info("alpaca_latest=%s, daily_rsi_value=%s", alpaca_latest, daily_rsi_value)
             logging.debug(json.dumps(result, indent=2))
             logging.info(
                 "1day(alpaca) %s-%s - RSI, interval %s for %s periods is %.2f",
