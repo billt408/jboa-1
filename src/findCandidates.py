@@ -1,4 +1,3 @@
-
 import sys
 import json
 import logging
@@ -12,21 +11,20 @@ from lib.apGetStockRSI import mk_alpaca_client
 from lib.utils import JsonIniParser
 from lib.getOptionsContracts import get_pruned_option_chain
 
-def display_results(item, platform, display_now):
-    # Pythonic boolean check
+def display_results(item, platform, timeframe, display_now):
     if not display_now:
         return
         
     logging.debug(json.dumps(item, indent=2))
-    
     symbol = item.get("symbol", "UNKNOWN")
     
     logging.info(
-        "(%s-%s) %s-%s - RSI for %s periods is %.2f",
-        item["interval"], 
+        "(%s-%s) %s-%s - RSI with interval %s and %s periods is %.2f",
         platform,
+        timeframe,
         item["latest"]["datetime"],
         symbol, 
+        item["interval"], 
         item["period"], 
         item["latest"].get("rsi", 0.0)
     )
@@ -34,8 +32,34 @@ def display_results(item, platform, display_now):
     for row in item["history"]:
         logging.debug("%s %s RSI=%.6f", symbol, row["datetime"], row["rsi"])
 
+
+def display_static_results(history_list, platform, timeframe, display_now):
+    if not display_now or not history_list:
+        return
+        
+    # Grab the most recent data point (assumed to be the last item)
+    latest_item = history_list[-1]
+    symbol = latest_item.get("symbol", "UNKNOWN")
+    
+    # Safely look for configuration fallback details if missing from individual rows
+    interval = latest_item.get("interval", "1min")
+    period = latest_item.get("period", "14")
+    
+    logging.info(
+        "(%s-%s) %s-%s - RSI with interval %s and %s periods is %.2f",
+        platform,
+        timeframe,
+        latest_item.get("datetime", "UNKNOWN"),
+        symbol,
+        interval,
+        period,
+        latest_item.get("rsi", 0.0)
+    )
+    
+    for row in history_list:
+        logging.debug("%s %s RSI=%.6f", symbol, row.get("datetime"), row.get("rsi", 0.0))
+
 try:
-    # Initialize the parser with the file path
     config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
     config.load_globals()
 except Exception as ce:
@@ -68,8 +92,6 @@ try:
 except Exception as e:
     logging.error(f"Critical Error loading Alpaca configuration or initializing twelvedata api: {e}")
     sys.exit(2)        
-if not api_key:
-    raise SystemExit("Set the TWELVEDATA_API_KEY environment variable first.")
 
 logging.debug("DEBUG SIGNATURE: %s", inspect.signature(mk_twelvedata_client))
 
@@ -88,36 +110,27 @@ try:
     for symbol in target_symbols:
         logging.debug(f" Analyzing: {symbol} ")
         try:
-            #gets the daily RSI value for the last 30 sessions (days) and returns a dictionary with the latest RSI value and other details
-            #twelvedata = twelvedata_client.daily_rsi(symbol, period=4, sessions=30, interval="1min")
             twelvedata_daily = twelvedata_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
             twelvedata_daily_rsi = twelvedata_daily["latest"]["rsi"]
-            display_results(twelvedata_daily, "twelvedata", True)
+            display_results(twelvedata_daily, "twelvedata", "1day", True)
 
             alpaca_daily = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
-            alpaca_daily_rsi = twelvedata_daily["latest"]["rsi"]
-            display_results(alpaca_daily, "alpaca", True)
+            alpaca_daily_rsi = alpaca_daily["latest"]["rsi"] 
+            display_results(alpaca_daily, "alpaca", "1day", True)
 
-#           alpaca_history = alpaca_client.rsi(symbol, period=14, outputsize=5, interval="1min",
-#               date="2026-10-23T15:59:00-04:00",
-#           )
-#           for row in alpaca_history:
-#               logging.info("%s %s RSI=%.6f", symbol, row["datetime"], row["rsi"])
-#           alpaca_latest = alpaca_history[-1]
-#           logging.info("alpaca_latest=%s, old_alpaca_history_daily_rsi=%s", alpaca_latest, old_alpaca_daily_rsi)
-#            display_results(alpaca_history, "alpaca", True)
-            
+            alpaca_daily_static = alpaca_client.rsi(symbol, period=14, outputsize=5, interval="1min",
+               date="2026-10-23T15:59:00-04:00",
+           )
+            alpaca_daily_static_rsi = alpaca_daily_static[-1].get("rsi", 0.0)
+            display_static_results(alpaca_daily_static, "alpaca_static", "1day", True)
+
             twelvedata_monthly = twelvedata_client.daily_rsi(symbol, period=14, sessions=30, interval="1day")
             twelvedata_monthly_rsi = twelvedata_monthly["latest"]["rsi"]
-            display_results(twelvedata_monthly, "twelvedata", True)
+            display_results(twelvedata_monthly, "twelvedata", "monthly", True)
 
             alpaca_monthly = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1day")
             alpaca_monthly_rsi = alpaca_monthly["latest"]["rsi"]
-            display_results(alpaca_monthly, "alpaca",  True)
-
-            #history = twelvedata_client.rsi(symbol=symbol, interval="1min", period=14, outputsize=5000, date="today") 
-            #latest = history[-1]
-            #logging.info("Latest RSI(14), 1-minute, for %s on %s is %.2f", symbol, latest["datetime"], latest["rsi"])           
+            display_results(alpaca_monthly, "alpaca",  "monthly", True)
 
             logging.debug("?" * 40)
             
@@ -143,7 +156,7 @@ try:
 
             elif twelvedata_daily_rsi >= 65:
                 logging.info(
-                    "%s-%s - RSI, interval %s for %s days is %.2f (SELL CANDIDATE)",
+                    "%s-%s - RSI, interval %s for %s days is twelvedata: %.2f / alpaca: %.2f (SELL CANDIDATE)",
                     twelvedata_daily["latest"]["datetime"],
                     symbol,
                     twelvedata_daily["interval"],
