@@ -225,6 +225,26 @@ class JsonIniParser:
 
         return stock_historical_data_client
 
+    def mk_alpaca_client(self) -> 'AlpacaClient':
+        try:
+            # Load the configuration variables into the instance
+            self.load_globals()
+        except Exception as ce:
+            logger.error(f"? Failed to parse configuration file: {ce}")
+            sys.exit(1)
+
+        logger.info(f"Paper Trading Mode: {self.IS_PAPER}")
+        # ==========================================
+        # 2. INITIALIZE ALPACA TRADING CLIENT
+        # ==========================================
+        try:
+            trading_client = TradingClient(self.ALPACA_KEY, self.ALPACA_SECRET, paper={self.IS_PAPER})
+        except Exception as e:
+            logger.error(f"Critical Error loading Alpaca configuration or initializing client: {e}")
+            sys.exit(1)
+
+        return trading_client
+
 
 def get_three_fridays_away(start_date=None) -> datetime:
     """Accurately calculates the date exactly 3 Fridays away from the start date."""
