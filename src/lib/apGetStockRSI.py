@@ -1,6 +1,7 @@
 import math
 import time
 import logging
+import json
 from datetime import date as Date
 from datetime import datetime, time as DateTime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -78,6 +79,7 @@ class AlpacaClient:
         self.warmup_bars = warmup_bars
         self.min_interval = max(0.0, float(min_interval))
         self._last_request = None
+        logging.debug("Just created \n%s", json.dumps(vars(self.client), indent=2, default=str))
 
     def _get_bars(self, request):
         if self._last_request is not None:
