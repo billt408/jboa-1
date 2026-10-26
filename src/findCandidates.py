@@ -8,8 +8,10 @@ from lib.logger_init import initialize_logging
 initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 from pathlib import Path
 from lib.getStockRSI import mk_twelvedata_client
+from lib.apGetStockRSI import mk_alpaca_client
 from lib.utils import JsonIniParser
 from lib.getOptionsContracts import get_pruned_option_chain
+
 
 try:
     # Initialize the parser with the file path
@@ -34,43 +36,106 @@ except Exception as e:
 if not api_key:
     raise SystemExit("Set the TWELVEDATA_API_KEY environment variable first.")
 
+try:
+    credentials = config.CREDENTIALS
+    if not credentials or "api_key" not in credentials or "secret_key" not in credentials:
+        print("? Error: Missing credentials dictionary in your config.json.ini file.")
+        sys.exit(1)
+    alpaca_api_key = config.CREDENTIALS["api_key"]
+    alpaca_secret_key = config.CREDENTIALS["secret_key"]
+    logging.debug(f"Using API key: {alpaca_api_key}")
+except Exception as e:
+    logging.error(f"Critical Error loading Alpaca configuration or initializing twelvedata api: {e}")
+    sys.exit(2)        
+if not api_key:
+    raise SystemExit("Set the TWELVEDATA_API_KEY environment variable first.")
+
 logging.debug("DEBUG SIGNATURE: %s", inspect.signature(mk_twelvedata_client))
+
 try:
     twelvedata_client = mk_twelvedata_client(api_key)
 except Exception as e:
     print(f"Critical Error loading twelvedata configuration or initializing client: {e}")
     sys.exit(2)
-
 try:
-    trading_client = config.mk_alpaca_trading_client()
+    alpaca_client = mk_alpaca_client(api_key=alpaca_api_key, secret_key=alpaca_secret_key)
 except Exception as e:
-    print(f"Critical Error loading Alpaca configuration or initializing client: {e}")
-    sys.exit(3)
+    print(f"Critical Error loading alpaca configuration or initializing client: {e}")
+    sys.exit(2)
 
 try:
     for symbol in target_symbols:
-        logging.info(f" Analyzing: {symbol} ")
+        logging.debug(f" Analyzing: {symbol} ")
         try:
             #gets the daily RSI value for the last 30 sessions (days) and returns a dictionary with the latest RSI value and other details
             #result = twelvedata_client.daily_rsi(symbol, period=4, sessions=30, interval="1min")
             result = twelvedata_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
             daily_rsi_value = result["latest"]["rsi"]
             logging.debug(json.dumps(result, indent=2))
-            logging.debug("1 day")
-            logging.debug(
-                "%s-%s - RSI, interval %s for %s periods is %.2f",
+            logging.info(
+                "1day(twelvedata) %s-%s - RSI, interval %s for %s periods is %.2f",
                 result["latest"]["datetime"],
                 symbol,
                 result["interval"],
                 result["period"],
                 result["latest"]["rsi"],
             )
+            for row in result["history"]:
+                logging.info(
+                    "%s %s RSI=%.6f",
+                    symbol,
+                    row["datetime"],
+                    row["rsi"],
+                )
+
+            old_alpaca_history = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1min")
+            for row in old_alpaca_history["history"]:
+                logging.info(
+                    "%s %s RSI=%.6f",
+                    symbol,
+                    row["datetime"],
+                    row["rsi"],
+                )
+            logging.info("here")
+            alpaca_history = alpaca_client.rsi(symbol, period=14, outputsize=5, interval="1min",
+                date="2026-10-23T15:59:00-04:00",
+            )
+            for row in alpaca_history:
+                logging.info(
+                    "%s %s RSI=%.6f",
+                    symbol,
+                    row["datetime"],
+                    row["rsi"],
+                )
+            alpaca_latest = alpaca_history[-1]
+            daily_rsi_value = result["latest"]["rsi"]
+            logging.info("alpaca_latest=%s, daily_rsi_value=%s", alpaca_latest, daily_rsi_value)
+            logging.debug(json.dumps(result, indent=2))
+            logging.info(
+                "1day(alpaca) %s-%s - RSI, interval %s for %s periods is %.2f",
+                result["latest"]["datetime"],
+                symbol,
+                result["interval"],
+                result["period"],
+                result["latest"]["rsi"],
+            )
+            
             result = twelvedata_client.daily_rsi(symbol, period=14, sessions=30, interval="1day")
             monthly_rsi_value = result["latest"]["rsi"]
             logging.debug(json.dumps(result, indent=2))
-            logging.debug("1 month")
             logging.debug(
-                "%s-%s - RSI, interval %s for %s periods is %.2f",
+                "1month(twelvedata) %s-%s - RSI, interval %s for %s periods is %.2f",
+                result["latest"]["datetime"],
+                symbol,
+                result["interval"],
+                result["period"],
+                result["latest"]["rsi"],
+            )
+            result = alpaca_client.daily_rsi(symbol, period=14, sessions=30, interval="1day")
+            monthly_rsi_value = result["latest"]["rsi"]
+            logging.debug(json.dumps(result, indent=2))
+            logging.debug(
+                "1month(alpaca) %s-%s - RSI, interval %s for %s periods is %.2f",
                 result["latest"]["datetime"],
                 symbol,
                 result["interval"],
@@ -95,7 +160,7 @@ try:
                     monthly_rsi_value,
                 )
                 try:
-                    contract, clean_payload = get_pruned_option_chain(symbol, config.ALPACA_KEY, config.ALPACA_SECRET, twelvedata_client)
+                    contract, clean_payload = get_pruned_option_chain(symbol, config.ALPACA_KEY, config.ALPACA_SECRET, alpaca_client)
                     logging.debug(f"Pruned Option Chain Payload for {symbol}:")
                     logging.debug(clean_payload)
                     logging.info(f"  This is the second OTM contract, stopping further logging.")
