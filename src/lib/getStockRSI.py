@@ -51,7 +51,7 @@ class TwelveData:
 
         return data
 
-    def rsi(self, symbol, interval="1day", period=30, outputsize=30, date=None):
+    def rsi(self, symbol, interval="1day", period=30, outputsize=30, date=None, end_date=None):
         """
         Return RSI observations, oldest first.
 
@@ -94,8 +94,15 @@ class TwelveData:
             "format": "JSON",
         }
 
+        if date is not None and end_date is not None:
+            raise ValueError("Specify date or end_date, not both")
+
         if date is not None:
             params["date"] = date
+
+        if end_date is not None:
+            params["end_date"] = end_date
+            params["timezone"] = "America/New_York"
 
         data = self._get("rsi", **params)
         values = data.get("values")

@@ -1,12 +1,15 @@
 import json
 import sys
-import datetime
 import logging
+import datetime 
 from pathlib import Path
 from typing import Any, Dict, Optional
 from alpaca.trading import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
+from zoneinfo import ZoneInfo
+
+NY = ZoneInfo("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +252,7 @@ class JsonIniParser:
 def get_three_fridays_away(start_date=None) -> datetime:
     """Accurately calculates the date exactly 3 Fridays away from the start date."""
     if start_date is None:
-        start_date = datetime.today().date()
+        start_date = datetime.datetime.today().date()
     
     current_weekday = start_date.weekday() # 0=Mon, 4=Fri, 6=Sun
     target_weekday = 4
@@ -338,3 +341,343 @@ def get_logger(name: str, level=logging.INFO) -> logging.Logger:
         logger.addHandler(ch)
     
     return logger
+
+NY = ZoneInfo("America/New_York")
+
+
+def get_aligned_rsi(twelvedata_client,alpaca_client,symbol,cutoff,period=14,observations=60):
+    """
+    Fetch one-minute RSI histories using a shared cutoff.
+
+    Select the latest timestamp present in BOTH histories.
+    Never compare observations with different timestamps.
+
+    Assumes both histories use America/New_York timestamps.
+    """
+    if cutoff.tzinfo is None:
+        raise ValueError("cutoff must be timezone-aware")
+
+    cutoff_ny = cutoff.astimezone(NY)
+    cutoff_text = cutoff_ny.strftime("%Y-%m-%d %H:%M:%S")
+
+    td_history = twelvedata_client.rsi(
+        symbol=symbol,
+        period=period,
+        outputsize=observations,
+        interval="1min",
+        end_date=cutoff_text,
+    )
+
+    ap_history = alpaca_client.rsi(
+        symbol=symbol,
+        period=period,
+        outputsize=observations,
+        interval="1min",
+        date=cutoff,
+    )
+
+    def index_history(history):
+        indexed = {}
+
+        for row in history:
+            # Your clients return intraday timestamps in this format.
+            timestamp = datetime.datetime.strptime(
+                row["datetime"],
+                "%Y-%m-%d %H:%M:%S",
+            )
+
+            # Compare local wall-clock timestamps consistently.
+            if timestamp <= cutoff_ny.replace(tzinfo=None):
+                indexed[timestamp] = row
+
+        return indexed
+
+    td_by_time = index_history(td_history)
+    ap_by_time = index_history(ap_history)
+
+    common_times = td_by_time.keys() & ap_by_time.keys()
+
+    if not common_times:
+        raise RuntimeError(
+            f"{symbol}: no common RSI candle at or before "
+            f"{cutoff_text}; refusing to compare mismatched candles"
+        )
+
+    common_time = max(common_times)
+    common_text = common_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    td_latest_time = max(td_by_time)
+    ap_latest_time = max(ap_by_time)
+
+    if common_time != td_latest_time or common_time != ap_latest_time:
+        logging.warning(
+            "%s: aligning to %s; latest available: "
+            "Twelve Data=%s, Alpaca=%s",
+            symbol,
+            common_text,
+            td_latest_time.strftime("%Y-%m-%d %H:%M:%S"),
+            ap_latest_time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    return {
+        "symbol": symbol,
+        "interval": "1min",
+        "period": period,
+        "requested_cutoff": cutoff_text,
+        "datetime": common_text,
+        "twelvedata_rsi": float(td_by_time[common_time]["rsi"]),
+        "alpaca_rsi": float(ap_by_time[common_time]["rsi"]),
+    }
+
+def debug_rsi_inputs(
+    twelvedata_client,
+    alpaca_client,
+    symbol,
+    cutoff,
+    period=14,
+    bars_requested=1500,
+    output_dir="rsi_debug",
+):
+    import csv
+    import datetime as dt
+    import math
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from alpaca.common.enums import Sort
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    if cutoff.tzinfo is None:
+        raise ValueError("cutoff must be timezone-aware")
+
+    symbol = symbol.strip().upper()
+    cutoff_ny = cutoff.astimezone(NY)
+    end_text = cutoff_ny.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Fetch the actual Twelve Data RSI at this cutoff.
+    td_api_history = twelvedata_client.rsi(
+        symbol=symbol,
+        interval="1min",
+        period=period,
+        outputsize=60,
+        end_date=end_text,
+    )
+
+    # Fetch Twelve Data's raw input prices independently.
+    td_response = twelvedata_client._get(
+        "time_series",
+        symbol=symbol,
+        interval="1min",
+        outputsize=bars_requested,
+        end_date=end_text,
+        timezone="America/New_York",
+        order="asc",
+        format="JSON",
+    )
+
+    td_rows = td_response.get("values")
+
+    if not isinstance(td_rows, list) or not td_rows:
+        raise RuntimeError(
+            f"{symbol}: no Twelve Data time-series values returned"
+        )
+
+    td_prices = {}
+
+    for row in td_rows:
+        timestamp = dt.datetime.strptime(
+            row["datetime"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=NY)
+
+        close = float(row["close"])
+
+        if not math.isfinite(close):
+            raise RuntimeError("Non-finite Twelve Data close")
+
+        if timestamp <= cutoff:
+            td_prices[timestamp] = close
+
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+        start=cutoff - dt.timedelta(days=30),
+        end=cutoff,
+        limit=bars_requested,
+        sort=Sort.DESC,
+        feed=alpaca_client.feed,
+        adjustment=alpaca_client.adjustment,
+    )
+
+    response = alpaca_client._get_bars(request)
+
+    ap_prices = {
+        bar.timestamp.astimezone(NY): float(bar.close)
+        for bar in response.data.get(symbol, [])
+        if bar.timestamp <= cutoff
+    }
+
+    if not td_prices or not ap_prices:
+        raise RuntimeError(f"{symbol}: one price history is empty")
+
+    # Use the same calculation implementation on each native history.
+    def calculate(prices):
+        bars = [
+            SimpleNamespace(timestamp=timestamp, close=close)
+            for timestamp, close in sorted(prices.items())
+        ]
+
+        return {
+            row["datetime"]: row["rsi"]
+            for row in alpaca_client._calculate_rsi(
+                bars, period, "1min"
+            )
+        }
+
+    td_local = calculate(td_prices)
+    ap_local = calculate(ap_prices)
+
+    td_api = {
+        row["datetime"]: float(row["rsi"])
+        for row in td_api_history
+    }
+
+    comparable = td_api.keys() & td_local.keys() & ap_local.keys()
+
+    if not comparable:
+        raise RuntimeError(f"{symbol}: no common diagnostic timestamp")
+
+    target = max(comparable)
+
+    logging.info(
+        "%s diagnostic at %s: "
+        "TD API=%.6f | local(TD closes)=%.6f | "
+        "local(Alpaca closes)=%.6f",
+        symbol,
+        target,
+        td_api[target],
+        td_local[target],
+        ap_local[target],
+    )
+
+    logging.info(
+        "%s price histories: TD=%d bars [%s through %s]; "
+        "Alpaca=%d bars [%s through %s]",
+        symbol,
+        len(td_prices),
+        min(td_prices).isoformat(),
+        max(td_prices).isoformat(),
+        len(ap_prices),
+        min(ap_prices).isoformat(),
+        max(ap_prices).isoformat(),
+    )
+
+    # Test initialization sensitivity independently for each provider.
+    for label, prices in (
+        ("Twelve Data", td_prices),
+        ("Alpaca", ap_prices),
+    ):
+        items = sorted(prices.items())
+
+        for count in (300, 600, 1200):
+            if len(items) < count:
+                continue
+
+            values = calculate(dict(items[-count:]))
+
+            if target in values:
+                logging.info(
+                    "%s %s initialization test: "
+                    "%d input bars -> RSI at %s = %.6f",
+                    symbol,
+                    label,
+                    count,
+                    target,
+                    values[target],
+                )
+
+    # Compare the last 120 minutes through the common target.
+    target_dt = dt.datetime.strptime(
+        target, "%Y-%m-%d %H:%M:%S"
+    ).replace(tzinfo=NY)
+
+    window_start = target_dt - dt.timedelta(minutes=120)
+
+    timestamps = sorted(
+        timestamp
+        for timestamp in td_prices.keys() | ap_prices.keys()
+        if window_start <= timestamp <= target_dt
+    )
+
+    records = []
+
+    for timestamp in timestamps:
+        td_close = td_prices.get(timestamp)
+        ap_close = ap_prices.get(timestamp)
+
+        delta = (
+            ap_close - td_close
+            if td_close is not None and ap_close is not None
+            else None
+        )
+
+        records.append({
+            "datetime": timestamp.isoformat(),
+            "td_close": td_close,
+            "alpaca_close": ap_close,
+            "alpaca_minus_td": delta,
+        })
+
+    missing_td = sum(row["td_close"] is None for row in records)
+    missing_ap = sum(row["alpaca_close"] is None for row in records)
+    different = [
+        row for row in records
+        if row["alpaca_minus_td"] is not None
+        and abs(row["alpaca_minus_td"]) > 1e-8
+    ]
+
+    logging.info(
+        "%s last 120 minutes: missing TD=%d, missing Alpaca=%d, "
+        "different closes=%d",
+        symbol,
+        missing_td,
+        missing_ap,
+        len(different),
+    )
+
+    for row in different[-10:]:
+        logging.info(
+            "%s close comparison %s: "
+            "TD=%.8f Alpaca=%.8f difference=%+.8f",
+            symbol,
+            row["datetime"],
+            row["td_close"],
+            row["alpaca_close"],
+            row["alpaca_minus_td"],
+        )
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{symbol}_minute_closes.csv"
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "datetime",
+                "td_close",
+                "alpaca_close",
+                "alpaca_minus_td",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+    logging.info("Saved RSI price diagnostic: %s", path.resolve())
+
+    return {
+        "datetime": target,
+        "td_api_rsi": td_api[target],
+        "td_local_rsi": td_local[target],
+        "alpaca_local_rsi": ap_local[target],
+    }
