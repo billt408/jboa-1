@@ -24,7 +24,8 @@ CLOSE_TIME = clock_time(16, 0)
 
 # "since_open": cumulative gains/losses from observed minute closes.
 # "wilder": standard Wilder smoothing, reset each session.
-MODE = "since_open"
+#MODE = "since_open"
+MODE = "wilder"
 RSI_PERIOD = 14
 
 FEED = DataFeed.IEX

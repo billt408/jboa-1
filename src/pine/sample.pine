@@ -1,0 +1,14 @@
+//@version=6
+indicator("My first check", overlay=true)
+
+length = input.int(14, "Length", minval=1)
+fast = ta.ema(close, length)
+slow = ta.ema(close, length * 2)
+
+// Higher-timeframe data, read without repainting. Change close[1] to close and
+// delete the last two arguments: the repainting warning (S1) appears, with the fix.
+daily = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+plot(fast, "Fast", color=color.new(color.blue, 0))
+plot(slow, "Slow", color=color.new(color.orange, 0))
+plot(daily, "Prior daily close", color=color.gray, style=plot.style_stepline)
