@@ -1,0 +1,24 @@
+//@version=6
+indicator("RSI Webhook Export", overlay=false)
+
+length = input.int(14, "RSI Length", minval=2)
+source = input.source(close, "RSI Source")
+
+rsiValue = ta.rsi(source, length)
+
+plot(rsiValue, "RSI", color=color.purple)
+hline(70, "Overbought")
+hline(30, "Oversold")
+
+if barstate.isconfirmed and not na(rsiValue)
+    payload = '{"source":"tradingview"'
+    payload += ',"symbol":"' + syminfo.tickerid + '"'
+    payload += ',"timeframe":"' + timeframe.period + '"'
+    payload += ',"bar_open_ms":' + str.tostring(time)
+    payload += ',"bar_close_ms":' + str.tostring(time_close)
+    payload += ',"period":' + str.tostring(length)
+    payload += ',"close":' + str.tostring(close, format.mintick)
+    payload += ',"rsi":' + str.tostring(rsiValue, "#.########")
+    payload += ',"confirmed":true}'
+
+    alert(payload, alert.freq_once_per_bar_close)
