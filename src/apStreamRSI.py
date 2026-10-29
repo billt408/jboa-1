@@ -14,7 +14,7 @@ from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from lib.logger_init import initialize_logging
+from lib.logger import initialize_logging
 from lib.utils import JsonIniParser
 
 initialize_logging(default_level=logging.INFO)
