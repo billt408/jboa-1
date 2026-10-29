@@ -9,7 +9,7 @@ import websocket
 import sys
 from pathlib import Path
 from lib.utils import JsonIniParser
-from lib.logger_init import initialize_logging
+from lib.logger import initialize_logging
 
 # Initialize external logging layer module
 initialize_logging(default_level=logging.INFO)

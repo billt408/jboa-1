@@ -10,7 +10,7 @@ import websocket
 
 import sys
 import inspect
-from lib.logger_init import initialize_logging
+from lib.logger import initialize_logging
 initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 from pathlib import Path
 from lib.getStockRSI import mk_twelvedata_client
