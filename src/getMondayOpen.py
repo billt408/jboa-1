@@ -2,7 +2,7 @@ from datetime import datetime
 import pytz
 import logging
 import sys
-from lib.logger_init import initialize_logging
+from lib.logger import initialize_logging
 initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 
 from alpaca.data.requests import StockBarsRequest

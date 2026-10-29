@@ -1,6 +1,6 @@
 import sys
 import logging
-from lib.logger_init import initialize_logging
+from lib.logger import initialize_logging
 initialize_logging(default_level=logging.INFO) # Pass logging.DEBUG here if you want full app debug mode
 from pathlib import Path
 from lib.getOptionsContracts import get_pruned_option_chain
