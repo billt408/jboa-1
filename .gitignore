@@ -4,3 +4,6 @@
 *.pyc
 src/lib/parms.ini
 src/jboa.log
+logs/*
+!logs/.gitkeep
+
