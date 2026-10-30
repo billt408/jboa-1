@@ -34,7 +34,7 @@ try:
     api_key = config.get("twelvedata_api", "twelvedata_api_key")
     logging.debug(f"Using API key: {api_key}")
 except Exception as e:
-    logging.error(f"Critical Error loading Alpaca configuration or initializing twelvedata api: {e}")
+    logging.error(f"Critical Error loading twelvedata configuration or initializing twelvedata api: {e}")
     sys.exit(2)        
 if not api_key:
     raise SystemExit("Set the TWELVEDATA_api_key environment variable first.")
