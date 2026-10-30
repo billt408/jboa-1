@@ -1,0 +1,7 @@
+app.alpaca.markets
+twelvedata.com
+site.financialmodelingprep.com
+finabase.io
+tradier.com
+finance.yahoo.com
+
