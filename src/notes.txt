@@ -4,4 +4,4 @@ site.financialmodelingprep.com
 finabase.io
 tradier.com
 finance.yahoo.com
-
+tradingView.com (export from webpage)
