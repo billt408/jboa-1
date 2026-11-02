@@ -6,4 +6,5 @@ src/lib/parms.ini
 src/jboa.log
 logs/*
 !logs/.gitkeep
-
+src/logs/*
+!src/logs/.gitkeep

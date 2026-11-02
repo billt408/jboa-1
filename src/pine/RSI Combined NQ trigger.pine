@@ -1,0 +1,221 @@
+//@version=6
+indicator(title="RSI 1-min + Daily-bar with Nasdaq Futures Open Trigger", shorttitle="RSI 1m+D | NQ Open", format=format.price, precision=2)
+
+// Trigger = Daily-bar RSI below Y (what your "RSI - Monthly" panel shows: RSI 14 on 1-day bars, last completed day)
+//       AND the 1-minute RSI gets below X inside the entry window (your "RSI - Daily" panel: RSI 14 on 1-minute bars)
+//       AND Nasdaq futures are up more than Z% at the 09:30 ET open
+//       AND (optional) the stock is in a 1-year uptrend and its daily 20 SMA is above its daily 200 SMA.
+// - The Daily-bar RSI defaults to the last COMPLETED daily bar, exactly like your panel ("Wait for timeframe closes" on).
+//   Tick "Update with today's price" to use today's developing daily bar instead.
+// - The 1-minute RSI is always requested from 1-minute bars, whatever the chart interval is. Create the alert with
+//   Interval = 1 minute so it is checked every minute.
+// - Futures gap = price at 09:30 ET vs the prior 16:00 ET close of the futures symbol (Friday close on a Monday).
+// - Futures OFF = the trigger uses the RSI conditions only.
+// - Trend filters (daily bars, last completed day, known before the open): 1-year uptrend = the close is up more than X% versus
+//   252 daily bars earlier; SMA filter = fast daily SMA (20) above slow daily SMA (200). A stock without enough daily history
+//   (e.g. a recent IPO) fails them; untick a filter to ignore it.
+// - Entry window (intraday charts): the trigger and the alert only fire on bars that open inside the window,
+//   in New York (ET) time.
+// - Alert repeats: with "Alert only once per day per ticker" on (default), the first trigger of the New York day
+//   sends the alert and later triggers that day (a second cross below the level) are muted until the next day.
+//   Muted repeats show as small grey crosses. Each ticker keeps its own latch, so a watchlist alert fires once per ticker.
+// - Use on an intraday chart (1m-30m) or a daily chart. Weekly/monthly charts are blocked.
+
+// ----------------------------- Inputs -----------------------------
+GRP_SLOW = "Daily-bar RSI (your 'RSI - Monthly' panel)"
+useSlow  = input.bool(true, "Require Daily-bar RSI", group = GRP_SLOW, inline = "s")
+slowMax  = input.float(30.0, "below", minval = 0.0, maxval = 100.0, step = 1.0, group = GRP_SLOW, inline = "s", tooltip = "Daily-bar RSI must be below this level. Untick to ignore it.")
+slowLen  = input.int(14, "RSI length", minval = 1, group = GRP_SLOW)
+slowTf   = input.string("D", "Timeframe", options = ["D", "W", "M"], group = GRP_SLOW, tooltip = "D = daily bars (matches your 'RSI - Monthly' panel, set to 1 day). W / M = weekly / monthly bars.")
+slowLive = input.bool(false, "Update with today's price", group = GRP_SLOW, tooltip = "OFF = last completed bar (the value your panel shows all day; known before the open).\nON = developing value of today's bar, which moves with the price.")
+
+GRP_MIN = "1-minute RSI (entry trigger)"
+useMin = input.bool(true, "Require 1-min RSI", group = GRP_MIN, inline = "r")
+minMax = input.float(30.0, "below", minval = 0.0, maxval = 100.0, step = 1.0, group = GRP_MIN, inline = "r", tooltip = "The 1-minute RSI must get below this level on a bar inside the entry window. Untick to ignore it.")
+minLen = input.int(14, "RSI length", minval = 1, group = GRP_MIN)
+minSmooth = input.int(1, "Smoothing (SMA length, 1 = none)", minval = 1, group = GRP_MIN, tooltip = "Your 'RSI - Daily' panel has an SMA of length 4 on its smoothing line. Set 4 to test the trigger on that smoothed line; 1 uses the raw RSI.")
+needCross = input.bool(true, "Must cross below the level inside the window", group = GRP_MIN, tooltip = "ON = the 1-min RSI must move from at/above the level to below it on a bar inside the window (it 'gets below').\nOFF = it only has to be below the level on a bar inside the window, even if it was already below when the window opened.")
+
+GRP_FUT = "Nasdaq futures at the open"
+useFut = input.bool(true, "Use Nasdaq futures filter", group = GRP_FUT, tooltip = "OFF = trigger on the RSI conditions only (no futures data is requested).")
+futSym = input.symbol("CME_MINI:NQ1!", "Futures symbol", group = GRP_FUT)
+futMin = input.float(0.0, "Futures must be up more than (%)", step = 0.05, group = GRP_FUT, tooltip = "Gap = futures price at 09:30 ET vs the prior 16:00 ET close.\n0 = any positive gap.\n0.25 = must be up more than 0.25%.\nNegative values allow a small down gap.")
+
+GRP_TREND = "Trend filters (daily bars, last completed day)"
+useYear   = input.bool(true, "Require 1-year uptrend", group = GRP_TREND, inline = "y", tooltip = "The close of the last completed day must be up more than the % at right versus the close 'Lookback' daily bars earlier (252 = about 1 year). A stock with less history than that fails this check. Untick to ignore it.")
+yearMin   = input.float(0.0, "return above (%)", step = 1.0, group = GRP_TREND, inline = "y")
+yearBars  = input.int(252, "Lookback (daily bars, 252 = 1 year)", minval = 21, group = GRP_TREND)
+useSma    = input.bool(true, "Require fast SMA above slow SMA", group = GRP_TREND, inline = "m", tooltip = "Daily-bar SMAs as of the last completed day: the fast SMA must be above the slow SMA (20 above 200 by default). A stock with fewer daily bars than the slow length fails this check. Untick to ignore it.")
+smaFast   = input.int(20, "fast", minval = 1, group = GRP_TREND, inline = "m")
+smaSlow   = input.int(200, "slow", minval = 2, group = GRP_TREND, inline = "m")
+
+GRP_WIN = "Alert entry window"
+useWindow = input.bool(true, "Limit trigger / alert to an entry window", group = GRP_WIN, tooltip = "Intraday charts only (ignored on daily charts). The trigger and alert fire only on bars that open inside the window. Times are New York (ET).")
+entryWin  = input.session("0930-1030", "Window start - end (ET)", group = GRP_WIN, tooltip = "Start is included, end is not: 09:30-10:30 covers bars that open from 09:30 up to 10:29.")
+
+GRP_ALR = "Alert repeats"
+oncePerDay = input.bool(true, "Alert only once per day per ticker", group = GRP_ALR, tooltip = "ON = after the first trigger of the day for a ticker, further triggers on that ticker are muted until the next New York trading day (e.g. when the 1-min RSI bounces above the level and crosses below it again).\nOFF = every new trigger sends an alert.")
+
+GRP_OTHER = "Other"
+mondayOnly = input.bool(false, "Only trigger on Mondays", group = GRP_OTHER)
+showTable  = input.bool(true, "Show status table", group = GRP_OTHER)
+
+if timeframe.in_seconds() > 86400
+    runtime.error("Use this indicator on an intraday or daily chart.")
+
+// ----------------------------- Daily-bar RSI -----------------------------
+// State of the RSI average gain / loss as of the last completed bar of the chosen timeframe.
+f_slowState() =>
+    chg = ta.change(close)
+    up = ta.rma(math.max(chg, 0), slowLen)
+    dn = ta.rma(-math.min(chg, 0), slowLen)
+    [up[1], dn[1], close[1]]
+
+[sUp1, sDn1, sC1] = request.security(syminfo.tickerid, slowTf, f_slowState(), lookahead = barmerge.lookahead_on)
+// RSI of the last completed bar (what the panel shows)
+rsiDone = sDn1 == 0 ? 100.0 : sUp1 == 0 ? 0.0 : 100.0 - 100.0 / (1.0 + sUp1 / sDn1)
+// RSI of the developing bar at the current price
+sChg = close - sC1
+sUp = (sUp1 * (slowLen - 1) + math.max(sChg, 0)) / slowLen
+sDn = (sDn1 * (slowLen - 1) - math.min(sChg, 0)) / slowLen
+rsiLive = sDn == 0 ? 100.0 : sUp == 0 ? 0.0 : 100.0 - 100.0 / (1.0 + sUp / sDn)
+slowRsi = slowLive ? rsiLive : rsiDone
+
+// ----------------------------- 1-minute RSI (any chart interval) -----------------------------
+f_min1() =>
+    r = ta.sma(ta.rsi(close, minLen), minSmooth)
+    [r, r[1]]
+
+[rsiNow, rsiPrev] = request.security(syminfo.tickerid, "1", f_min1())
+
+// ----------------------------- Trend filters (daily bars, any chart interval) -----------------------------
+// SMAs and the 1-year reference close as of the last COMPLETED daily bar (known before the open).
+f_trend() =>
+    fast = ta.sma(close, smaFast)
+    slow = ta.sma(close, smaSlow)
+    [fast[1], slow[1], close[1], close[1 + yearBars]]
+
+[tFast, tSlow, tClose, tCloseYr] = request.security(syminfo.tickerid, "D", f_trend(), lookahead = barmerge.lookahead_on)
+yearRet = (tClose / tCloseYr - 1.0) * 100.0
+smaGap  = (tFast / tSlow - 1.0) * 100.0
+
+// ----------------------------- Nasdaq futures gap at the 09:30 ET open -----------------------------
+// Runs on the futures bars: remembers the 16:00 ET close, then at the first bar at/after 09:30 ET latches
+// (open / 16:00 close - 1) in % together with that day's date. "live" = futures now vs the 16:00 close.
+f_nqOpen() =>
+    var float ref16 = na
+    var float gap = na
+    var float gapDay = na
+    nyTod = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    if nyTod >= 960 and nyTod[1] < 960
+        ref16 := close[1]
+    if nyTod >= 570 and nyTod[1] < 570
+        gap := (open / ref16 - 1.0) * 100.0
+        gapDay := year(time, "America/New_York") * 10000 + month(time, "America/New_York") * 100 + dayofmonth(time, "America/New_York")
+    live = (close / ref16 - 1.0) * 100.0
+    [gap, gapDay, live]
+
+// Intraday charts of 1-30 minutes use their own timeframe (no lag); daily charts use 5-minute futures bars.
+baseTf = timeframe.isintraday and timeframe.in_seconds() >= 60 and timeframe.in_seconds() <= 1800 ? timeframe.period : "5"
+
+float nqGap = na
+float nqGapDay = na
+float nqLive = na
+if useFut
+    [g, gd, lv] = request.security(futSym, baseTf, f_nqOpen())
+    nqGap := g
+    nqGapDay := gd
+    nqLive := lv
+
+chartDay = year(time_close, "America/New_York") * 10000 + month(time_close, "America/New_York") * 100 + dayofmonth(time_close, "America/New_York")
+nqKnown = nqGapDay == chartDay
+
+// ----------------------------- Entry window + today's lowest RSI levels -----------------------------
+inWinRaw = not na(time(timeframe.period, entryWin, "America/New_York"))
+inWindow = not useWindow or not timeframe.isintraday or inWinRaw
+
+// Lowest levels reached today: over the whole day ("day low") and only on bars inside the window ("window low").
+var float dayLow = na
+var float winLow = na
+var int winLowT = na
+var int dayLowT = na
+var float sDayLow = na
+var float sWinLow = na
+if chartDay != chartDay[1]
+    dayLow := na
+    dayLowT := na
+    winLow := na
+    winLowT := na
+    sDayLow := na
+    sWinLow := na
+if not na(rsiNow) and (na(dayLow) or rsiNow < dayLow)
+    dayLow := rsiNow
+    dayLowT := time
+if inWinRaw and not na(rsiNow) and (na(winLow) or rsiNow < winLow)
+    winLow := rsiNow
+    winLowT := time
+if not na(slowRsi) and (na(sDayLow) or slowRsi < sDayLow)
+    sDayLow := slowRsi
+if inWinRaw and not na(slowRsi) and (na(sWinLow) or slowRsi < sWinLow)
+    sWinLow := slowRsi
+
+// ----------------------------- Trigger -----------------------------
+crossedBelow = rsiPrev >= minMax and rsiNow < minMax
+slowOk = not useSlow or slowRsi < slowMax
+minOk  = not useMin or (needCross ? crossedBelow : rsiNow < minMax)
+futOk  = not useFut or (nqKnown and nqGap > futMin)
+monOk  = not mondayOnly or dayofweek(time_close, "America/New_York") == dayofweek.monday
+yearOk = not useYear or yearRet > yearMin
+smaOk  = not useSma or tFast > tSlow
+trigger    = slowOk and minOk and futOk and monOk and inWindow and yearOk and smaOk
+newTrigger = trigger and not trigger[1]
+
+// Once-per-day latch: remembers the New York day of the last alert for this ticker.
+var int firedDay = na
+var int firedT = na
+firedToday = firedDay == chartDay
+fire = newTrigger and (not oncePerDay or not firedToday)
+if fire
+    firedDay := chartDay
+    firedT := time
+
+// ----------------------------- Plots -----------------------------
+hline(70, "RSI Upper Band", color = #787B86)
+hline(50, "RSI Middle Band", color = color.new(#787B86, 50))
+hline(30, "RSI Lower Band", color = #787B86)
+plot(rsiNow, "1-min RSI", color = #7E57C2, linewidth = 2)
+plot(slowRsi, "Daily-bar RSI", color = color.orange, linewidth = 2)
+plot(useMin ? minMax : na, "1-min threshold", color = color.new(#7E57C2, 55), linewidth = 1)
+plot(useSlow ? slowMax : na, "Daily-bar threshold", color = color.new(color.orange, 55), linewidth = 1)
+plot(nqKnown ? nqGap : na, "NQ gap at open (%)", display = display.data_window)
+plot(yearRet, "1-year return (%)", display = display.data_window)
+plot(smaGap, "Fast vs slow SMA (%)", display = display.data_window)
+bgcolor(trigger ? color.new(color.green, 85) : na, title = "Trigger")
+plotshape(fire, "Trigger", shape.triangleup, location.bottom, color = color.green, size = size.small)
+plotshape(newTrigger and not fire, "Muted repeat", shape.xcross, location.bottom, color = color.gray, size = size.tiny)
+
+alertcondition(fire, "Combined trigger", "RSI + Nasdaq futures trigger on {{ticker}}")
+
+// ----------------------------- Status table (last bar = current day) -----------------------------
+var table tbl = table.new(position.top_right, 2, 10, border_width = 1, border_color = color.new(color.white, 70))
+
+f_row(int r, string label, string val, bool active, bool ok) =>
+    bg = not active ? #546E7A : ok ? #2E7D32 : #C62828
+    table.cell(tbl, 0, r, label, text_color = color.white, text_halign = text.align_left, bgcolor = bg, text_size = size.small)
+    table.cell(tbl, 1, r, val, text_color = color.white, text_halign = text.align_left, bgcolor = bg, text_size = size.small)
+
+winHit = not na(winLow) and winLow < minMax
+
+f_fmt(float v) => na(v) ? "n/a" : str.tostring(v, "0.0")
+
+if showTable and barstate.islast
+    f_row(0, "Last bar (ET)", str.format_time(time, "yyyy-MM-dd HH:mm", "America/New_York"), false, true)
+    f_row(1, "Daily-bar RSI", not useSlow ? "off" : "now " + f_fmt(slowRsi) + " | day low " + f_fmt(sDayLow) + " | window low " + f_fmt(sWinLow) + "  (< " + str.tostring(slowMax, "0.0#") + ")  " + slowTf + "/" + str.tostring(slowLen) + (slowLive ? " live" : " closed"), useSlow, slowOk)
+    f_row(2, "1-min RSI", not useMin ? "off" : "now " + f_fmt(rsiNow) + " | day low " + f_fmt(dayLow) + (na(dayLowT) ? "" : " @" + str.format_time(dayLowT, "HH:mm", "America/New_York")) + " | window low " + f_fmt(winLow) + (na(winLow) ? "" : " @" + str.format_time(winLowT, "HH:mm", "America/New_York")) + "  (< " + str.tostring(minMax, "0.0#") + ")", useMin, winHit)
+    f_row(3, "NQ gap", not useFut ? "off" : "@open " + (nqKnown ? str.tostring(nqGap, "0.00") + "%" : "n/a") + " | now " + (na(nqLive) ? "n/a" : str.tostring(nqLive, "0.00") + "%") + "  (> " + str.tostring(futMin, "0.0#") + "%)", useFut, futOk)
+    f_row(4, "Monday only", mondayOnly ? (monOk ? "yes" : "not Monday") : "off", mondayOnly, monOk)
+    f_row(5, "Entry window", not useWindow ? "off" : not timeframe.isintraday ? "n/a (daily chart)" : entryWin + " ET" + (inWinRaw ? "  (open now)" : "  (closed)"), useWindow and timeframe.isintraday, inWindow)
+    f_row(6, "1-yr uptrend", not useYear ? "off" : "return " + (na(yearRet) ? "n/a" : str.tostring(yearRet, "0.0") + "%") + "  (> " + str.tostring(yearMin, "0.0#") + "%, " + str.tostring(yearBars) + " bars)", useYear, yearOk)
+    f_row(7, "SMA trend", not useSma ? "off" : str.tostring(smaFast) + " SMA " + f_fmt(tFast) + " | " + str.tostring(smaSlow) + " SMA " + f_fmt(tSlow) + "  (fast > slow)", useSma, smaOk)
+    f_row(8, "TRIGGER", trigger ? "YES" : "no", true, trigger)
+    f_row(9, "Alert today", not oncePerDay ? "once-per-day off" : firedToday ? "sent @" + str.format_time(firedT, "HH:mm", "America/New_York") + " (later triggers muted)" : "not yet", oncePerDay, firedToday)
