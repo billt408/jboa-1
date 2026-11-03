@@ -1,6 +1,6 @@
-"""Multi-provider session RSI: Alpaca, Tradier, and Twelve Data.
+"""Multi-provider RSI with a dedicated-thread TRADEVIEWER webhook receiver.
 
-Dependencies: aiohttp, alpaca-py, plus the existing lib.utils.JsonIniParser.
+Dependencies: aiohttp, alpaca-py, Flask (includes Werkzeug), and lib.utils.JsonIniParser.
 Uses fixed weekday US regular-session hours, not an exchange calendar.
 Historical recovery is best effort, not a completeness guarantee.
 """
@@ -31,7 +31,7 @@ CLOSE_TIME = clock_time(16, 0)
 MODE = "wilder"
 RSI_PERIOD = 14
 FEED = DataFeed.IEX
-ROUTER_SWITCH = "BOTH"  # ALPACA, TRADIER, TWELVEDATA, BOTH, ALL
+ROUTER_SWITCH = "MOST"  # ALPACA, TRADIER, TWELVEDATA, BOTH, ALL, MOST
 FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = True
@@ -111,6 +111,7 @@ class SessionRSI:
         self.gain_sum = self.loss_sum = 0.0
         self.average_gain = self.average_loss = None
         self.latest = None
+        self.provider = provider
 
     def reset_session(self, day):
         self.session_date = day
@@ -121,49 +122,110 @@ class SessionRSI:
         self.logger.info("SESSION_START date=%s", day)
 
     def process_bar(self, bar, source):
+        """Apply one completed minute close to this provider's RSI."""
         timestamp = normalized_time(bar.timestamp)
         close = positive_price(bar.close)
+
         if timestamp.second or timestamp.microsecond:
             raise ValueError("Bar must be minute-aligned")
+
         if not regular_session(timestamp):
             return None
-        if self.session_date is not None and timestamp.date() < self.session_date:
+
+        if (
+            self.session_date is not None
+            and timestamp.date() < self.session_date
+        ):
             return None
-        if self.last_timestamp is not None and timestamp <= self.last_timestamp:
+
+        if (
+            self.last_timestamp is not None
+            and timestamp <= self.last_timestamp
+        ):
             return None
+
         if self.session_date != timestamp.date():
             self.reset_session(timestamp.date())
+
         value = None
+
         if self.previous_close is not None:
             change = close - self.previous_close
-            gain, loss = max(change, 0.0), max(-change, 0.0)
+            gain = max(change, 0.0)
+            loss = max(-change, 0.0)
+
             self.changes += 1
             self.gain_sum += gain
             self.loss_sum += loss
+
+            up = down = None
+
             if self.mode == "since_open":
-                up, down = self.gain_sum, self.loss_sum
-            elif self.changes < self.period:
-                up = down = None
+                up = self.gain_sum
+                down = self.loss_sum
+
             elif self.changes == self.period:
                 self.average_gain = self.gain_sum / self.period
                 self.average_loss = self.loss_sum / self.period
-                up, down = self.average_gain, self.average_loss
-            else:
-                self.average_gain = (self.average_gain * (self.period - 1) + gain) / self.period
-                self.average_loss = (self.average_loss * (self.period - 1) + loss) / self.period
-                up, down = self.average_gain, self.average_loss
+                up = self.average_gain
+                down = self.average_loss
+
+            elif self.changes > self.period:
+                self.average_gain = (
+                    self.average_gain * (self.period - 1) + gain
+                ) / self.period
+
+                self.average_loss = (
+                    self.average_loss * (self.period - 1) + loss
+                ) / self.period
+
+                up = self.average_gain
+                down = self.average_loss
+
             if up is not None:
-                value = 50.0 if up == down == 0 else (
-                    100.0 if down == 0 else 100.0 - 100.0 / (1.0 + up / down)
-                )
+                if up == 0.0 and down == 0.0:
+                    value = 50.0
+                elif down == 0.0:
+                    value = 100.0
+                else:
+                    value = 100.0 - 100.0 / (1.0 + up / down)
+
         self.previous_close = close
         self.last_timestamp = timestamp
-        self.logger.info("MINUTE source=%s timestamp=%s close=%.8f rsi=%s changes=%d",
-                         source, timestamp.isoformat(), close, value, self.changes)
-        if value is not None:
-            self.latest = {"datetime": timestamp.isoformat(), "close": close, "rsi": value}
-        return self.latest if value is not None else None
 
+        observation = None
+
+        if value is not None:
+            observation = {
+                "provider": self.provider,
+                "symbol": self.symbol,
+                "datetime": timestamp.isoformat(),
+                "close": close,
+                "rsi": value,
+            }
+            self.latest = observation
+
+        message = (
+            "MINUTE provider=%s symbol=%s source=%s timestamp=%s "
+            "close=%.8f rsi=%s changes=%d"
+        )
+
+        arguments = (
+            self.provider,
+            self.symbol,
+            source,
+            timestamp.isoformat(),
+            close,
+            "warming-up" if value is None else f"{value:.2f}",
+            self.changes,
+        )
+
+        self.logger.info(message, *arguments)
+
+        if source != "REST_BACKFILL":
+            logging.info(message, *arguments)
+
+        return observation
 
 class FatalProviderError(RuntimeError):
     pass
@@ -339,22 +401,107 @@ class ProviderRouter:
             if not isinstance(rows, list):
                 raise ValueError("Twelve Data response missing values")
             return [Bar(parse_local(r["datetime"]), r["close"]) for r in rows]
-        payload = await request_json(
-            self.session, "GET", "https://api.tradier.com/v1/markets/timesales",
-            headers=self.tradier_headers(),
-            params={"symbol": symbol, "interval": "1min", "session_filter": "open",
+        if self.provider == "TRADIER":
+            payload = await request_json(
+                self.session,
+                "GET",
+                "https://api.tradier.com/v1/markets/timesales",
+                headers=self.tradier_headers(),
+                params={
+                    "symbol": symbol,
+                    "interval": "1min",
+                    "session_filter": "open",
                     "start": start.strftime("%Y-%m-%d %H:%M"),
-                    "end": end.strftime("%Y-%m-%d %H:%M")})
-        series = payload.get("series")
-        if series is None:
-            return []
-        if not isinstance(series, dict) or "data" not in series:
-            raise ValueError("Tradier response missing series.data")
-        rows = series["data"] or []
-        if isinstance(rows, dict):
-            rows = [rows]
-        return [Bar(parse_local(r["time"]), r["close"]) for r in rows]
+                    "end": end.strftime("%Y-%m-%d %H:%M"),
+                },
+            )
 
+            if payload.get("errors"):
+                safe_errors = sanitize_provider_event(
+                    payload["errors"],
+                    secrets=tuple(self.credentials.values()),
+                )
+                raise FatalProviderError(
+                    "Tradier historical request failed: "
+                    + json.dumps(safe_errors, default=str)
+                )
+
+            if "series" not in payload:
+                raise ValueError(
+                    "Tradier historical response missing series"
+                )
+
+            series = payload["series"]
+
+            if series is None:
+                self.logger.warning(
+                    "NO_HISTORY provider=TRADIER symbol=%s "
+                    "start=%s end=%s",
+                    symbol,
+                    start.isoformat(),
+                    end.isoformat(),
+                )
+                return []
+
+            if not isinstance(series, dict):
+                raise ValueError(
+                    "Tradier historical series must be an object"
+                )
+
+            if "data" not in series:
+                raise ValueError(
+                    "Tradier historical response missing series.data"
+                )
+
+            rows = series["data"]
+
+            if rows is None:
+                return []
+
+            if isinstance(rows, dict):
+                rows = [rows]
+
+            if not isinstance(rows, list):
+                raise ValueError(
+                    "Tradier historical series.data must be a list"
+                )
+
+            bars = []
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        "Tradier historical bar must be an object"
+                    )
+
+                # The interval-bar timestamp is expressed in epoch
+                # seconds. Stream trade dates use milliseconds instead.
+                if row.get("timestamp") is not None:
+                    epoch = float(row["timestamp"])
+
+                    if not math.isfinite(epoch):
+                        raise ValueError(
+                            "Invalid Tradier historical timestamp"
+                        )
+
+                    timestamp = datetime.fromtimestamp(
+                        epoch,
+                        tz=MARKET_TZ,
+                    )
+                else:
+                    timestamp = parse_local(row["time"])
+
+                bars.append(
+                    Bar(
+                        timestamp=timestamp,
+                        close=positive_price(row["close"]),
+                    )
+                )
+            return bars
+        raise ValueError(
+            f"Unsupported historical provider: {self.provider}"
+        )
+            
     async def recover(self, symbol, through):
         tracker = self.trackers[symbol]
         end = min(normalized_time(through), datetime.now(MARKET_TZ)).replace(second=0, microsecond=0)
@@ -384,43 +531,166 @@ class ProviderRouter:
         tracker.logger.info("BACKFILL loaded=%d start=%s end_exclusive=%s best_effort=true",
                             len(unique), start.isoformat(), end.isoformat())
 
+        ready = tracker.latest is not None
+
+        required_changes = (
+            tracker.period
+            if tracker.mode == "wilder"
+            else 1
+        )
+
+        additional_closes = (
+            0
+            if ready
+            else max(
+                0,
+                required_changes
+                - tracker.changes
+                + (1 if tracker.previous_close is None else 0),
+            )
+        )
+
+        logging.info(
+            "WARMUP provider=%s symbol=%s loaded=%d "
+            "ready=%s additional_closes=%d latest_rsi=%s",
+            self.provider,
+            symbol,
+            len(unique),
+            ready,
+            additional_closes,
+            (
+                f"{tracker.latest['rsi']:.2f}"
+                if ready
+                else "warming-up"
+            ),
+        )
     async def consume(self, symbol):
         tracker = self.trackers[symbol]
         queue = self.queues[symbol]
         buckets = {}
+        tick_count = 0
+
         while True:
             try:
-                kind, value = await asyncio.wait_for(queue.get(), timeout=0.5)
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=0.5,
+                )
             except asyncio.TimeoutError:
-                kind = None
-            if kind is not None:
+                item = None
+
+            if item is not None:
+                kind, value = item
+
                 try:
                     if kind == "recover":
-                        # Disconnected/partial buckets are discarded; REST is
-                        # asked for completed observations before live replay.
                         buckets.clear()
                         await self.recover(symbol, value)
+
                     elif kind == "bar":
                         timestamp = normalized_time(value.timestamp)
+
                         if regular_session(timestamp):
-                            await self.accept_bar(symbol, value, "ALPACA_BAR")
+                            await self.accept_bar(
+                                symbol,
+                                value,
+                                "ALPACA_BAR",
+                            )
+
                     elif kind == "tick":
                         timestamp, price = value
                         timestamp = normalized_time(timestamp)
                         price = positive_price(price)
+
                         if regular_session(timestamp):
-                            minute = timestamp.replace(second=0, microsecond=0)
-                            if tracker.last_timestamp is None or minute > tracker.last_timestamp:
+                            minute = timestamp.replace(
+                                second=0,
+                                microsecond=0,
+                            )
+
+                            is_new_minute = (
+                                tracker.last_timestamp is None
+                                or minute > tracker.last_timestamp
+                            )
+
+                            if is_new_minute:
                                 existing = buckets.get(minute)
-                                if existing is None or timestamp >= existing[0]:
-                                    buckets[minute] = (timestamp, price)
+
+                                if (
+                                    existing is None
+                                    or timestamp >= existing[0]
+                                ):
+                                    buckets[minute] = (
+                                        timestamp,
+                                        price,
+                                    )
+
+                                tick_count += 1
+
+                                if tick_count == 1:
+                                    logging.info(
+                                        "FIRST_SESSION_TICK "
+                                        "provider=%s symbol=%s "
+                                        "timestamp=%s price=%.8f",
+                                        self.provider,
+                                        symbol,
+                                        timestamp.isoformat(),
+                                        price,
+                                    )
+
+                    else:
+                        raise ValueError(
+                            f"Unknown queue event kind: {kind!r}"
+                        )
+
+                except Exception as exc:
+                    # Log execution locations without exception strings
+                    # that might contain an authenticated request URL.
+                    self.logger.error(
+                        "CONSUMER_FAILURE provider=%s symbol=%s "
+                        "kind=%s error_type=%s",
+                        self.provider,
+                        symbol,
+                        kind,
+                        type(exc).__name__,
+                    )
+                    raise
+
                 finally:
                     queue.task_done()
-            watermark = datetime.now(MARKET_TZ) - timedelta(seconds=FINALIZE_GRACE_SECONDS)
-            for minute in sorted(list(buckets)):
-                if minute + MINUTE <= watermark:
-                    _, close = buckets.pop(minute)
-                    await self.accept_bar(symbol, Bar(minute, close), "WS_MINUTE_CLOSE")
+
+            # Do not finalize a minute while received ticks are still
+            # waiting to be incorporated into its closing price.
+            if not queue.empty():
+                continue
+
+            watermark = (
+                datetime.now(MARKET_TZ)
+                - timedelta(seconds=FINALIZE_GRACE_SECONDS)
+            )
+
+            completed = sorted(
+                minute
+                for minute in buckets
+                if minute + MINUTE <= watermark
+            )
+
+            for minute in completed:
+                _, close = buckets.pop(minute)
+
+                # Historical recovery may already have accepted a
+                # bucket's timestamp.
+                if (
+                    tracker.last_timestamp is not None
+                    and minute <= tracker.last_timestamp
+                ):
+                    continue
+
+                await self.accept_bar(
+                    symbol,
+                    Bar(minute, close),
+                    f"{self.provider}_WS_MINUTE",
+                )
 
     async def accept_bar(self, symbol, bar, source):
         tracker = self.trackers[symbol]
@@ -436,11 +706,48 @@ class ProviderRouter:
         for symbol in self.symbols:
             self.enqueue(symbol, "recover", datetime.now(MARKET_TZ))
         async def callback(bar):
-            if bar.symbol in self.queues:
-                if LOG_RAW_EVENTS:
-                    self.trackers[bar.symbol].logger.info("WS_BAR timestamp=%s close=%s", bar.timestamp, bar.close)
-                self.enqueue(bar.symbol, "bar", Bar(bar.timestamp, bar.close))
-        self.stream.subscribe_bars(callback, *self.symbols)
+            tracker = self.trackers.get(bar.symbol)
+
+            if tracker is None:
+                return
+
+            # The queued bar has not been processed yet. This RSI is
+            # therefore the latest previously calculated minute RSI.
+            latest = tracker.latest
+            bar_timestamp = normalized_time(bar.timestamp)
+
+            current_session_rsi = (
+                latest is not None
+                and tracker.session_date == bar_timestamp.date()
+            )
+
+            if LOG_RAW_EVENTS:
+                tracker.logger.info(
+                    "WS_BAR provider=ALPACA symbol=%s "
+                    "timestamp=%s close=%.8f "
+                    "previous_rsi[%s]=%s rsi_bar_timestamp=%s",
+                    bar.symbol,
+                    bar_timestamp.isoformat(),
+                    float(bar.close),
+                    tracker.mode,
+                    (
+                        f"{latest['rsi']:.2f}"
+                        if current_session_rsi
+                        else "warming-up"
+                    ),
+                    (
+                        latest["datetime"]
+                        if current_session_rsi
+                        else "none"
+                    ),
+                )
+
+            self.enqueue(
+                bar.symbol,
+                "bar",
+                Bar(bar.timestamp, bar.close),
+            )
+            self.stream.subscribe_bars(callback, *self.symbols)
         # Alpaca public run() starts its own event loop. This application
         # already owns one; pin/test alpaca-py because this runner is private.
         await self.stream._run_forever()
@@ -588,10 +895,123 @@ class ProviderRouter:
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             self.trackers[symbol].logger.warning("INVALID_TICK")
             return
-        if LOG_RAW_EVENTS:
-            self.trackers[symbol].logger.info("WS_PRICE %s", json.dumps(event, separators=(",", ":")))
-        self.enqueue(symbol, "tick", (timestamp, price))
+        tracker = self.trackers[symbol]
+        latest = tracker.latest
 
+        in_regular_session = regular_session(timestamp)
+
+        same_session = (
+            latest is not None
+            and tracker.session_date == timestamp.date()
+        )
+
+        if not in_regular_session:
+            rsi_status = "outside_regular_session"
+        elif not same_session:
+            rsi_status = "warming_up"
+        else:
+            rsi_status = "latest_completed_minute"
+
+        rsi_text = (
+            f"{latest['rsi']:.2f}"
+            if same_session
+            else "unavailable"
+        )
+
+        rsi_timestamp = (
+            latest["datetime"]
+            if same_session
+            else "none"
+        )
+
+        if LOG_RAW_EVENTS:
+            safe_event = sanitize_provider_event(
+                event,
+                secrets=tuple(self.credentials.values()),
+            )
+
+            tracker.logger.info(
+                "WS_PRICE provider=%s symbol=%s "
+                "tick_timestamp=%s price=%.8f "
+                "accepted_for_rsi=%s rsi_status=%s "
+                "latest_rsi[%s]=%s rsi_bar_timestamp=%s raw=%s",
+                self.provider,
+                symbol,
+                timestamp.isoformat(),
+                price,
+                in_regular_session,
+                rsi_status,
+                tracker.mode,
+                rsi_text,
+                rsi_timestamp,
+                json.dumps(
+                    safe_event,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
+
+        # Outside-session prices may be logged, but do not enter
+        # the regular-session RSI calculation.
+        if not in_regular_session:
+            return
+
+        self.enqueue(
+            symbol,
+            "tick",
+            (timestamp, price),
+        )
+        
+def load_tradier_token(config, credentials):
+    """Load a token without exposing it in logs.
+
+    Priority:
+        1. TRADIER_TOKEN environment variable
+        2. [tradier] tradier_token
+        3. CREDENTIALS["tradier_token"]
+    """
+    value = os.getenv("TRADIER_TOKEN", "")
+    source = "environment:TRADIER_TOKEN"
+
+    if not isinstance(value, str) or not value.strip():
+        try:
+            value = config.get("tradier", "tradier_token")
+        except Exception:
+            value = ""
+
+        source = "configuration:tradier.tradier_token"
+
+    if not isinstance(value, str) or not value.strip():
+        value = credentials.get("tradier_token", "")
+        source = "configuration:CREDENTIALS.tradier_token"
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("No Tradier token configured")
+
+    token = value.strip()
+
+    # Be tolerant of a copied Authorization header value.
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    # Reject surrounding quotes rather than sending them to the API.
+    if token.startswith(("'", '"')) or token.endswith(("'", '"')):
+        raise ValueError(
+            "Tradier token contains surrounding quotes. "
+            "Remove the literal quote characters from its value."
+        )
+
+    if not token or any(character.isspace() for character in token):
+        raise ValueError(
+            "Tradier token is empty or contains whitespace"
+        )
+
+    logging.info(
+        "Tradier credential loaded source=%s token_present=true",
+        source,
+    )
+
+    return token
 
 def load_settings():
     config = JsonIniParser(str(Path(__file__).resolve().parent / "lib" / "parms.ini"))
@@ -611,28 +1031,234 @@ def load_settings():
     credentials = getattr(config, "CREDENTIALS", {}) or {}
     if not isinstance(credentials, dict):
         raise ValueError("CREDENTIALS must be a dictionary")
-    td_key = credentials.get("twelvedata_api_key") or os.getenv("TWELVEDATA_API_KEY", "")
-    if not td_key:
-        try:
-            td_key = config.get("twelvedata_api", "twelvedata_api_key")
-        except Exception:
-            td_key = ""
+    try:
+        td_key = config.get("twelvedata_api", "twelvedata_api_key")
+    except Exception:
+        td_key = ""
+    selected_uses_tradier = ROUTER_SWITCH.strip().upper() in {
+        "TRADIER",
+        "ALL",
+        "MOST",
+    }
+
+    tradier_token = (load_tradier_token(config, credentials)
+        if selected_uses_tradier
+        else ""
+    )
+
     keys = {
         "alpaca_key": credentials.get("api_key") or os.getenv("ALPACA_API_KEY", ""),
         "alpaca_secret": credentials.get("secret_key") or os.getenv("ALPACA_SECRET_KEY", ""),
-        "tradier_token": config.get("tradier", "tradier_token"),
+        "tradier_token": tradier_token,
         "twelvedata_key": td_key
     }
     keys = {key: value.strip() if isinstance(value, str) else "" for key, value in keys.items()}
     return symbols, keys
 
 
+
+
+# TRADEVIEWER receives TradingView alerts without shared-secret authentication.
+# TRADINGVIEW is accepted as an alias in ROUTER_SWITCH.
+WEBHOOK_ENABLED = True
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
+WEBHOOK_QUEUE_LIMIT = 2000
+WEBHOOK_MAX_BYTES = 16384
+
+
+def validate_tradeviewer_payload(payload, allowed_symbols):
+    """Validate alert fields; reported RSI is not a locally calculated RSI."""
+    if not isinstance(payload, dict):
+        raise ValueError("JSON payload must be an object")
+    ticker = payload.get("ticker")
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise ValueError("ticker must be a nonempty string")
+    ticker = ticker.strip().upper()
+    if len(ticker) > 100:
+        raise ValueError("ticker is too long")
+    symbol = ticker if ticker in allowed_symbols else ticker.rsplit(":", 1)[-1]
+    if symbol not in allowed_symbols:
+        raise ValueError("ticker is not in configured target_symbols")
+    try:
+        if isinstance(payload.get("price"), bool):
+            raise ValueError()
+        price = positive_price(payload.get("price"))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("price must be finite and positive") from None
+    raw_rsi = payload.get("rsi_value")
+    if raw_rsi is None or raw_rsi == "" or raw_rsi == "N/A":
+        rsi = None
+    else:
+        try:
+            if isinstance(raw_rsi, bool):
+                raise ValueError()
+            rsi = float(raw_rsi)
+            if not math.isfinite(rsi) or not 0 <= rsi <= 100:
+                raise ValueError()
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("rsi_value must be between 0 and 100, or omitted") from None
+    raw_time = payload.get("time", "")
+    event_time = None
+    if raw_time:
+        if not isinstance(raw_time, str) or len(raw_time) > 100:
+            raise ValueError("time must be a timezone-aware ISO-8601 string")
+        try:
+            event_time = normalized_time(datetime.fromisoformat(raw_time.replace("Z", "+00:00")))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("time must be a timezone-aware ISO-8601 string") from None
+    return {
+        "symbol": symbol,
+        "ticker": ticker,
+        "price": price,
+        "rsi_value": rsi,
+        "event_time": event_time.isoformat() if event_time else None,
+        "received_at": datetime.now(MARKET_TZ).isoformat(),
+    }
+
+
+class TradeviewerProvider:
+    """Receive HTTP alerts on a dedicated thread and log via an asyncio consumer.
+
+    This endpoint has no authentication. It does not place orders or feed sparse
+    alerts into the providers' minute-based RSI trackers.
+    """
+    def __init__(self, symbols, host=WEBHOOK_HOST, port=WEBHOOK_PORT):
+        import queue
+        import threading
+        self.provider = "TRADEVIEWER"
+        self.symbols = set(symbols)
+        self.host = host
+        self.port = port
+        self.queue = queue.Queue(maxsize=WEBHOOK_QUEUE_LIMIT)
+        self.stop = threading.Event()
+        self.server = None
+        self.thread = None
+        self.thread_error = None
+        self.logger = make_logger(self.provider, "_STREAM")
+        self.symbol_loggers = {symbol: make_logger(self.provider, symbol) for symbol in symbols}
+        self.latest = {}
+        self.app = self.create_app()
+
+    def create_app(self):
+        import queue
+        from flask import Flask, request, jsonify
+        app = Flask("tradeviewer_webhook")
+        app.config["MAX_CONTENT_LENGTH"] = WEBHOOK_MAX_BYTES
+
+        @app.errorhandler(413)
+        def too_large(_error):
+            return jsonify(status="error", message="Payload too large"), 413
+
+        @app.get("/health")
+        def health():
+            return jsonify(status="ok", provider=self.provider), 200
+
+        @app.post("/webhook")
+        def receive():
+            if not request.is_json:
+                return jsonify(status="error", message="Payload must be JSON"), 415
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                return jsonify(status="error", message="JSON payload must be an object"), 400
+            try:
+                event = validate_tradeviewer_payload(payload, self.symbols)
+            except ValueError as exc:
+                return jsonify(status="error", message=str(exc)), 400
+            try:
+                self.queue.put_nowait(event)
+            except queue.Full:
+                return jsonify(status="error", message="Receiver busy; alert not queued"), 503
+            # Acknowledges memory-queue acceptance, not durable persistence.
+            return jsonify(status="queued", provider=self.provider, received=event["symbol"]), 200
+
+        return app
+
+    def serve(self):
+        try:
+            while not self.stop.is_set():
+                self.server.handle_request()
+        except Exception as exc:
+            self.thread_error = type(exc).__name__
+        finally:
+            self.server.server_close()
+
+    def record(self, event):
+        rsi = event["rsi_value"]
+        label = ("ALERT" if rsi is None else "OVERBOUGHT" if rsi >= 70
+                 else "OVERSOLD" if rsi <= 35 else "TRIPPED")
+        event = {
+            **event, "provider": self.provider,
+            "status_label": label, "rsi_source": "webhook_reported",
+        }
+        self.latest[event["symbol"]] = event
+        text = json.dumps(event, separators=(",", ":"))
+        self.symbol_loggers[event["symbol"]].info("WEBHOOK_ALERT %s", text)
+        logging.info("WEBHOOK_ALERT %s", text)
+
+    async def run(self):
+        import queue
+        import threading
+        from werkzeug.serving import make_server, WSGIRequestHandler
+
+        class BoundedRequestHandler(WSGIRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(2.0)
+
+        self.server = make_server(
+            self.host, self.port, self.app, threaded=False,
+            request_handler=BoundedRequestHandler,
+        )
+        self.server.timeout = 0.5
+        self.thread = threading.Thread(
+            target=self.serve, name="TRADEVIEWER-webhook", daemon=True,
+        )
+        self.thread.start()
+        logging.info(
+            "TRADEVIEWER listening host=%s port=%d route=/webhook authentication=none",
+            self.host, self.port,
+        )
+        try:
+            while True:
+                for _ in range(100):
+                    try:
+                        event = self.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        self.record(event)
+                    finally:
+                        self.queue.task_done()
+                if not self.thread.is_alive():
+                    raise RuntimeError(
+                        "TRADEVIEWER server thread stopped: " + str(self.thread_error)
+                    )
+                await asyncio.sleep(0.05)
+        finally:
+            self.stop.set()
+            await asyncio.to_thread(self.thread.join, 3.0)
+            if self.thread.is_alive():
+                logging.error("TRADEVIEWER thread did not stop within timeout")
+            while True:
+                try:
+                    event = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.record(event)
+                finally:
+                    self.queue.task_done()
+
+
 async def main():
     choices = {"ALPACA": ["ALPACA"], "TRADIER": ["TRADIER"],
                "TWELVEDATA": ["TWELVEDATA"], "BOTH": ["ALPACA", "TWELVEDATA"],
-               "ALL": ["ALPACA", "TRADIER", "TWELVEDATA"]}
-    selected = choices.get(ROUTER_SWITCH.upper())
-    if not selected:
+               "ALL": ["ALPACA", "TRADIER", "TWELVEDATA"],
+               "MOST": ["ALPACA", "TRADIER"],
+               "TRADEVIEWER": [], "TRADINGVIEW": [],}
+    selected = choices.get(ROUTER_SWITCH.strip().upper())
+    if selected is None:
         raise ValueError("Invalid ROUTER_SWITCH")
     symbols, keys = load_settings()
     required = {"ALPACA": ["alpaca_key", "alpaca_secret"],
@@ -641,6 +1267,8 @@ async def main():
         if any(not keys[key] for key in required[provider]):
             raise ValueError(f"Missing credentials for {provider}")
     routers = [ProviderRouter(provider, symbols, keys) for provider in selected]
+    if WEBHOOK_ENABLED or ROUTER_SWITCH.strip().upper() in {"TRADEVIEWER", "TRADINGVIEW"}:
+        routers.append(TradeviewerProvider(symbols=symbols))
     tasks = [asyncio.create_task(router.run(), name=router.provider) for router in routers]
     try:
         await asyncio.gather(*tasks)

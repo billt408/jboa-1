@@ -2,49 +2,44 @@
 // © billt408
 
 //@version=6
-indicator(title="RSI 1m Webhook Streamer - Fixed All Bars", shorttitle="RSI Streamer Fixed", overlay=false, format=format.price, precision=2)
+indicator(title="RSI 1m Webhook Streamer - Manual Math", shorttitle="RSI Streamer Fixed", overlay=false, format=format.price, precision=2)
 
 // ----------------------------- Inputs -----------------------------
 GRP_RSI  = "RSI Configuration"
 rsiLen   = input.int(14, "RSI Length", minval=1, group=GRP_RSI)
-rsiLow   = input.float(35.0, "Oversold Level (<=)", minval=0.0, maxval=100.0, group=GRP_RSI)
-rsiHigh  = input.float(70.0, "Overbought Level (>=)", minval=0.0, maxval=100.0, group=GRP_RSI)
 
-// ----------------------------- Logic -----------------------------
-// Enforce 1-minute chart execution boundary
-if timeframe.isintraday and timeframe.multiplier != 1
-    runtime.error("This script is specifically optimized for a 1-minute chart resolution.")
+// ----------------------------- Manual RSI Calculation Loop -----------------------------
+// We calculate Wilder's RMA manually using persistent memory arrays to ensure non-zero alert states
+alpha = 1.0 / rsiLen
+diff  = ta.change(close)
 
-// Calculate standard 1-minute RSI continuously
-rsiLive = ta.rsi(close, rsiLen)
+var float rmaUp = na
+var float rmaDown = na
 
-// FIX: Grab the fully completed, non-zero historic calculation from the bar that JUST closed
-// This ensures TradingView's alert server sends the real numerical index instead of 0
-rsiCompleted = rsiLive[1]
+// Calculate smooth upward and downward change components
+upChg   = math.max(diff, 0.0)
+downChg = -math.min(diff, 0.0)
 
-// Trigger an execution step on EVERY single confirmed bar close
+rmaUp   := na(rmaUp[1])   ? ta.sma(upChg, rsiLen)   : alpha * upChg + (1.0 - alpha) * rmaUp[1]
+rmaDown := na(rmaDown[1]) ? ta.sma(downChg, rsiLen) : alpha * downChg + (1.0 - alpha) * rmaDown[1]
+
+// Explicitly calculate the exact manual RSI float index
+rs = rmaDown == 0.0 ? na : rmaUp / rmaDown
+rsiManual = rmaDown == 0.0 ? 100.0 : na(rs) ? 50.0 : 100.0 - (100.0 / (1.0 + rs))
+
+// Ensure a hard latch of the completed historic bar value to push to the webhook alert engine
+var float rsiStreamValue = 50.0
+if barstate.isconfirmed
+    rsiStreamValue := rsiManual
+
+// Trigger step on every single bar completion frame
 rsiTrigger = barstate.isconfirmed
 
-// Maintain visual context flags using the verified historic data index
-isOversold   = rsiCompleted <= rsiLow
-isOverbought = rsiCompleted >= rsiHigh
-
-// ----------------------------- GUI Plottings -----------------------------
-hline(rsiHigh, "Overbought Line", color=color.red, linestyle=hline.style_dashed)
-hline(50, "Center Line", color=color.new(color.gray, 50))
-hline(rsiLow, "Oversold Line", color=color.green, linestyle=hline.style_dashed)
-
-// Plot the real-time processing line for your visual layout monitor
-plot(rsiLive, "Live 1m RSI", color=color.purple, linewidth=2)
-
-// Visual circles to help audit historical hits on your main screen space
-plotshape(rsiTrigger and isOversold, "Oversold State", shape.circle, location.bottom, color=color.green, size=size.tiny)
-plotshape(rsiTrigger and isOverbought, "Overbought State", shape.circle, location.top, color=color.red, size=size.tiny)
-
-// Expose the raw data to the TradingView alert engine system
-// plot_0 = Live 1m RSI
-// plot_1 = RSI Value Plot (Points directly to our fixed historic tracking variable)
-plot(rsiCompleted, "RSI Value Plot", display=display.data_window)
+// ----------------------------- GUI & Data Export -----------------------------
+// This is the absolute first plot array assignment in the script engine
+plot(rsiManual, "RSI Stream Output", color=color.purple, linewidth=2)
+hline(70, "Overbought", color=color.red, linestyle=hline.style_dashed)
+hline(30, "Oversold", color=color.green, linestyle=hline.style_dashed)
 
 // Create the unified alert construct hook
 alertcondition(rsiTrigger, "RSI Minute Update", "New 1m Bar Closed")
