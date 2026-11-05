@@ -1,8 +1,13 @@
 """Multi-provider RSI with a dedicated-thread TRADINGVIEW webhook receiver.
 
-Dependencies: aiohttp, alpaca-py, Flask (includes Werkzeug), yfinance, pandas, pandas_ta, and lib.utils.JsonIniParser.
-Uses fixed weekday US regular-session hours, not an exchange calendar.
-Historical recovery is best effort, not a completeness guarantee.
+Python 3.12 recommended.
+Dependencies: aiohttp, alpaca-py, Flask, yfinance, pandas, pandas-market-calendars,
+tzdata, and the existing project-local lib.utils.JsonIniParser.
+Uses NYSE calendar holidays and early closes. Summary minute keys use UTC.
+One JSON summary per regular-session minute per provider in a dedicated JSONL log.
+Late data cannot change emitted summaries or RSI state. Historical warmup is best effort.
+TradingView requires a 1m closed-bar payload with explicit bar_start.
+Deduplication is in-memory only and does not survive process restarts.
 """
 
 import asyncio
@@ -13,7 +18,10 @@ import os
 import sys
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as clock_time
+from datetime import datetime, timedelta, time as clock_time, timezone
+from functools import lru_cache
+import hmac
+import pandas_market_calendars as mcal
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -35,13 +43,25 @@ CLOSE_TIME = clock_time(16, 0)
 MODE = "wilder"
 RSI_PERIOD = 14
 FEED = DataFeed.IEX
-ROUTER_SWITCH = "ALL"  # ALPACA, TRADIER, TWELVEDATA, YAHOOFINANCE, BOTH, ALL, MOST
+ROUTER_SWITCH = os.getenv(
+    "ROUTER_SWITCH", "ALL"
+)  # ALPACA, TRADIER, TWELVEDATA, YAHOOFINANCE, BOTH, ALL, MOST
 FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
-LOG_RAW_EVENTS = True
+LOG_RAW_EVENTS = False
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 LOG_ROOT = Path(__file__).resolve().parent / "logs"
 MINUTE = timedelta(minutes=1)
+UTC = timezone.utc
+SUMMARY_DELAY_SECONDS = float(os.getenv("SUMMARY_DELAY_SECONDS", "45"))
+SUMMARY_TO_CONSOLE = os.getenv("SUMMARY_TO_CONSOLE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+YAHOO_POLL_SECONDS = float(os.getenv("YAHOO_POLL_SECONDS", "30"))
+if not math.isfinite(YAHOO_POLL_SECONDS) or YAHOO_POLL_SECONDS <= 0:
+    raise ValueError("YAHOO_POLL_SECONDS must be finite and positive")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +95,8 @@ def normalized_time(value):
 
 
 def positive_price(value):
+    if isinstance(value, bool):
+        raise ValueError("Price must not be boolean")
     price = float(value)
     if not math.isfinite(price) or price <= 0:
         raise ValueError("Price must be finite and positive")
@@ -82,7 +104,9 @@ def positive_price(value):
 
 
 def regular_session(timestamp):
-    return timestamp.weekday() < 5 and OPEN_TIME <= timestamp.time() < CLOSE_TIME
+    value = as_utc(timestamp)
+    bounds = session_bounds(value.astimezone(MARKET_TZ).date())
+    return bounds is not None and bounds[0] <= value < bounds[1]
 
 
 def parse_local(value):
@@ -218,10 +242,10 @@ class SessionRSI:
             self.changes,
         )
 
-        self.logger.info(message, *arguments)
+        self.logger.debug(message, *arguments)
 
         if source != "REST_BACKFILL":
-            logging.info(message, *arguments)
+            logging.debug(message, *arguments)
 
         return observation
 
@@ -236,15 +260,22 @@ async def request_json(session, method, url, **kwargs):
             async with session.request(method, url, **kwargs) as response:
                 if response.status in {401, 403}:
                     raise FatalProviderError(
-                        f"HTTP {response.status}: " "authentication/access rejected"
+                        f"HTTP {response.status}: authentication/access rejected"
                     )
-                if response.status == 429 or response.status >= 500:
+                text = await response.text()
+                retry = (
+                    response.status == 429
+                    or response.status >= 500
+                    or (response.status == 400 and "quota violation" in text.lower())
+                )
+                if retry:
                     if attempt == 3:
                         raise RuntimeError("Provider HTTP retries exhausted")
                     await asyncio.sleep(2**attempt)
                     continue
-                response.raise_for_status()
-                data = await response.json()
+                if response.status >= 400:
+                    raise RuntimeError(f"Provider HTTP {response.status}")
+                data = json.loads(text)
                 if not isinstance(data, dict):
                     raise ValueError("Provider returned a non-object response")
                 return data
@@ -292,34 +323,377 @@ def sanitize_provider_event(value, secrets=()):
     return value
 
 
+@dataclass(frozen=True)
+class MinuteCandidate:
+    close: float
+    event_time: datetime
+    received_at: datetime
+    source: str
+    kind: str
+    reported_rsi: float | None = None
+
+
+def as_utc(value):
+    return normalized_time(value).astimezone(UTC)
+
+
+def minute_utc(value):
+    return as_utc(value).replace(second=0, microsecond=0)
+
+
+MARKET_CALENDAR = mcal.get_calendar("NYSE")
+
+
+@lru_cache(maxsize=512)
+def session_bounds(day):
+    schedule = MARKET_CALENDAR.schedule(start_date=day, end_date=day)
+    if schedule.empty:
+        return None
+    row = schedule.iloc[0]
+    return (
+        as_utc(row["market_open"].to_pydatetime()),
+        as_utc(row["market_close"].to_pydatetime()),
+    )
+
+
+def next_session_minute(value):
+    value = minute_utc(value)
+    day = value.astimezone(MARKET_TZ).date()
+    for _ in range(370):
+        bounds = session_bounds(day)
+        if bounds is not None:
+            opening, closing = bounds
+            if value < closing:
+                return max(opening, value)
+        day += timedelta(days=1)
+        value = as_utc(datetime.combine(day, clock_time(0), tzinfo=MARKET_TZ))
+    raise RuntimeError("Could not find the next NYSE session")
+
+
+def make_summary_logger():
+    logger = logging.getLogger(f"rsi.{RUN_ID}.minute_summary")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        LOG_ROOT.mkdir(parents=True, exist_ok=True)
+        path = LOG_ROOT / f"minute-summary-{RUN_ID}.jsonl"
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+        if SUMMARY_TO_CONSOLE:
+            console = logging.StreamHandler()
+            console.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(console)
+        logging.info("MINUTE_SUMMARY_FILE %s", path)
+    return logger
+
+
+class MinuteCoordinator:
+    """Single event-loop owner of pending closes, RSI state and summary output.
+
+    Finalization is immutable within this process. Late records are rejected,
+    including REST backfills for a minute whose summary already exists.
+    No network requests or blocking queue drains occur in finalization.
+    """
+
+    def __init__(
+        self, providers, symbols, start=None, delay=SUMMARY_DELAY_SECONDS, emit=None
+    ):
+        if not math.isfinite(delay) or not 0 <= delay <= 3600:
+            raise ValueError("SUMMARY_DELAY_SECONDS must be between 0 and 3600")
+        self.providers = tuple(dict.fromkeys(providers))
+        self.symbols = tuple(dict.fromkeys(symbols))
+        if not self.providers or not self.symbols:
+            raise ValueError("Coordinator requires providers and symbols")
+        self.delay = timedelta(seconds=delay)
+        self.started_at = as_utc(start or datetime.now(UTC))
+        self.report_start = next_session_minute(self.started_at)
+        self.next_minute = self.report_start
+        self.last_finalized = None
+        self.pending = {}
+        self.trackers = {
+            (provider, symbol): SessionRSI(symbol, provider)
+            for provider in self.providers
+            if provider != "TRADINGVIEW"
+            for symbol in self.symbols
+        }
+        self.counts = {}
+        self.connected = {provider: False for provider in self.providers}
+        self.outages = {
+            provider: [(self.started_at, None)] for provider in self.providers
+        }
+        self.late_counts = {provider: 0 for provider in self.providers}
+        logger = None if emit is not None else make_summary_logger()
+        self.emit = emit or (
+            lambda record: logger.info(
+                "%s", json.dumps(record, separators=(",", ":"), allow_nan=False)
+            )
+        )
+
+    def set_connected(self, provider, connected, at=None):
+        if self.connected[provider] == connected:
+            return
+        at = as_utc(at or datetime.now(UTC))
+        self.connected[provider] = connected
+        if connected:
+            start, _ = self.outages[provider][-1]
+            self.outages[provider][-1] = (start, at)
+        else:
+            self.outages[provider].append((at, None))
+
+    def submit(
+        self,
+        provider,
+        symbol,
+        timestamp,
+        close,
+        *,
+        source,
+        kind="bar",
+        received_at=None,
+        reported_rsi=None,
+    ):
+        if provider not in self.providers or symbol not in self.symbols:
+            raise ValueError("Unconfigured provider or symbol")
+        if kind not in {"bar", "tick", "webhook"}:
+            raise ValueError("Unknown candidate kind")
+        received_at = as_utc(received_at or datetime.now(UTC))
+        event_time = as_utc(timestamp)
+        minute = minute_utc(event_time)
+        if kind != "tick" and minute != event_time:
+            raise ValueError("Bar timestamps must identify the exact minute start")
+        if event_time > received_at + timedelta(seconds=30):
+            raise ValueError("Future event timestamp")
+        if not regular_session(minute):
+            return False
+        price = positive_price(close)
+        if provider == "TRADINGVIEW" and kind != "webhook":
+            raise ValueError("TradingView requires aligned webhook records")
+        if reported_rsi is not None:
+            if isinstance(reported_rsi, bool):
+                raise ValueError("Invalid RSI")
+            reported_rsi = float(reported_rsi)
+            if not math.isfinite(reported_rsi) or not 0 <= reported_rsi <= 100:
+                raise ValueError("Invalid RSI")
+        warmup = minute < self.report_start
+        first_deadline = self.report_start + MINUTE + self.delay
+        deadline = first_deadline if warmup else minute + MINUTE + self.delay
+        if (
+            self.last_finalized is not None and minute <= self.last_finalized
+        ) or received_at > deadline:
+            self.late_counts[provider] += 1
+            return False
+        if kind == "webhook" and received_at < minute + MINUTE:
+            raise ValueError("bar_closed=true cannot precede the minute end")
+        # Retain only current/recent sessions, never arbitrary old warmup data.
+        if (
+            warmup
+            and minute.astimezone(MARKET_TZ).date()
+            != self.report_start.astimezone(MARKET_TZ).date()
+        ):
+            return False
+        key = (provider, symbol, minute)
+        old = self.pending.get(key)
+        priority = 3 if source == "REST_BACKFILL" else (1 if kind == "tick" else 2)
+        old_priority = (
+            (3 if old.source == "REST_BACKFILL" else (1 if old.kind == "tick" else 2))
+            if old
+            else -1
+        )
+        if old and (
+            priority < old_priority
+            or (priority == old_priority and event_time < old.event_time)
+        ):
+            return False
+        self.pending[key] = MinuteCandidate(
+            price, event_time, received_at, source, kind, reported_rsi
+        )
+        return True
+
+    def _apply(self, provider, symbol, minute, candidate):
+        tracker = self.trackers[(provider, symbol)]
+        result = tracker.process_bar(Bar(minute, candidate.close), candidate.source)
+        day = minute.astimezone(MARKET_TZ).date()
+        count_key = (provider, symbol, day)
+        self.counts[count_key] = self.counts.get(count_key, 0) + 1
+        return result
+
+    def _symbol_record(self, provider, symbol, minute):
+        key = (provider, symbol, minute)
+        candidate = self.pending.pop(key, None)
+        base = {"close": None, "rsi": None, "status": "missing"}
+        if provider != "TRADINGVIEW":
+            tracker = self.trackers[(provider, symbol)]
+            day = minute.astimezone(MARKET_TZ).date()
+            if tracker.session_date != day:
+                tracker.reset_session(day)
+            # Bootstrap only with data already present at this deadline.
+            warmup = sorted(
+                other
+                for other in self.pending
+                if other[0] == provider
+                and other[1] == symbol
+                and other[2] < minute
+                and other[2].astimezone(MARKET_TZ).date() == day
+            )
+            for other in warmup:
+                self._apply(provider, symbol, other[2], self.pending.pop(other))
+            observation = None
+            if candidate:
+                observation = self._apply(provider, symbol, minute, candidate)
+            opening, _ = session_bounds(day)
+            expected = int((minute - opening) / MINUTE) + 1
+            observed = self.counts.get((provider, symbol, day), 0)
+            base.update(
+                {
+                    "rsi_source": "local_session_rsi",
+                    "observed_closes": observed,
+                    "expected_minutes": expected,
+                    "missing_minutes": max(0, expected - observed),
+                }
+            )
+            if observation:
+                base["rsi"] = observation["rsi"]
+            if candidate:
+                base["status"] = "ok" if observation else "warming_up"
+        elif candidate:
+            base.update(
+                {
+                    "rsi": candidate.reported_rsi,
+                    "rsi_source": "webhook_reported",
+                    "status": (
+                        "ok"
+                        if candidate.reported_rsi is not None
+                        else "rsi_unavailable"
+                    ),
+                }
+            )
+        if candidate:
+            base.update(
+                {
+                    "close": candidate.close,
+                    "source": candidate.source,
+                    "event_time_utc": candidate.event_time.isoformat(),
+                    "received_at_utc": candidate.received_at.isoformat(),
+                    "aggregation": (
+                        "last_received_event"
+                        if candidate.kind == "tick"
+                        else "source_bar"
+                    ),
+                }
+            )
+            if candidate.kind == "tick":
+                partial = self.started_at > minute or any(
+                    start < minute + MINUTE and (end is None or end > minute)
+                    for start, end in self.outages[provider]
+                )
+                base["partial"] = partial
+                if partial:
+                    base["status"] = "partial"
+        return base
+
+    def finalize_due(self, now=None):
+        now = as_utc(now or datetime.now(UTC))
+        emitted = 0
+        while now >= self.next_minute + MINUTE + self.delay:
+            minute = self.next_minute
+            local = minute.astimezone(MARKET_TZ)
+            for provider in self.providers:
+                record = {
+                    "type": "MINUTE_SUMMARY",
+                    "run_id": RUN_ID,
+                    "provider": provider,
+                    "minute_start_utc": minute.isoformat(),
+                    "minute_start": local.isoformat(),
+                    "minute_end_utc": (minute + MINUTE).isoformat(),
+                    "deadline_utc": (minute + MINUTE + self.delay).isoformat(),
+                    "emitted_at_utc": now.isoformat(),
+                    "connection_at_emission": (
+                        "connected" if self.connected[provider] else "disconnected"
+                    ),
+                    "late_records_since_previous_summary": self.late_counts[provider],
+                    "symbols": {
+                        symbol: self._symbol_record(provider, symbol, minute)
+                        for symbol in self.symbols
+                    },
+                }
+                self.emit(record)
+                self.late_counts[provider] = 0
+                emitted += 1
+            self.last_finalized = minute
+            self.next_minute = next_session_minute(minute + MINUTE)
+            # Old dates cannot influence new-session RSI or grow memory forever.
+            next_day = self.next_minute.astimezone(MARKET_TZ).date()
+            self.pending = {
+                key: value
+                for key, value in self.pending.items()
+                if key[2].astimezone(MARKET_TZ).date() >= next_day
+            }
+            self.counts = {
+                key: value for key, value in self.counts.items() if key[2] >= next_day
+            }
+            for provider in self.providers:
+                self.outages[provider] = [
+                    (a, b) for a, b in self.outages[provider] if b is None or b > minute
+                ]
+        return emitted
+
+    async def run(self):
+        while True:
+            self.finalize_due()
+            await asyncio.sleep(0.25)
+
+
 class ProviderRouter:
-    def __init__(self, provider, symbols, credentials):
+    def __init__(self, provider, symbols, credentials, coordinator):
         self.provider = provider
-        self.symbols = symbols
+        self.symbols = tuple(symbols)
         self.credentials = credentials
-        self.trackers = {s: SessionRSI(s, provider) for s in symbols}
-        self.queues = {s: asyncio.Queue(maxsize=QUEUE_LIMIT) for s in symbols}
+        self.coordinator = coordinator
+        self.trackers = {s: coordinator.trackers[(provider, s)] for s in self.symbols}
         self.logger = make_logger(provider, "_STREAM")
         self.history_lock = asyncio.Lock()
+        self.history_requests = asyncio.Queue(maxsize=1000)
+        self.recovery_pending = set()
         self.historical = None
         self.stream = None
-
         if provider == "ALPACA":
             self.historical = StockHistoricalDataClient(
-                credentials["alpaca_key"],
-                credentials["alpaca_secret"],
+                credentials["alpaca_key"], credentials["alpaca_secret"]
             )
             self.stream = StockDataStream(
-                credentials["alpaca_key"],
-                credentials["alpaca_secret"],
-                feed=FEED,
+                credentials["alpaca_key"], credentials["alpaca_secret"], feed=FEED
             )
 
     def enqueue(self, symbol, kind, value):
-        try:
-            self.queues[symbol].put_nowait((kind, value))
-        except asyncio.QueueFull:
-            raise RuntimeError(f"{self.provider} queue overflow for {symbol}") from None
+        if symbol not in self.symbols:
+            return
+        if kind == "recover":
+            through = minute_utc(value)
+            key = (symbol, through)
+            if key not in self.recovery_pending:
+                self.history_requests.put_nowait(key)
+                self.recovery_pending.add(key)
+        elif kind == "bar":
+            self.coordinator.submit(
+                self.provider,
+                symbol,
+                value.timestamp,
+                value.close,
+                source=f"{self.provider}_BAR",
+            )
+        elif kind == "tick":
+            timestamp, price = value
+            self.coordinator.submit(
+                self.provider,
+                symbol,
+                timestamp,
+                price,
+                source=f"{self.provider}_WS_MINUTE",
+                kind="tick",
+            )
+        else:
+            raise ValueError(f"Unknown event kind: {kind!r}")
 
     async def run(self):
         """Run this provider and attach its identity to failures."""
@@ -347,31 +721,28 @@ class ProviderRouter:
 
     async def _run(self):
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
-
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
-            tasks = [asyncio.create_task(self.consume(s)) for s in self.symbols]
-
-            if self.provider == "ALPACA":
-                tasks.append(asyncio.create_task(self.run_alpaca()))
-            elif self.provider == "YAHOOFINANCE":
-                tasks.append(asyncio.create_task(self.run_yfinance()))
-            else:
-                tasks.append(asyncio.create_task(self.run_websocket()))
-
+            collector = {
+                "ALPACA": self.run_alpaca,
+                "YAHOOFINANCE": self.run_yfinance,
+                "TWELVEDATA": self.run_websocket,
+                "TRADIER": self.run_websocket,
+            }[self.provider]
+            tasks = [
+                asyncio.create_task(self.consume()),
+                asyncio.create_task(collector()),
+            ]
             try:
-                done, _ = await asyncio.wait(
-                    tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
+                raise RuntimeError("Provider worker exited unexpectedly")
             finally:
+                self.coordinator.set_connected(self.provider, False)
                 for task in tasks:
                     task.cancel()
-
                 await asyncio.gather(*tasks, return_exceptions=True)
-
                 if self.stream is not None:
                     await self.stream.close()
 
@@ -484,6 +855,7 @@ class ProviderRouter:
         return [unique[timestamp] for timestamp in sorted(unique)]
 
     async def fetch_history(self, symbol, start, end):
+        start, end = normalized_time(start), normalized_time(end)
         if self.provider == "ALPACA":
             return await asyncio.to_thread(
                 self.alpaca_history,
@@ -501,10 +873,12 @@ class ProviderRouter:
             )
 
         if self.provider == "TWELVEDATA":
+            ############ This is a hack because Twelve Data's free plan only supports a few symbols, such as AAPL, MSFT, and SPY. For other symbols, it will return an error. ############
+            symbol = "AAPL"
             payload = await request_json(
                 self.session,
                 "GET",
-                "twelvedata.com",
+                "https://api.twelvedata.com/time_series",
                 params={
                     "symbol": symbol,
                     "interval": "1min",
@@ -533,7 +907,7 @@ class ProviderRouter:
             payload = await request_json(
                 self.session,
                 "GET",
-                "tradier.com",
+                "https://api.tradier.com/v1/markets/timesales",
                 headers=self.tradier_headers(),
                 params={
                     "symbol": symbol,
@@ -616,277 +990,107 @@ class ProviderRouter:
         raise ValueError(f"Unsupported historical provider: {self.provider}")
 
     async def recover(self, symbol, through):
-        tracker = self.trackers[symbol]
-        end = min(
-            normalized_time(through),
-            datetime.now(MARKET_TZ),
-        ).replace(second=0, microsecond=0)
-
-        if end.weekday() >= 5:
+        through = minute_utc(through)
+        day = through.astimezone(MARKET_TZ).date()
+        bounds = session_bounds(day)
+        if bounds is None:
             return
-
-        day = end.date()
-
-        if tracker.session_date is not None and day < tracker.session_date:
-            return
-
-        start = datetime.combine(day, OPEN_TIME, tzinfo=MARKET_TZ)
-        end = min(
-            end,
-            datetime.combine(day, CLOSE_TIME, tzinfo=MARKET_TZ),
-        )
-
-        if tracker.session_date == day and tracker.last_timestamp is not None:
-            start = max(start, tracker.last_timestamp + MINUTE)
-
+        start, closing = bounds
+        end = min(through, closing, minute_utc(datetime.now(UTC)))
+        if self.coordinator.last_finalized is not None:
+            start = max(start, self.coordinator.last_finalized + MINUTE)
         if start >= end:
             return
-
         async with self.history_lock:
             bars = await self.fetch_history(symbol, start, end)
-
-        unique = {}
-
-        for bar in bars:
-            timestamp = normalized_time(bar.timestamp)
-
-            if not start <= timestamp < end:
-                continue
-
-            if timestamp.second or timestamp.microsecond:
-                raise ValueError("Historical minute is not aligned")
-
-            unique[timestamp] = Bar(
-                timestamp,
-                positive_price(bar.close),
-            )
-
-        for timestamp in sorted(unique):
-            tracker.process_bar(unique[timestamp], "REST_BACKFILL")
-
-        tracker.logger.info(
-            "BACKFILL loaded=%d start=%s end_exclusive=%s best_effort=true",
-            len(unique),
+        accepted = 0
+        for bar in sorted(bars, key=lambda item: item.timestamp):
+            timestamp = as_utc(bar.timestamp)
+            if start <= timestamp < end:
+                accepted += self.coordinator.submit(
+                    self.provider, symbol, timestamp, bar.close, source="REST_BACKFILL"
+                )
+        self.logger.info(
+            "BACKFILL symbol=%s received=%d accepted=%d start=%s end=%s",
+            symbol,
+            len(bars),
+            accepted,
             start.isoformat(),
             end.isoformat(),
         )
 
-        ready = tracker.latest is not None
-        required_changes = tracker.period if tracker.mode == "wilder" else 1
-        additional_closes = (
-            0
-            if ready
-            else max(
-                0,
-                required_changes
-                - tracker.changes
-                + (1 if tracker.previous_close is None else 0),
-            )
-        )
-
-        logging.info(
-            "WARMUP provider=%s symbol=%s loaded=%d ready=%s "
-            "additional_closes=%d latest_rsi=%s",
-            self.provider,
-            symbol,
-            len(unique),
-            ready,
-            additional_closes,
-            (f"{tracker.latest['rsi']:.2f}" if ready else "warming-up"),
-        )
-
-    async def consume(self, symbol):
-        tracker = self.trackers[symbol]
-        queue = self.queues[symbol]
-        buckets = {}
-        tick_count = 0
-
+    async def consume(self):
+        """Serialized recovery worker; streaming events bypass this queue."""
         while True:
+            symbol, through = await self.history_requests.get()
             try:
-                item = await asyncio.wait_for(
-                    queue.get(),
-                    timeout=0.5,
-                )
-            except asyncio.TimeoutError:
-                item = None
-
-            if item is not None:
-                kind, value = item
-
-                try:
-                    if kind == "recover":
-                        buckets.clear()
-                        await self.recover(symbol, value)
-                    elif kind == "bar":
-                        timestamp = normalized_time(value.timestamp)
-
-                        if regular_session(timestamp):
-                            await self.accept_bar(
-                                symbol,
-                                value,
-                                f"{self.provider}_BAR",
-                            )
-                    elif kind == "tick":
-                        timestamp, price = value
-                        timestamp = normalized_time(timestamp)
-                        price = positive_price(price)
-
-                        if regular_session(timestamp):
-                            minute = timestamp.replace(
-                                second=0,
-                                microsecond=0,
-                            )
-                            is_new_minute = (
-                                tracker.last_timestamp is None
-                                or minute > tracker.last_timestamp
-                            )
-
-                            if is_new_minute:
-                                existing = buckets.get(minute)
-
-                                if existing is None or timestamp >= existing:
-                                    buckets[minute] = (timestamp, price)
-
-                                tick_count += 1
-
-                                if tick_count == 1:
-                                    logging.info(
-                                        "FIRST_SESSION_TICK provider=%s "
-                                        "symbol=%s timestamp=%s price=%.8f",
-                                        self.provider,
-                                        symbol,
-                                        timestamp.isoformat(),
-                                        price,
-                                    )
-                    else:
-                        raise ValueError(f"Unknown queue event kind: {kind!r}")
-                except Exception as exc:
-                    self.logger.error(
-                        "CONSUMER_FAILURE provider=%s symbol=%s "
-                        "kind=%s error_type=%s",
-                        self.provider,
-                        symbol,
-                        kind,
-                        type(exc).__name__,
-                    )
-                    raise
-                finally:
-                    queue.task_done()
-
-            if not queue.empty():
-                continue
-
-            watermark = datetime.now(MARKET_TZ) - timedelta(
-                seconds=FINALIZE_GRACE_SECONDS
-            )
-            completed = sorted(
-                minute for minute in buckets if minute + MINUTE <= watermark
-            )
-
-            for minute in completed:
-                _, close = buckets.pop(minute)
-
-                if (
-                    tracker.last_timestamp is not None
-                    and minute <= tracker.last_timestamp
-                ):
-                    continue
-
-                await self.accept_bar(
-                    symbol,
-                    Bar(minute, close),
-                    f"{self.provider}_WS_MINUTE",
-                )
-
-    async def accept_bar(self, symbol, bar, source):
-        tracker = self.trackers[symbol]
-        timestamp = normalized_time(bar.timestamp)
-
-        if tracker.last_timestamp is not None and timestamp <= tracker.last_timestamp:
-            return
-
-        if (
-            tracker.session_date != timestamp.date()
-            or tracker.last_timestamp is None
-            or timestamp > tracker.last_timestamp + MINUTE
-        ):
-            await self.recover(symbol, timestamp)
-
-        tracker.process_bar(bar, source)
-
-    async def run_alpaca(self):
-        for symbol in self.symbols:
-            self.enqueue(symbol, "recover", datetime.now(MARKET_TZ))
-
-        async def callback(bar):
-            tracker = self.trackers.get(bar.symbol)
-
-            if tracker is None:
-                return
-
-            latest = tracker.latest
-            bar_timestamp = normalized_time(bar.timestamp)
-            current_session_rsi = (
-                latest is not None and tracker.session_date == bar_timestamp.date()
-            )
-
-            if LOG_RAW_EVENTS:
-                tracker.logger.info(
-                    "WS_BAR provider=ALPACA symbol=%s timestamp=%s "
-                    "close=%.8f previous_rsi[%s]=%s rsi_bar_timestamp=%s",
-                    bar.symbol,
-                    bar_timestamp.isoformat(),
-                    float(bar.close),
-                    tracker.mode,
-                    (f"{latest['rsi']:.2f}" if current_session_rsi else "warming-up"),
-                    (latest["datetime"] if current_session_rsi else "none"),
-                )
-
-            self.enqueue(
-                bar.symbol,
-                "bar",
-                Bar(bar.timestamp, bar.close),
-            )
-
-        self.stream.subscribe_bars(callback, *self.symbols)
-        await self.stream._run_forever()
-
-    async def run_yfinance(self):
-        """Simulate a streaming data feed by polling Yahoo Finance intraday bars."""
-        for symbol in self.symbols:
-            self.enqueue(symbol, "recover", datetime.now(MARKET_TZ))
-
-        self.logger.info(
-            "CONNECTED polling engine active for symbols=%s",
-            self.symbols,
-        )
-
-        while True:
-            try:
-                now = datetime.now(MARKET_TZ)
-
-                # Look back 5 minutes to sweep past bars and guarantee
-                # capture across boundary transitions.
-                start_time = now - timedelta(minutes=5)
-
-                for symbol in self.symbols:
-                    bars = await self.fetch_history(
-                        symbol,
-                        start_time,
-                        now,
-                    )
-
-                    for bar in bars:
-                        self.enqueue(symbol, "bar", bar)
+                await self.recover(symbol, through)
+            except FatalProviderError:
+                raise
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.logger.warning(
-                    "YAHOOFINANCE_POLL_ERROR error_type=%s",
+                    "RECOVERY_FAILED symbol=%s error_type=%s",
+                    symbol,
                     type(exc).__name__,
                 )
+            finally:
+                self.recovery_pending.discard((symbol, through))
+                self.history_requests.task_done()
 
-            await asyncio.sleep(30)
+    async def accept_bar(self, symbol, bar, source):
+        return self.coordinator.submit(
+            self.provider, symbol, bar.timestamp, bar.close, source=source
+        )
+
+    async def run_alpaca(self):
+        async def callback(bar):
+            if bar.symbol not in self.symbols:
+                return
+            self.coordinator.set_connected(self.provider, True)
+            self.enqueue(bar.symbol, "bar", Bar(bar.timestamp, bar.close))
+
+        async def bootstrap():
+            for symbol in self.symbols:
+                self.enqueue(symbol, "recover", datetime.now(UTC))
+            await self.stream._run_forever()
+
+        self.stream.subscribe_bars(callback, *self.symbols)
+        # Corrections received before the common deadline replace the candidate.
+        subscribe_updates = getattr(self.stream, "subscribe_updated_bars", None)
+        if subscribe_updates is not None:
+            subscribe_updates(callback, *self.symbols)
+        await bootstrap()
+
+    async def run_yfinance(self):
+        for symbol in self.symbols:
+            self.enqueue(symbol, "recover", datetime.now(UTC))
+        self.logger.info("POLLING_STARTED symbols=%s", self.symbols)
+        while True:
+            # A full cycle takes request time plus the configured polling pause.
+            for symbol in self.symbols:
+                try:
+                    now = datetime.now(UTC)
+                    async with self.history_lock:
+                        bars = await self.fetch_history(
+                            symbol, now - timedelta(minutes=5), now
+                        )
+                    self.coordinator.set_connected(self.provider, True)
+                    for bar in bars:
+                        self.enqueue(symbol, "bar", bar)
+                except asyncio.CancelledError:
+                    raise
+                except FatalProviderError:
+                    raise
+                except Exception as exc:
+                    self.coordinator.set_connected(self.provider, False)
+                    self.logger.warning(
+                        "YAHOOFINANCE_POLL_ERROR symbol=%s error_type=%s",
+                        symbol,
+                        type(exc).__name__,
+                    )
+            await asyncio.sleep(YAHOO_POLL_SECONDS)
 
     def tradier_headers(self):
         return {
@@ -907,8 +1111,10 @@ class ProviderRouter:
 
             try:
                 if self.provider == "TWELVEDATA":
-                    url = "wss://twelvedata.com"
+                    url = "wss://ws.twelvedata.com/v1/quotes/price"
                     params = {"apikey": self.credentials["twelvedata_key"]}
+                    ############ This is a hack because Twelve Data's free plan only supports a few symbols, such as AAPL, MSFT, and SPY. For other symbols, it will return an error. ############
+                    self.symbols = ["AAPL"]
                     subscription = {
                         "action": "subscribe",
                         "params": {"symbols": ",".join(self.symbols)},
@@ -917,7 +1123,7 @@ class ProviderRouter:
                     payload = await request_json(
                         self.session,
                         "POST",
-                        "tradier.com",
+                        "https://api.tradier.com/v1/markets/events/session",
                         headers=self.tradier_headers(),
                     )
                     stream = payload.get("stream", {})
@@ -928,7 +1134,7 @@ class ProviderRouter:
                             "Tradier returned no streaming session ID"
                         )
 
-                    url = "wss://tradier.com"
+                    url = "wss://ws.tradier.com/v1/markets/events"
                     params = None
                     subscription = {
                         "symbols": self.symbols,
@@ -944,6 +1150,7 @@ class ProviderRouter:
                     heartbeat=20,
                 ) as websocket:
                     await websocket.send_json(subscription)
+                    self.coordinator.set_connected(self.provider, True)
                     cutoff = datetime.now(MARKET_TZ)
 
                     for symbol in self.symbols:
@@ -996,6 +1203,7 @@ class ProviderRouter:
                     type(exc).__name__,
                 )
             finally:
+                self.coordinator.set_connected(self.provider, False)
                 if heartbeat is not None:
                     heartbeat.cancel()
                     await asyncio.gather(
@@ -1008,125 +1216,48 @@ class ProviderRouter:
 
     def handle_event(self, event):
         if not isinstance(event, dict):
-            self.logger.warning("Ignoring non-object event")
+            self.logger.warning("INVALID_EVENT non_object=true")
             return
-
         is_tick = (
             event.get("event") == "price"
             if self.provider == "TWELVEDATA"
             else event.get("type") == "trade"
         )
-
         if not is_tick:
-            safe_event = sanitize_provider_event(
-                event,
-                secrets=tuple(self.credentials.values()),
+            safe = sanitize_provider_event(
+                event, secrets=tuple(self.credentials.values())
             )
-            details = json.dumps(
-                safe_event,
-                separators=(",", ":"),
-                default=str,
-            )
+            details = json.dumps(safe, separators=(",", ":"), default=str)
             event_type = str(event.get("event", event.get("type", ""))).lower()
             status = str(event.get("status", "")).lower()
-            is_error = event_type == "error" or status in {"error", "failed", "failure"}
-            log_method = self.logger.error if is_error else self.logger.info
-            log_method(
+            code = event.get("code")
+            is_error = (
+                event_type == "error"
+                or status in {"error", "failed", "failure"}
+                or (isinstance(code, int) and code >= 400)
+            )
+            self.logger.log(
+                logging.ERROR if is_error else logging.INFO,
                 "WS_CONTROL provider=%s payload=%s",
                 self.provider,
                 details,
             )
-
-            console_method = logging.error if is_error else logging.info
-            console_method(
-                "WS_CONTROL provider=%s payload=%s",
-                self.provider,
-                details,
-            )
-
             if is_error:
-                raise FatalProviderError(f"Websocket rejected request: {details}")
-
+                raise FatalProviderError(f"WebSocket rejected request: {details}")
             return
-
         symbol = str(event.get("symbol", "")).upper()
-
-        if symbol not in self.queues:
+        if symbol not in self.symbols:
             return
-
         try:
-            if self.provider == "TWELVEDATA":
-                epoch, price = (
-                    float(event["timestamp"]),
-                    positive_price(event["price"]),
-                )
-            else:
-                epoch, price = (
-                    float(event["date"]) / 1000.0,
-                    positive_price(event["price"]),
-                )
-
+            raw = event["timestamp"] if self.provider == "TWELVEDATA" else event["date"]
+            epoch = float(raw) / (1 if self.provider == "TWELVEDATA" else 1000)
             if not math.isfinite(epoch):
                 raise ValueError("Nonfinite timestamp")
-
-            timestamp = datetime.fromtimestamp(epoch, MARKET_TZ)
-
-            if timestamp > datetime.now(MARKET_TZ) + timedelta(seconds=30):
-                raise ValueError("Future timestamp")
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            OverflowError,
-            OSError,
-        ):
-            self.trackers[symbol].logger.warning("INVALID_TICK")
-            return
-
-        tracker = self.trackers[symbol]
-        latest = tracker.latest
-        in_regular_session = regular_session(timestamp)
-        same_session = latest is not None and tracker.session_date == timestamp.date()
-
-        if not in_regular_session:
-            rsi_status = "outside_regular_session"
-        elif not same_session:
-            rsi_status = "warming_up"
-        else:
-            rsi_status = "latest_completed_minute"
-
-        rsi_text = f"{latest['rsi']:.2f}" if same_session else "unavailable"
-        rsi_timestamp = latest["datetime"] if same_session else "none"
-
-        if LOG_RAW_EVENTS:
-            safe_event = sanitize_provider_event(
-                event,
-                secrets=tuple(self.credentials.values()),
-            )
-            tracker.logger.info(
-                "WS_PRICE provider=%s symbol=%s tick_timestamp=%s "
-                "price=%.8f accepted_for_rsi=%s rsi_status=%s "
-                "latest_rsi[%s]=%s rsi_bar_timestamp=%s raw=%s",
-                self.provider,
-                symbol,
-                timestamp.isoformat(),
-                price,
-                in_regular_session,
-                rsi_status,
-                tracker.mode,
-                rsi_text,
-                rsi_timestamp,
-                json.dumps(
-                    safe_event,
-                    separators=(",", ":"),
-                    default=str,
-                ),
-            )
-
-        if not in_regular_session:
-            return
-
-        self.enqueue(symbol, "tick", (timestamp, price))
+            timestamp = datetime.fromtimestamp(epoch, UTC)
+            price = positive_price(event["price"])
+            self.enqueue(symbol, "tick", (timestamp, price))
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            self.logger.warning("INVALID_TICK symbol=%s", symbol)
 
 
 def load_tradier_token(config, credentials):
@@ -1222,7 +1353,7 @@ def load_settings():
             credentials.get("secret_key") or os.getenv("ALPACA_SECRET_KEY", "")
         ),
         "tradier_token": tradier_token,
-        "twelvedata_key": td_key,
+        "twelvedata_key": os.getenv("TWELVEDATA_API_KEY", "").strip() or td_key,
     }
     keys = {
         key: value.strip() if isinstance(value, str) else ""
@@ -1232,51 +1363,42 @@ def load_settings():
     return symbols, keys
 
 
-WEBHOOK_ENABLED = True
+WEBHOOK_ENABLED = os.getenv("WEBHOOK_ENABLED", "true").lower() in {"1", "true", "yes"}
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 WEBHOOK_QUEUE_LIMIT = 2000
 WEBHOOK_MAX_BYTES = 16384
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 
 def validate_tradingview_payload(payload, allowed_symbols):
+    from datetime import datetime, UTC
+    import math
+
     if not isinstance(payload, dict):
         raise ValueError("JSON payload must be an object")
 
     ticker = payload.get("ticker")
-
-    if not isinstance(ticker, str) or not ticker.strip():
-        raise ValueError("ticker must be a nonempty string")
-
+    if not isinstance(ticker, str) or not ticker.strip() or len(ticker) > 100:
+        raise ValueError("ticker must be a nonempty string of at most 100 characters")
     ticker = ticker.strip().upper()
-
-    if len(ticker) > 100:
-        raise ValueError("ticker is too long")
-
     symbol = ticker if ticker in allowed_symbols else ticker.rsplit(":", 1)[-1]
-
     if symbol not in allowed_symbols:
         raise ValueError("ticker is not in configured target_symbols")
 
     try:
-        if isinstance(payload.get("price"), bool):
-            raise ValueError()
-
         price = positive_price(payload.get("price"))
     except (TypeError, ValueError, OverflowError):
         raise ValueError("price must be finite and positive") from None
 
-    raw_rsi = payload.get("rsi_value")
-
+    raw_rsi = payload.get("rsi_value") if "rsi_value" in payload else payload.get("rsi")
     if raw_rsi is None or raw_rsi == "" or raw_rsi == "N/A":
         rsi = None
     else:
         try:
             if isinstance(raw_rsi, bool):
                 raise ValueError()
-
             rsi = float(raw_rsi)
-
             if not math.isfinite(rsi) or not 0 <= rsi <= 100:
                 raise ValueError()
         except (TypeError, ValueError, OverflowError):
@@ -1284,48 +1406,67 @@ def validate_tradingview_payload(payload, allowed_symbols):
                 "rsi_value must be between 0 and 100, or omitted"
             ) from None
 
-    raw_time = payload.get("time", "")
-    event_time = None
+    if payload.get("timeframe") != "1m":
+        raise ValueError('timeframe must be "1m"')
+    if payload.get("bar_closed") is not True:
+        raise ValueError("bar_closed must be JSON true")
 
-    if raw_time:
-        if not isinstance(raw_time, str) or len(raw_time) > 100:
-            raise ValueError("time must be a timezone-aware ISO-8601 string")
+    raw_time = payload.get("bar_start")
+    if not isinstance(raw_time, str) or not raw_time or len(raw_time) > 100:
+        raise ValueError(
+            "bar_start must be a timezone-aware ISO-8601 minute-start string"
+        )
 
-        try:
-            event_time = normalized_time(
-                datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            )
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("time must be a timezone-aware ISO-8601 string") from None
+    try:
+        # FIX: Keep TradingView's original baseline timestamp (e.g., 18:16:00)
+        # Your coordinator handles historical bucket alignment automatically.
+        timestamp = as_utc(datetime.fromisoformat(raw_time.replace("Z", "+00:00")))
+
+        if timestamp != minute_utc(timestamp):
+            raise ValueError()
+
+        now = datetime.now(UTC)
+
+        if now < timestamp:
+            raise ValueError()
+
+        if not regular_session(timestamp):
+            raise ValueError()
+
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "bar_start must identify a completed regular-session minute"
+        ) from None
 
     return {
         "symbol": symbol,
         "ticker": ticker,
         "price": price,
         "rsi_value": rsi,
-        "event_time": (event_time.isoformat() if event_time else None),
-        "received_at": datetime.now(MARKET_TZ).isoformat(),
+        "event_time": timestamp.isoformat(),
+        "received_at": now.isoformat(),
+        "timeframe": "1m",
+        "bar_closed": True,
     }
 
 
 class TradingviewProvider:
-    def __init__(self, symbols, host=WEBHOOK_HOST, port=WEBHOOK_PORT):
+    def __init__(self, symbols, coordinator, host=WEBHOOK_HOST, port=WEBHOOK_PORT):
         import queue
         import threading
 
+        if not WEBHOOK_TOKEN and host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Set WEBHOOK_TOKEN before binding a non-loopback host")
         self.provider = "TRADINGVIEW"
         self.symbols = set(symbols)
-        self.host = host
-        self.port = port
+        self.coordinator = coordinator
+        self.host, self.port = host, port
         self.queue = queue.Queue(maxsize=WEBHOOK_QUEUE_LIMIT)
         self.stop = threading.Event()
         self.server = None
         self.thread = None
         self.thread_error = None
         self.logger = make_logger(self.provider, "_STREAM")
-        self.symbol_loggers = {
-            symbol: make_logger(self.provider, symbol) for symbol in symbols
-        }
         self.latest = {}
         self.app = self.create_app()
 
@@ -1353,53 +1494,81 @@ class TradingviewProvider:
 
         @app.post("/webhook")
         def receive():
-            if not request.is_json:
-                return (
-                    jsonify(
-                        status="error",
-                        message="Payload must be JSON",
-                    ),
-                    415,
-                )
+            import traceback
+            import hmac
 
-            payload = request.get_json(silent=True)
+            payload = request.get_json(force=True, silent=True)
 
             if not isinstance(payload, dict):
                 return (
-                    jsonify(
-                        status="error",
-                        message="JSON payload must be an object",
-                    ),
+                    jsonify(status="error", message="JSON payload must be an object"),
                     400,
                 )
 
+            if WEBHOOK_TOKEN:
+                supplied = request.headers.get("X-Webhook-Token")
+                if supplied is None:
+                    supplied = payload.get("webhook_token", "")
+                if not isinstance(supplied, str) or not hmac.compare_digest(
+                    supplied.encode("utf-8"), WEBHOOK_TOKEN.encode("utf-8")
+                ):
+                    return jsonify(status="error", message="Unauthorized"), 401
+
             try:
+                # Execute your payload validation logic
                 event = validate_tradingview_payload(
                     payload,
                     self.symbols,
                 )
-            except ValueError as exc:
-                return jsonify(status="error", message=str(exc)), 400
 
-            try:
+                # SAFEGUARD: Verify the exact type and key of the returned object
+                if not isinstance(event, dict) or "symbol" not in event:
+                    print(
+                        f"\n[CRITICAL ERROR]: validate_tradingview_payload returned an invalid structure."
+                    )
+                    print(f"Expected dict with 'symbol' key, but got: {event}\n")
+                    return (
+                        jsonify(
+                            status="error",
+                            message="Internal payload structural mismatch",
+                        ),
+                        500,
+                    )
+
                 self.queue.put_nowait(event)
-            except queue.Full:
+
                 return (
                     jsonify(
-                        status="error",
-                        message="Receiver busy; alert not queued",
+                        status="queued",
+                        provider=self.provider,
+                        received=event["symbol"],
                     ),
+                    200,
+                )
+
+            except ValueError as exc:
+                print(f"[VALIDATION FAILED]: {exc}")
+                return jsonify(status="error", message=str(exc)), 400
+
+            except queue.Full:
+                return (
+                    jsonify(status="error", message="Receiver busy; alert not queued"),
                     503,
                 )
 
-            return (
-                jsonify(
-                    status="queued",
-                    provider=self.provider,
-                    received=event["symbol"],
-                ),
-                200,
-            )
+            except Exception as system_err:
+                # This block captures exactly what line crashed inside your processing pipeline
+                print(
+                    "\n=================== CRITICAL SERVER TRACEBACK (500) ==================="
+                )
+                traceback.print_exc()
+                print(
+                    "=======================================================================\n"
+                )
+                return (
+                    jsonify(status="error", message="Internal Server Processing Error"),
+                    500,
+                )
 
         return app
 
@@ -1413,27 +1582,21 @@ class TradingviewProvider:
             self.server.server_close()
 
     def record(self, event):
-        rsi = event["rsi_value"]
-        label = (
-            "ALERT"
-            if rsi is None
-            else "OVERBOUGHT" if rsi >= 70 else "OVERSOLD" if rsi <= 35 else "TRIPPED"
+        accepted = self.coordinator.submit(
+            self.provider,
+            event["symbol"],
+            datetime.fromisoformat(event["event_time"]),
+            event["price"],
+            source="TRADINGVIEW_WEBHOOK",
+            kind="webhook",
+            # Use event-loop acceptance time for the strict deadline. The original
+            # HTTP receipt time remains in the diagnostic event, not the snapshot.
+            reported_rsi=event["rsi_value"],
         )
-        event = {
-            **event,
-            "provider": self.provider,
-            "status_label": label,
-            "rsi_source": "webhook_reported",
-        }
-
-        self.latest[event["symbol"]] = event
-        text = json.dumps(event, separators=(",", ":"))
-
-        self.symbol_loggers[event["symbol"]].info(
-            "WEBHOOK_ALERT %s",
-            text,
+        self.latest[event["symbol"]] = {**event, "accepted_for_summary": accepted}
+        self.logger.debug(
+            "WEBHOOK_ACCEPTED symbol=%s accepted=%s", event["symbol"], accepted
         )
-        logging.info("WEBHOOK_ALERT %s", text)
 
     async def run(self):
         import queue
@@ -1460,12 +1623,13 @@ class TradingviewProvider:
             daemon=True,
         )
         self.thread.start()
+        self.coordinator.set_connected(self.provider, True)
 
         logging.info(
-            "TRADINGVIEW listening host=%s port=%d "
-            "route=/webhook authentication=none",
+            "TRADINGVIEW listening host=%s port=%d " "route=/webhook authentication=%s",
             self.host,
             self.port,
+            "token" if WEBHOOK_TOKEN else "none-loopback-only",
         )
 
         try:
@@ -1488,6 +1652,7 @@ class TradingviewProvider:
 
                 await asyncio.sleep(0.05)
         finally:
+            self.coordinator.set_connected(self.provider, False)
             self.stop.set()
             await asyncio.to_thread(self.thread.join, 3.0)
 
@@ -1507,99 +1672,56 @@ class TradingviewProvider:
 
 
 async def main():
-    logging.info("ENTERED main()  separate webhook routing")
-
     switch = ROUTER_SWITCH.strip().upper()
-
-    # These lists contain ONLY ProviderRouter-compatible providers.
     choices = {
         "ALPACA": ["ALPACA"],
         "TRADIER": ["TRADIER"],
         "TWELVEDATA": ["TWELVEDATA"],
         "YAHOOFINANCE": ["YAHOOFINANCE"],
         "BOTH": ["ALPACA", "TWELVEDATA"],
-        "ALL": [
-            "ALPACA",
-            "TRADIER",
-            "TWELVEDATA",
-            "YAHOOFINANCE",
-        ],
+        "ALL": ["ALPACA", "TRADIER", "TWELVEDATA", "YAHOOFINANCE"],
         "MOST": ["ALPACA", "TRADIER"],
-        # Webhook-only modes: no market-data routers.
         "TRADINGVIEW": [],
     }
-
     if switch not in choices:
-        raise ValueError(
-            f"Invalid ROUTER_SWITCH: {ROUTER_SWITCH!r}. "
-            f"Valid choices: {', '.join(choices)}"
-        )
-
+        raise ValueError(f"Invalid ROUTER_SWITCH: {switch!r}")
     selected = choices[switch]
-
-    logging.info(
-        "ROUTER_SELECTION switch=%s market_data_providers=%s",
-        switch,
-        selected,
-    )
-
     symbols, keys = load_settings()
-
     required = {
         "ALPACA": ["alpaca_key", "alpaca_secret"],
         "TRADIER": ["tradier_token"],
         "TWELVEDATA": ["twelvedata_key"],
         "YAHOOFINANCE": [],
     }
-
-    # Validate credentials only for market-data providers.
     for provider in selected:
-        if provider not in required:
-            raise ValueError(f"Unexpected market-data provider: {provider!r}")
-
         missing = [key for key in required[provider] if not keys.get(key)]
-
         if missing:
             raise ValueError(
-                f"Missing credentials for {provider}: " + ", ".join(missing)
+                f"Missing credentials for {provider}: {', '.join(missing)}"
             )
-
-    routers = [ProviderRouter(provider, symbols, keys) for provider in selected]
-
-    # The webhook uses its own class, not ProviderRouter.
-    enable_webhook = WEBHOOK_ENABLED or switch in {"TRADINGVIEW"}
-
-    if enable_webhook:
-        routers.append(TradingviewProvider(symbols=symbols))
-
-    if not routers:
-        raise ValueError("No market-data providers or webhook receiver enabled")
-
+    webhook = WEBHOOK_ENABLED or switch == "TRADINGVIEW"
+    providers = selected + (["TRADINGVIEW"] if webhook else [])
+    coordinator = MinuteCoordinator(providers, symbols)
+    routers = [ProviderRouter(p, symbols, keys, coordinator) for p in selected]
+    if webhook:
+        routers.append(TradingviewProvider(symbols, coordinator))
     logging.info(
-        "STARTUP symbols=%s providers=%s",
+        "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
+        providers,
         symbols,
-        [router.provider for router in routers],
+        coordinator.report_start.isoformat(),
+        SUMMARY_DELAY_SECONDS,
     )
-
-    tasks = [
-        asyncio.create_task(
-            router.run(),
-            name=router.provider,
-        )
-        for router in routers
-    ]
-
+    tasks = [asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR")]
+    tasks.extend(
+        asyncio.create_task(router.run(), name=router.provider) for router in routers
+    )
     try:
         await asyncio.gather(*tasks)
     finally:
         for task in tasks:
             task.cancel()
-
-        await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
-        )
-
+        await asyncio.gather(*tasks, return_exceptions=True)
     return 0
 
 

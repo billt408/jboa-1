@@ -6,3 +6,41 @@ tradier.com
 finance.yahoo.com
 tradingView.com
 
+# Start Python and ngrok.
+sudo systemctl start jboa-rsi.service
+
+# Stop Python and ngrok.
+sudo systemctl stop jboa-rsi.service
+
+# Restart both, creating new timestamped logs.
+sudo systemctl restart jboa-rsi.service
+
+# Inspect service status.
+sudo systemctl status jboa-rsi.service --no-pager -l
+
+# Disable automatic boot startup and stop it now.
+sudo systemctl disable --now jboa-rsi.service
+
+sudo journalctl -u jboa-rsi.service -n 100 --no-pager
+sudo journalctl -u jboa-rsi.service -f
+ls -lt /home/billt/jboa-1/logs/console/
+latest="$(ls -1t /home/billt/jboa-1/logs/console/multiStreamRSI-*.log | head -n 1)"
+tail -n 100 -F "$latest"
+Pythons stdout and stderr go into the multiStreamRSI-log file. Ngrok output goes into its matching ngrok-log file. Your applications existing summary and diagnostic files remain separate.
+
+Each launch creates new files; this setup does not yet delete old logs or rotate a continuously growing file.
+
+11/5/2026 - tradingView alert package
+{
+  "type": "MINUTE_SUMMARY",
+  "provider": "TRADINGVIEW",
+  "timeframe": "1m",
+  "bar_closed": true,
+  "bar_start": "{{time}}",
+  "minute_end_utc": "{{time}}",
+  "ticker": "{{ticker}}",
+  "price": {{close}},
+  "rsi": {{plot_0}},
+  "status": "active",
+  "aggregation": "tv_alert"
+}
