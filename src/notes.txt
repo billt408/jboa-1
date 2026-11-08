@@ -44,3 +44,57 @@ Each launch creates new files; this setup does not yet delete old logs or rotate
   "status": "active",
   "aggregation": "tv_alert"
 }
+
+jq -r '
+  select(.minute_end_utc == "2026-11-05T14:57:00+00:00")
+  | . as $record
+  | .symbols
+  | to_entries[]
+  | {
+      provider: $record.provider,
+      minute_end_utc: $record.minute_end_utc,
+      symbol: .key,
+      data: .value
+    }
+  | (tojson, "==============")
+' logs/minute-summary-20261104-124518-264341-48f32e5e.jsonl
+## by provider
+jq -r '
+  . as $record
+  | (
+      (
+        .symbols
+        | to_entries[]
+        | {
+            provider: $record.provider,
+            minute_end_utc: $record.minute_end_utc,
+            symbol: .key,
+            data: .value
+          }
+        | tojson
+      ),
+      "=============="
+    )
+' logs/minute-summary-20261105-075120-219782-e17b1dec.jsonl
+## by symbol
+jq -rs '
+  [
+    .[] as $record
+    | $record.symbols
+    | to_entries[]
+    | {
+        provider: $record.provider,
+        minute_end_utc: $record.minute_end_utc,
+        symbol: .key,
+        data: .value
+      }
+  ]
+  | group_by([.minute_end_utc, .symbol])
+  | .[]
+  | (
+      (sort_by(.provider)[] | tojson),
+      "=============="
+    )
+' logs/minute-summary-20261105-075120-219782-e17b1dec.jsonl
+
+
