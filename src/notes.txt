@@ -98,3 +98,5 @@ jq -rs '
 ' logs/minute-summary-20261105-075120-219782-e17b1dec.jsonl
 
 
+python cli.py status
+python cli.py reconnect --provider ALPACA

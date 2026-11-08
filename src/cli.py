@@ -53,6 +53,16 @@ def main():
         "--timestamp", help="ISO Timestamp string (defaults to current time)"
     )
 
+    # Reconnect Command
+    reconnect = subparsers.add_parser(
+        "reconnect", help="Force restart and reconnect a specific provider stream"
+    )
+    reconnect.add_argument(
+        "--provider",
+        required=True,
+        help="Provider name to cycle (e.g. ALPACA, TWELVEDATA)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "status":
@@ -67,6 +77,9 @@ def main():
             "timestamp": args.timestamp,
         }
         send_command("/cli/inject", payload)
+    elif args.command == "reconnect":
+        payload = {"provider": args.provider.upper()}
+        send_command("/cli/reconnect", payload)
 
 
 if __name__ == "__main__":

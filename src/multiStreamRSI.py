@@ -1746,6 +1746,10 @@ class TradingviewProvider:
                     self.queue.task_done()
 
 
+# Create a dictionary to keep track of active provider instances and tasks across the engine
+PROVIDER_REGISTRY = {}
+
+
 class AdminCliProvider:
     def __init__(self, coordinator, host="127.0.0.1", port=5001):
         import threading
@@ -1753,9 +1757,7 @@ class AdminCliProvider:
         self.coordinator = coordinator
         self.host = host
         self.port = port
-        self.loop = (
-            asyncio.get_running_loop()
-        )  # Save references to our main execution loop
+        self.loop = asyncio.get_running_loop()
         self.stop = threading.Event()
         self.server = None
         self.thread = None
@@ -1767,21 +1769,21 @@ class AdminCliProvider:
         app = Flask("admin_cli_interface")
         app.config["MAX_CONTENT_LENGTH"] = 16384
 
-        @app.post("/cli/status")
+        # @app.post("/cli/status")
+        @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
-            # Reading small metadata maps built in memory is thread-safe
             status_report = {
                 "run_id": RUN_ID,
                 "connected_providers": self.coordinator.connected,
                 "tracked_instruments": self.coordinator.symbols,
                 "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
+                "loaded_providers": list(PROVIDER_REGISTRY.keys()),
             }
             return jsonify(status="ok", metrics=status_report), 200
 
         @app.post("/cli/finalize")
         def force_finalize():
-            # Mutating state inside the loop from a thread must happen via threadsafe scheduling
             def run_finalize():
                 return self.coordinator.finalize_due()
 
@@ -1791,8 +1793,7 @@ class AdminCliProvider:
             emitted = future.result(timeout=5.0)
             return (
                 jsonify(
-                    status="ok",
-                    message=f"Flush execution complete. Emitted {emitted} summaries.",
+                    status="ok", message=f"Flush complete. Emitted {emitted} summaries."
                 ),
                 200,
             )
@@ -1811,7 +1812,6 @@ class AdminCliProvider:
             try:
                 target_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
 
-                # Execute coordination threadsafe onto loop
                 def process_submission():
                     return self.coordinator.submit(
                         provider=provider,
@@ -1826,13 +1826,63 @@ class AdminCliProvider:
                     asyncio.to_thread(process_submission), self.loop
                 )
                 accepted = future.result(timeout=5.0)
-
                 return (
                     jsonify(status="ok", processed=True, summary_accepted=accepted),
                     200,
                 )
             except Exception as e:
                 return jsonify(status="error", message=str(e)), 400
+
+        # --- NEW: Reconnect endpoint ---
+        @app.post("/cli/reconnect")
+        def reconnect_provider():
+            payload = request.get_json(force=True, silent=True) or {}
+            provider = (payload.get("provider") or "").upper()
+
+            if provider not in PROVIDER_REGISTRY:
+                return (
+                    jsonify(
+                        status="error",
+                        message=f"Provider '{provider}' is not configured or enabled.",
+                    ),
+                    400,
+                )
+
+            async def trigger_reconnect():
+                entry = PROVIDER_REGISTRY[provider]
+                old_task = entry["task"]
+                router = entry["router"]
+
+                # Cancel running task loop gracefully
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                    try:
+                        await old_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Reset connection state in case it was stuck on True
+                self.coordinator.set_connected(provider, False)
+
+                # Spawn clean instance run loop inside our main event loop
+                new_task = asyncio.create_task(
+                    run_provider_isolated(router, self.coordinator), name=provider
+                )
+                entry["task"] = new_task
+                return True
+
+            future = asyncio.run_coroutine_threadsafe(trigger_reconnect(), self.loop)
+            future.result(
+                timeout=10.0
+            )  # Blocks thread cleanly until replacement task is mounted
+
+            return (
+                jsonify(
+                    status="ok",
+                    message=f"Reconnection cycle triggered for provider: {provider}",
+                ),
+                200,
+            )
 
         return app
 
@@ -1878,39 +1928,36 @@ async def run_provider_isolated(router, coordinator):
     """Keep other providers running after a fatal provider rejection."""
     try:
         await router.run()
-
     except asyncio.CancelledError:
+        logging.info(
+            "Provider task run loop canceled for allocation update: %s", router.provider
+        )
         raise
-
     except FatalProviderError as exc:
         coordinator.set_connected(router.provider, False)
-
         logging.error(
             "PROVIDER_DISABLED provider=%s reason=%s "
             "other_providers_continue=true "
-            "restart_required_to_retry=true",
+            "restart or CLI reconnect required to retry",
             router.provider,
             exc,
         )
-
-        # Do not repeatedly retry an authentication or subscription rejection.
-        # Keep the task pending until normal application shutdown.
+        # Keep task alive but sleeping so execution structure is healthy until a restart/reconnect request
+        await asyncio.Event().wait()
+    except Exception as exc:
+        coordinator.set_connected(router.provider, False)
+        logging.error(
+            "PROVIDER_CRASHED provider=%s error=%s", router.provider, type(exc).__name__
+        )
         await asyncio.Event().wait()
 
 
 async def main():
-    # load_settings populates the global selected and required values.
     symbols, keys = load_settings()
     if not selected:
         return 0
 
     coordinator = MinuteCoordinator(selected, symbols)
-    routers = []
-    for provider in selected:
-        if provider == "TRADINGVIEW":
-            routers.append(TradingviewProvider(symbols, coordinator))
-        else:
-            routers.append(ProviderRouter(provider, symbols, keys, coordinator))
 
     logging.info(
         "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
@@ -1920,30 +1967,42 @@ async def main():
         SUMMARY_DELAY_SECONDS,
     )
 
-    tasks = [
-        asyncio.create_task(
-            coordinator.run(),
-            name="MINUTE_COORDINATOR",
-        )
-    ]
+    tasks = [asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR")]
 
-    # --- NEW: Append the command-line admin engine app thread task here ---
     cli_admin = AdminCliProvider(coordinator, host="127.0.0.1", port=5001)
     tasks.append(asyncio.create_task(cli_admin.run(), name="CLI_ADMIN_PANEL"))
-    # ---------------------------------------------------------------------
 
-    tasks.extend(
-        asyncio.create_task(
-            run_provider_isolated(router, coordinator),
-            name=router.provider,
+    # Instantiate and mount routers to global container dictionary object
+    for provider in selected:
+        if provider == "TRADINGVIEW":
+            router_instance = TradingviewProvider(symbols, coordinator)
+        else:
+            router_instance = ProviderRouter(provider, symbols, keys, coordinator)
+
+        # Build placeholder space inside our dictionary topology
+        PROVIDER_REGISTRY[provider] = {"router": router_instance, "task": None}
+
+    # Generate asynchronous execution loops from our registry slots
+    for provider, entry in PROVIDER_REGISTRY.items():
+        task = asyncio.create_task(
+            run_provider_isolated(entry["router"], coordinator), name=provider
         )
-        for router in routers
-    )
+        entry["task"] = task
+        tasks.append(task)
+
     try:
-        await asyncio.gather(*tasks)
+        # We wrap this in an inner monitoring structure because individual task targets
+        # within `tasks` list can change dynamically via references inside PROVIDER_REGISTRY.
+        while True:
+            await asyncio.sleep(3600)
     finally:
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
+        # Ensure dynamically spawned tasks that aren't inside the baseline local `tasks` array get closed
+        for entry in PROVIDER_REGISTRY.values():
+            if entry["task"] and not entry["task"].done():
+                entry["task"].cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     return 0
 
