@@ -1,0 +1,143 @@
+#!/usr/bin/bash
+
+set -Eeuo pipefail
+umask 077
+
+PROJECT="/home/billt/jboa-1"
+LOG_DIR="${PROJECT}/src/logs/console"
+
+export HOME="/home/billt"
+export PATH="/home/billt/.local/bin:/home/billt/bin:/usr/local/bin:/usr/bin:/bin"
+export PYTHONUNBUFFERED=1
+
+# Keep the webhook listener consistent with the ngrok upstream.
+export WEBHOOK_HOST="127.0.0.1"
+export WEBHOOK_PORT="5000"
+export WEBHOOK_ENABLED="true"
+
+NGROK_PID=""
+PYTHON_PID=""
+
+cleanup() {
+    local status=$?
+
+    # Avoid recursive cleanup if another signal arrives.
+    trap - EXIT
+    trap '' INT TERM HUP
+
+    for pid in "$PYTHON_PID" "$NGROK_PID"; do
+        if [[ -n "$pid" ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Allow up to 10 seconds before forcefully stopping survivors.
+    for _ in {1..50}; do
+        local alive=0
+
+        for pid in "$PYTHON_PID" "$NGROK_PID"; do
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                alive=1
+            fi
+        done
+
+        if (( alive == 0 )); then
+            break
+        fi
+
+        sleep 0.2
+    done
+
+    for pid in "$PYTHON_PID" "$NGROK_PID"; do
+        if [[ -n "$pid" ]]; then
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+
+    exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+cd "$PROJECT"
+mkdir -p "$LOG_DIR"
+
+# Prevent two copies of this launcher from running simultaneously.
+exec 9>"${PROJECT}/.rsi-launcher.lock"
+
+if ! /usr/bin/flock -n 9; then
+    echo "Another jboa-rsi launcher is already running." >&2
+    exit 75
+fi
+
+STAMP="$(date -u +'%Y%m%dT%H%M%S.%NZ')-$$"
+APP_LOG="${LOG_DIR}/multiStreamRSI-${STAMP}.log"
+NGROK_LOG="${LOG_DIR}/ngrok-${STAMP}.log"
+
+# These locations appear in the systemd journal before redirection.
+printf 'Python console log: %s\n' "$APP_LOG"
+printf 'ngrok log: %s\n' "$NGROK_LOG"
+
+# Capture launcher and Python stdout/stderr in the same file.
+exec >>"$APP_LOG" 2>&1
+
+printf '[%s] Starting launcher\n' "$(date -Is)"
+
+if [[ ! -r "${PROJECT}/.venv/bin/activate" ]]; then
+    echo "ERROR: Virtual environment activation file not found."
+    exit 1
+fi
+
+if [[ ! -f "${PROJECT}/src/multiStreamRSI.py" ]]; then
+    echo "ERROR: Python script not found."
+    exit 1
+fi
+
+# Activate the project's virtual environment.
+source "${PROJECT}/.venv/bin/activate"
+
+# Set NGROK_BIN in the service environment if installed elsewhere.
+NGROK_BIN="${NGROK_BIN:-$(command -v ngrok || true)}"
+
+if [[ -z "$NGROK_BIN" || ! -x "$NGROK_BIN" ]]; then
+    echo "ERROR: ngrok not found. Configure NGROK_BIN with its absolute path."
+    exit 1
+fi
+
+printf '[%s] Starting ngrok\n' "$(date -Is)"
+
+"$NGROK_BIN" http 5000 \
+    --url https://implant-dainty-unlatch.ngrok-free.dev \
+    --log stdout \
+    --log-format json \
+    >"$NGROK_LOG" 2>&1 &
+
+NGROK_PID=$!
+
+cd "${PROJECT}/src"
+
+printf '[%s] Starting Python: %s\n' \
+    "$(date -Is)" "$(command -v python)"
+
+python -u ./multiStreamRSI.py &
+PYTHON_PID=$!
+
+printf 'Python PID=%s ngrok PID=%s\n' "$PYTHON_PID" "$NGROK_PID"
+
+# Stay in the foreground while both children run.
+# If either exits, cleanup stops the other and systemd can restart both.
+status=0
+wait -n "$NGROK_PID" "$PYTHON_PID" || status=$?
+
+printf '[%s] A child process exited; status=%s\n' \
+    "$(date -Is)" "$status"
+
+# These are long-running processes: even an unexpected clean exit
+# should trigger the service's on-failure restart policy.
+if (( status == 0 )); then
+    status=1
+fi
+
+exit "$status"

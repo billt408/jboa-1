@@ -8,9 +8,13 @@ One JSON summary per regular-session minute per provider in a dedicated JSONL lo
 Late data cannot change emitted summaries or RSI state. Historical warmup is best effort.
 TradingView requires a 1m closed-bar payload with explicit bar_start.
 Deduplication is in-memory only and does not survive process restarts.
+Provider startup is controlled exclusively by [providers] NAME.enabled in lib/parms.ini.
+load_settings populates module globals selected and required; disabled providers
+are not instantiated or included in minute summaries.
 """
 
 import asyncio
+import configparser
 import json
 import logging
 import math
@@ -43,9 +47,9 @@ CLOSE_TIME = clock_time(16, 0)
 MODE = "wilder"
 RSI_PERIOD = 14
 FEED = DataFeed.IEX
-ROUTER_SWITCH = os.getenv(
-    "ROUTER_SWITCH", "ALL"
-)  # ALPACA, TRADIER, TWELVEDATA, YAHOOFINANCE, BOTH, ALL, MOST
+# Populated by load_settings(); provider startup is controlled only by parms.ini.
+selected: list[str] = []
+required: dict[str, list[str]] = {}
 FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
@@ -873,8 +877,6 @@ class ProviderRouter:
             )
 
         if self.provider == "TWELVEDATA":
-            ############ This is a hack because Twelve Data's free plan only supports a few symbols, such as AAPL, MSFT, and SPY. For other symbols, it will return an error. ############
-            symbol = "AAPL"
             payload = await request_json(
                 self.session,
                 "GET",
@@ -1113,8 +1115,6 @@ class ProviderRouter:
                 if self.provider == "TWELVEDATA":
                     url = "wss://ws.twelvedata.com/v1/quotes/price"
                     params = {"apikey": self.credentials["twelvedata_key"]}
-                    ############ This is a hack because Twelve Data's free plan only supports a few symbols, such as AAPL, MSFT, and SPY. For other symbols, it will return an error. ############
-                    self.symbols = ["AAPL"]
                     subscription = {
                         "action": "subscribe",
                         "params": {"symbols": ",".join(self.symbols)},
@@ -1300,12 +1300,79 @@ def load_tradier_token(config, credentials):
     return token
 
 
-def load_settings():
-    config_path = Path(__file__).resolve().parent / "lib" / "parms.ini"
+def parse_provider_enabled(value, provider):
+    """Only explicit true enables a provider; quoted true/false are supported."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"[providers] {provider}.enabled must be True or False")
+    flag = value.strip()
+    if len(flag) >= 2 and flag[0] == flag[-1] and flag[0] in {"'", '"'}:
+        flag = flag[1:-1].strip()
+    flag = flag.casefold()
+    if flag == "true":
+        return True
+    if flag == "false":
+        return False
+    raise ValueError(
+        f"[providers] {provider}.enabled must be True or False; got {value!r}"
+    )
 
+
+def load_settings():
+    """Load enabled providers, symbols and credentials from project configuration.
+
+    selected contains ALL enabled providers, including TRADINGVIEW.
+    required maps each provider to its required credential names.
+    Missing flags are disabled; invalid flag values are configuration errors.
+    """
+    global selected, required
+
+    # Reset on every call so repeated loads cannot retain an old selection.
+    selected = []
+    required = {
+        "ALPACA": ["alpaca_key", "alpaca_secret"],
+        "TRADIER": ["tradier_token"],
+        "TWELVEDATA": ["twelvedata_key"],
+        "YAHOOFINANCE": [],
+        "TRADINGVIEW": [],
+    }
+
+    config_path = Path(__file__).resolve().parent / "lib" / "parms.ini"
     if not config_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
+    # Read provider flags with standard INI semantics, independent of how the
+    # project's JsonIniParser interprets dotted names or quoted values.
+    provider_config = configparser.ConfigParser(interpolation=None)
+    with config_path.open("r", encoding="utf-8-sig") as handle:
+        provider_config.read_file(handle)
+
+    if not provider_config.has_section("providers"):
+        raise ValueError("Configuration is missing the [providers] section")
+
+    recognized = {f"{provider}.enabled".lower() for provider in required}
+    for option in provider_config.options("providers"):
+        if option.lower().endswith(".enabled") and option.lower() not in recognized:
+            raise ValueError(f"Unknown provider flag in [providers]: {option}")
+
+    for provider in required:
+        option = f"{provider}.enabled"
+        raw_flag = provider_config.get("providers", option, fallback=None)
+        enabled = parse_provider_enabled(raw_flag, provider)
+        logging.info("PROVIDER_CONFIG provider=%s enabled=%s", provider, enabled)
+        if enabled:
+            selected.append(provider)
+
+    if not selected:
+        logging.warning(
+            "NO_PROVIDERS_ENABLED: no collectors, webhook or summaries will start"
+        )
+        return [], {}
+
+    # Keep the existing project-specific parsing for symbols and API credentials.
     config = JsonIniParser(str(config_path))
     config.load_globals()
     raw = config.get("symbols", "target_symbols")
@@ -1315,55 +1382,63 @@ def load_settings():
     elif isinstance(raw, (list, tuple)):
         if any(not isinstance(s, str) or not s.strip() for s in raw):
             raise ValueError("Symbols must be nonempty strings")
-
         symbols = [s.strip().upper() for s in raw]
     else:
         raise ValueError("target_symbols must be a string, list, or tuple")
 
     symbols = list(dict.fromkeys(symbols))
-
     if not symbols:
         raise ValueError("No symbols configured")
 
-    credentials = getattr(config, "CREDENTIALS", {}) or {}
-
-    if not isinstance(credentials, dict):
-        raise ValueError("CREDENTIALS must be a dictionary")
-
-    try:
-        td_key = config.get(
-            "twelvedata_api",
-            "twelvedata_api_key",
-        )
-    except Exception:
-        td_key = ""
-
-    selected_uses_tradier = ROUTER_SWITCH.strip().upper() in {
-        "TRADIER",
-        "ALL",
-        "MOST",
-    }
-    tradier_token = (
-        load_tradier_token(config, credentials) if selected_uses_tradier else ""
-    )
+    credentials = {}
+    if any(required[provider] for provider in selected):
+        credentials = getattr(config, "CREDENTIALS", {}) or {}
+        if not isinstance(credentials, dict):
+            raise ValueError("CREDENTIALS must be a dictionary")
 
     keys = {
-        "alpaca_key": (credentials.get("api_key") or os.getenv("ALPACA_API_KEY", "")),
-        "alpaca_secret": (
-            credentials.get("secret_key") or os.getenv("ALPACA_SECRET_KEY", "")
-        ),
-        "tradier_token": tradier_token,
-        "twelvedata_key": os.getenv("TWELVEDATA_API_KEY", "").strip() or td_key,
+        "alpaca_key": "",
+        "alpaca_secret": "",
+        "tradier_token": "",
+        "twelvedata_key": "",
     }
+
+    if "ALPACA" in selected:
+        keys["alpaca_key"] = credentials.get("api_key") or os.getenv(
+            "ALPACA_API_KEY", ""
+        )
+        keys["alpaca_secret"] = credentials.get("secret_key") or os.getenv(
+            "ALPACA_SECRET_KEY", ""
+        )
+
+    if "TRADIER" in selected:
+        keys["tradier_token"] = load_tradier_token(config, credentials)
+
+    if "TWELVEDATA" in selected:
+        td_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+        if not td_key:
+            try:
+                td_key = config.get("twelvedata_api", "twelvedata_api_key")
+            except Exception:
+                td_key = ""
+        keys["twelvedata_key"] = td_key
+
     keys = {
         key: value.strip() if isinstance(value, str) else ""
         for key, value in keys.items()
     }
 
+    for provider in selected:
+        missing = [key for key in required[provider] if not keys.get(key)]
+        if missing:
+            raise ValueError(
+                f"Missing credentials for enabled provider {provider}: {', '.join(missing)}"
+            )
+
+    logging.info("PROVIDERS_SELECTED providers=%s symbols=%s", selected, symbols)
     return symbols, keys
 
 
-WEBHOOK_ENABLED = os.getenv("WEBHOOK_ENABLED", "true").lower() in {"1", "true", "yes"}
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 WEBHOOK_QUEUE_LIMIT = 2000
@@ -1671,50 +1746,65 @@ class TradingviewProvider:
                     self.queue.task_done()
 
 
+async def run_provider_isolated(router, coordinator):
+    """Keep other providers running after a fatal provider rejection."""
+    try:
+        await router.run()
+
+    except asyncio.CancelledError:
+        raise
+
+    except FatalProviderError as exc:
+        coordinator.set_connected(router.provider, False)
+
+        logging.error(
+            "PROVIDER_DISABLED provider=%s reason=%s "
+            "other_providers_continue=true "
+            "restart_required_to_retry=true",
+            router.provider,
+            exc,
+        )
+
+        # Do not repeatedly retry an authentication or subscription rejection.
+        # Keep the task pending until normal application shutdown.
+        await asyncio.Event().wait()
+
+
 async def main():
-    switch = ROUTER_SWITCH.strip().upper()
-    choices = {
-        "ALPACA": ["ALPACA"],
-        "TRADIER": ["TRADIER"],
-        "TWELVEDATA": ["TWELVEDATA"],
-        "YAHOOFINANCE": ["YAHOOFINANCE"],
-        "BOTH": ["ALPACA", "TWELVEDATA"],
-        "ALL": ["ALPACA", "TRADIER", "TWELVEDATA", "YAHOOFINANCE"],
-        "MOST": ["ALPACA", "TRADIER"],
-        "TRADINGVIEW": [],
-    }
-    if switch not in choices:
-        raise ValueError(f"Invalid ROUTER_SWITCH: {switch!r}")
-    selected = choices[switch]
+    # load_settings populates the global selected and required values.
     symbols, keys = load_settings()
-    required = {
-        "ALPACA": ["alpaca_key", "alpaca_secret"],
-        "TRADIER": ["tradier_token"],
-        "TWELVEDATA": ["twelvedata_key"],
-        "YAHOOFINANCE": [],
-    }
+    if not selected:
+        return 0
+
+    coordinator = MinuteCoordinator(selected, symbols)
+    routers = []
     for provider in selected:
-        missing = [key for key in required[provider] if not keys.get(key)]
-        if missing:
-            raise ValueError(
-                f"Missing credentials for {provider}: {', '.join(missing)}"
-            )
-    webhook = WEBHOOK_ENABLED or switch == "TRADINGVIEW"
-    providers = selected + (["TRADINGVIEW"] if webhook else [])
-    coordinator = MinuteCoordinator(providers, symbols)
-    routers = [ProviderRouter(p, symbols, keys, coordinator) for p in selected]
-    if webhook:
-        routers.append(TradingviewProvider(symbols, coordinator))
+        if provider == "TRADINGVIEW":
+            routers.append(TradingviewProvider(symbols, coordinator))
+        else:
+            routers.append(ProviderRouter(provider, symbols, keys, coordinator))
+
     logging.info(
         "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
-        providers,
+        selected,
         symbols,
         coordinator.report_start.isoformat(),
         SUMMARY_DELAY_SECONDS,
     )
-    tasks = [asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR")]
+
+    tasks = [
+        asyncio.create_task(
+            coordinator.run(),
+            name="MINUTE_COORDINATOR",
+        )
+    ]
+
     tasks.extend(
-        asyncio.create_task(router.run(), name=router.provider) for router in routers
+        asyncio.create_task(
+            run_provider_isolated(router, coordinator),
+            name=router.provider,
+        )
+        for router in routers
     )
     try:
         await asyncio.gather(*tasks)
