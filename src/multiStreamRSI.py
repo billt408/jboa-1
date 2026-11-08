@@ -1746,6 +1746,134 @@ class TradingviewProvider:
                     self.queue.task_done()
 
 
+class AdminCliProvider:
+    def __init__(self, coordinator, host="127.0.0.1", port=5001):
+        import threading
+
+        self.coordinator = coordinator
+        self.host = host
+        self.port = port
+        self.loop = (
+            asyncio.get_running_loop()
+        )  # Save references to our main execution loop
+        self.stop = threading.Event()
+        self.server = None
+        self.thread = None
+        self.app = self.create_app()
+
+    def create_app(self):
+        from flask import Flask, request, jsonify
+
+        app = Flask("admin_cli_interface")
+        app.config["MAX_CONTENT_LENGTH"] = 16384
+
+        @app.post("/cli/status")
+        def get_status():
+            # Reading small metadata maps built in memory is thread-safe
+            status_report = {
+                "run_id": RUN_ID,
+                "connected_providers": self.coordinator.connected,
+                "tracked_instruments": self.coordinator.symbols,
+                "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
+                "pending_queue_size": len(self.coordinator.pending),
+            }
+            return jsonify(status="ok", metrics=status_report), 200
+
+        @app.post("/cli/finalize")
+        def force_finalize():
+            # Mutating state inside the loop from a thread must happen via threadsafe scheduling
+            def run_finalize():
+                return self.coordinator.finalize_due()
+
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.to_thread(run_finalize), self.loop
+            )
+            emitted = future.result(timeout=5.0)
+            return (
+                jsonify(
+                    status="ok",
+                    message=f"Flush execution complete. Emitted {emitted} summaries.",
+                ),
+                200,
+            )
+
+        @app.post("/cli/inject")
+        def inject_bar():
+            payload = request.get_json(force=True, silent=True) or {}
+            provider = payload.get("provider")
+            symbol = payload.get("symbol")
+            price = payload.get("price")
+            raw_time = payload.get("timestamp") or datetime.now(UTC).isoformat()
+
+            if not provider or not symbol or price is None:
+                return jsonify(status="error", message="Missing parameters"), 400
+
+            try:
+                target_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+
+                # Execute coordination threadsafe onto loop
+                def process_submission():
+                    return self.coordinator.submit(
+                        provider=provider,
+                        symbol=symbol,
+                        timestamp=target_time,
+                        close=price,
+                        source="CLI_MANUAL_INJECT",
+                        kind="bar",
+                    )
+
+                future = asyncio.run_coroutine_threadsafe(
+                    asyncio.to_thread(process_submission), self.loop
+                )
+                accepted = future.result(timeout=5.0)
+
+                return (
+                    jsonify(status="ok", processed=True, summary_accepted=accepted),
+                    200,
+                )
+            except Exception as e:
+                return jsonify(status="error", message=str(e)), 400
+
+        return app
+
+    def serve(self):
+        while not self.stop.is_set():
+            self.server.handle_request()
+        self.server.server_close()
+
+    async def run(self):
+        import threading
+        from werkzeug.serving import make_server, WSGIRequestHandler
+
+        class BoundedRequestHandler(WSGIRequestHandler):
+            def setup(self):
+                super().setup()
+                self.connection.settimeout(2.0)
+
+        self.server = make_server(
+            self.host,
+            self.port,
+            self.app,
+            threaded=False,
+            request_handler=BoundedRequestHandler,
+        )
+        self.server.timeout = 0.5
+        self.thread = threading.Thread(
+            target=self.serve, name="CLI-Admin-Server", daemon=True
+        )
+        self.thread.start()
+
+        logging.info(
+            "CLI Engine interface running on http://%s:%d", self.host, self.port
+        )
+        try:
+            while not self.stop.is_set():
+                await asyncio.sleep(1.0)
+        finally:
+            self.stop.set()
+            await asyncio.to_thread(self.thread.join, 2.0)
+
+
 async def run_provider_isolated(router, coordinator):
     """Keep other providers running after a fatal provider rejection."""
     try:
@@ -1798,6 +1926,11 @@ async def main():
             name="MINUTE_COORDINATOR",
         )
     ]
+
+    # --- NEW: Append the command-line admin engine app thread task here ---
+    cli_admin = AdminCliProvider(coordinator, host="127.0.0.1", port=5001)
+    tasks.append(asyncio.create_task(cli_admin.run(), name="CLI_ADMIN_PANEL"))
+    # ---------------------------------------------------------------------
 
     tasks.extend(
         asyncio.create_task(

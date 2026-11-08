@@ -1,0 +1,329 @@
+// This Pine Script® code is subject to the terms of the
+// Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © billt408
+
+//@version=6
+indicator(
+     title = "RSI 1m Multi-Symbol Webhook Streamer",
+     shorttitle = "Multi RSI Streamer",
+     overlay = false,
+     format = format.price,
+     precision = 2,
+     dynamic_requests = true
+ )
+
+// ----------------------------- Inputs -----------------------------
+
+GRP_SYMBOLS = "Symbols"
+
+enable1 = input.bool(true, "Enable symbol 1", group = GRP_SYMBOLS)
+symbol1 = input.symbol("NASDAQ:NVDA", "Symbol 1", group = GRP_SYMBOLS)
+
+enable2 = input.bool(true, "Enable symbol 2", group = GRP_SYMBOLS)
+symbol2 = input.symbol("NASDAQ:MU", "Symbol 2", group = GRP_SYMBOLS)
+
+enable3 = input.bool(true, "Enable symbol 3", group = GRP_SYMBOLS)
+symbol3 = input.symbol("NASDAQ:CRWV", "Symbol 3", group = GRP_SYMBOLS)
+
+GRP_RSI = "RSI Configuration"
+
+rsiLen = input.int(
+     14, "RSI Length",
+     minval = 1,
+     group = GRP_RSI
+ )
+
+rsiLow = input.float(
+     35.0, "Oversold Level (<=)",
+     minval = 0.0,
+     maxval = 100.0,
+     group = GRP_RSI
+ )
+
+rsiHigh = input.float(
+     70.0, "Overbought Level (>=)",
+     minval = 0.0,
+     maxval = 100.0,
+     group = GRP_RSI
+ )
+
+// This controls the history used in RSI.
+// Webhooks below are restricted to regular-session bars in either mode.
+includeExtended = input.bool(
+     false,
+     "Include extended-hours bars in RSI history",
+     group = GRP_RSI
+ )
+
+GRP_WEBHOOK = "Webhook Configuration"
+
+sendWebhooks = input.bool(
+     true,
+     "Enable webhook messages",
+     group = GRP_WEBHOOK
+ )
+
+webhookToken = input.string(
+     "",
+     "Webhook token  optional",
+     group = GRP_WEBHOOK,
+     tooltip = "Must match WEBHOOK_TOKEN in Python when authentication is enabled. Do not publish a script containing your secret."
+ )
+
+settleSeconds = input.int(
+     2,
+     "Wait after source minute ends  seconds",
+     minval = 0,
+     maxval = 20,
+     group = GRP_WEBHOOK
+ )
+
+maxAgeSeconds = input.int(
+     40,
+     "Maximum age after source minute ends  seconds",
+     minval = 5,
+     maxval = 300,
+     group = GRP_WEBHOOK,
+     tooltip = "Keep this below Python's summary delay, allowing time for delivery. Default 40 fits a 45-second summary delay."
+ )
+
+// ----------------------------- Validation -----------------------------
+
+if not (timeframe.isminutes and timeframe.multiplier == 1)
+    runtime.error("Use this indicator on a standard 1-minute chart.")
+
+if not chart.is_standard
+    runtime.error("Use a standard chart, not Heikin Ashi, Renko, or another synthetic chart.")
+
+if maxAgeSeconds <= settleSeconds
+    runtime.error("Maximum age must be greater than the wait after minute end.")
+
+if enable1 and enable2 and symbol1 == symbol2
+    runtime.error("Symbols 1 and 2 must be different.")
+
+if enable1 and enable3 and symbol1 == symbol3
+    runtime.error("Symbols 1 and 3 must be different.")
+
+if enable2 and enable3 and symbol2 == symbol3
+    runtime.error("Symbols 2 and 3 must be different.")
+
+// ----------------------------- Persistent state -----------------------------
+
+// varip preserves updates across realtime executions within a host bar.
+// Each slot stores the most recently transmitted source minute.
+varip array<int> lastSent = array.new_int(3, na)
+
+// ----------------------------- Functions -----------------------------
+
+// Evaluated inside each requested symbol's context.
+// All values in each group refer to the same source bar.
+f_sourceValues() =>
+    float sourceRsi = ta.rsi(close, rsiLen)
+
+    [
+         time,
+         time_close,
+         close,
+         sourceRsi,
+         session.ismarket,
+         time[1],
+         time_close[1],
+         close[1],
+         sourceRsi[1],
+         session.ismarket[1]
+     ]
+
+// Request both the latest source bar and its predecessor.
+// During a newly forming minute, the predecessor is the completed bar.
+// After the source's last session bar, the latest bar itself may be ended.
+f_completedSample(simple string requestedSymbol) =>
+    string sourceTicker = ticker.modify(
+         ticker.standard(requestedSymbol),
+         session = includeExtended ? session.extended : session.regular
+     )
+
+    [t0, end0, price0, rsi0, regular0,
+     t1, end1, price1, rsi1, regular1] = request.security(
+         sourceTicker,
+         "1",
+         f_sourceValues(),
+         gaps = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_off,
+         ignore_invalid_symbol = true
+     )
+
+    bool latestHasEnded = (
+         not na(end0) and
+         end0 + settleSeconds * 1000 <= timenow
+     )
+
+    [
+         latestHasEnded ? t0 : t1,
+         latestHasEnded ? end0 : end1,
+         latestHasEnded ? price0 : price1,
+         latestHasEnded ? rsi0 : rsi1,
+         latestHasEnded ? regular0 : regular1
+     ]
+
+f_jsonEscape(string value) =>
+    string escaped = str.replace_all(value, "\\", "\\\\")
+    escaped := str.replace_all(escaped, "\"", "\\\"")
+    escaped := str.replace_all(escaped, "\n", "\\n")
+    escaped := str.replace_all(escaped, "\r", "\\r")
+    escaped := str.replace_all(escaped, "\t", "\\t")
+    escaped
+
+f_payload(
+     string requestedSymbol,
+     int barStart,
+     float barPrice,
+     float barRsi
+ ) =>
+    string timestamp = str.format_time(
+         barStart,
+         "yyyy-MM-dd'T'HH:mm:ss'Z'",
+         "UTC+0"
+     )
+
+    string message = (
+         "{\"ticker\":\"" + f_jsonEscape(requestedSymbol) +
+         "\",\"timeframe\":\"1m\"" +
+         ",\"bar_start\":\"" + timestamp +
+         "\",\"bar_closed\":true" +
+         ",\"price\":" + str.tostring(barPrice, "#.################") +
+         ",\"rsi_value\":" + str.tostring(barRsi, "#.################")
+     )
+
+    if str.length(webhookToken) > 0
+        message := (
+             message +
+             ",\"webhook_token\":\"" +
+             f_jsonEscape(webhookToken) +
+             "\""
+         )
+
+    message + "}"
+
+f_send(
+     bool enabled,
+     int slot,
+     string requestedSymbol,
+     int barStart,
+     int barEnd,
+     float barPrice,
+     float barRsi,
+     bool isRegular
+ ) =>
+    bool sent = false
+
+    bool valid = (
+         enabled and
+         sendWebhooks and
+         barstate.isrealtime and
+         isRegular and
+         not na(barStart) and
+         not na(barEnd) and
+         not na(barPrice) and
+         not na(barRsi) and
+         barPrice > 0
+     )
+
+    if valid
+        int ageMs = timenow - barEnd
+        int previousMinute = array.get(lastSent, slot)
+
+        bool insideWindow = (
+             ageMs >= settleSeconds * 1000 and
+             ageMs <= maxAgeSeconds * 1000
+         )
+
+        bool newMinute = (
+             na(previousMinute) or
+             barStart > previousMinute
+         )
+
+        if insideWindow and newMinute
+            string message = f_payload(
+                 requestedSymbol,
+                 barStart,
+                 barPrice,
+                 barRsi
+             )
+
+            // Allow all three symbols to send during the same host bar.
+            // Per-symbol duplicate control is handled by lastSent.
+            alert(message, alert.freq_all)
+
+            array.set(lastSent, slot, barStart)
+            sent := true
+
+    sent
+
+// ----------------------------- Source data -----------------------------
+
+// Request all contexts on historical executions as well as realtime ones.
+// This is required for reliable use of dynamic requests.
+[t1, end1, price1, rsi1, regular1] = f_completedSample(symbol1)
+[t2, end2, price2, rsi2, regular2] = f_completedSample(symbol2)
+[t3, end3, price3, rsi3, regular3] = f_completedSample(symbol3)
+
+// ----------------------------- Webhook dispatch -----------------------------
+
+sent1 = f_send(enable1, 0, symbol1, t1, end1, price1, rsi1, regular1)
+sent2 = f_send(enable2, 1, symbol2, t2, end2, price2, rsi2, regular2)
+sent3 = f_send(enable3, 2, symbol3, t3, end3, price3, rsi3, regular3)
+
+// ----------------------------- Display -----------------------------
+
+// Plot titles are fixed; the selected symbols are shown in Inputs.
+plot(
+     enable1 ? rsi1 : na,
+     "Symbol 1 RSI",
+     color = color.purple,
+     linewidth = 2
+ )
+
+plot(
+     enable2 ? rsi2 : na,
+     "Symbol 2 RSI",
+     color = color.blue,
+     linewidth = 2
+ )
+
+plot(
+     enable3 ? rsi3 : na,
+     "Symbol 3 RSI",
+     color = color.orange,
+     linewidth = 2
+ )
+
+hline(rsiHigh, "Overbought", color = color.red, linestyle = hline.style_dashed)
+hline(50, "Center", color = color.new(color.gray, 50))
+hline(rsiLow, "Oversold", color = color.green, linestyle = hline.style_dashed)
+
+plotshape(
+     sent1,
+     title = "Symbol 1 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.purple,
+     size = size.tiny
+ )
+
+plotshape(
+     sent2,
+     title = "Symbol 2 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.blue,
+     size = size.tiny
+ )
+
+plotshape(
+     sent3,
+     title = "Symbol 3 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.orange,
+     size = size.tiny
+ )
