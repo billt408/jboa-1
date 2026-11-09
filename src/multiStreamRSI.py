@@ -2087,52 +2087,31 @@ class TradingviewProvider:
 
 
 class AlpacaPositionMonitor:
-    """Poll Alpaca account positions every minute and log option holdings.
-
-    Runs as its own task with its own log file (logs/positions/). Each poll
-    logs an account snapshot, one line per holding, and a dedicated
-    OPTION_POSITION line for every current option position. Polls are
-    minute-aligned (just after each minute boundary) and never interact with
-    the RSI coordinator; failures are logged and the next minute retries.
-    """
+    """Poll Alpaca account positions every minute and log option holdings."""
 
     def __init__(self, keys):
         self.provider = "POSITIONS"
         self.credentials = dict(keys or {})
         self.logger = make_logger("POSITIONS", "ALPACA")
         self.client = build_option_chain_client(self.credentials)
-
-    @staticmethod
-    def _is_option(position):
-        raw = getattr(position, "asset_class", None)
-        value = str(getattr(raw, "value", raw) or "").lower()
-        return "option" in value
-
-    @staticmethod
-    def _num(position, field):
-        try:
-            value = float(getattr(position, field) or 0.0)
-            return value if math.isfinite(value) else 0.0
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-
-    def _format_option(self, position):
-        return (
-            f"symbol={getattr(position, 'symbol', '?')} "
-            f"qty={self._num(position, 'qty'):.4g} "
-            f"side={getattr(position, 'side', '?')} "
-            f"avg_entry={self._num(position, 'avg_entry_price'):.4f} "
-            f"current_price={self._num(position, 'current_price'):.4f} "
-            f"market_value={self._num(position, 'market_value'):.2f} "
-            f"unrealized_pl={self._num(position, 'unrealized_pl'):.2f} "
-            f"unrealized_plpc={self._num(position, 'unrealized_plpc'):.4f}"
-        )
+        # --- NEW: Status Tracking State Variables ---
+        self.last_poll_utc = None
+        self.last_status = "uninitialized"
+        self.position_count = 0
+        self.option_count = 0
 
     def poll(self):
         """Fetch account + positions and log the snapshot (blocking)."""
+        # --- NEW: Set active state flag ---
+        self.last_status = "polling"
         account = self.client.get_account()
         positions = list(self.client.get_all_positions() or [])
         options = [p for p in positions if self._is_option(p)]
+
+        self.position_count = len(positions)
+        self.option_count = len(options)
+        self.last_poll_utc = datetime.now(timezone.utc).isoformat()
+        self.last_status = "healthy"
 
         self.logger.info(
             "POSITIONS_SNAPSHOT equity=%.2f cash=%.2f buying_power=%.2f "
@@ -2166,6 +2145,7 @@ class AlpacaPositionMonitor:
 
     async def run(self):
         if self.client is None:
+            self.last_status = "disabled"
             self.logger.warning(
                 "POSITION_MONITOR_DISABLED reason=missing_alpaca_credentials "
                 "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
@@ -2183,6 +2163,7 @@ class AlpacaPositionMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self.last_status = f"error: {type(exc).__name__}"
                 self.logger.warning(
                     "POSITION_MONITOR_ERROR error_type=%s detail=%s",
                     type(exc).__name__,
@@ -2222,13 +2203,26 @@ class AdminCliProvider:
         # @app.post("/cli/status")
         @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
+            # Dynamically extract monitor reference out of the global registry map
+            pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
+            pm = pm_entry.get("router")
+
+            position_monitor_report = {
+                "status": pm.last_status if pm else "not_loaded",
+                "last_poll_utc": pm.last_poll_utc if pm else None,
+                "active_equity_positions": pm.position_count if pm else 0,
+                "active_option_positions": pm.option_count if pm else 0,
+            }
             status_report = {
                 "run_id": RUN_ID,
                 "connected_providers": self.coordinator.connected,
                 "tracked_instruments": self.coordinator.symbols,
                 "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
-                "loaded_providers": list(PROVIDER_REGISTRY.keys()),
+                "loaded_providers": [
+                    k for k in PROVIDER_REGISTRY.keys() if k != "POSITIONS_MONITOR"
+                ],
+                "position_monitor": position_monitor_report,
             }
             return jsonify(status="ok", metrics=status_report), 200
 
