@@ -1590,7 +1590,7 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 # outside this neutral band (below the low or above the high), the pruned
 # option chain is fetched and written to logs/optionchains/.
 OPTION_CHAIN_RSI_LOW = float(os.getenv("OPTION_CHAIN_RSI_LOW", "35"))
-OPTION_CHAIN_RSI_HIGH = float(os.getenv("OPTION_CHAIN_RSI_HIGH", "55"))
+OPTION_CHAIN_RSI_HIGH = float(os.getenv("OPTION_CHAIN_RSI_HIGH", "65"))
 
 
 def validate_tradingview_payload(payload, allowed_symbols):
@@ -1862,7 +1862,7 @@ class TradingviewProvider:
         rsi = event.get("rsi_value")
         if rsi is None:
             return
-        if OPTION_CHAIN_RSI_LOW <= rsi <= OPTION_CHAIN_RSI_HIGH:
+        if OPTION_CHAIN_RSI_LOW < rsi < OPTION_CHAIN_RSI_HIGH:
             return
         if not self.credentials.get("alpaca_key") or not self.credentials.get(
             "alpaca_secret"
@@ -1912,7 +1912,9 @@ class TradingviewProvider:
                 )
                 return
             try:
-                path = self.write_option_chain_payload(symbol, rsi, event, clean_payload)
+                path = self.write_option_chain_payload(
+                    symbol, rsi, event, clean_payload
+                )
             except Exception as exc:
                 self.logger.error(
                     "OPTION_CHAIN_WRITE_FAILED symbol=%s rsi=%.4f error_type=%s detail=%s",
