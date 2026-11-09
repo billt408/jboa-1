@@ -1953,11 +1953,16 @@ async def run_provider_isolated(router, coordinator):
 
 
 async def main():
+    # 1. Load system settings
     symbols, keys = load_settings()
     if not selected:
         return 0
 
     coordinator = MinuteCoordinator(selected, symbols)
+
+    # 2. START THE ADMIN CLI SERVER FIRST
+    # We explicitly launch this on local interfaces to ensure the port binds immediately
+    cli_admin = AdminCliProvider(coordinator, host="127.0.0.1", port=5001)
 
     logging.info(
         "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
@@ -1967,22 +1972,23 @@ async def main():
         SUMMARY_DELAY_SECONDS,
     )
 
-    tasks = [asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR")]
-
-    cli_admin = AdminCliProvider(coordinator, host="127.0.0.1", port=5001)
-    tasks.append(asyncio.create_task(cli_admin.run(), name="CLI_ADMIN_PANEL"))
-
-    # Instantiate and mount routers to global container dictionary object
+    # 3. Initialize background providers
     for provider in selected:
         if provider == "TRADINGVIEW":
             router_instance = TradingviewProvider(symbols, coordinator)
         else:
             router_instance = ProviderRouter(provider, symbols, keys, coordinator)
 
-        # Build placeholder space inside our dictionary topology
         PROVIDER_REGISTRY[provider] = {"router": router_instance, "task": None}
 
-    # Generate asynchronous execution loops from our registry slots
+    # 4. Gather up all execution tasks securely
+    tasks = [
+        asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR"),
+        asyncio.create_task(
+            cli_admin.run(), name="CLI_ADMIN_PANEL"
+        ),  # Mount server task
+    ]
+
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
             run_provider_isolated(entry["router"], coordinator), name=provider
@@ -1990,16 +1996,15 @@ async def main():
         entry["task"] = task
         tasks.append(task)
 
+    # 5. Execute engine orchestration
     try:
-        # We wrap this in an inner monitoring structure because individual task targets
-        # within `tasks` list can change dynamically via references inside PROVIDER_REGISTRY.
-        while True:
-            await asyncio.sleep(3600)
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        # Ensure dynamically spawned tasks that aren't inside the baseline local `tasks` array get closed
         for entry in PROVIDER_REGISTRY.values():
             if entry["task"] and not entry["task"].done():
                 entry["task"].cancel()
