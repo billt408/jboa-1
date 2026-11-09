@@ -11,6 +11,10 @@ RSI_WARMUP_SESSIONS prior sessions (default 5) so Wilder averages converge like
 TradingView's continuous-history RSI. Set RSI_WARMUP_SESSIONS=0 to skip the
 startup backfill; per-session cold resets return only if state is not carried.
 TradingView requires a 1m closed-bar payload with explicit bar_start.
+TradingView webhook RSI values outside OPTION_CHAIN_RSI_LOW/HIGH (default
+35/55) trigger option-chain collection via lib.getOptionsContracts; the full
+clean payload is written to logs/optionchains/ with provider, symbol, RSI and
+timestamp in the filename, and the contract is logged in the provider log.
 Deduplication is in-memory only and does not survive process restarts.
 Provider startup is controlled exclusively by [providers] NAME.enabled in lib/parms.ini.
 load_settings populates module globals selected and required; disabled providers
@@ -1527,7 +1531,9 @@ def load_settings():
         raise ValueError("No symbols configured")
 
     credentials = {}
-    if any(required[provider] for provider in selected):
+    # TRADINGVIEW also needs the Alpaca credentials for option-chain collection
+    # on out-of-band RSI values, so load them even without the ALPACA stream.
+    if any(required[provider] for provider in selected) or "TRADINGVIEW" in selected:
         credentials = getattr(config, "CREDENTIALS", {}) or {}
         if not isinstance(credentials, dict):
             raise ValueError("CREDENTIALS must be a dictionary")
@@ -1539,7 +1545,7 @@ def load_settings():
         "twelvedata_key": "",
     }
 
-    if "ALPACA" in selected:
+    if "ALPACA" in selected or "TRADINGVIEW" in selected:
         keys["alpaca_key"] = credentials.get("api_key") or os.getenv(
             "ALPACA_API_KEY", ""
         )
@@ -1580,6 +1586,11 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 WEBHOOK_QUEUE_LIMIT = 2000
 WEBHOOK_MAX_BYTES = 16384
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+# Option-chain collection trigger: when a TradingView webhook reports an RSI
+# outside this neutral band (below the low or above the high), the pruned
+# option chain is fetched and written to logs/optionchains/.
+OPTION_CHAIN_RSI_LOW = float(os.getenv("OPTION_CHAIN_RSI_LOW", "35"))
+OPTION_CHAIN_RSI_HIGH = float(os.getenv("OPTION_CHAIN_RSI_HIGH", "55"))
 
 
 def validate_tradingview_payload(payload, allowed_symbols):
@@ -1661,8 +1672,37 @@ def validate_tradingview_payload(payload, allowed_symbols):
     }
 
 
+def build_option_chain_client(keys):
+    """Create the Alpaca client handed to get_pruned_option_chain.
+
+    The option-chain call receives the key/secret alongside this client. If
+    your lib.getOptionsContracts implementation expects a different client
+    type, adjust only this factory — the rest of the plumbing is unchanged.
+    Returns None when credentials are missing; the trigger then skips with a
+    logged warning instead of failing the webhook loop.
+    """
+    if not keys.get("alpaca_key") or not keys.get("alpaca_secret"):
+        logging.warning(
+            "OPTION_CHAIN_DISABLED reason=missing_alpaca_credentials "
+            "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
+            "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
+        )
+        return None
+    from alpaca.trading.client import TradingClient
+
+    return TradingClient(keys["alpaca_key"], keys["alpaca_secret"])
+
+
 class TradingviewProvider:
-    def __init__(self, symbols, coordinator, host=WEBHOOK_HOST, port=WEBHOOK_PORT):
+    def __init__(
+        self,
+        symbols,
+        coordinator,
+        host=WEBHOOK_HOST,
+        port=WEBHOOK_PORT,
+        credentials=None,
+        option_client=None,
+    ):
         import queue
         import threading
 
@@ -1672,6 +1712,9 @@ class TradingviewProvider:
         self.symbols = set(symbols)
         self.coordinator = coordinator
         self.host, self.port = host, port
+        self.credentials = dict(credentials or {})
+        self.option_client = option_client
+        self.option_chain_lock = asyncio.Lock()
         self.queue = queue.Queue(maxsize=WEBHOOK_QUEUE_LIMIT)
         self.stop = threading.Event()
         self.server = None
@@ -1809,6 +1852,107 @@ class TradingviewProvider:
             "WEBHOOK_ACCEPTED symbol=%s accepted=%s", event["symbol"], accepted
         )
 
+    def schedule_option_chain(self, event):
+        """Queue option-chain collection when a webhook RSI exits the band.
+
+        Called on the event loop right after record(); collection itself runs
+        as a background task so a slow Alpaca call never blocks the webhook
+        drain loop. Only one collection runs at a time per provider.
+        """
+        rsi = event.get("rsi_value")
+        if rsi is None:
+            return
+        if OPTION_CHAIN_RSI_LOW <= rsi <= OPTION_CHAIN_RSI_HIGH:
+            return
+        if not self.credentials.get("alpaca_key") or not self.credentials.get(
+            "alpaca_secret"
+        ):
+            self.logger.warning(
+                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=missing_alpaca_credentials",
+                event["symbol"],
+                rsi,
+            )
+            return
+        if self.option_client is None:
+            self.logger.warning(
+                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=no_option_client",
+                event["symbol"],
+                rsi,
+            )
+            return
+        if self.option_chain_lock.locked():
+            self.logger.info(
+                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=collection_in_progress",
+                event["symbol"],
+                rsi,
+            )
+            return
+        asyncio.create_task(self.collect_option_chain(event))
+
+    async def collect_option_chain(self, event):
+        """Fetch the pruned option chain and persist the full clean payload."""
+        symbol = event["symbol"]
+        rsi = event["rsi_value"]
+        async with self.option_chain_lock:
+            try:
+                contract, clean_payload = await asyncio.to_thread(
+                    get_pruned_option_chain,
+                    symbol,
+                    self.credentials["alpaca_key"],
+                    self.credentials["alpaca_secret"],
+                    self.option_client,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "OPTION_CHAIN_FAILED symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    symbol,
+                    rsi,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            try:
+                path = self.write_option_chain_payload(symbol, rsi, event, clean_payload)
+            except Exception as exc:
+                self.logger.error(
+                    "OPTION_CHAIN_WRITE_FAILED symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    symbol,
+                    rsi,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            self.logger.info(
+                "OPTION_CHAIN_CONTRACT provider=%s symbol=%s rsi=%.4f contract=%s file=%s",
+                self.provider,
+                symbol,
+                rsi,
+                contract,
+                path.name,
+            )
+
+    def write_option_chain_payload(self, symbol, rsi, event, clean_payload):
+        """Write the entire clean payload to a uniquely named JSON file."""
+        directory = LOG_ROOT / "optionchains"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in symbol)
+        try:
+            bar_time = datetime.fromisoformat(event["event_time"])
+            stamp = bar_time.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        except (KeyError, TypeError, ValueError):
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        # The short random suffix guarantees uniqueness even if two alerts
+        # fire for the same symbol, RSI and minute.
+        filename = (
+            f"optionchain-{self.provider}-{safe}-rsi{rsi:.2f}-{stamp}-"
+            f"{uuid4().hex[:6]}.json"
+        )
+        path = directory / filename
+        path.write_text(
+            json.dumps(clean_payload, indent=2, default=str), encoding="utf-8"
+        )
+        return path
+
     async def run(self):
         import queue
         import threading
@@ -1853,6 +1997,10 @@ class TradingviewProvider:
 
                     try:
                         self.record(event)
+                        # Out-of-band RSI values trigger option-chain
+                        # collection as a background task; the shutdown drain
+                        # below intentionally calls only record().
+                        self.schedule_option_chain(event)
                     finally:
                         self.queue.task_done()
 
@@ -2111,7 +2259,12 @@ async def main():
     # 3. Initialize background providers
     for provider in selected:
         if provider == "TRADINGVIEW":
-            router_instance = TradingviewProvider(symbols, coordinator)
+            router_instance = TradingviewProvider(
+                symbols,
+                coordinator,
+                credentials=keys,
+                option_client=build_option_chain_client(keys),
+            )
         else:
             router_instance = ProviderRouter(provider, symbols, keys, coordinator)
 
