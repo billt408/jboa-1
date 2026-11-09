@@ -6,6 +6,10 @@ tzdata, and the existing project-local lib.utils.JsonIniParser.
 Uses NYSE calendar holidays and early closes. Summary minute keys use UTC.
 One JSON summary per regular-session minute per provider in a dedicated JSONL log.
 Late data cannot change emitted summaries or RSI state. Historical warmup is best effort.
+RSI state rolls over across sessions and is seeded at startup with the last
+RSI_WARMUP_SESSIONS prior sessions (default 5) so Wilder averages converge like
+TradingView's continuous-history RSI. Set RSI_WARMUP_SESSIONS=0 to skip the
+startup backfill; per-session cold resets return only if state is not carried.
 TradingView requires a 1m closed-bar payload with explicit bar_start.
 Deduplication is in-memory only and does not survive process restarts.
 Provider startup is controlled exclusively by [providers] NAME.enabled in lib/parms.ini.
@@ -40,12 +44,18 @@ from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from lib.utils import JsonIniParser
+from lib.getOptionsContracts import get_pruned_option_chain
 
 MARKET_TZ = ZoneInfo("America/New_York")
 OPEN_TIME = clock_time(9, 30)
 CLOSE_TIME = clock_time(16, 0)
 MODE = "wilder"
 RSI_PERIOD = 14
+# Cross-session warmup: at startup each provider's SessionRSI is seeded with
+# this many prior NYSE sessions of 1-minute closes so the Wilder averages are
+# converged, matching TradingView's continuous-history RSI. 0 disables the
+# startup backfill (state still rolls over across sessions once converged).
+RSI_WARMUP_SESSIONS = int(os.getenv("RSI_WARMUP_SESSIONS", "5"))
 FEED = DataFeed.IEX
 # Populated by load_settings(); provider startup is controlled only by parms.ini.
 selected: list[str] = []
@@ -127,7 +137,9 @@ class Bar:
 
 
 class SessionRSI:
-    def __init__(self, symbol, provider, mode=MODE, period=RSI_PERIOD):
+    def __init__(
+        self, symbol, provider, mode=MODE, period=RSI_PERIOD, cross_session=True
+    ):
         if mode not in {"since_open", "wilder"}:
             raise ValueError("Unknown RSI mode")
         if isinstance(period, bool) or not isinstance(period, int) or period < 2:
@@ -135,6 +147,10 @@ class SessionRSI:
         self.symbol = symbol
         self.mode = mode
         self.period = period
+        # When True, a new session rolls the Wilder averages forward instead of
+        # clearing them: the first bar of the day contributes the overnight
+        # change from the previous close, like TradingView's bar series.
+        self.cross_session = cross_session
         self.logger = make_logger(provider, symbol)
         self.session_date = None
         self.last_timestamp = None
@@ -153,8 +169,36 @@ class SessionRSI:
         self.average_gain = self.average_loss = self.latest = None
         self.logger.info("SESSION_START date=%s", day)
 
-    def process_bar(self, bar, source):
-        """Apply one completed minute close to this provider's RSI."""
+    def begin_session(self, day):
+        """Enter a new session, keeping converged Wilder state when possible.
+
+        With cross_session enabled and the averages already seeded (at least
+        `period` changes observed), the averages, previous_close and change
+        counter roll forward so the first bar of the day measures the overnight
+        gap from the prior close — the same series TradingView smooths over.
+        Otherwise this falls back to a cold per-session reset.
+        """
+        if self.cross_session and self.average_gain is not None:
+            # Keep previous_close, average_gain/average_loss and the change
+            # counter exactly as they are: the next bar's change is the
+            # overnight gap, and the recursion continues without reseeding.
+            self.session_date = day
+            self.last_timestamp = None
+            self.logger.info(
+                "SESSION_ROLLOVER date=%s rsi_state=carried avg_gain=%.6f avg_loss=%.6f",
+                day,
+                self.average_gain or 0.0,
+                self.average_loss or 0.0,
+            )
+        else:
+            self.reset_session(day)
+
+    def process_bar(self, bar, source, warmup=False):
+        """Apply one completed minute close to this provider's RSI.
+
+        warmup=True feeds history into the Wilder state without emitting an
+        observation; it is used only for startup seeding, never live minutes.
+        """
         timestamp = normalized_time(bar.timestamp)
         close = positive_price(bar.close)
 
@@ -171,7 +215,7 @@ class SessionRSI:
             return None
 
         if self.session_date != timestamp.date():
-            self.reset_session(timestamp.date())
+            self.begin_session(timestamp.date())
 
         value = None
 
@@ -190,7 +234,7 @@ class SessionRSI:
                 up = self.gain_sum
                 down = self.loss_sum
 
-            elif self.changes == self.period:
+            elif self.average_gain is None and self.changes == self.period:
                 self.average_gain = self.gain_sum / self.period
                 self.average_loss = self.loss_sum / self.period
                 up = self.average_gain
@@ -221,7 +265,7 @@ class SessionRSI:
 
         observation = None
 
-        if value is not None:
+        if value is not None and not warmup:
             observation = {
                 "provider": self.provider,
                 "symbol": self.symbol,
@@ -514,6 +558,35 @@ class MinuteCoordinator:
         )
         return True
 
+    def seed_history(self, provider, symbol, bars):
+        """Warm a provider's RSI state with historical bars (startup only).
+
+        Bars are applied oldest-first through the normal SessionRSI recursion
+        with warmup=True, so they never emit observations or touch pending
+        candidates. Only the local RSI state is affected; TradingView's
+        webhook-reported values are never seeded.
+        """
+        if provider == "TRADINGVIEW" or (provider, symbol) not in self.trackers:
+            return 0
+        tracker = self.trackers[(provider, symbol)]
+        applied = 0
+        for bar in sorted(bars, key=lambda item: item.timestamp):
+            before = tracker.changes
+            tracker.process_bar(bar, "WARMUP_BACKFILL", warmup=True)
+            if tracker.changes != before or tracker.previous_close is not None:
+                applied += 1
+        logging.info(
+            "RSI_WARMUP provider=%s symbol=%s bars=%d applied=%d changes=%d "
+            "converged=%s",
+            provider,
+            symbol,
+            len(bars),
+            applied,
+            tracker.changes,
+            tracker.average_gain is not None,
+        )
+        return applied
+
     def _apply(self, provider, symbol, minute, candidate):
         tracker = self.trackers[(provider, symbol)]
         result = tracker.process_bar(Bar(minute, candidate.close), candidate.source)
@@ -530,7 +603,7 @@ class MinuteCoordinator:
             tracker = self.trackers[(provider, symbol)]
             day = minute.astimezone(MARKET_TZ).date()
             if tracker.session_date != day:
-                tracker.reset_session(day)
+                tracker.begin_session(day)
             # Bootstrap only with data already present at this deadline.
             warmup = sorted(
                 other
@@ -727,6 +800,10 @@ class ProviderRouter:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
+            # Seed RSI state with prior sessions before any live minute is
+            # finalized, so the first summary of the run reports converged
+            # Wilder averages instead of a since-open cold start.
+            await self.warmup()
             collector = {
                 "ALPACA": self.run_alpaca,
                 "YAHOOFINANCE": self.run_yfinance,
@@ -990,6 +1067,65 @@ class ProviderRouter:
             return bars
 
         raise ValueError(f"Unsupported historical provider: {self.provider}")
+
+    def prior_sessions(self):
+        """Return the last RSI_WARMUP_SESSIONS completed NYSE sessions.
+
+        Each entry is (date, (open_utc, close_utc)), ordered oldest first.
+        Today's session is never included: its minutes are covered by the live
+        streams and the existing same-session recovery path.
+        """
+        if RSI_WARMUP_SESSIONS <= 0:
+            return []
+        sessions = []
+        day = datetime.now(MARKET_TZ).date() - timedelta(days=1)
+        # A generous scan window handles holidays and weekends.
+        for _ in range(RSI_WARMUP_SESSIONS * 5 + 10):
+            if len(sessions) >= RSI_WARMUP_SESSIONS:
+                break
+            bounds = session_bounds(day)
+            if bounds is not None:
+                sessions.append((day, bounds))
+            day -= timedelta(days=1)
+        return list(reversed(sessions))
+
+    async def warmup(self):
+        """Seed each symbol's RSI state with prior sessions' 1-minute closes.
+
+        Best effort: a provider that cannot fetch history still runs with a
+        cold session reset, exactly as before this warmup existed.
+        """
+        sessions = self.prior_sessions()
+        if not sessions:
+            return
+        for symbol in self.symbols:
+            applied_total = 0
+            for day, (opening, closing) in sessions:
+                try:
+                    async with self.history_lock:
+                        bars = await self.fetch_history(symbol, opening, closing)
+                except FatalProviderError:
+                    raise
+                except Exception as exc:
+                    self.logger.warning(
+                        "RSI_WARMUP_SKIP provider=%s symbol=%s date=%s "
+                        "error_type=%s",
+                        self.provider,
+                        symbol,
+                        day,
+                        type(exc).__name__,
+                    )
+                    continue
+                applied_total += self.coordinator.seed_history(
+                    self.provider, symbol, bars
+                )
+            self.logger.info(
+                "RSI_WARMUP_DONE provider=%s symbol=%s sessions=%d bars_applied=%d",
+                self.provider,
+                symbol,
+                len(sessions),
+                applied_total,
+            )
 
     async def recover(self, symbol, through):
         through = minute_utc(through)
