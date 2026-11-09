@@ -11,10 +11,16 @@ RSI_WARMUP_SESSIONS prior sessions (default 5) so Wilder averages converge like
 TradingView's continuous-history RSI. Set RSI_WARMUP_SESSIONS=0 to skip the
 startup backfill; per-session cold resets return only if state is not carried.
 TradingView requires a 1m closed-bar payload with explicit bar_start.
-TradingView webhook RSI values outside OPTION_CHAIN_RSI_LOW/HIGH (default
-35/55) trigger option-chain collection via lib.getOptionsContracts; the full
-clean payload is written to logs/optionchains/ with provider, symbol, RSI and
-timestamp in the filename, and the contract is logged in the provider log.
+TradingView webhook RSI values are classified as signals: rsi <=
+OPTION_CHAIN_RSI_LOW (default 35) is the BUY signal and rsi >=
+OPTION_CHAIN_RSI_HIGH (default 65) is the SELL signal. Each signal triggers
+option-chain collection via lib.getOptionsContracts; the full clean payload is
+written to logs/optionchains/ with provider, symbol, BUY/SELL signal, RSI and
+timestamp in the filename. Every option-chain log line and each TRADINGVIEW
+minute-summary record carries the signal label.
+An AlpacaPositionMonitor thread polls the account's positions every minute,
+writes them to its own log file under logs/positions/ and prints each current
+option position.
 Deduplication is in-memory only and does not survive process restarts.
 Provider startup is controlled exclusively by [providers] NAME.enabled in lib/parms.ini.
 load_settings populates module globals selected and required; disabled providers
@@ -179,7 +185,7 @@ class SessionRSI:
         With cross_session enabled and the averages already seeded (at least
         `period` changes observed), the averages, previous_close and change
         counter roll forward so the first bar of the day measures the overnight
-        gap from the prior close — the same series TradingView smooths over.
+        gap from the prior close  the same series TradingView smooths over.
         Otherwise this falls back to a cold per-session reset.
         """
         if self.cross_session and self.average_gain is not None:
@@ -638,10 +644,14 @@ class MinuteCoordinator:
             if candidate:
                 base["status"] = "ok" if observation else "warming_up"
         elif candidate:
+            signal = rsi_signal(candidate.reported_rsi)
             base.update(
                 {
                     "rsi": candidate.reported_rsi,
                     "rsi_source": "webhook_reported",
+                    # BUY when rsi <= OPTION_CHAIN_RSI_LOW, SELL when
+                    # rsi >= OPTION_CHAIN_RSI_HIGH, else null (neutral band).
+                    "signal": signal,
                     "status": (
                         "ok"
                         if candidate.reported_rsi is not None
@@ -1531,9 +1541,10 @@ def load_settings():
         raise ValueError("No symbols configured")
 
     credentials = {}
-    # TRADINGVIEW also needs the Alpaca credentials for option-chain collection
-    # on out-of-band RSI values, so load them even without the ALPACA stream.
-    if any(required[provider] for provider in selected) or "TRADINGVIEW" in selected:
+    # TRADINGVIEW and the position monitor both need the Alpaca credentials
+    # even without the ALPACA stream, so always load CREDENTIALS when any
+    # provider is enabled.
+    if selected:
         credentials = getattr(config, "CREDENTIALS", {}) or {}
         if not isinstance(credentials, dict):
             raise ValueError("CREDENTIALS must be a dictionary")
@@ -1586,11 +1597,28 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 WEBHOOK_QUEUE_LIMIT = 2000
 WEBHOOK_MAX_BYTES = 16384
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
-# Option-chain collection trigger: when a TradingView webhook reports an RSI
-# outside this neutral band (below the low or above the high), the pruned
-# option chain is fetched and written to logs/optionchains/.
+# Option-chain collection trigger: a TradingView webhook RSI at or below the
+# low threshold is the BUY signal (oversold); at or above the high threshold
+# is the SELL signal (overbought). Either signal fetches the pruned option
+# chain and writes it to logs/optionchains/.
 OPTION_CHAIN_RSI_LOW = float(os.getenv("OPTION_CHAIN_RSI_LOW", "35"))
 OPTION_CHAIN_RSI_HIGH = float(os.getenv("OPTION_CHAIN_RSI_HIGH", "65"))
+
+
+def rsi_signal(rsi):
+    """Classify a TradingView-reported RSI value as a buy or sell signal.
+
+    Returns "buy" when rsi <= OPTION_CHAIN_RSI_LOW (oversold), "sell" when
+    rsi >= OPTION_CHAIN_RSI_HIGH (overbought), and None inside the neutral
+    band or when the RSI is unavailable.
+    """
+    if rsi is None:
+        return None
+    if rsi <= OPTION_CHAIN_RSI_LOW:
+        return "buy"
+    if rsi >= OPTION_CHAIN_RSI_HIGH:
+        return "sell"
+    return None
 
 
 def validate_tradingview_payload(payload, allowed_symbols):
@@ -1677,7 +1705,7 @@ def build_option_chain_client(keys):
 
     The option-chain call receives the key/secret alongside this client. If
     your lib.getOptionsContracts implementation expects a different client
-    type, adjust only this factory — the rest of the plumbing is unchanged.
+    type, adjust only this factory  the rest of the plumbing is unchanged.
     Returns None when credentials are missing; the trigger then skips with a
     logged warning instead of failing the webhook loop.
     """
@@ -1853,8 +1881,10 @@ class TradingviewProvider:
         )
 
     def schedule_option_chain(self, event):
-        """Queue option-chain collection when a webhook RSI exits the band.
+        """Queue option-chain collection on a BUY or SELL RSI signal.
 
+        rsi <= OPTION_CHAIN_RSI_LOW is the BUY signal (oversold);
+        rsi >= OPTION_CHAIN_RSI_HIGH is the SELL signal (overbought).
         Called on the event loop right after record(); collection itself runs
         as a background task so a slow Alpaca call never blocks the webhook
         drain loop. Only one collection runs at a time per provider.
@@ -1862,37 +1892,58 @@ class TradingviewProvider:
         rsi = event.get("rsi_value")
         if rsi is None:
             return
-        if OPTION_CHAIN_RSI_LOW < rsi < OPTION_CHAIN_RSI_HIGH:
+        signal = rsi_signal(rsi)
+        if signal is None:
             return
+        symbol = event["symbol"]
+        self.logger.info(
+            "RSI_SIGNAL provider=%s symbol=%s rsi=%.4f signal=%s",
+            self.provider,
+            symbol,
+            rsi,
+            signal.upper(),
+        )
+        # Also surface the signal on the console/root multiStreamRSI log.
+        logging.info(
+            "RSI_SIGNAL provider=%s symbol=%s rsi=%.4f signal=%s",
+            self.provider,
+            symbol,
+            rsi,
+            signal.upper(),
+        )
         if not self.credentials.get("alpaca_key") or not self.credentials.get(
             "alpaca_secret"
         ):
             self.logger.warning(
-                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=missing_alpaca_credentials",
-                event["symbol"],
+                "OPTION_CHAIN_SKIPPED signal=%s symbol=%s rsi=%.4f reason=missing_alpaca_credentials",
+                signal.upper(),
+                symbol,
                 rsi,
             )
             return
         if self.option_client is None:
             self.logger.warning(
-                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=no_option_client",
-                event["symbol"],
+                "OPTION_CHAIN_SKIPPED signal=%s symbol=%s rsi=%.4f reason=no_option_client",
+                signal.upper(),
+                symbol,
                 rsi,
             )
             return
         if self.option_chain_lock.locked():
             self.logger.info(
-                "OPTION_CHAIN_SKIPPED symbol=%s rsi=%.4f reason=collection_in_progress",
-                event["symbol"],
+                "OPTION_CHAIN_SKIPPED signal=%s symbol=%s rsi=%.4f reason=collection_in_progress",
+                signal.upper(),
+                symbol,
                 rsi,
             )
             return
-        asyncio.create_task(self.collect_option_chain(event))
+        asyncio.create_task(self.collect_option_chain(event, signal))
 
-    async def collect_option_chain(self, event):
+    async def collect_option_chain(self, event, signal):
         """Fetch the pruned option chain and persist the full clean payload."""
         symbol = event["symbol"]
         rsi = event["rsi_value"]
+        label = signal.upper()
         async with self.option_chain_lock:
             try:
                 contract, clean_payload = await asyncio.to_thread(
@@ -1904,7 +1955,8 @@ class TradingviewProvider:
                 )
             except Exception as exc:
                 self.logger.error(
-                    "OPTION_CHAIN_FAILED symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    "OPTION_CHAIN_FAILED signal=%s symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    label,
                     symbol,
                     rsi,
                     type(exc).__name__,
@@ -1913,11 +1965,12 @@ class TradingviewProvider:
                 return
             try:
                 path = self.write_option_chain_payload(
-                    symbol, rsi, event, clean_payload
+                    symbol, rsi, signal, event, clean_payload
                 )
             except Exception as exc:
                 self.logger.error(
-                    "OPTION_CHAIN_WRITE_FAILED symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    "OPTION_CHAIN_WRITE_FAILED signal=%s symbol=%s rsi=%.4f error_type=%s detail=%s",
+                    label,
                     symbol,
                     rsi,
                     type(exc).__name__,
@@ -1925,15 +1978,16 @@ class TradingviewProvider:
                 )
                 return
             self.logger.info(
-                "OPTION_CHAIN_CONTRACT provider=%s symbol=%s rsi=%.4f contract=%s file=%s",
+                "OPTION_CHAIN_CONTRACT provider=%s signal=%s symbol=%s rsi=%.4f contract=%s file=%s",
                 self.provider,
+                label,
                 symbol,
                 rsi,
                 contract,
                 path.name,
             )
 
-    def write_option_chain_payload(self, symbol, rsi, event, clean_payload):
+    def write_option_chain_payload(self, symbol, rsi, signal, event, clean_payload):
         """Write the entire clean payload to a uniquely named JSON file."""
         directory = LOG_ROOT / "optionchains"
         directory.mkdir(parents=True, exist_ok=True)
@@ -1946,8 +2000,8 @@ class TradingviewProvider:
         # The short random suffix guarantees uniqueness even if two alerts
         # fire for the same symbol, RSI and minute.
         filename = (
-            f"optionchain-{self.provider}-{safe}-rsi{rsi:.2f}-{stamp}-"
-            f"{uuid4().hex[:6]}.json"
+            f"optionchain-{self.provider}-{safe}-{signal.upper()}-rsi{rsi:.2f}-"
+            f"{stamp}-{uuid4().hex[:6]}.json"
         )
         path = directory / filename
         path.write_text(
@@ -2030,6 +2084,116 @@ class TradingviewProvider:
                     self.record(event)
                 finally:
                     self.queue.task_done()
+
+
+class AlpacaPositionMonitor:
+    """Poll Alpaca account positions every minute and log option holdings.
+
+    Runs as its own task with its own log file (logs/positions/). Each poll
+    logs an account snapshot, one line per holding, and a dedicated
+    OPTION_POSITION line for every current option position. Polls are
+    minute-aligned (just after each minute boundary) and never interact with
+    the RSI coordinator; failures are logged and the next minute retries.
+    """
+
+    def __init__(self, keys):
+        self.provider = "POSITIONS"
+        self.credentials = dict(keys or {})
+        self.logger = make_logger("POSITIONS", "ALPACA")
+        self.client = build_option_chain_client(self.credentials)
+
+    @staticmethod
+    def _is_option(position):
+        raw = getattr(position, "asset_class", None)
+        value = str(getattr(raw, "value", raw) or "").lower()
+        return "option" in value
+
+    @staticmethod
+    def _num(position, field):
+        try:
+            value = float(getattr(position, field) or 0.0)
+            return value if math.isfinite(value) else 0.0
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+    def _format_option(self, position):
+        return (
+            f"symbol={getattr(position, 'symbol', '?')} "
+            f"qty={self._num(position, 'qty'):.4g} "
+            f"side={getattr(position, 'side', '?')} "
+            f"avg_entry={self._num(position, 'avg_entry_price'):.4f} "
+            f"current_price={self._num(position, 'current_price'):.4f} "
+            f"market_value={self._num(position, 'market_value'):.2f} "
+            f"unrealized_pl={self._num(position, 'unrealized_pl'):.2f} "
+            f"unrealized_plpc={self._num(position, 'unrealized_plpc'):.4f}"
+        )
+
+    def poll(self):
+        """Fetch account + positions and log the snapshot (blocking)."""
+        account = self.client.get_account()
+        positions = list(self.client.get_all_positions() or [])
+        options = [p for p in positions if self._is_option(p)]
+
+        self.logger.info(
+            "POSITIONS_SNAPSHOT equity=%.2f cash=%.2f buying_power=%.2f "
+            "long_market_value=%.2f short_market_value=%.2f positions=%d options=%d",
+            float(getattr(account, "equity", 0.0) or 0.0),
+            float(getattr(account, "cash", 0.0) or 0.0),
+            float(getattr(account, "buying_power", 0.0) or 0.0),
+            float(getattr(account, "long_market_value", 0.0) or 0.0),
+            float(getattr(account, "short_market_value", 0.0) or 0.0),
+            len(positions),
+            len(options),
+        )
+
+        for position in positions:
+            if self._is_option(position):
+                self.logger.info("OPTION_POSITION %s", self._format_option(position))
+            else:
+                self.logger.info(
+                    "HOLDING type=equity symbol=%s qty=%.4g avg_entry=%.4f "
+                    "current_price=%.4f market_value=%.2f unrealized_pl=%.2f",
+                    getattr(position, "symbol", "?"),
+                    self._num(position, "qty"),
+                    self._num(position, "avg_entry_price"),
+                    self._num(position, "current_price"),
+                    self._num(position, "market_value"),
+                    self._num(position, "unrealized_pl"),
+                )
+
+        if not options:
+            self.logger.info("OPTIONS_POSITIONS none")
+
+    async def run(self):
+        if self.client is None:
+            self.logger.warning(
+                "POSITION_MONITOR_DISABLED reason=missing_alpaca_credentials "
+                "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
+                "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
+            )
+            return
+        self.logger.info("POSITION_MONITOR_START cadence=every-minute")
+        logging.info(
+            "POSITION_MONITOR_START provider=POSITIONS log=%s",
+            self.logger.handlers[0].baseFilename if self.logger.handlers else "n/a",
+        )
+        while True:
+            try:
+                await asyncio.to_thread(self.poll)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "POSITION_MONITOR_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+            # Sleep until just after the next minute boundary.
+            now = datetime.now(UTC)
+            target = (
+                now.replace(second=0, microsecond=0) + MINUTE + timedelta(seconds=2)
+            )
+            await asyncio.sleep(max(1.0, (target - now).total_seconds()))
 
 
 # Create a dictionary to keep track of active provider instances and tasks across the engine
@@ -2279,6 +2443,18 @@ async def main():
             cli_admin.run(), name="CLI_ADMIN_PANEL"
         ),  # Mount server task
     ]
+
+    # Alpaca position monitor: independent of the RSI providers, polls the
+    # account every minute and prints current option positions to its own log.
+    # Starts whenever Alpaca credentials are available; otherwise it logs a
+    # single disabled warning and exits.
+    position_monitor = AlpacaPositionMonitor(keys)
+    tasks.append(
+        asyncio.create_task(
+            run_provider_isolated(position_monitor, coordinator),
+            name="ALPACA_POSITION_MONITOR",
+        )
+    )
 
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(

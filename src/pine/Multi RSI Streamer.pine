@@ -1,20 +1,24 @@
 // This Pine Script® code is subject to the terms of the
-// Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Mozilla Public License 2.0 at [https://mozilla.org/MPL/2.0/](https://mozilla.org/MPL/2.0/)
 // © billt408
+
 
 //@version=6
 indicator(
      title = "RSI 1m Multi-Symbol Webhook Streamer",
-     shorttitle = "Multi RSI Streamer",
+     shorttitle = "MultiRSI",
      overlay = false,
      format = format.price,
      precision = 2,
      dynamic_requests = true
- )
+)
+
 
 // ----------------------------- Inputs -----------------------------
 
+
 GRP_SYMBOLS = "Symbols"
+GRP_EXTRA = "Additional Symbols"
 
 enable1 = input.bool(true, "Enable symbol 1", group = GRP_SYMBOLS)
 symbol1 = input.symbol("NASDAQ:NVDA", "Symbol 1", group = GRP_SYMBOLS)
@@ -25,27 +29,87 @@ symbol2 = input.symbol("NASDAQ:MU", "Symbol 2", group = GRP_SYMBOLS)
 enable3 = input.bool(true, "Enable symbol 3", group = GRP_SYMBOLS)
 symbol3 = input.symbol("NASDAQ:CRWV", "Symbol 3", group = GRP_SYMBOLS)
 
+enable4 = input.bool(true, "Enable symbol 4", group = GRP_EXTRA)
+symbol4 = input.symbol("NASDAQ:SNDK", "Symbol 4", group = GRP_EXTRA)
+
+enable5 = input.bool(true, "Enable symbol 5", group = GRP_EXTRA)
+symbol5 = input.symbol("NYSE:DELL", "Symbol 5", group = GRP_EXTRA)
+
+enable6 = input.bool(true, "Enable symbol 6", group = GRP_EXTRA)
+symbol6 = input.symbol("NYSE:LLY", "Symbol 6", group = GRP_EXTRA)
+
+enable7 = input.bool(true, "Enable symbol 7", group = GRP_EXTRA)
+symbol7 = input.symbol("NYSE:TMO", "Symbol 7", group = GRP_EXTRA)
+
+enable8 = input.bool(true, "Enable symbol 8", group = GRP_EXTRA)
+symbol8 = input.symbol("NASDAQ:ISRG", "Symbol 8", group = GRP_EXTRA)
+
+enable9 = input.bool(true, "Enable symbol 9", group = GRP_EXTRA)
+symbol9 = input.symbol("NASDAQ:VRTX", "Symbol 9", group = GRP_EXTRA)
+
+enable10 = input.bool(true, "Enable symbol 10", group = GRP_EXTRA)
+symbol10 = input.symbol("NYSE:MCD", "Symbol 10", group = GRP_EXTRA)
+
+enable11 = input.bool(true, "Enable symbol 11", group = GRP_EXTRA)
+symbol11 = input.symbol("NYSE:V", "Symbol 11", group = GRP_EXTRA)
+
+enable12 = input.bool(true, "Enable symbol 12", group = GRP_EXTRA)
+symbol12 = input.symbol("NYSE:NOC", "Symbol 12", group = GRP_EXTRA)
+
+enable13 = input.bool(true, "Enable symbol 13", group = GRP_EXTRA)
+symbol13 = input.symbol("NYSE:ROK", "Symbol 13", group = GRP_EXTRA)
+
+enable14 = input.bool(true, "Enable symbol 14", group = GRP_EXTRA)
+symbol14 = input.symbol("NYSE:TSM", "Symbol 14", group = GRP_EXTRA)
+
+enable15 = input.bool(true, "Enable symbol 15", group = GRP_EXTRA)
+symbol15 = input.symbol("NASDAQ:MSFT", "Symbol 15", group = GRP_EXTRA)
+
+enable16 = input.bool(true, "Enable symbol 16", group = GRP_EXTRA)
+symbol16 = input.symbol("NASDAQ:LITE", "Symbol 16", group = GRP_EXTRA)
+
+enable17 = input.bool(true, "Enable symbol 17", group = GRP_EXTRA)
+symbol17 = input.symbol("NASDAQ:META", "Symbol 17", group = GRP_EXTRA)
+
+enable18 = input.bool(true, "Enable symbol 18", group = GRP_EXTRA)
+symbol18 = input.symbol("NASDAQ:AMD", "Symbol 18", group = GRP_EXTRA)
+
+enable19 = input.bool(true, "Enable symbol 19", group = GRP_EXTRA)
+symbol19 = input.symbol("NASDAQ:TSLA", "Symbol 19", group = GRP_EXTRA)
+
+enable20 = input.bool(true, "Enable symbol 20", group = GRP_EXTRA)
+symbol20 = input.symbol("NASDAQ:STX", "Symbol 20", group = GRP_EXTRA)
+
+enable21 = input.bool(true, "Enable symbol 21", group = GRP_EXTRA)
+symbol21 = input.symbol("AMEX:SURE", "Symbol 21", group = GRP_EXTRA, tooltip = "(21: AMEX:SURE is the AdvisorShares Insider Advantage ETF on NYSE Arca  verify this is the intended instrument; SURE is not a US common-stock ticker.)")
+
+
+// MU appears once as Symbol 2; it is intentionally not repeated in the
+// additional slots. All 21 slots use explicit input.symbol values so every
+// request.security call runs at global scope on each calculation, and every
+// symbol stays a simple string for ticker.standard/ticker.modify.
+
 GRP_RSI = "RSI Configuration"
 
 rsiLen = input.int(
      14, "RSI Length",
      minval = 1,
      group = GRP_RSI
- )
+)
 
 rsiLow = input.float(
      35.0, "Oversold Level (<=)",
      minval = 0.0,
      maxval = 100.0,
      group = GRP_RSI
- )
+)
 
 rsiHigh = input.float(
      70.0, "Overbought Level (>=)",
      minval = 0.0,
      maxval = 100.0,
      group = GRP_RSI
- )
+)
 
 // This controls the history used in RSI.
 // Webhooks below are restricted to regular-session bars in either mode.
@@ -53,7 +117,7 @@ includeExtended = input.bool(
      false,
      "Include extended-hours bars in RSI history",
      group = GRP_RSI
- )
+)
 
 GRP_WEBHOOK = "Webhook Configuration"
 
@@ -61,14 +125,14 @@ sendWebhooks = input.bool(
      true,
      "Enable webhook messages",
      group = GRP_WEBHOOK
- )
+)
 
 webhookToken = input.string(
      "",
      "Webhook token  optional",
      group = GRP_WEBHOOK,
      tooltip = "Must match WEBHOOK_TOKEN in Python when authentication is enabled. Do not publish a script containing your secret."
- )
+)
 
 settleSeconds = input.int(
      2,
@@ -76,7 +140,7 @@ settleSeconds = input.int(
      minval = 0,
      maxval = 20,
      group = GRP_WEBHOOK
- )
+)
 
 maxAgeSeconds = input.int(
      40,
@@ -85,9 +149,11 @@ maxAgeSeconds = input.int(
      maxval = 300,
      group = GRP_WEBHOOK,
      tooltip = "Keep this below Python's summary delay, allowing time for delivery. Default 40 fits a 45-second summary delay."
- )
+)
+
 
 // ----------------------------- Validation -----------------------------
+
 
 if not (timeframe.isminutes and timeframe.multiplier == 1)
     runtime.error("Use this indicator on a standard 1-minute chart.")
@@ -98,22 +164,31 @@ if not chart.is_standard
 if maxAgeSeconds <= settleSeconds
     runtime.error("Maximum age must be greater than the wait after minute end.")
 
-if enable1 and enable2 and symbol1 == symbol2
-    runtime.error("Symbols 1 and 2 must be different.")
+// Duplicate detection across all enabled slots (plain string equality;
+// input.symbol values are canonical EXCHANGE:TICKER strings).
+allSymbols = array.from(symbol1, symbol2, symbol3, symbol4, symbol5, symbol6, symbol7, symbol8, symbol9, symbol10, symbol11, symbol12, symbol13, symbol14, symbol15, symbol16, symbol17, symbol18, symbol19, symbol20, symbol21)
+allEnabled = array.from(enable1, enable2, enable3, enable4, enable5, enable6, enable7, enable8, enable9, enable10, enable11, enable12, enable13, enable14, enable15, enable16, enable17, enable18, enable19, enable20, enable21)
 
-if enable1 and enable3 and symbol1 == symbol3
-    runtime.error("Symbols 1 and 3 must be different.")
+bool duplicateFound = false
 
-if enable2 and enable3 and symbol2 == symbol3
-    runtime.error("Symbols 2 and 3 must be different.")
+for i = 0 to array.size(allSymbols) - 2
+    for j = i + 1 to array.size(allSymbols) - 1
+        if not duplicateFound and array.get(allEnabled, i) and array.get(allEnabled, j) and array.get(allSymbols, i) == array.get(allSymbols, j)
+            duplicateFound := true
+
+if duplicateFound
+    runtime.error("Enabled symbols must be unique across all slots.")
 
 // ----------------------------- Persistent state -----------------------------
 
+
 // varip preserves updates across realtime executions within a host bar.
 // Each slot stores the most recently transmitted source minute.
-varip array<int> lastSent = array.new_int(3, na)
+varip array<int> lastSent = array.new_int(21, na)
+
 
 // ----------------------------- Functions -----------------------------
+
 
 // Evaluated inside each requested symbol's context.
 // All values in each group refer to the same source bar.
@@ -131,16 +206,19 @@ f_sourceValues() =>
          close[1],
          sourceRsi[1],
          session.ismarket[1]
-     ]
+    ]
 
 // Request both the latest source bar and its predecessor.
 // During a newly forming minute, the predecessor is the completed bar.
 // After the source's last session bar, the latest bar itself may be ended.
+// requestedSymbol stays a simple string (input.symbol) so ticker.standard
+// and ticker.modify work, and every call below runs at global scope on
+// each calculation, satisfying request-consistency requirements.
 f_completedSample(simple string requestedSymbol) =>
     string sourceTicker = ticker.modify(
          ticker.standard(requestedSymbol),
          session = includeExtended ? session.extended : session.regular
-     )
+    )
 
     [t0, end0, price0, rsi0, regular0,
      t1, end1, price1, rsi1, regular1] = request.security(
@@ -150,12 +228,12 @@ f_completedSample(simple string requestedSymbol) =>
          gaps = barmerge.gaps_off,
          lookahead = barmerge.lookahead_off,
          ignore_invalid_symbol = true
-     )
+    )
 
     bool latestHasEnded = (
          not na(end0) and
          end0 + settleSeconds * 1000 <= timenow
-     )
+    )
 
     [
          latestHasEnded ? t0 : t1,
@@ -163,7 +241,7 @@ f_completedSample(simple string requestedSymbol) =>
          latestHasEnded ? price0 : price1,
          latestHasEnded ? rsi0 : rsi1,
          latestHasEnded ? regular0 : regular1
-     ]
+    ]
 
 f_jsonEscape(string value) =>
     string escaped = str.replace_all(value, "\\", "\\\\")
@@ -183,7 +261,7 @@ f_payload(
          barStart,
          "yyyy-MM-dd'T'HH:mm:ss'Z'",
          "UTC+0"
-     )
+    )
 
     string message = (
          "{\"ticker\":\"" + f_jsonEscape(requestedSymbol) +
@@ -192,7 +270,7 @@ f_payload(
          "\",\"bar_closed\":true" +
          ",\"price\":" + str.tostring(barPrice, "#.################") +
          ",\"rsi_value\":" + str.tostring(barRsi, "#.################")
-     )
+    )
 
     if str.length(webhookToken) > 0
         message := (
@@ -200,7 +278,7 @@ f_payload(
              ",\"webhook_token\":\"" +
              f_jsonEscape(webhookToken) +
              "\""
-         )
+        )
 
     message + "}"
 
@@ -226,7 +304,7 @@ f_send(
          not na(barPrice) and
          not na(barRsi) and
          barPrice > 0
-     )
+    )
 
     if valid
         int ageMs = timenow - barEnd
@@ -235,12 +313,12 @@ f_send(
         bool insideWindow = (
              ageMs >= settleSeconds * 1000 and
              ageMs <= maxAgeSeconds * 1000
-         )
+        )
 
         bool newMinute = (
              na(previousMinute) or
              barStart > previousMinute
-         )
+        )
 
         if insideWindow and newMinute
             string message = f_payload(
@@ -248,9 +326,9 @@ f_send(
                  barStart,
                  barPrice,
                  barRsi
-             )
+            )
 
-            // Allow all three symbols to send during the same host bar.
+            // Allow all symbols to send during the same host bar.
             // Per-symbol duplicate control is handled by lastSent.
             alert(message, alert.freq_all)
 
@@ -259,47 +337,92 @@ f_send(
 
     sent
 
+
 // ----------------------------- Source data -----------------------------
+
 
 // Request all contexts on historical executions as well as realtime ones.
 // This is required for reliable use of dynamic requests.
-[t1, end1, price1, rsi1, regular1] = f_completedSample(symbol1)
-[t2, end2, price2, rsi2, regular2] = f_completedSample(symbol2)
-[t3, end3, price3, rsi3, regular3] = f_completedSample(symbol3)
+// 21 unique requests  within Pine's 40-request limit.
+[t1, e1, p1, r1, g1] = f_completedSample(symbol1)
+[t2, e2, p2, r2, g2] = f_completedSample(symbol2)
+[t3, e3, p3, r3, g3] = f_completedSample(symbol3)
+[t4, e4, p4, r4, g4] = f_completedSample(symbol4)
+[t5, e5, p5, r5, g5] = f_completedSample(symbol5)
+[t6, e6, p6, r6, g6] = f_completedSample(symbol6)
+[t7, e7, p7, r7, g7] = f_completedSample(symbol7)
+[t8, e8, p8, r8, g8] = f_completedSample(symbol8)
+[t9, e9, p9, r9, g9] = f_completedSample(symbol9)
+[t10, e10, p10, r10, g10] = f_completedSample(symbol10)
+[t11, e11, p11, r11, g11] = f_completedSample(symbol11)
+[t12, e12, p12, r12, g12] = f_completedSample(symbol12)
+[t13, e13, p13, r13, g13] = f_completedSample(symbol13)
+[t14, e14, p14, r14, g14] = f_completedSample(symbol14)
+[t15, e15, p15, r15, g15] = f_completedSample(symbol15)
+[t16, e16, p16, r16, g16] = f_completedSample(symbol16)
+[t17, e17, p17, r17, g17] = f_completedSample(symbol17)
+[t18, e18, p18, r18, g18] = f_completedSample(symbol18)
+[t19, e19, p19, r19, g19] = f_completedSample(symbol19)
+[t20, e20, p20, r20, g20] = f_completedSample(symbol20)
+[t21, e21, p21, r21, g21] = f_completedSample(symbol21)
 
 // ----------------------------- Webhook dispatch -----------------------------
 
-sent1 = f_send(enable1, 0, symbol1, t1, end1, price1, rsi1, regular1)
-sent2 = f_send(enable2, 1, symbol2, t2, end2, price2, rsi2, regular2)
-sent3 = f_send(enable3, 2, symbol3, t3, end3, price3, rsi3, regular3)
+
+// One slot per symbol; each transmits at most once per source minute.
+
+sent1 = f_send(enable1, 0, symbol1, t1, e1, p1, r1, g1)
+sent2 = f_send(enable2, 1, symbol2, t2, e2, p2, r2, g2)
+sent3 = f_send(enable3, 2, symbol3, t3, e3, p3, r3, g3)
+sent4 = f_send(enable4, 3, symbol4, t4, e4, p4, r4, g4)
+sent5 = f_send(enable5, 4, symbol5, t5, e5, p5, r5, g5)
+sent6 = f_send(enable6, 5, symbol6, t6, e6, p6, r6, g6)
+sent7 = f_send(enable7, 6, symbol7, t7, e7, p7, r7, g7)
+sent8 = f_send(enable8, 7, symbol8, t8, e8, p8, r8, g8)
+sent9 = f_send(enable9, 8, symbol9, t9, e9, p9, r9, g9)
+sent10 = f_send(enable10, 9, symbol10, t10, e10, p10, r10, g10)
+sent11 = f_send(enable11, 10, symbol11, t11, e11, p11, r11, g11)
+sent12 = f_send(enable12, 11, symbol12, t12, e12, p12, r12, g12)
+sent13 = f_send(enable13, 12, symbol13, t13, e13, p13, r13, g13)
+sent14 = f_send(enable14, 13, symbol14, t14, e14, p14, r14, g14)
+sent15 = f_send(enable15, 14, symbol15, t15, e15, p15, r15, g15)
+sent16 = f_send(enable16, 15, symbol16, t16, e16, p16, r16, g16)
+sent17 = f_send(enable17, 16, symbol17, t17, e17, p17, r17, g17)
+sent18 = f_send(enable18, 17, symbol18, t18, e18, p18, r18, g18)
+sent19 = f_send(enable19, 18, symbol19, t19, e19, p19, r19, g19)
+sent20 = f_send(enable20, 19, symbol20, t20, e20, p20, r20, g20)
+sent21 = f_send(enable21, 20, symbol21, t21, e21, p21, r21, g21)
 
 // ----------------------------- Display -----------------------------
 
+
 // Plot titles are fixed; the selected symbols are shown in Inputs.
 plot(
-     enable1 ? rsi1 : na,
+     enable1 ? r1 : na,
      "Symbol 1 RSI",
      color = color.purple,
      linewidth = 2
- )
+)
 
 plot(
-     enable2 ? rsi2 : na,
+     enable2 ? r2 : na,
      "Symbol 2 RSI",
      color = color.blue,
      linewidth = 2
- )
+)
 
 plot(
-     enable3 ? rsi3 : na,
+     enable3 ? r3 : na,
      "Symbol 3 RSI",
      color = color.orange,
      linewidth = 2
- )
+)
 
 hline(rsiHigh, "Overbought", color = color.red, linestyle = hline.style_dashed)
 hline(50, "Center", color = color.new(color.gray, 50))
 hline(rsiLow, "Oversold", color = color.green, linestyle = hline.style_dashed)
+
+// One marker per slot when that symbol transmits a webhook.
 
 plotshape(
      sent1,
@@ -308,7 +431,7 @@ plotshape(
      location = location.bottom,
      color = color.purple,
      size = size.tiny
- )
+)
 
 plotshape(
      sent2,
@@ -317,7 +440,7 @@ plotshape(
      location = location.bottom,
      color = color.blue,
      size = size.tiny
- )
+)
 
 plotshape(
      sent3,
@@ -326,4 +449,166 @@ plotshape(
      location = location.bottom,
      color = color.orange,
      size = size.tiny
- )
+)
+
+plotshape(
+     sent4,
+     title = "Symbol 4 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.teal,
+     size = size.tiny
+)
+
+plotshape(
+     sent5,
+     title = "Symbol 5 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.fuchsia,
+     size = size.tiny
+)
+
+plotshape(
+     sent6,
+     title = "Symbol 6 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.olive,
+     size = size.tiny
+)
+
+plotshape(
+     sent7,
+     title = "Symbol 7 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.aqua,
+     size = size.tiny
+)
+
+plotshape(
+     sent8,
+     title = "Symbol 8 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.lime,
+     size = size.tiny
+)
+
+plotshape(
+     sent9,
+     title = "Symbol 9 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.yellow,
+     size = size.tiny
+)
+
+plotshape(
+     sent10,
+     title = "Symbol 10 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.maroon,
+     size = size.tiny
+)
+
+plotshape(
+     sent11,
+     title = "Symbol 11 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.navy,
+     size = size.tiny
+)
+
+plotshape(
+     sent12,
+     title = "Symbol 12 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.red,
+     size = size.tiny
+)
+
+plotshape(
+     sent13,
+     title = "Symbol 13 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.green,
+     size = size.tiny
+)
+
+plotshape(
+     sent14,
+     title = "Symbol 14 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.gray,
+     size = size.tiny
+)
+
+plotshape(
+     sent15,
+     title = "Symbol 15 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.black,
+     size = size.tiny
+)
+
+plotshape(
+     sent16,
+     title = "Symbol 16 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.white,
+     size = size.tiny
+)
+
+plotshape(
+     sent17,
+     title = "Symbol 17 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.rgb(160, 82, 45),
+     size = size.tiny
+)
+
+plotshape(
+     sent18,
+     title = "Symbol 18 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.purple,
+     size = size.tiny
+)
+
+plotshape(
+     sent19,
+     title = "Symbol 19 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.blue,
+     size = size.tiny
+)
+
+plotshape(
+     sent20,
+     title = "Symbol 20 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.orange,
+     size = size.tiny
+)
+
+plotshape(
+     sent21,
+     title = "Symbol 21 webhook",
+     style = shape.circle,
+     location = location.bottom,
+     color = color.purple,
+     size = size.tiny
+)
