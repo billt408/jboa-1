@@ -1,7 +1,6 @@
 // This Pine Script® code is subject to the terms of the
-// Mozilla Public License 2.0 at [https://mozilla.org/MPL/2.0/](https://mozilla.org/MPL/2.0/)
-// © billt408
-
+// Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © billt408 / Merged 21-Symbol 1-Chart Webhook Streamer (<= 35 or >= 65)
 
 //@version=6
 indicator(
@@ -13,9 +12,7 @@ indicator(
      dynamic_requests = true
 )
 
-
 // ----------------------------- Inputs -----------------------------
-
 
 GRP_SYMBOLS = "Symbols"
 GRP_EXTRA = "Additional Symbols"
@@ -81,15 +78,9 @@ enable20 = input.bool(true, "Enable symbol 20", group = GRP_EXTRA)
 symbol20 = input.symbol("NASDAQ:STX", "Symbol 20", group = GRP_EXTRA)
 
 enable21 = input.bool(true, "Enable symbol 21", group = GRP_EXTRA)
-symbol21 = input.symbol("AMEX:SURE", "Symbol 21", group = GRP_EXTRA, tooltip = "(21: AMEX:SURE is the AdvisorShares Insider Advantage ETF on NYSE Arca  verify this is the intended instrument; SURE is not a US common-stock ticker.)")
+symbol21 = input.symbol("AMEX:SURE", "Symbol 21", group = GRP_EXTRA, tooltip = "(21: AMEX:SURE is the AdvisorShares Insider Advantage ETF on NYSE Arca)")
 
-
-// MU appears once as Symbol 2; it is intentionally not repeated in the
-// additional slots. All 21 slots use explicit input.symbol values so every
-// request.security call runs at global scope on each calculation, and every
-// symbol stays a simple string for ticker.standard/ticker.modify.
-
-GRP_RSI = "RSI Configuration"
+GRP_RSI = "RSI Configuration & Alert Filtering"
 
 rsiLen = input.int(
      14, "RSI Length",
@@ -100,19 +91,26 @@ rsiLen = input.int(
 rsiLow = input.float(
      35.0, "Oversold Level (<=)",
      minval = 0.0,
-     maxval = 100.0,
-     group = GRP_RSI
+     maxval = 50.0,
+     group = GRP_RSI,
+     tooltip = "Alert triggers when a symbol's 1m closed RSI is <= this value."
 )
 
 rsiHigh = input.float(
-     70.0, "Overbought Level (>=)",
-     minval = 0.0,
+     65.0, "Overbought Level (>=)",
+     minval = 50.0,
      maxval = 100.0,
-     group = GRP_RSI
+     group = GRP_RSI,
+     tooltip = "Alert triggers when a symbol's 1m closed RSI is >= this value."
 )
 
-// This controls the history used in RSI.
-// Webhooks below are restricted to regular-session bars in either mode.
+alertOnlyExtremes = input.bool(
+     true,
+     "Alert ONLY on RSI <= 35 or >= 65",
+     group = GRP_RSI,
+     tooltip = "Critical: Prevents 'Alert triggered too often' by skipping neutral bars (35 < RSI < 65) and only alerting on extreme conditions."
+)
+
 includeExtended = input.bool(
      false,
      "Include extended-hours bars in RSI history",
@@ -131,7 +129,7 @@ webhookToken = input.string(
      "",
      "Webhook token  optional",
      group = GRP_WEBHOOK,
-     tooltip = "Must match WEBHOOK_TOKEN in Python when authentication is enabled. Do not publish a script containing your secret."
+     tooltip = "Must match WEBHOOK_TOKEN in Python when authentication is enabled."
 )
 
 settleSeconds = input.int(
@@ -147,13 +145,10 @@ maxAgeSeconds = input.int(
      "Maximum age after source minute ends  seconds",
      minval = 5,
      maxval = 300,
-     group = GRP_WEBHOOK,
-     tooltip = "Keep this below Python's summary delay, allowing time for delivery. Default 40 fits a 45-second summary delay."
+     group = GRP_WEBHOOK
 )
 
-
 // ----------------------------- Validation -----------------------------
-
 
 if not (timeframe.isminutes and timeframe.multiplier == 1)
     runtime.error("Use this indicator on a standard 1-minute chart.")
@@ -164,13 +159,10 @@ if not chart.is_standard
 if maxAgeSeconds <= settleSeconds
     runtime.error("Maximum age must be greater than the wait after minute end.")
 
-// Duplicate detection across all enabled slots (plain string equality;
-// input.symbol values are canonical EXCHANGE:TICKER strings).
 allSymbols = array.from(symbol1, symbol2, symbol3, symbol4, symbol5, symbol6, symbol7, symbol8, symbol9, symbol10, symbol11, symbol12, symbol13, symbol14, symbol15, symbol16, symbol17, symbol18, symbol19, symbol20, symbol21)
 allEnabled = array.from(enable1, enable2, enable3, enable4, enable5, enable6, enable7, enable8, enable9, enable10, enable11, enable12, enable13, enable14, enable15, enable16, enable17, enable18, enable19, enable20, enable21)
 
 bool duplicateFound = false
-
 for i = 0 to array.size(allSymbols) - 2
     for j = i + 1 to array.size(allSymbols) - 1
         if not duplicateFound and array.get(allEnabled, i) and array.get(allEnabled, j) and array.get(allSymbols, i) == array.get(allSymbols, j)
@@ -181,20 +173,12 @@ if duplicateFound
 
 // ----------------------------- Persistent state -----------------------------
 
-
-// varip preserves updates across realtime executions within a host bar.
-// Each slot stores the most recently transmitted source minute.
 varip array<int> lastSent = array.new_int(21, na)
-
 
 // ----------------------------- Functions -----------------------------
 
-
-// Evaluated inside each requested symbol's context.
-// All values in each group refer to the same source bar.
 f_sourceValues() =>
     float sourceRsi = ta.rsi(close, rsiLen)
-
     [
          time,
          time_close,
@@ -208,12 +192,6 @@ f_sourceValues() =>
          session.ismarket[1]
     ]
 
-// Request both the latest source bar and its predecessor.
-// During a newly forming minute, the predecessor is the completed bar.
-// After the source's last session bar, the latest bar itself may be ended.
-// requestedSymbol stays a simple string (input.symbol) so ticker.standard
-// and ticker.modify work, and every call below runs at global scope on
-// each calculation, satisfying request-consistency requirements.
 f_completedSample(simple string requestedSymbol) =>
     string sourceTicker = ticker.modify(
          ticker.standard(requestedSymbol),
@@ -263,13 +241,19 @@ f_payload(
          "UTC+0"
     )
 
+    bool isOversold = barRsi <= rsiLow
+    string signalType = isOversold ? "oversold" : "overbought"
+    float thresholdUsed = isOversold ? rsiLow : rsiHigh
+
     string message = (
-         "{\"ticker\":\"" + f_jsonEscape(requestedSymbol) +
-         "\",\"timeframe\":\"1m\"" +
-         ",\"bar_start\":\"" + timestamp +
-         "\",\"bar_closed\":true" +
-         ",\"price\":" + str.tostring(barPrice, "#.################") +
-         ",\"rsi_value\":" + str.tostring(barRsi, "#.################")
+         "{\"ticker\":\"" + f_jsonEscape(requestedSymbol) + "\"" +
+         ",\"signal\":\"" + signalType + "\"" +
+         ",\"rsi_value\":" + str.tostring(barRsi, "#.##") +
+         ",\"price\":" + str.tostring(barPrice, "#.##") +
+         ",\"timeframe\":\"1m\"" +
+         ",\"bar_start\":\"" + timestamp + "\"" +
+         ",\"bar_closed\":true" +
+         ",\"threshold_used\":" + str.tostring(thresholdUsed, "#.##")
     )
 
     if str.length(webhookToken) > 0
@@ -294,6 +278,12 @@ f_send(
  ) =>
     bool sent = false
 
+    // STRICT CONDITION: Only alert when RSI <= 35 or >= 65
+    // Do NOT alert if RSI is between 35 and 65 (35 < RSI < 65)
+    bool isOversold = not na(barRsi) and barRsi <= rsiLow
+    bool isOverbought = not na(barRsi) and barRsi >= rsiHigh
+    bool inExtremeZone = isOversold or isOverbought
+
     bool valid = (
          enabled and
          sendWebhooks and
@@ -303,7 +293,8 @@ f_send(
          not na(barEnd) and
          not na(barPrice) and
          not na(barRsi) and
-         barPrice > 0
+         barPrice > 0 and
+         inExtremeZone
     )
 
     if valid
@@ -328,8 +319,7 @@ f_send(
                  barRsi
             )
 
-            // Allow all symbols to send during the same host bar.
-            // Per-symbol duplicate control is handled by lastSent.
+            // Dispatches only when RSI <= 35 or >= 65
             alert(message, alert.freq_all)
 
             array.set(lastSent, slot, barStart)
@@ -337,13 +327,8 @@ f_send(
 
     sent
 
+// ----------------------------- Source data (21 Symbols) -----------------------------
 
-// ----------------------------- Source data -----------------------------
-
-
-// Request all contexts on historical executions as well as realtime ones.
-// This is required for reliable use of dynamic requests.
-// 21 unique requests  within Pine's 40-request limit.
 [t1, e1, p1, r1, g1] = f_completedSample(symbol1)
 [t2, e2, p2, r2, g2] = f_completedSample(symbol2)
 [t3, e3, p3, r3, g3] = f_completedSample(symbol3)
@@ -368,9 +353,6 @@ f_send(
 
 // ----------------------------- Webhook dispatch -----------------------------
 
-
-// One slot per symbol; each transmits at most once per source minute.
-
 sent1 = f_send(enable1, 0, symbol1, t1, e1, p1, r1, g1)
 sent2 = f_send(enable2, 1, symbol2, t2, e2, p2, r2, g2)
 sent3 = f_send(enable3, 2, symbol3, t3, e3, p3, r3, g3)
@@ -393,222 +375,40 @@ sent19 = f_send(enable19, 18, symbol19, t19, e19, p19, r19, g19)
 sent20 = f_send(enable20, 19, symbol20, t20, e20, p20, r20, g20)
 sent21 = f_send(enable21, 20, symbol21, t21, e21, p21, r21, g21)
 
-// ----------------------------- Display -----------------------------
+// ----------------------------- Display & Guidelines -----------------------------
 
+plot(enable1 ? r1 : na, "Symbol 1 RSI", color = color.purple, linewidth = 2)
+plot(enable2 ? r2 : na, "Symbol 2 RSI", color = color.blue, linewidth = 2)
+plot(enable3 ? r3 : na, "Symbol 3 RSI", color = color.orange, linewidth = 2)
 
-// Plot titles are fixed; the selected symbols are shown in Inputs.
-plot(
-     enable1 ? r1 : na,
-     "Symbol 1 RSI",
-     color = color.purple,
-     linewidth = 2
-)
+hTop = hline(100, "Top 100", color = color.new(color.gray, 100))
+hHigh = hline(rsiHigh, "Overbought (>= 65)", color = color.red, linestyle = hline.style_dashed, linewidth = 1)
+hMid = hline(50, "Center 50", color = color.new(color.gray, 60))
+hLow = hline(rsiLow, "Oversold (<= 35)", color = color.green, linestyle = hline.style_dashed, linewidth = 1)
+hBot = hline(0, "Bottom 0", color = color.new(color.gray, 100))
 
-plot(
-     enable2 ? r2 : na,
-     "Symbol 2 RSI",
-     color = color.blue,
-     linewidth = 2
-)
+fill(hHigh, hTop, color = color.new(color.red, 90), title = "Overbought Zone")
+fill(hBot, hLow, color = color.new(color.green, 90), title = "Oversold Zone")
 
-plot(
-     enable3 ? r3 : na,
-     "Symbol 3 RSI",
-     color = color.orange,
-     linewidth = 2
-)
-
-hline(rsiHigh, "Overbought", color = color.red, linestyle = hline.style_dashed)
-hline(50, "Center", color = color.new(color.gray, 50))
-hline(rsiLow, "Oversold", color = color.green, linestyle = hline.style_dashed)
-
-// One marker per slot when that symbol transmits a webhook.
-
-plotshape(
-     sent1,
-     title = "Symbol 1 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.purple,
-     size = size.tiny
-)
-
-plotshape(
-     sent2,
-     title = "Symbol 2 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.blue,
-     size = size.tiny
-)
-
-plotshape(
-     sent3,
-     title = "Symbol 3 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.orange,
-     size = size.tiny
-)
-
-plotshape(
-     sent4,
-     title = "Symbol 4 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.teal,
-     size = size.tiny
-)
-
-plotshape(
-     sent5,
-     title = "Symbol 5 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.fuchsia,
-     size = size.tiny
-)
-
-plotshape(
-     sent6,
-     title = "Symbol 6 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.olive,
-     size = size.tiny
-)
-
-plotshape(
-     sent7,
-     title = "Symbol 7 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.aqua,
-     size = size.tiny
-)
-
-plotshape(
-     sent8,
-     title = "Symbol 8 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.lime,
-     size = size.tiny
-)
-
-plotshape(
-     sent9,
-     title = "Symbol 9 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.yellow,
-     size = size.tiny
-)
-
-plotshape(
-     sent10,
-     title = "Symbol 10 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.maroon,
-     size = size.tiny
-)
-
-plotshape(
-     sent11,
-     title = "Symbol 11 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.navy,
-     size = size.tiny
-)
-
-plotshape(
-     sent12,
-     title = "Symbol 12 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.red,
-     size = size.tiny
-)
-
-plotshape(
-     sent13,
-     title = "Symbol 13 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.green,
-     size = size.tiny
-)
-
-plotshape(
-     sent14,
-     title = "Symbol 14 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.gray,
-     size = size.tiny
-)
-
-plotshape(
-     sent15,
-     title = "Symbol 15 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.black,
-     size = size.tiny
-)
-
-plotshape(
-     sent16,
-     title = "Symbol 16 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.white,
-     size = size.tiny
-)
-
-plotshape(
-     sent17,
-     title = "Symbol 17 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.rgb(160, 82, 45),
-     size = size.tiny
-)
-
-plotshape(
-     sent18,
-     title = "Symbol 18 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.purple,
-     size = size.tiny
-)
-
-plotshape(
-     sent19,
-     title = "Symbol 19 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.blue,
-     size = size.tiny
-)
-
-plotshape(
-     sent20,
-     title = "Symbol 20 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.orange,
-     size = size.tiny
-)
-
-plotshape(
-     sent21,
-     title = "Symbol 21 webhook",
-     style = shape.circle,
-     location = location.bottom,
-     color = color.purple,
-     size = size.tiny
-)
+// Webhook dispatch markers
+plotshape(sent1, title = "Symbol 1 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
+plotshape(sent2, title = "Symbol 2 webhook", style = shape.circle, location = location.bottom, color = color.blue, size = size.tiny)
+plotshape(sent3, title = "Symbol 3 webhook", style = shape.circle, location = location.bottom, color = color.orange, size = size.tiny)
+plotshape(sent4, title = "Symbol 4 webhook", style = shape.circle, location = location.bottom, color = color.teal, size = size.tiny)
+plotshape(sent5, title = "Symbol 5 webhook", style = shape.circle, location = location.bottom, color = color.fuchsia, size = size.tiny)
+plotshape(sent6, title = "Symbol 6 webhook", style = shape.circle, location = location.bottom, color = color.olive, size = size.tiny)
+plotshape(sent7, title = "Symbol 7 webhook", style = shape.circle, location = location.bottom, color = color.aqua, size = size.tiny)
+plotshape(sent8, title = "Symbol 8 webhook", style = shape.circle, location = location.bottom, color = color.lime, size = size.tiny)
+plotshape(sent9, title = "Symbol 9 webhook", style = shape.circle, location = location.bottom, color = color.yellow, size = size.tiny)
+plotshape(sent10, title = "Symbol 10 webhook", style = shape.circle, location = location.bottom, color = color.maroon, size = size.tiny)
+plotshape(sent11, title = "Symbol 11 webhook", style = shape.circle, location = location.bottom, color = color.navy, size = size.tiny)
+plotshape(sent12, title = "Symbol 12 webhook", style = shape.circle, location = location.bottom, color = color.red, size = size.tiny)
+plotshape(sent13, title = "Symbol 13 webhook", style = shape.circle, location = location.bottom, color = color.green, size = size.tiny)
+plotshape(sent14, title = "Symbol 14 webhook", style = shape.circle, location = location.bottom, color = color.gray, size = size.tiny)
+plotshape(sent15, title = "Symbol 15 webhook", style = shape.circle, location = location.bottom, color = color.black, size = size.tiny)
+plotshape(sent16, title = "Symbol 16 webhook", style = shape.circle, location = location.bottom, color = color.white, size = size.tiny)
+plotshape(sent17, title = "Symbol 17 webhook", style = shape.circle, location = location.bottom, color = color.rgb(160, 82, 45), size = size.tiny)
+plotshape(sent18, title = "Symbol 18 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
+plotshape(sent19, title = "Symbol 19 webhook", style = shape.circle, location = location.bottom, color = color.blue, size = size.tiny)
+plotshape(sent20, title = "Symbol 20 webhook", style = shape.circle, location = location.bottom, color = color.orange, size = size.tiny)
+plotshape(sent21, title = "Symbol 21 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
