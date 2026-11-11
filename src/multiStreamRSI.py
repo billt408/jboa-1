@@ -51,10 +51,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import pandas as pd
 import yfinance as yf
-
-#  CORRECT
 from alpaca.common.enums import Sort
-from alpaca.trading.enums import AssetClass
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -151,6 +148,39 @@ def parse_local(value):
 class Bar:
     timestamp: datetime
     close: float
+
+
+def classify_kinematic_regime(
+    rsi_velocity, rsi_acceleration, price_velocity=None, price_acceleration=None
+):
+    """Classify kinematics into one of 4 phase regimes or neutral.
+
+    Accelerating Bullish: v > 0, a > 0 (buying thrust expanding)
+    Decelerating Bullish: v > 0, a <= 0 (buying waning / topping)
+    Accelerating Bearish: v < 0, a < 0 (selling impulse accelerating)
+    Decelerating Bearish: v < 0, a >= 0 (selling decelerating / absorption)
+    """
+    if rsi_velocity is not None:
+        if rsi_velocity > 0:
+            if rsi_acceleration is not None and rsi_acceleration > 0:
+                return "accelerating_bullish"
+            return "decelerating_bullish"
+        elif rsi_velocity < 0:
+            if rsi_acceleration is not None and rsi_acceleration < 0:
+                return "accelerating_bearish"
+            return "decelerating_bearish"
+
+    if price_velocity is not None:
+        if price_velocity > 0:
+            if price_acceleration is not None and price_acceleration > 0:
+                return "accelerating_bullish"
+            return "decelerating_bullish"
+        elif price_velocity < 0:
+            if price_acceleration is not None and price_acceleration < 0:
+                return "accelerating_bearish"
+            return "decelerating_bearish"
+
+    return "neutral"
 
 
 class SessionRSI:
@@ -657,15 +687,27 @@ class MinuteCoordinator:
         if sorted_bars:
             history = self.kinematics_history.setdefault((provider, symbol), [])
             for b in sorted_bars[-10:]:
+                pv = tracker.latest_price_velocity
+                pa = tracker.latest_price_acceleration
+                rv = tracker.latest_rsi_velocity
+                ra = tracker.latest_rsi_acceleration
+                reg = classify_kinematic_regime(rv, ra, pv, pa)
                 history.append(
                     {
                         "minute": minute_utc(b.timestamp),
+                        "timestamp": (
+                            b.timestamp.isoformat()
+                            if hasattr(b.timestamp, "isoformat")
+                            else str(b.timestamp)
+                        ),
                         "close": b.close,
                         "rsi": tracker.latest["rsi"] if tracker.latest else None,
-                        "price_velocity": tracker.latest_price_velocity,
+                        "price_velocity": pv,
                         "price_velocity_pct": None,
-                        "rsi_velocity": tracker.latest_rsi_velocity,
-                        "rsi_acceleration": tracker.latest_rsi_acceleration,
+                        "price_acceleration": pa,
+                        "rsi_velocity": rv,
+                        "rsi_acceleration": ra,
+                        "regime": reg,
                     }
                 )
         logging.info(
@@ -829,32 +871,32 @@ class MinuteCoordinator:
                 rsi_velocity_3m = round(curr_rsi - r3m, 4)
 
         # Classify kinematics regime
-        if rsi_velocity is not None:
-            if rsi_velocity > 0:
-                regime = (
-                    "accelerating_bullish"
-                    if (rsi_acceleration is not None and rsi_acceleration > 0)
-                    else "decelerating_bullish"
-                )
-            elif rsi_velocity < 0:
-                regime = (
-                    "accelerating_bearish"
-                    if (rsi_acceleration is not None and rsi_acceleration < 0)
-                    else "decelerating_bearish"
-                )
-            else:
-                regime = "neutral"
+        regime = classify_kinematic_regime(
+            rsi_velocity,
+            rsi_acceleration,
+            price_velocity,
+            price_acceleration,
+        )
 
         if curr_close is not None or curr_rsi is not None:
             history.append(
                 {
                     "minute": minute,
+                    "timestamp": (
+                        minute.isoformat()
+                        if hasattr(minute, "isoformat")
+                        else str(minute)
+                    ),
                     "close": curr_close,
                     "rsi": curr_rsi,
                     "price_velocity": price_velocity,
                     "price_velocity_pct": price_velocity_pct,
+                    "price_acceleration": price_acceleration,
+                    "price_acceleration_pct": price_acceleration_pct,
                     "rsi_velocity": rsi_velocity,
                     "rsi_acceleration": rsi_acceleration,
+                    "momentum_3m_pct": price_velocity_3m_pct,
+                    "regime": regime,
                 }
             )
             if len(history) > 60:
@@ -2394,34 +2436,6 @@ class AlpacaPositionMonitor:
         self.position_count = 0
         self.option_count = 0
 
-    def _is_option(self, position) -> bool:
-        """Helper to determine if an alpaca-py position is an option contract."""
-        asset_class = getattr(position, "asset_class", None)
-        return asset_class == AssetClass.US_OPTION or asset_class == "us_option"
-
-    def _num(self, obj, attr) -> float:
-        """Safely extract and parse numerical strings/floats from Alpaca payloads."""
-        val = getattr(obj, attr, 0.0)
-        try:
-            return float(val) if val is not None else 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _format_option(self, position) -> str:
-        """Extract and format option contract details into a standard log string."""
-        symbol = getattr(position, "symbol", "?")
-        qty = self._num(position, "qty")
-        avg_entry = self._num(position, "avg_entry_price")
-        current_price = self._num(position, "current_price")
-        market_value = self._num(position, "market_value")
-        unrealized_pl = self._num(position, "unrealized_pl")
-
-        return (
-            f"type=option symbol={symbol} qty={qty:.4g} "
-            f"avg_entry={avg_entry:.4f} current_price={current_price:.4f} "
-            f"market_value={market_value:.2f} unrealized_pl={unrealized_pl:.2f}"
-        )
-
     def poll(self):
         """Fetch account + positions and log the snapshot (blocking)."""
         # --- NEW: Set active state flag ---
@@ -2516,57 +2530,56 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <style>
         body { font-family: 'Plus Jakarta Sans', sans-serif; }
         code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
-        @keyframes pulse-slow {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.6; transform: scale(0.98); }
-        }
-        .animate-pulse-slow { animation: pulse-slow 3s infinite ease-in-out; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); }
+        ::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); rounded: 9999px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.8); }
     </style>
 </head>
 <body class="bg-[#080d19] text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
 
     <!-- Top Navigation Bar -->
-    <header class="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur sticky top-0 z-40">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
+    <header class="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur sticky top-0 z-40">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center font-black text-white text-xl shadow-lg shadow-indigo-500/20">
+                <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center font-black text-white text-lg shadow-md shadow-indigo-500/20">
                     K
                 </div>
                 <div>
                     <div class="flex items-center gap-2">
-                        <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">RSI & Price Kinematics Engine</h1>
+                        <h1 class="text-sm sm:text-base font-bold tracking-tight text-white">RSI & Price Kinematics Engine</h1>
                         <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                             ACTIVE
                         </span>
                     </div>
-                    <p class="text-xs text-slate-400">Real-time Phase Regimes &bull; 1m Velocities &bull; Accelerations</p>
+                    <p class="text-[11px] text-slate-400">Multi-Stream Aggregation &bull; 1m Velocities &bull; Accelerations &bull; Dynamic Phase Regimes</p>
                 </div>
             </div>
 
-            <!-- Engine Context & Controls -->
-            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                <div class="hidden md:flex items-center gap-2 px-3 py-1.5 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
-                    <span class="text-slate-400">Run ID:</span>
+            <!-- Engine Controls -->
+            <div class="flex flex-wrap items-center gap-2">
+                <div class="hidden lg:flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
+                    <span class="text-slate-400">Run:</span>
                     <span id="runIdBadge" class="mono font-semibold text-indigo-300">__RUN_ID__</span>
                 </div>
 
-                <div class="flex items-center gap-2 px-3 py-1.5 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
+                <div class="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
                     <span class="text-slate-400">Next Minute:</span>
                     <span id="minuteCountdown" class="mono font-semibold text-amber-300">--s</span>
                 </div>
 
-                <button id="btnFlush" onclick="forceFinalize()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 rounded-lg text-xs font-semibold transition flex items-center gap-1.5">
+                <button id="btnFlush" onclick="forceFinalize()" class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 rounded-lg text-xs font-semibold transition flex items-center gap-1">
                     <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                     Flush Minute
                 </button>
 
-                <button id="btnToggleInject" onclick="toggleInjectModal()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition flex items-center gap-1.5 shadow-md shadow-indigo-600/20">
+                <button id="btnToggleInject" onclick="toggleInjectModal()" class="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition flex items-center gap-1 shadow-md shadow-indigo-600/20">
                     <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
                     Inject Bar
                 </button>
 
-                <button id="btnRefresh" onclick="fetchAllData()" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
+                <button id="btnRefresh" onclick="fetchAllData()" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
                     <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                 </button>
             </div>
@@ -2574,178 +2587,197 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
     </header>
 
     <!-- Main Content Container -->
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 space-y-6">
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 flex-1 space-y-5">
 
         <!-- Banner Toast for Actions -->
-        <div id="statusToast" class="hidden transition-all duration-300 p-3 rounded-xl text-xs font-medium border"></div>
+        <div id="statusToast" class="hidden transition-all duration-300 p-2.5 rounded-xl text-xs font-medium border"></div>
 
         <!-- KPI Metric Cards Grid -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <!-- Active Instruments -->
-            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3.5">
+            <!-- Unique Tracked Symbols -->
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between">
                 <span class="text-xs font-medium text-slate-400 flex items-center justify-between">
-                    Tracked Instruments
-                    <span id="activeProvidersCount" class="text-[10px] mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">0 Providers</span>
+                    Tracked Symbols
+                    <span id="activeProvidersCount" class="text-[10px] mono px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-semibold">5 Providers</span>
                 </span>
-                <div class="mt-2 flex items-baseline gap-2">
-                    <span id="totalInstrumentsCount" class="text-2xl sm:text-3xl font-extrabold text-white mono">0</span>
-                    <span class="text-xs text-slate-400">symbols</span>
+                <div class="mt-1 flex items-baseline gap-2">
+                    <span id="uniqueSymbolsCount" class="text-2xl sm:text-3xl font-extrabold text-white mono">0</span>
+                    <span class="text-xs text-slate-400">unique symbols</span>
                 </div>
-                <div class="mt-2 flex items-center gap-1.5 text-[10px] text-slate-400">
-                    <span id="bullCount" class="text-emerald-400 font-semibold">0 Bull</span> &bull;
-                    <span id="bearCount" class="text-rose-400 font-semibold">0 Bear</span> &bull;
-                    <span id="neutralCount" class="text-slate-400 font-semibold">0 Neutral</span>
+                <div class="mt-1.5 flex items-center justify-between text-[11px]">
+                    <span class="text-slate-400"><span id="streamFeedsCount" class="text-indigo-300 font-bold mono">0</span> streams</span>
+                    <div class="flex items-center gap-1.5 text-[10px]">
+                        <span id="bullCount" class="text-emerald-400 font-bold">0 Bull</span> &bull;
+                        <span id="bearCount" class="text-rose-400 font-bold">0 Bear</span> &bull;
+                        <span id="neutralCount" class="text-slate-400 font-bold">0 Neutral</span>
+                    </div>
                 </div>
             </div>
 
             <!-- Peak RSI Velocity -->
-            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
-                <span class="text-xs font-medium text-slate-400">Peak RSI Velocity (?RSI)</span>
-                <div class="mt-2 flex items-baseline gap-2">
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Peak RSI Velocity (&Delta;RSI)</span>
+                <div class="mt-1 flex items-baseline gap-2">
                     <span id="peakRsiVel" class="text-2xl sm:text-3xl font-extrabold text-emerald-400 mono">--</span>
                     <span class="text-xs text-slate-400">/min</span>
                 </div>
-                <div class="mt-2 text-[11px] text-slate-400 truncate">
-                    Symbol: <span id="peakRsiVelSymbol" class="font-semibold text-slate-200 mono">None</span>
+                <div class="mt-1.5 text-[11px] text-slate-400 truncate flex items-center justify-between">
+                    <span>Symbol: <span id="peakRsiVelSymbol" class="font-semibold text-slate-200 mono">None</span></span>
+                    <span id="peakRsiVelRegime" class="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-800/50">Bull</span>
                 </div>
             </div>
 
             <!-- Peak Price Velocity -->
-            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
-                <span class="text-xs font-medium text-slate-400">Peak Price Velocity (?P/P%)</span>
-                <div class="mt-2 flex items-baseline gap-2">
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Peak Price Velocity (&Delta;P/P%)</span>
+                <div class="mt-1 flex items-baseline gap-2">
                     <span id="peakPriceVel" class="text-2xl sm:text-3xl font-extrabold text-indigo-400 mono">--</span>
                     <span class="text-xs text-slate-400">%/min</span>
                 </div>
-                <div class="mt-2 text-[11px] text-slate-400 truncate">
-                    Symbol: <span id="peakPriceVelSymbol" class="font-semibold text-slate-200 mono">None</span>
+                <div class="mt-1.5 text-[11px] text-slate-400 truncate flex items-center justify-between">
+                    <span>Symbol: <span id="peakPriceVelSymbol" class="font-semibold text-slate-200 mono">None</span></span>
+                    <span id="peakPriceVelRegime" class="text-[10px] px-1.5 py-0.2 rounded bg-indigo-950/60 text-indigo-300 border border-indigo-800/50">Active</span>
                 </div>
             </div>
 
             <!-- Peak Acceleration -->
-            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
-                <span class="text-xs font-medium text-slate-400">Max RSI Acceleration (a)</span>
-                <div class="mt-2 flex items-baseline gap-2">
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-xl p-3.5 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Max Acceleration (a)</span>
+                <div class="mt-1 flex items-baseline gap-2">
                     <span id="peakRsiAccel" class="text-2xl sm:text-3xl font-extrabold text-cyan-400 mono">--</span>
                     <span class="text-xs text-slate-400">/min²</span>
                 </div>
-                <div class="mt-2 text-[11px] text-slate-400 truncate">
-                    Queue: <span id="pendingQueueSize" class="font-semibold text-slate-200 mono">0</span> &bull; Late: <span id="lateRecordsCount" class="font-semibold text-slate-200 mono">0</span>
+                <div class="mt-1.5 text-[11px] text-slate-400 truncate flex items-center justify-between">
+                    <span>Queue: <span id="pendingQueueSize" class="font-semibold text-slate-200 mono">0</span></span>
+                    <span>Late: <span id="lateRecordsCount" class="font-semibold text-slate-200 mono">0</span></span>
                 </div>
             </div>
         </div>
 
         <!-- 4-Quadrant Kinematics Matrix Grid -->
-        <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5">
-            <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <div>
-                    <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                    <h2 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
                         <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
                         Kinematics 4-Quadrant Phase Matrix
                     </h2>
-                    <p class="text-xs text-slate-400">Velocity (v) vs Acceleration (a) dynamic regime mapping across tracked instruments</p>
+                    <p class="text-[11px] text-slate-400">Velocity (v) vs Acceleration (a) regime classification. Click any symbol to inspect below.</p>
                 </div>
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <!-- Quadrant II: Decelerating Bullish (Top Left) -->
-                <div class="bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-4">
+                <div class="bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
                             <span>??</span> Decelerating Bullish
                         </span>
-                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-200">v &gt; 0, a &lt; 0</span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-200">v &gt; 0, a &le; 0</span>
                     </div>
-                    <p class="text-[11px] text-cyan-400/80 mt-1">Bullish exhaustion &bull; upward velocity slowing &bull; consolidation / top forming</p>
-                    <div id="quadDecBullish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
-                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    <p class="text-[10px] text-cyan-400/80 mt-0.5">Bullish exhaustion &bull; upward velocity slowing &bull; consolidation / potential top</p>
+                    <div id="quadDecBullish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
                 </div>
 
                 <!-- Quadrant I: Accelerating Bullish (Top Right) -->
-                <div class="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-4">
+                <div class="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
                             <span>??</span> Accelerating Bullish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-emerald-900/40 text-emerald-200">v &gt; 0, a &gt; 0</span>
                     </div>
-                    <p class="text-[11px] text-emerald-400/80 mt-1">Aggressive momentum expansion &bull; buyers dominant &bull; strong trend thrust</p>
-                    <div id="quadAccBullish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
-                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    <p class="text-[10px] text-emerald-400/80 mt-0.5">Aggressive momentum expansion &bull; buyers dominant &bull; trend thrust</p>
+                    <div id="quadAccBullish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
                 </div>
 
                 <!-- Quadrant III: Accelerating Bearish (Bottom Left) -->
-                <div class="bg-rose-950/20 border border-rose-800/40 rounded-xl p-4">
+                <div class="bg-rose-950/20 border border-rose-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-rose-300 flex items-center gap-1.5">
                             <span>??</span> Accelerating Bearish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-rose-900/40 text-rose-200">v &lt; 0, a &lt; 0</span>
                     </div>
-                    <p class="text-[11px] text-rose-400/80 mt-1">Aggressive selling impulse &bull; downward velocity speeding up &bull; flush / breakdown</p>
-                    <div id="quadAccBearish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
-                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    <p class="text-[10px] text-rose-400/80 mt-0.5">Aggressive selling impulse &bull; downward velocity speeding up &bull; breakdown</p>
+                    <div id="quadAccBearish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
                 </div>
 
                 <!-- Quadrant IV: Decelerating Bearish (Bottom Right) -->
-                <div class="bg-amber-950/20 border border-amber-800/40 rounded-xl p-4">
+                <div class="bg-amber-950/20 border border-amber-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                             <span>??</span> Decelerating Bearish
                         </span>
-                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-amber-900/40 text-amber-200">v &lt; 0, a &gt; 0</span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-amber-900/40 text-amber-200">v &lt; 0, a &ge; 0</span>
                     </div>
-                    <p class="text-[11px] text-amber-400/80 mt-1">Downside absorption &bull; selling losing speed &bull; basing / potential recovery</p>
-                    <div id="quadDecBearish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
-                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    <p class="text-[10px] text-amber-400/80 mt-0.5">Downside absorption &bull; selling losing speed &bull; basing / potential reversal</p>
+                    <div id="quadDecBearish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Filter & Search Controls -->
+        <!-- Table Toolbar: Search, Mode Switcher & Regime Filters -->
         <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-            <div class="relative flex-1 max-w-xs">
-                <input id="symbolSearch" oninput="applyFilters()" type="text" placeholder="Filter symbol (e.g. NVDA, SPY)..." class="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition">
+            <div class="flex flex-wrap items-center gap-2 flex-1">
+                <div class="relative w-full sm:w-64">
+                    <input id="symbolSearch" oninput="onSearchInput()" type="text" placeholder="Filter symbol (e.g. SNDK, NVDA, SPY)..." class="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-3.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition">
+                    <button onclick="clearSearch()" id="btnClearSearch" class="hidden absolute right-2.5 top-1.5 text-slate-400 hover:text-white text-xs">&times;</button>
+                </div>
+
+                <!-- View Switcher: Consolidated Symbols vs All Streams -->
+                <div class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800 text-xs font-medium">
+                    <button id="btnViewConsolidated" onclick="setViewMode('consolidated')" class="px-2.5 py-1 rounded-md text-white bg-indigo-600 transition shadow-sm font-semibold">
+                        Consolidated Symbols (<span id="tabConsolidatedCount">0</span>)
+                    </button>
+                    <button id="btnViewStreams" onclick="setViewMode('streams')" class="px-2.5 py-1 rounded-md text-slate-400 hover:text-slate-200 transition">
+                        All Provider Feeds (<span id="tabStreamsCount">0</span>)
+                    </button>
+                </div>
             </div>
 
             <!-- Regime Filter Buttons -->
-            <div class="flex flex-wrap items-center gap-1.5 text-xs">
-                <button onclick="setFilter('all')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500" data-regime="all">All</button>
-                <button onclick="setFilter('accelerating_bullish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bullish">Acc Bullish</button>
-                <button onclick="setFilter('decelerating_bullish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bullish">Dec Bullish</button>
-                <button onclick="setFilter('accelerating_bearish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bearish">Acc Bearish</button>
-                <button onclick="setFilter('decelerating_bearish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bearish">Dec Bearish</button>
-                <button onclick="setFilter('neutral')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="neutral">Neutral</button>
+            <div class="flex flex-wrap items-center gap-1 text-xs">
+                <button onclick="setFilter('all')" class="filter-btn px-2.5 py-1 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500" data-regime="all">All</button>
+                <button onclick="setFilter('accelerating_bullish')" class="filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bullish">Acc Bull</button>
+                <button onclick="setFilter('decelerating_bullish')" class="filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bullish">Dec Bull</button>
+                <button onclick="setFilter('accelerating_bearish')" class="filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bearish">Acc Bear</button>
+                <button onclick="setFilter('decelerating_bearish')" class="filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bearish">Dec Bear</button>
+                <button onclick="setFilter('neutral')" class="filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="neutral">Neutral</button>
             </div>
         </div>
 
-        <!-- Main Instruments Kinematics Table -->
+        <!-- Main Instruments Kinematics Table (Scrollable container to protect bottom panel) -->
         <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl overflow-hidden shadow-xl">
-            <div class="overflow-x-auto">
+            <div class="max-h-[380px] overflow-y-auto">
                 <table class="w-full text-left text-xs">
-                    <thead>
-                        <tr class="bg-slate-950/60 border-b border-slate-800 text-slate-400 font-semibold">
-                            <th class="px-4 py-3">Symbol / Feed</th>
-                            <th class="px-4 py-3 text-right">Close ($)</th>
-                            <th class="px-4 py-3 text-right">Price Velocity (v)</th>
-                            <th class="px-4 py-3 text-right">Price Accel (a)</th>
-                            <th class="px-4 py-3 min-w-[140px]">RSI (14)</th>
-                            <th class="px-4 py-3 text-right">RSI Velocity (v_rsi)</th>
-                            <th class="px-4 py-3 text-right">RSI Accel (a_rsi)</th>
-                            <th class="px-4 py-3">Kinematics Regime</th>
-                            <th class="px-4 py-3 text-right">Momentum (3m)</th>
-                            <th class="px-4 py-3 text-center">Action</th>
+                    <thead class="sticky top-0 z-20 bg-slate-950/90 backdrop-blur border-b border-slate-800 text-slate-400 font-semibold shadow-sm">
+                        <tr>
+                            <th class="px-4 py-2.5" id="thSymbolCol">Symbol / Feeds</th>
+                            <th class="px-4 py-2.5 text-right">Close ($)</th>
+                            <th class="px-4 py-2.5 text-right">Price Velocity (v)</th>
+                            <th class="px-4 py-2.5 text-right">Price Accel (a)</th>
+                            <th class="px-4 py-2.5 min-w-[130px]">RSI (14)</th>
+                            <th class="px-4 py-2.5 text-right">RSI Velocity (v_rsi)</th>
+                            <th class="px-4 py-2.5 text-right">RSI Accel (a_rsi)</th>
+                            <th class="px-4 py-2.5">Kinematics Regime</th>
+                            <th class="px-4 py-2.5 text-right">Momentum (3m)</th>
+                            <th class="px-4 py-2.5 text-center">Inspect / Test</th>
                         </tr>
                     </thead>
                     <tbody id="kinematicsTableBody" class="divide-y divide-slate-800/60">
                         <tr>
                             <td colspan="10" class="px-4 py-8 text-center text-slate-500">
                                 <div class="flex flex-col items-center justify-center gap-2">
-                                    <svg class="w-6 h-6 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+                                    <svg class="w-5 h-5 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
                                     <span>Connecting to engine telemetry stream...</span>
                                 </div>
                             </td>
@@ -2755,59 +2787,136 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Minute Summaries Feed & Raw Output Section -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- Emitted Summaries Feed (2 cols) -->
-            <div class="lg:col-span-2 bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5">
-                <div class="flex items-center justify-between mb-4">
-                    <div>
-                        <h3 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                            Emitted Minute Summaries Log Feed
-                        </h3>
-                        <p class="text-xs text-slate-400">Records emitted to <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
+        <!-- ========================================================================================= -->
+        <!-- BOTTOM PANEL: ALWAYS LOADS WITH OR WITHOUT SYMBOL FILTER -->
+        <!-- ========================================================================================= -->
+        <div id="bottomInspectorSection" class="space-y-4 pt-2">
+            
+            <!-- Section 1: Symbol Kinematics Deep-Dive & Multi-Stream Comparison -->
+            <div class="bg-slate-900/60 border border-slate-800/90 rounded-2xl p-5 shadow-xl">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3.5 border-b border-slate-800/80">
+                    <div class="flex items-center gap-2.5">
+                        <div class="w-8 h-8 rounded-lg bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 flex items-center justify-center font-black mono text-sm" id="detailSymbolBadge">
+                            --
+                        </div>
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <h3 class="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+                                    <span id="detailSymbolTitle">Symbol Multi-Stream Inspector</span>
+                                    <span id="detailRegimeBadge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold border bg-slate-800 text-slate-300 border-slate-700">Neutral</span>
+                                </h3>
+                            </div>
+                            <p class="text-[11px] text-slate-400" id="detailSymbolSubtitle">Select any symbol in table above or dropdown to inspect cross-provider consensus</p>
+                        </div>
                     </div>
-                    <button onclick="fetchMinuteSummaries()" class="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition">Refresh Summaries</button>
+
+                    <!-- Symbol Selector Dropdown directly in bottom panel -->
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-slate-400 font-medium">Inspect Symbol:</span>
+                        <select id="bottomSymbolSelect" onchange="selectSymbolFromDropdown(this.value)" class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-white mono focus:outline-none focus:border-indigo-500">
+                            <option value="">Loading symbols...</option>
+                        </select>
+                    </div>
                 </div>
 
-                <div id="summariesContainer" class="space-y-3 max-h-[460px] overflow-y-auto pr-1">
-                    <div class="text-center py-8 text-slate-500 text-xs">Waiting for first minute summary finalization...</div>
+                <!-- Deep-Dive Content Container (Always renders content) -->
+                <div id="symbolDeepDiveContent" class="mt-4 space-y-4">
+                    <!-- Provider Comparison Table for Selected Symbol -->
+                    <div class="overflow-x-auto rounded-xl border border-slate-800/80 bg-slate-950/50">
+                        <table class="w-full text-left text-xs">
+                            <thead class="bg-slate-950/80 text-slate-400 font-semibold border-b border-slate-800">
+                                <tr>
+                                    <th class="px-3.5 py-2">Provider Feed</th>
+                                    <th class="px-3.5 py-2 text-right">Close ($)</th>
+                                    <th class="px-3.5 py-2 text-right">Price Velocity (v)</th>
+                                    <th class="px-3.5 py-2 text-right">Price Accel (a)</th>
+                                    <th class="px-3.5 py-2 text-right">RSI (14)</th>
+                                    <th class="px-3.5 py-2 text-right">RSI Velocity (v_rsi)</th>
+                                    <th class="px-3.5 py-2 text-right">RSI Accel (a_rsi)</th>
+                                    <th class="px-3.5 py-2">Phase Regime</th>
+                                    <th class="px-3.5 py-2 text-center">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="detailProvidersTableBody" class="divide-y divide-slate-800/50 font-mono text-[11px]">
+                                <tr>
+                                    <td colspan="9" class="px-3.5 py-4 text-center text-slate-500">
+                                        Select a symbol to view provider stream breakdown.
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Phase Explanation Banner -->
+                    <div id="detailPhaseExplanation" class="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80 text-xs flex items-center justify-between gap-4">
+                        <div class="flex items-center gap-2">
+                            <span class="text-indigo-400 font-bold">Kinematic Diagnosis:</span>
+                            <span id="detailDiagnosisText" class="text-slate-300">Awaiting stream telemetry...</span>
+                        </div>
+                        <button onclick="injectForSelectedSymbol()" class="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] font-semibold transition shrink-0">
+                            Test Inject This Symbol
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            <!-- Position Monitor & Engine Diagnostic Info (1 col) -->
-            <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 space-y-4">
-                <div>
-                    <h3 class="text-sm font-bold text-white uppercase tracking-wider">Engine Diagnostic Telemetry</h3>
-                    <p class="text-xs text-slate-400">Positions monitor &amp; provider heartbeat</p>
-                </div>
-
-                <div class="space-y-3 text-xs">
-                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                        <span class="text-slate-400">Position Monitor</span>
-                        <span id="posMonitorStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+            <!-- Section 2: Emitted Minute Summaries Log & Position Monitor (2 cols) -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <!-- Minute Summaries Feed (2 cols) -->
+                <div class="lg:col-span-2 bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 space-y-3">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                                Emitted Minute Summaries Log Feed
+                            </h3>
+                            <p class="text-[11px] text-slate-400">Records from <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
+                        </div>
+                        <button onclick="fetchMinuteSummaries()" class="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition">Refresh Logs</button>
                     </div>
 
-                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                        <span class="text-slate-400">Active Equity Positions</span>
-                        <span id="posMonitorEquity" class="mono font-semibold text-slate-200">0</span>
-                    </div>
-
-                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                        <span class="text-slate-400">Active Option Positions</span>
-                        <span id="posMonitorOption" class="mono font-semibold text-slate-200">0</span>
-                    </div>
-
-                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                        <span class="text-slate-400">Last Telemetry Poll</span>
-                        <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
+                    <div id="summariesContainer" class="space-y-2.5 max-h-[280px] overflow-y-auto pr-1">
+                        <div class="p-4 rounded-xl bg-slate-950/50 border border-slate-800/80 text-center text-slate-400 text-xs space-y-1.5">
+                            <div class="font-semibold text-slate-300">Awaiting Minute Finalization</div>
+                            <p class="text-[11px] text-slate-500">Summaries are emitted at minute boundary + 45s delay. Live ticks are buffered in memory.</p>
+                        </div>
                     </div>
                 </div>
 
-                <div class="pt-2 border-t border-slate-800/80">
-                    <h4 class="text-xs font-semibold text-slate-300 mb-2">Connected Feeds</h4>
-                    <div id="connectedFeedsList" class="flex flex-wrap gap-1.5 text-xs">
-                        <span class="text-slate-500">Checking...</span>
+                <!-- Position Monitor & Engine Heartbeat (1 col) -->
+                <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 space-y-3">
+                    <div>
+                        <h3 class="text-xs font-bold text-white uppercase tracking-wider">Engine Diagnostic Telemetry</h3>
+                        <p class="text-[11px] text-slate-400">Positions monitor &amp; feed heartbeat</p>
+                    </div>
+
+                    <div class="space-y-2 text-xs">
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Position Monitor</span>
+                            <span id="posMonitorStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Active Equity Positions</span>
+                            <span id="posMonitorEquity" class="mono font-semibold text-slate-200">0</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Active Option Positions</span>
+                            <span id="posMonitorOption" class="mono font-semibold text-slate-200">0</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Last Telemetry Poll</span>
+                            <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
+                        </div>
+                    </div>
+
+                    <div class="pt-2 border-t border-slate-800/80">
+                        <h4 class="text-[11px] font-semibold text-slate-300 mb-1.5">Connected Feeds</h4>
+                        <div id="connectedFeedsList" class="flex flex-wrap gap-1 text-[11px]">
+                            <span class="text-slate-500">Checking feeds...</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2840,7 +2949,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div>
                     <label class="block text-slate-300 font-medium mb-1">Symbol</label>
-                    <input id="injectSymbol" type="text" required placeholder="e.g. NVDA" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white uppercase font-mono focus:outline-none focus:border-indigo-500">
+                    <input id="injectSymbol" type="text" required placeholder="e.g. SNDK" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white uppercase font-mono focus:outline-none focus:border-indigo-500">
                 </div>
 
                 <div>
@@ -2861,47 +2970,98 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <!-- JavaScript Application Engine -->
     <script>
         let currentFilter = 'all';
+        let currentViewMode = 'consolidated'; // 'consolidated' or 'streams'
+        let selectedSymbol = null;
         let latestData = null;
         let nextMinuteUtc = null;
         let countdownTimer = null;
+        let expandedSymbols = new Set();
 
         const REGIME_CONFIG = {
             accelerating_bullish: {
                 label: 'Accelerating Bullish',
                 badgeClass: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
                 icon: '??',
-                pillColor: 'text-emerald-400'
+                pillColor: 'text-emerald-400',
+                desc: 'Strong buyer thrust & momentum expansion'
             },
             decelerating_bullish: {
                 label: 'Decelerating Bullish',
                 badgeClass: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30',
                 icon: '??',
-                pillColor: 'text-cyan-400'
+                pillColor: 'text-cyan-400',
+                desc: 'Upward momentum waning / consolidation'
             },
             accelerating_bearish: {
                 label: 'Accelerating Bearish',
                 badgeClass: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
                 icon: '??',
-                pillColor: 'text-rose-400'
+                pillColor: 'text-rose-400',
+                desc: 'Aggressive selling impulse accelerating'
             },
             decelerating_bearish: {
                 label: 'Decelerating Bearish',
                 badgeClass: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
                 icon: '??',
-                pillColor: 'text-amber-400'
+                pillColor: 'text-amber-400',
+                desc: 'Downside absorption / selling deceleration'
             },
             neutral: {
                 label: 'Neutral',
                 badgeClass: 'bg-slate-700/30 text-slate-300 border-slate-700',
                 icon: '?',
-                pillColor: 'text-slate-400'
+                pillColor: 'text-slate-400',
+                desc: 'Equilibrium / no directional acceleration'
             }
         };
+
+        // Safe format helpers that NEVER throw on null/undefined
+        function safeNum(v) {
+            if (v === null || v === undefined) return null;
+            const n = Number(v);
+            return isFinite(n) ? n : null;
+        }
+
+        function fmtPrice(v) {
+            const n = safeNum(v);
+            return n !== null ? '$' + n.toFixed(2) : '--';
+        }
+
+        function fmtNum(v, dec = 2, prefix = '') {
+            const n = safeNum(v);
+            if (n === null) return '--';
+            const s = n >= 0 && prefix === '+' ? '+' : '';
+            return s + n.toFixed(dec);
+        }
+
+        function fmtPct(v, dec = 2, prefix = '') {
+            const n = safeNum(v);
+            if (n === null) return '--';
+            const s = n >= 0 && prefix === '+' ? '+' : '';
+            return s + n.toFixed(dec) + '%';
+        }
+
+        function getRegime(inst) {
+            if (inst.regime && inst.regime !== 'neutral') return inst.regime;
+            const rv = safeNum(inst.rsi_velocity);
+            const ra = safeNum(inst.rsi_acceleration);
+            if (rv !== null) {
+                if (rv > 0) return (ra !== null && ra > 0) ? 'accelerating_bullish' : 'decelerating_bullish';
+                if (rv < 0) return (ra !== null && ra < 0) ? 'accelerating_bearish' : 'decelerating_bearish';
+            }
+            const pv = safeNum(inst.price_velocity);
+            const pa = safeNum(inst.price_acceleration);
+            if (pv !== null) {
+                if (pv > 0) return (pa !== null && pa > 0) ? 'accelerating_bullish' : 'decelerating_bullish';
+                if (pv < 0) return (pa !== null && pa < 0) ? 'accelerating_bearish' : 'decelerating_bearish';
+            }
+            return 'neutral';
+        }
 
         function showToast(message, type = 'success') {
             const toast = document.getElementById('statusToast');
             toast.textContent = message;
-            toast.className = `p-3 rounded-xl text-xs font-medium border block ${
+            toast.className = `p-2.5 rounded-xl text-xs font-medium border block ${
                 type === 'success' 
                     ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800' 
                     : 'bg-rose-950/40 text-rose-300 border-rose-800'
@@ -2909,15 +3069,47 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             setTimeout(() => { toast.classList.add('hidden'); }, 4000);
         }
 
+        function setViewMode(mode) {
+            currentViewMode = mode;
+            const btnConsolidated = document.getElementById('btnViewConsolidated');
+            const btnStreams = document.getElementById('btnViewStreams');
+            if (mode === 'consolidated') {
+                btnConsolidated.className = 'px-2.5 py-1 rounded-md text-white bg-indigo-600 transition shadow-sm font-semibold';
+                btnStreams.className = 'px-2.5 py-1 rounded-md text-slate-400 hover:text-slate-200 transition';
+                document.getElementById('thSymbolCol').textContent = 'Symbol / Providers';
+            } else {
+                btnStreams.className = 'px-2.5 py-1 rounded-md text-white bg-indigo-600 transition shadow-sm font-semibold';
+                btnConsolidated.className = 'px-2.5 py-1 rounded-md text-slate-400 hover:text-slate-200 transition';
+                document.getElementById('thSymbolCol').textContent = 'Symbol / Feed';
+            }
+            applyFilters();
+        }
+
         function setFilter(regime) {
             currentFilter = regime;
             document.querySelectorAll('.filter-btn').forEach(btn => {
                 if (btn.dataset.regime === regime) {
-                    btn.className = 'filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500';
+                    btn.className = 'filter-btn px-2 py-1 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500';
                 } else {
-                    btn.className = 'filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white';
+                    btn.className = 'filter-btn px-2 py-1 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white';
                 }
             });
+            applyFilters();
+        }
+
+        function onSearchInput() {
+            const val = (document.getElementById('symbolSearch').value || '').trim().toUpperCase();
+            document.getElementById('btnClearSearch').classList.toggle('hidden', !val);
+            if (val) {
+                selectedSymbol = val;
+            }
+            applyFilters();
+            renderSymbolDeepDive();
+        }
+
+        function clearSearch() {
+            document.getElementById('symbolSearch').value = '';
+            document.getElementById('btnClearSearch').classList.add('hidden');
             applyFilters();
         }
 
@@ -2928,6 +3120,38 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById('injectSymbol').value = prefillSymbol;
                 document.getElementById('injectPrice').focus();
             }
+        }
+
+        function injectForSelectedSymbol() {
+            if (selectedSymbol) {
+                toggleInjectModal(selectedSymbol);
+            } else {
+                toggleInjectModal();
+            }
+        }
+
+        function selectSymbolFromDropdown(sym) {
+            if (!sym) return;
+            selectedSymbol = sym;
+            renderSymbolDeepDive();
+        }
+
+        function selectAndInspectSymbol(sym) {
+            selectedSymbol = sym;
+            renderSymbolDeepDive();
+            const el = document.getElementById('bottomInspectorSection');
+            if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
+
+        function toggleExpandSymbol(sym) {
+            if (expandedSymbols.has(sym)) {
+                expandedSymbols.delete(sym);
+            } else {
+                expandedSymbols.add(sym);
+            }
+            applyFilters();
         }
 
         async function handleInjectSubmit(e) {
@@ -2950,6 +3174,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (res.ok) {
                     showToast(`Successfully injected bar for ${symbol} @ $${price.toFixed(2)}`);
                     toggleInjectModal();
+                    selectedSymbol = symbol;
                     await fetchAllData();
                 } else {
                     showToast(`Injection failed: ${data.message || 'Error'}`, 'error');
@@ -2992,11 +3217,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const el = document.getElementById('minuteCountdown');
             if (el) {
                 el.textContent = `${diff}s`;
-                if (diff <= 5) {
-                    el.className = 'mono font-semibold text-rose-400 animate-pulse';
-                } else {
-                    el.className = 'mono font-semibold text-amber-300';
-                }
+                el.className = diff <= 5 ? 'mono font-semibold text-rose-400 animate-pulse' : 'mono font-semibold text-amber-300';
             }
         }
 
@@ -3014,9 +3235,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     renderStatusMetrics(statusRes.metrics);
                 }
 
-                if (kinRes && kinRes.instruments) {
+                if (kinRes) {
                     latestData = kinRes;
                     renderKinematics(kinRes);
+                    renderSymbolDeepDive();
                 }
             } catch (err) {
                 console.error("Telemetry fetch error:", err);
@@ -3041,15 +3263,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById('posMonitorLastPoll').textContent = m.position_monitor.last_poll_utc ? new Date(m.position_monitor.last_poll_utc).toLocaleTimeString() : '--';
             }
 
-            // Connected Providers
+            // Connected Feeds
             const feedsContainer = document.getElementById('connectedFeedsList');
             if (feedsContainer && m.connected_providers) {
                 feedsContainer.innerHTML = '';
                 const providers = Object.entries(m.connected_providers);
-                document.getElementById('activeProvidersCount').textContent = `${providers.filter(([_, c]) => c).length} Providers Connected`;
+                document.getElementById('activeProvidersCount').textContent = `${providers.filter(([_, c]) => c).length} Providers Online`;
                 providers.forEach(([prov, connected]) => {
                     const badge = document.createElement('span');
-                    badge.className = `px-2 py-0.5 rounded text-[11px] font-mono font-medium border ${
+                    badge.className = `px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border ${
                         connected 
                             ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800' 
                             : 'bg-rose-950/40 text-rose-300 border-rose-800'
@@ -3061,57 +3283,90 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function renderKinematics(data) {
-            const instruments = data.instruments || [];
-            document.getElementById('totalInstrumentsCount').textContent = instruments.length;
+            const consolidated = data.consolidated_symbols || [];
+            const streams = data.instruments || [];
 
-            const counts = data.regime_counts || {};
-            const bull = (counts.accelerating_bullish || 0) + (counts.decelerating_bullish || 0);
-            const bear = (counts.accelerating_bearish || 0) + (counts.decelerating_bearish || 0);
-            const neutral = counts.neutral || 0;
+            // 1. Correct deduplicated symbol counts
+            const uniqueCount = data.total_unique_symbols || consolidated.length;
+            const streamsCount = data.total_provider_streams || streams.length;
+            document.getElementById('uniqueSymbolsCount').textContent = uniqueCount;
+            document.getElementById('streamFeedsCount').textContent = streamsCount;
+            document.getElementById('tabConsolidatedCount').textContent = uniqueCount;
+            document.getElementById('tabStreamsCount').textContent = streamsCount;
+
+            // 2. Regime counts based on unique symbols
+            let bull = 0, bear = 0, neutral = 0;
+            consolidated.forEach(item => {
+                const r = getRegime(item);
+                item.regime = r; // ensure normalized
+                if (r === 'accelerating_bullish' || r === 'decelerating_bullish') bull++;
+                else if (r === 'accelerating_bearish' || r === 'decelerating_bearish') bear++;
+                else neutral++;
+            });
 
             document.getElementById('bullCount').textContent = `${bull} Bull`;
             document.getElementById('bearCount').textContent = `${bear} Bear`;
             document.getElementById('neutralCount').textContent = `${neutral} Neutral`;
 
-            // Calculate peak values
-            let maxRsiVel = null, maxRsiVelSym = null;
+            // 3. Peak values across instruments
+            let maxRsiVel = null, maxRsiVelSym = null, maxRsiRegime = 'Bull';
             let maxPriceVel = null, maxPriceVelSym = null;
             let maxRsiAccel = null;
 
-            instruments.forEach(inst => {
-                const rv = inst.rsi_velocity;
+            consolidated.forEach(inst => {
+                const rv = safeNum(inst.rsi_velocity);
                 if (rv !== null && (maxRsiVel === null || Math.abs(rv) > Math.abs(maxRsiVel))) {
                     maxRsiVel = rv;
                     maxRsiVelSym = inst.symbol;
+                    maxRsiRegime = rv >= 0 ? 'Bull' : 'Bear';
                 }
-                const pv = inst.price_velocity_pct;
+                const pv = safeNum(inst.price_velocity_pct);
                 if (pv !== null && (maxPriceVel === null || Math.abs(pv) > Math.abs(maxPriceVel))) {
                     maxPriceVel = pv;
                     maxPriceVelSym = inst.symbol;
                 }
-                const ra = inst.rsi_acceleration;
+                const ra = safeNum(inst.rsi_acceleration);
                 if (ra !== null && (maxRsiAccel === null || Math.abs(ra) > Math.abs(maxRsiAccel))) {
                     maxRsiAccel = ra;
                 }
             });
 
             if (maxRsiVel !== null) {
-                document.getElementById('peakRsiVel').textContent = (maxRsiVel >= 0 ? '+' : '') + maxRsiVel.toFixed(2);
-                document.getElementById('peakRsiVelSymbol').textContent = `${maxRsiVelSym} (${maxRsiVel >= 0 ? 'Bull' : 'Bear'})`;
+                document.getElementById('peakRsiVel').textContent = fmtNum(maxRsiVel, 2, '+');
+                document.getElementById('peakRsiVelSymbol').textContent = maxRsiVelSym || 'None';
+                document.getElementById('peakRsiVelRegime').textContent = maxRsiRegime;
             }
             if (maxPriceVel !== null) {
-                document.getElementById('peakPriceVel').textContent = (maxPriceVel >= 0 ? '+' : '') + maxPriceVel.toFixed(2);
-                document.getElementById('peakPriceVelSymbol').textContent = `${maxPriceVelSym} (${maxPriceVel >= 0 ? 'Bull' : 'Bear'})`;
+                document.getElementById('peakPriceVel').textContent = fmtNum(maxPriceVel, 2, '+');
+                document.getElementById('peakPriceVelSymbol').textContent = maxPriceVelSym || 'None';
             }
             if (maxRsiAccel !== null) {
-                document.getElementById('peakRsiAccel').textContent = (maxRsiAccel >= 0 ? '+' : '') + maxRsiAccel.toFixed(2);
+                document.getElementById('peakRsiAccel').textContent = fmtNum(maxRsiAccel, 2, '+');
             }
 
-            // Render Quadrant Matrix
-            renderQuadrantMatrix(instruments);
+            // 4. Update Dropdown Options in bottom panel
+            updateBottomSymbolDropdown(consolidated);
 
-            // Render Table
+            // 5. Render Quadrant Matrix
+            renderQuadrantMatrix(consolidated);
+
+            // 6. Render Table
             applyFilters();
+        }
+
+        function updateBottomSymbolDropdown(symbolsList) {
+            const sel = document.getElementById('bottomSymbolSelect');
+            if (!sel || symbolsList.length === 0) return;
+            const current = sel.value;
+            sel.innerHTML = symbolsList.map(s => `
+                <option value="${s.symbol}" ${s.symbol === (selectedSymbol || current) ? 'selected' : ''}>
+                    ${s.symbol} (${s.providers_count} feeds &bull; ${s.regime.replace('_', ' ')})
+                </option>
+            `).join('');
+
+            if (!selectedSymbol && symbolsList.length > 0) {
+                selectedSymbol = symbolsList[0].symbol;
+            }
         }
 
         function renderQuadrantMatrix(instruments) {
@@ -3132,8 +3387,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
 
             instruments.forEach(inst => {
-                if (grouped[inst.regime]) {
-                    grouped[inst.regime].push(inst);
+                const r = getRegime(inst);
+                if (grouped[r]) {
+                    grouped[r].push(inst);
                 }
             });
 
@@ -3146,120 +3402,292 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 items.forEach(item => {
                     const pill = document.createElement('span');
-                    const vText = item.rsi_velocity !== null ? `${item.rsi_velocity >= 0 ? '+' : ''}${item.rsi_velocity.toFixed(1)}/m` : '';
+                    const rv = safeNum(item.rsi_velocity);
+                    const vText = rv !== null ? ` ${fmtNum(rv, 1, '+')}/m` : '';
                     pill.className = `cursor-pointer px-2 py-0.5 rounded text-[11px] font-mono font-medium border transition hover:scale-105 ${REGIME_CONFIG[regime].badgeClass}`;
-                    pill.textContent = `${item.symbol} ${vText}`;
-                    pill.title = `${item.symbol} (${item.provider})\nPrice: $${item.close}\nRSI: ${item.rsi}\nv_rsi: ${item.rsi_velocity}\na_rsi: ${item.rsi_acceleration}`;
-                    pill.onclick = () => toggleInjectModal(item.symbol);
+                    pill.textContent = `${item.symbol}${vText}`;
+                    pill.title = `${item.symbol}\nPrice: ${fmtPrice(item.close)}\nRSI: ${fmtNum(item.rsi, 1)}\nv_rsi: ${fmtNum(item.rsi_velocity, 2, '+')}\na_rsi: ${fmtNum(item.rsi_acceleration, 2, '+')}\nClick to inspect in detail panel`;
+                    pill.onclick = () => selectAndInspectSymbol(item.symbol);
                     container.appendChild(pill);
                 });
             });
         }
 
         function applyFilters() {
-            if (!latestData || !latestData.instruments) return;
+            if (!latestData) return;
             const search = (document.getElementById('symbolSearch').value || '').trim().toUpperCase();
             const tbody = document.getElementById('kinematicsTableBody');
 
-            let filtered = latestData.instruments;
+            let dataset = currentViewMode === 'consolidated' 
+                ? (latestData.consolidated_symbols || []) 
+                : (latestData.instruments || []);
+
+            // Normalize regimes
+            dataset.forEach(item => { item.regime = getRegime(item); });
+
+            // Apply regime filter
             if (currentFilter !== 'all') {
-                filtered = filtered.filter(i => i.regime === currentFilter);
-            }
-            if (search) {
-                filtered = filtered.filter(i => i.symbol.includes(search));
+                dataset = dataset.filter(i => i.regime === currentFilter);
             }
 
-            if (filtered.length === 0) {
+            // Apply symbol search
+            if (search) {
+                dataset = dataset.filter(i => i.symbol.includes(search));
+            }
+
+            if (dataset.length === 0) {
                 tbody.innerHTML = `<tr><td colspan="10" class="px-4 py-8 text-center text-slate-500">No instruments match current filter criteria.</td></tr>`;
                 return;
             }
 
-            tbody.innerHTML = filtered.map(inst => {
-                const rConf = REGIME_CONFIG[inst.regime] || REGIME_CONFIG.neutral;
-                const priceFormatted = inst.close !== null ? `$${inst.close.toFixed(2)}` : '--';
+            if (currentViewMode === 'consolidated') {
+                renderConsolidatedTableRows(tbody, dataset);
+            } else {
+                renderStreamTableRows(tbody, dataset);
+            }
+        }
+
+        function renderConsolidatedTableRows(tbody, symbolsList) {
+            tbody.innerHTML = symbolsList.map(item => {
+                const rConf = REGIME_CONFIG[item.regime] || REGIME_CONFIG.neutral;
+                const priceFormatted = fmtPrice(item.close);
                 
-                // Price velocity & pct
+                // Price velocity
+                const pv = safeNum(item.price_velocity);
+                const pvPct = safeNum(item.price_velocity_pct);
                 let pVelText = '--';
                 let pVelColor = 'text-slate-400';
-                if (inst.price_velocity !== null) {
-                    const sign = inst.price_velocity >= 0 ? '+' : '';
-                    const pctText = inst.price_velocity_pct !== null ? ` (${sign}${inst.price_velocity_pct.toFixed(2)}%)` : '';
-                    pVelText = `${sign}$${inst.price_velocity.toFixed(2)}${pctText}`;
-                    pVelColor = inst.price_velocity > 0 ? 'text-emerald-400' : (inst.price_velocity < 0 ? 'text-rose-400' : 'text-slate-400');
+                if (pv !== null) {
+                    pVelText = `${fmtNum(pv, 2, '+')} (${fmtPct(pvPct, 2, '+')})`;
+                    pVelColor = pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400');
                 }
 
                 // Price Accel
-                let pAccelText = '--';
-                if (inst.price_acceleration !== null) {
-                    const sign = inst.price_acceleration >= 0 ? '+' : '';
-                    pAccelText = `${sign}$${inst.price_acceleration.toFixed(2)}`;
-                }
+                const pa = safeNum(item.price_acceleration);
+                const pAccelText = pa !== null ? fmtNum(pa, 2, '+') : '--';
 
-                // RSI progress
-                let rsiVal = inst.rsi !== null ? inst.rsi.toFixed(1) : '--';
-                let rsiBarWidth = inst.rsi !== null ? Math.min(100, Math.max(0, inst.rsi)) : 50;
+                // RSI
+                const rsi = safeNum(item.rsi);
+                const rsiVal = rsi !== null ? rsi.toFixed(1) : '--';
+                const rsiBarWidth = rsi !== null ? Math.min(100, Math.max(0, rsi)) : 50;
                 let rsiBarColor = 'bg-indigo-500';
-                if (inst.rsi !== null) {
-                    if (inst.rsi >= 70) rsiBarColor = 'bg-rose-500';
-                    else if (inst.rsi <= 30) rsiBarColor = 'bg-emerald-500';
+                if (rsi !== null) {
+                    if (rsi >= 70) rsiBarColor = 'bg-rose-500';
+                    else if (rsi <= 30) rsiBarColor = 'bg-emerald-500';
                 }
 
-                // RSI velocity
-                let rVelText = '--';
-                let rVelColor = 'text-slate-400';
-                if (inst.rsi_velocity !== null) {
-                    const sign = inst.rsi_velocity >= 0 ? '+' : '';
-                    rVelText = `${sign}${inst.rsi_velocity.toFixed(2)}/m`;
-                    rVelColor = inst.rsi_velocity > 0 ? 'text-emerald-400' : (inst.rsi_velocity < 0 ? 'text-rose-400' : 'text-slate-400');
-                }
+                // RSI velocity & accel
+                const rv = safeNum(item.rsi_velocity);
+                const rvText = rv !== null ? `${fmtNum(rv, 2, '+')}/m` : '--';
+                const rvColor = rv !== null ? (rv > 0 ? 'text-emerald-400' : (rv < 0 ? 'text-rose-400' : 'text-slate-400')) : 'text-slate-400';
 
-                // RSI Accel
-                let rAccelText = '--';
-                let rAccelColor = 'text-slate-400';
-                if (inst.rsi_acceleration !== null) {
-                    const sign = inst.rsi_acceleration >= 0 ? '+' : '';
-                    rAccelText = `${sign}${inst.rsi_acceleration.toFixed(2)}/m²`;
-                    rAccelColor = inst.rsi_acceleration > 0 ? 'text-cyan-400' : (inst.rsi_acceleration < 0 ? 'text-amber-400' : 'text-slate-400');
-                }
+                const ra = safeNum(item.rsi_acceleration);
+                const raText = ra !== null ? `${fmtNum(ra, 2, '+')}/m²` : '--';
+                const raColor = ra !== null ? (ra > 0 ? 'text-cyan-400' : (ra < 0 ? 'text-amber-400' : 'text-slate-400')) : 'text-slate-400';
 
-                // Momentum 3m
-                let momText = '--';
-                if (inst.momentum_3m_pct !== null) {
-                    const sign = inst.momentum_3m_pct >= 0 ? '+' : '';
-                    momText = `${sign}${inst.momentum_3m_pct.toFixed(2)}%`;
-                }
+                const mom = safeNum(item.momentum_3m_pct);
+                const momText = mom !== null ? fmtPct(mom, 2, '+') : '--';
 
-                return `
-                    <tr class="hover:bg-slate-800/40 transition">
-                        <td class="px-4 py-3">
-                            <div class="font-bold text-white mono">${inst.symbol}</div>
-                            <div class="text-[10px] text-slate-500 uppercase">${inst.provider}</div>
-                        </td>
-                        <td class="px-4 py-3 text-right mono font-semibold text-slate-200">${priceFormatted}</td>
-                        <td class="px-4 py-3 text-right mono font-semibold ${pVelColor}">${pVelText}</td>
-                        <td class="px-4 py-3 text-right mono text-slate-300">${pAccelText}</td>
-                        <td class="px-4 py-3">
+                const isExpanded = expandedSymbols.has(item.symbol);
+                const isSelected = selectedSymbol === item.symbol;
+
+                let rowHtml = `
+                    <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-indigo-950/20 border-l-2 border-indigo-500' : ''}" onclick="selectAndInspectSymbol('${item.symbol}')">
+                        <td class="px-4 py-2.5">
                             <div class="flex items-center gap-2">
-                                <span class="mono font-bold text-slate-200 w-10 text-right">${rsiVal}</span>
-                                <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                <span class="font-bold text-white mono text-xs">${item.symbol}</span>
+                                <button onclick="event.stopPropagation(); toggleExpandSymbol('${item.symbol}')" class="px-1.5 py-0.5 rounded text-[10px] mono bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition" title="Toggle provider feed breakdown">
+                                    ${item.providers_count} feeds ${isExpanded ? '?' : '?'}
+                                </button>
+                            </div>
+                        </td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold text-slate-200">${priceFormatted}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${pVelColor}">${pVelText}</td>
+                        <td class="px-4 py-2.5 text-right mono text-slate-300">${pAccelText}</td>
+                        <td class="px-4 py-2.5">
+                            <div class="flex items-center gap-2">
+                                <span class="mono font-bold text-slate-200 w-9 text-right">${rsiVal}</span>
+                                <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden min-w-[50px]">
                                     <div class="h-full ${rsiBarColor} transition-all duration-300" style="width: ${rsiBarWidth}%"></div>
                                 </div>
                             </div>
                         </td>
-                        <td class="px-4 py-3 text-right mono font-semibold ${rVelColor}">${rVelText}</td>
-                        <td class="px-4 py-3 text-right mono font-semibold ${rAccelColor}">${rAccelText}</td>
-                        <td class="px-4 py-3">
-                            <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${rConf.badgeClass}">
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${rvColor}">${rvText}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${raColor}">${raText}</td>
+                        <td class="px-4 py-2.5">
+                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${rConf.badgeClass}">
                                 <span>${rConf.icon}</span>
                                 ${rConf.label}
                             </span>
                         </td>
-                        <td class="px-4 py-3 text-right mono text-slate-300">${momText}</td>
-                        <td class="px-4 py-3 text-center">
-                            <button onclick="toggleInjectModal('${inst.symbol}')" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] font-mono transition" title="Inject Test Bar">
+                        <td class="px-4 py-2.5 text-right mono text-slate-300">${momText}</td>
+                        <td class="px-4 py-2.5 text-center">
+                            <div class="flex items-center justify-center gap-1">
+                                <button onclick="event.stopPropagation(); selectAndInspectSymbol('${item.symbol}')" class="px-2 py-0.5 bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 rounded border border-indigo-800 text-[10px] mono transition">
+                                    Inspect
+                                </button>
+                                <button onclick="event.stopPropagation(); toggleInjectModal('${item.symbol}')" class="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition" title="Inject Test Bar">
+                                    +
+                                </button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+
+                // If expanded, show nested rows for each provider
+                if (isExpanded && item.provider_entries) {
+                    item.provider_entries.forEach(sub => {
+                        const sRConf = REGIME_CONFIG[getRegime(sub)] || REGIME_CONFIG.neutral;
+                        const sPv = safeNum(sub.price_velocity);
+                        const sRv = safeNum(sub.rsi_velocity);
+                        const sRa = safeNum(sub.rsi_acceleration);
+                        rowHtml += `
+                            <tr class="bg-slate-950/60 text-slate-400 text-[11px] border-l-2 border-cyan-500/50">
+                                <td class="px-4 py-1.5 pl-8 mono text-cyan-300">? ${sub.provider}</td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtPrice(sub.close)}</td>
+                                <td class="px-4 py-1.5 text-right mono ${sPv > 0 ? 'text-emerald-400' : (sPv < 0 ? 'text-rose-400' : '')}">${fmtNum(sPv, 2, '+')}</td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtNum(sub.price_acceleration, 2, '+')}</td>
+                                <td class="px-4 py-1.5 mono">${fmtNum(sub.rsi, 1)}</td>
+                                <td class="px-4 py-1.5 text-right mono ${sRv > 0 ? 'text-emerald-400' : (sRv < 0 ? 'text-rose-400' : '')}">${fmtNum(sRv, 2, '+')}</td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtNum(sRa, 2, '+')}</td>
+                                <td class="px-4 py-1.5">
+                                    <span class="text-[9px] px-1.5 py-0.2 rounded border ${sRConf.badgeClass}">${sRConf.label}</span>
+                                </td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtPct(sub.momentum_3m_pct, 2, '+')}</td>
+                                <td class="px-4 py-1.5 text-center mono text-slate-500">feed</td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                return rowHtml;
+            }).join('');
+        }
+
+        function renderStreamTableRows(tbody, streamList) {
+            tbody.innerHTML = streamList.map(inst => {
+                const rConf = REGIME_CONFIG[getRegime(inst)] || REGIME_CONFIG.neutral;
+                const pv = safeNum(inst.price_velocity);
+                const pvPct = safeNum(inst.price_velocity_pct);
+                const rv = safeNum(inst.rsi_velocity);
+                const ra = safeNum(inst.rsi_acceleration);
+                const rsi = safeNum(inst.rsi);
+                const isSelected = selectedSymbol === inst.symbol;
+
+                return `
+                    <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-indigo-950/20' : ''}" onclick="selectAndInspectSymbol('${inst.symbol}')">
+                        <td class="px-4 py-2.5">
+                            <div class="font-bold text-white mono">${inst.symbol}</div>
+                            <div class="text-[10px] text-slate-500 uppercase">${inst.provider}</div>
+                        </td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold text-slate-200">${fmtPrice(inst.close)}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400')}">
+                            ${fmtNum(pv, 2, '+')} (${fmtPct(pvPct, 2, '+')})
+                        </td>
+                        <td class="px-4 py-2.5 text-right mono text-slate-300">${fmtNum(inst.price_acceleration, 2, '+')}</td>
+                        <td class="px-4 py-2.5 mono font-semibold text-slate-200">${fmtNum(rsi, 1)}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${rv > 0 ? 'text-emerald-400' : (rv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(rv, 2, '+')}/m</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${ra > 0 ? 'text-cyan-400' : (ra < 0 ? 'text-amber-400' : 'text-slate-400')}">${fmtNum(ra, 2, '+')}/m²</td>
+                        <td class="px-4 py-2.5">
+                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${rConf.badgeClass}">
+                                <span>${rConf.icon}</span>
+                                ${rConf.label}
+                            </span>
+                        </td>
+                        <td class="px-4 py-2.5 text-right mono text-slate-300">${fmtPct(inst.momentum_3m_pct, 2, '+')}</td>
+                        <td class="px-4 py-2.5 text-center">
+                            <button onclick="event.stopPropagation(); toggleInjectModal('${inst.symbol}')" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition">
                                 Inject
                             </button>
                         </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // =========================================================================================
+        // BOTTOM PORTION: ALWAYS RENDERS WITH OR WITHOUT A SYMBOL
+        // =========================================================================================
+        function renderSymbolDeepDive() {
+            if (!latestData) return;
+            const consolidated = latestData.consolidated_symbols || [];
+            if (consolidated.length === 0) return;
+
+            // If no symbol selected, default to the first or highest velocity symbol
+            if (!selectedSymbol) {
+                selectedSymbol = consolidated[0].symbol;
+            }
+
+            // Find data for selected symbol
+            let symbolData = consolidated.find(s => s.symbol === selectedSymbol);
+            if (!symbolData && consolidated.length > 0) {
+                // If typed search doesn't match exact symbol, find first partial match
+                symbolData = consolidated.find(s => s.symbol.startsWith(selectedSymbol)) || consolidated[0];
+            }
+
+            const sym = symbolData.symbol;
+            const regime = getRegime(symbolData);
+            const rConf = REGIME_CONFIG[regime] || REGIME_CONFIG.neutral;
+
+            // Update Header Elements in Deep-Dive Panel
+            document.getElementById('detailSymbolBadge').textContent = sym;
+            document.getElementById('detailSymbolTitle').textContent = `${sym} Multi-Stream Kinematics Analysis`;
+            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds &bull; Close ${fmtPrice(symbolData.close)} &bull; RSI ${fmtNum(symbolData.rsi, 1)}`;
+            
+            const badgeEl = document.getElementById('detailRegimeBadge');
+            badgeEl.className = `text-[10px] px-2 py-0.5 rounded-full font-semibold border ${rConf.badgeClass}`;
+            badgeEl.innerHTML = `${rConf.icon} ${rConf.label}`;
+
+            // Diagnosis sentence
+            const rv = safeNum(symbolData.rsi_velocity);
+            const ra = safeNum(symbolData.rsi_acceleration);
+            let diag = `${rConf.desc}. `;
+            if (rv !== null) {
+                diag += `RSI velocity is ${fmtNum(rv, 2, '+')}/m. `;
+            }
+            if (ra !== null) {
+                diag += `Acceleration is ${fmtNum(ra, 2, '+')}/m² (${ra > 0 ? 'accelerating upward' : 'decelerating / slowing'}).`;
+            }
+            document.getElementById('detailDiagnosisText').textContent = diag;
+
+            // Render Providers Comparison Table
+            const tbody = document.getElementById('detailProvidersTableBody');
+            const entries = symbolData.provider_entries || [];
+
+            if (entries.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="9" class="px-3.5 py-4 text-center text-slate-500">No active streams for ${sym}</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = entries.map(e => {
+                const pRConf = REGIME_CONFIG[getRegime(e)] || REGIME_CONFIG.neutral;
+                const pClose = safeNum(e.close);
+                const pRsi = safeNum(e.rsi);
+                const pRv = safeNum(e.rsi_velocity);
+                const pRa = safeNum(e.rsi_acceleration);
+
+                // Calculate drift vs consensus
+                let priceDrift = '--';
+                if (pClose !== null && symbolData.close !== null) {
+                    const diff = pClose - symbolData.close;
+                    priceDrift = `${diff >= 0 ? '+' : ''}$${diff.toFixed(2)}`;
+                }
+
+                return `
+                    <tr class="hover:bg-slate-900/60 transition">
+                        <td class="px-3.5 py-2 font-bold text-white">${e.provider}</td>
+                        <td class="px-3.5 py-2 text-right text-slate-200">${fmtPrice(e.close)}</td>
+                        <td class="px-3.5 py-2 text-right ${pRv > 0 ? 'text-emerald-400' : (pRv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(e.price_velocity, 2, '+')}</td>
+                        <td class="px-3.5 py-2 text-right text-slate-300">${fmtNum(e.price_acceleration, 2, '+')}</td>
+                        <td class="px-3.5 py-2 text-right text-slate-200">${fmtNum(pRsi, 1)}</td>
+                        <td class="px-3.5 py-2 text-right ${pRv > 0 ? 'text-emerald-400' : (pRv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(pRv, 2, '+')}</td>
+                        <td class="px-3.5 py-2 text-right ${pRa > 0 ? 'text-cyan-400' : (pRa < 0 ? 'text-amber-400' : 'text-slate-400')}">${fmtNum(pRa, 2, '+')}</td>
+                        <td class="px-3.5 py-2">
+                            <span class="text-[10px] px-2 py-0.5 rounded-full border ${pRConf.badgeClass}">
+                                ${pRConf.icon} ${pRConf.label}
+                            </span>
+                        </td>
+                        <td class="px-3.5 py-2 text-center text-emerald-400 font-semibold">LIVE</td>
                     </tr>
                 `;
             }).join('');
@@ -3271,7 +3699,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const res = await fetch('/api/minute-summaries');
                 const data = await res.json();
                 if (!res.ok || !data.summaries || data.summaries.length === 0) {
-                    container.innerHTML = `<div class="text-center py-8 text-slate-500 text-xs">No minute summaries emitted yet. They are written to <code>minute-summary-${document.getElementById('runIdBadge').textContent}.jsonl</code> upon each NYSE minute finalization.</div>`;
+                    container.innerHTML = `
+                        <div class="p-4 rounded-xl bg-slate-950/50 border border-slate-800/80 text-center text-slate-400 text-xs space-y-1.5">
+                            <div class="font-semibold text-slate-300">Awaiting Minute Finalization</div>
+                            <p class="text-[11px] text-slate-500">
+                                Summaries emit to <code class="mono text-indigo-300">minute-summary-${document.getElementById('runIdBadge').textContent}.jsonl</code> upon each NYSE minute boundary + 45s delay.<br>
+                                Click <strong>"Flush Minute"</strong> above to force an immediate summary emission.
+                            </p>
+                        </div>
+                    `;
                     return;
                 }
 
@@ -3285,13 +3721,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const maxPrice = kin.max_price_velocity_pct;
 
                     return `
-                        <div class="p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-2">
+                        <div class="p-2.5 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-1.5">
                             <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
                                 <div class="flex items-center gap-2">
-                                    <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 mono font-bold">${minUtc}</span>
-                                    <span class="text-slate-300 font-semibold uppercase">${rec.provider || 'ALL'}</span>
+                                    <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 mono font-bold text-[11px]">${minUtc}</span>
+                                    <span class="text-slate-300 font-semibold uppercase text-[11px]">${rec.provider || 'ALL'}</span>
                                     <span class="text-slate-500">&bull;</span>
-                                    <span class="text-slate-400">${symbolsCount} symbols</span>
+                                    <span class="text-slate-400 text-[11px]">${symbolsCount} symbols</span>
                                 </div>
                                 <div class="flex items-center gap-2 text-[11px] mono">
                                     <span class="text-slate-400">Late: <span class="font-bold text-slate-200">${rec.late_records_since_previous_summary ?? 0}</span></span>
@@ -3299,17 +3735,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </div>
                             </div>
 
-                            <div class="flex flex-wrap items-center gap-2 text-[11px]">
-                                <span class="px-2 py-0.5 rounded bg-emerald-950/40 text-emerald-300 border border-emerald-900/40">?? Acc Bull: ${regimes.accelerating_bullish || 0}</span>
-                                <span class="px-2 py-0.5 rounded bg-cyan-950/40 text-cyan-300 border border-cyan-900/40">?? Dec Bull: ${regimes.decelerating_bullish || 0}</span>
-                                <span class="px-2 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">?? Acc Bear: ${regimes.accelerating_bearish || 0}</span>
-                                <span class="px-2 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">?? Dec Bear: ${regimes.decelerating_bearish || 0}</span>
+                            <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
+                                <span class="px-1.5 py-0.5 rounded bg-emerald-950/40 text-emerald-300 border border-emerald-900/40">?? Acc Bull: ${regimes.accelerating_bullish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-300 border border-cyan-900/40">?? Dec Bull: ${regimes.decelerating_bullish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">?? Acc Bear: ${regimes.accelerating_bearish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">?? Dec Bear: ${regimes.decelerating_bearish || 0}</span>
                             </div>
 
                             ${maxRsi || maxPrice ? `
-                                <div class="text-[10px] mono text-slate-400 flex flex-wrap gap-3 pt-1 border-t border-slate-900">
-                                    ${maxRsi ? `<span>Max ?RSI: <strong class="text-emerald-400">${maxRsi.symbol} (+${maxRsi.value?.toFixed(2)})</strong></span>` : ''}
-                                    ${maxPrice ? `<span>Max ?P%: <strong class="text-indigo-400">${maxPrice.symbol} (+${maxPrice.value?.toFixed(2)}%)</strong></span>` : ''}
+                                <div class="text-[10px] mono text-slate-400 flex flex-wrap gap-2.5 pt-1 border-t border-slate-900">
+                                    ${maxRsi ? `<span>Max &Delta;RSI: <strong class="text-emerald-400">${maxRsi.symbol} (+${fmtNum(maxRsi.value, 2)})</strong></span>` : ''}
+                                    ${maxPrice ? `<span>Max &Delta;P%: <strong class="text-indigo-400">${maxPrice.symbol} (+${fmtNum(maxPrice.value, 2)}%)</strong></span>` : ''}
                                 </div>
                             ` : ''}
                             <input type="hidden" id="rawSummary_${idx}" value='${JSON.stringify(rec).replace(/'/g, "&apos;")}'>
@@ -3366,26 +3802,25 @@ class AdminCliProvider:
         @app.route("/kinematics", methods=["GET"])
         def index():
             html = DASHBOARD_HTML_TEMPLATE.replace("__RUN_ID__", RUN_ID)
-            return html, 200, {"Content-Type": "text/html"}
+            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
         @app.get("/api/kinematics")
         def get_kinematics():
             latest = {}
-            regime_counts = {
-                "accelerating_bullish": 0,
-                "decelerating_bullish": 0,
-                "accelerating_bearish": 0,
-                "decelerating_bearish": 0,
-                "neutral": 0,
-            }
             records_flat = []
+            symbols_map = {}
 
             for (provider, symbol), hist in self.coordinator.kinematics_history.items():
                 if hist:
                     cur = hist[-1]
-                    regime = cur.get("regime", "neutral")
-                    if regime in regime_counts:
-                        regime_counts[regime] += 1
+                    regime = cur.get("regime")
+                    if not regime or regime == "neutral":
+                        regime = classify_kinematic_regime(
+                            cur.get("rsi_velocity"),
+                            cur.get("rsi_acceleration"),
+                            cur.get("price_velocity"),
+                            cur.get("price_acceleration"),
+                        )
 
                     entry = {
                         "provider": provider,
@@ -3405,12 +3840,115 @@ class AdminCliProvider:
                     latest.setdefault(provider, {})[symbol] = entry
                     records_flat.append(entry)
 
+                    # Group by unique ticker for consolidated view
+                    sym_group = symbols_map.setdefault(
+                        symbol,
+                        {
+                            "symbol": symbol,
+                            "providers": [],
+                            "entries": [],
+                            "closes": [],
+                            "rsis": [],
+                            "price_velocities": [],
+                            "price_velocity_pcts": [],
+                            "price_accelerations": [],
+                            "rsi_velocities": [],
+                            "rsi_accelerations": [],
+                            "momentums": [],
+                            "regimes": [],
+                        },
+                    )
+                    sym_group["providers"].append(provider)
+                    sym_group["entries"].append(entry)
+                    if entry["close"] is not None:
+                        sym_group["closes"].append(entry["close"])
+                    if entry["rsi"] is not None:
+                        sym_group["rsis"].append(entry["rsi"])
+                    if entry["price_velocity"] is not None:
+                        sym_group["price_velocities"].append(entry["price_velocity"])
+                    if entry["price_velocity_pct"] is not None:
+                        sym_group["price_velocity_pcts"].append(
+                            entry["price_velocity_pct"]
+                        )
+                    if entry["price_acceleration"] is not None:
+                        sym_group["price_accelerations"].append(
+                            entry["price_acceleration"]
+                        )
+                    if entry["rsi_velocity"] is not None:
+                        sym_group["rsi_velocities"].append(entry["rsi_velocity"])
+                    if entry["rsi_acceleration"] is not None:
+                        sym_group["rsi_accelerations"].append(entry["rsi_acceleration"])
+                    if entry["momentum_3m_pct"] is not None:
+                        sym_group["momentums"].append(entry["momentum_3m_pct"])
+                    sym_group["regimes"].append(regime)
+
+            # Build consolidated unique symbols list
+            consolidated_symbols = []
+            regime_counts = {
+                "accelerating_bullish": 0,
+                "decelerating_bullish": 0,
+                "accelerating_bearish": 0,
+                "decelerating_bearish": 0,
+                "neutral": 0,
+            }
+
+            def median_or_none(vals):
+                if not vals:
+                    return None
+                s = sorted(vals)
+                mid = len(s) // 2
+                return s[mid] if len(s) % 2 != 0 else (s[mid - 1] + s[mid]) / 2
+
+            for sym, g in sorted(symbols_map.items()):
+                c_close = median_or_none(g["closes"])
+                c_rsi = median_or_none(g["rsis"])
+                c_pv = median_or_none(g["price_velocities"])
+                c_pv_pct = median_or_none(g["price_velocity_pcts"])
+                c_pa = median_or_none(g["price_accelerations"])
+                c_rv = median_or_none(g["rsi_velocities"])
+                c_ra = median_or_none(g["rsi_accelerations"])
+                c_mom = median_or_none(g["momentums"])
+
+                c_regime = classify_kinematic_regime(c_rv, c_ra, c_pv, c_pa)
+                if c_regime in regime_counts:
+                    regime_counts[c_regime] += 1
+
+                consolidated_symbols.append(
+                    {
+                        "symbol": sym,
+                        "providers_count": len(g["providers"]),
+                        "providers": g["providers"],
+                        "close": round(c_close, 2) if c_close is not None else None,
+                        "rsi": round(c_rsi, 2) if c_rsi is not None else None,
+                        "price_velocity": round(c_pv, 2) if c_pv is not None else None,
+                        "price_velocity_pct": (
+                            round(c_pv_pct, 4) if c_pv_pct is not None else None
+                        ),
+                        "price_acceleration": (
+                            round(c_pa, 2) if c_pa is not None else None
+                        ),
+                        "rsi_velocity": round(c_rv, 2) if c_rv is not None else None,
+                        "rsi_acceleration": (
+                            round(c_ra, 2) if c_ra is not None else None
+                        ),
+                        "momentum_3m_pct": (
+                            round(c_mom, 2) if c_mom is not None else None
+                        ),
+                        "regime": c_regime,
+                        "provider_entries": g["entries"],
+                    }
+                )
+
             return (
                 jsonify(
                     status="ok",
                     run_id=RUN_ID,
+                    total_unique_symbols=len(consolidated_symbols),
+                    total_provider_streams=len(records_flat),
+                    configured_symbols=list(self.coordinator.symbols),
                     regime_counts=regime_counts,
                     latest_by_provider=latest,
+                    consolidated_symbols=consolidated_symbols,
                     instruments=records_flat,
                 ),
                 200,
@@ -3434,10 +3972,8 @@ class AdminCliProvider:
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
 
-        # @app.post("/cli/status")
         @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
-            # Dynamically extract monitor reference out of the global registry map
             pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
             pm = pm_entry.get("router")
 
@@ -3451,6 +3987,14 @@ class AdminCliProvider:
             for (provider, symbol), hist in self.coordinator.kinematics_history.items():
                 if hist:
                     latest = hist[-1]
+                    reg = latest.get("regime")
+                    if not reg or reg == "neutral":
+                        reg = classify_kinematic_regime(
+                            latest.get("rsi_velocity"),
+                            latest.get("rsi_acceleration"),
+                            latest.get("price_velocity"),
+                            latest.get("price_acceleration"),
+                        )
                     latest_kinematics.setdefault(provider, {})[symbol] = {
                         "close": latest.get("close"),
                         "rsi": latest.get("rsi"),
@@ -3461,7 +4005,7 @@ class AdminCliProvider:
                         "rsi_acceleration": latest.get("rsi_acceleration"),
                         "momentum_3m_pct": latest.get("momentum_3m_pct"),
                         "ema_slope": latest.get("ema_slope"),
-                        "regime": latest.get("regime", "neutral"),
+                        "regime": reg,
                         "timestamp": latest.get("timestamp"),
                     }
 
@@ -3469,6 +4013,8 @@ class AdminCliProvider:
                 "run_id": RUN_ID,
                 "connected_providers": self.coordinator.connected,
                 "tracked_instruments": self.coordinator.symbols,
+                "unique_symbols_count": len(self.coordinator.symbols),
+                "total_stream_feeds": len(self.coordinator.kinematics_history),
                 "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
                 "loaded_providers": [
