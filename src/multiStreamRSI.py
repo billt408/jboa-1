@@ -5,6 +5,10 @@ Dependencies: aiohttp, alpaca-py, Flask, yfinance, pandas, pandas-market-calenda
 tzdata, and the existing project-local lib.utils.JsonIniParser.
 Uses NYSE calendar holidays and early closes. Summary minute keys use UTC.
 One JSON summary per regular-session minute per provider in a dedicated JSONL log.
+Each symbol record includes 1-minute velocity and acceleration metrics for both RSI
+and Price (rsi_velocity, rsi_acceleration, price_velocity, price_velocity_pct,
+price_acceleration, plus multi-period 3m momentum and a kinematics regime classifier:
+accelerating_bullish, decelerating_bullish, accelerating_bearish, decelerating_bearish).
 Late data cannot change emitted summaries or RSI state. Historical warmup is best effort.
 RSI state rolls over across sessions and is seeded at startup with the last
 RSI_WARMUP_SESSIONS prior sessions (default 5) so Wilder averages converge like
@@ -17,7 +21,7 @@ OPTION_CHAIN_RSI_HIGH (default 65) is the SELL signal. Each signal triggers
 option-chain collection via lib.getOptionsContracts; the full clean payload is
 written to logs/optionchains/ with provider, symbol, BUY/SELL signal, RSI and
 timestamp in the filename. Every option-chain log line and each TRADINGVIEW
-minute-summary record carries the signal label.
+minute-summary record carries the signal label and kinematics metrics.
 An AlpacaPositionMonitor thread polls the account's positions every minute,
 writes them to its own log file under logs/positions/ and prints each current
 option position.
@@ -47,7 +51,10 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import pandas as pd
 import yfinance as yf
+
+#  CORRECT
 from alpaca.common.enums import Sort
+from alpaca.trading.enums import AssetClass
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
@@ -168,6 +175,13 @@ class SessionRSI:
         self.changes = 0
         self.gain_sum = self.loss_sum = 0.0
         self.average_gain = self.average_loss = None
+        self.previous_rsi = None
+        self.previous_rsi_velocity = None
+        self.previous_price_velocity = None
+        self.latest_rsi_velocity = None
+        self.latest_rsi_acceleration = None
+        self.latest_price_velocity = None
+        self.latest_price_acceleration = None
         self.latest = None
         self.provider = provider
 
@@ -177,6 +191,13 @@ class SessionRSI:
         self.changes = 0
         self.gain_sum = self.loss_sum = 0.0
         self.average_gain = self.average_loss = self.latest = None
+        self.previous_rsi = None
+        self.previous_rsi_velocity = None
+        self.previous_price_velocity = None
+        self.latest_rsi_velocity = None
+        self.latest_rsi_acceleration = None
+        self.latest_price_velocity = None
+        self.latest_price_acceleration = None
         self.logger.info("SESSION_START date=%s", day)
 
     def begin_session(self, day):
@@ -195,10 +216,11 @@ class SessionRSI:
             self.session_date = day
             self.last_timestamp = None
             self.logger.info(
-                "SESSION_ROLLOVER date=%s rsi_state=carried avg_gain=%.6f avg_loss=%.6f",
+                "SESSION_ROLLOVER date=%s rsi_state=carried avg_gain=%.6f avg_loss=%.6f prev_rsi=%s",
                 day,
                 self.average_gain or 0.0,
                 self.average_loss or 0.0,
+                f"{self.previous_rsi:.2f}" if self.previous_rsi is not None else "n/a",
             )
         else:
             self.reset_session(day)
@@ -270,8 +292,44 @@ class SessionRSI:
                 else:
                     value = 100.0 - 100.0 / (1.0 + up / down)
 
+        # Compute 1-minute velocity and acceleration metrics
+        price_velocity = None
+        price_velocity_pct = None
+        price_acceleration = None
+        if self.previous_close is not None:
+            price_velocity = round(close - self.previous_close, 4)
+            if self.previous_close > 0:
+                price_velocity_pct = round(
+                    (price_velocity / self.previous_close) * 100.0, 4
+                )
+            if self.previous_price_velocity is not None:
+                price_acceleration = round(
+                    price_velocity - self.previous_price_velocity, 4
+                )
+
+        rsi_velocity = None
+        rsi_acceleration = None
+        if value is not None:
+            if self.previous_rsi is not None:
+                rsi_velocity = round(value - self.previous_rsi, 4)
+                if self.previous_rsi_velocity is not None:
+                    rsi_acceleration = round(
+                        rsi_velocity - self.previous_rsi_velocity, 4
+                    )
+
+        # Update tracking state
+        self.previous_price_velocity = price_velocity
+        self.latest_price_velocity = price_velocity
+        self.latest_price_acceleration = price_acceleration
         self.previous_close = close
         self.last_timestamp = timestamp
+
+        if value is not None:
+            if rsi_velocity is not None:
+                self.previous_rsi_velocity = rsi_velocity
+            self.latest_rsi_velocity = rsi_velocity
+            self.latest_rsi_acceleration = rsi_acceleration
+            self.previous_rsi = value
 
         observation = None
 
@@ -282,12 +340,17 @@ class SessionRSI:
                 "datetime": timestamp.isoformat(),
                 "close": close,
                 "rsi": value,
+                "rsi_velocity": rsi_velocity,
+                "rsi_acceleration": rsi_acceleration,
+                "price_velocity": price_velocity,
+                "price_velocity_pct": price_velocity_pct,
+                "price_acceleration": price_acceleration,
             }
             self.latest = observation
 
         message = (
             "MINUTE provider=%s symbol=%s source=%s timestamp=%s "
-            "close=%.8f rsi=%s changes=%d"
+            "close=%.8f rsi=%s v_rsi=%s a_rsi=%s v_p=%s changes=%d"
         )
 
         arguments = (
@@ -297,6 +360,9 @@ class SessionRSI:
             timestamp.isoformat(),
             close,
             "warming-up" if value is None else f"{value:.2f}",
+            "n/a" if rsi_velocity is None else f"{rsi_velocity:+.2f}",
+            "n/a" if rsi_acceleration is None else f"{rsi_acceleration:+.2f}",
+            "n/a" if price_velocity is None else f"{price_velocity:+.2f}",
             self.changes,
         )
 
@@ -481,6 +547,7 @@ class MinuteCoordinator:
             provider: [(self.started_at, None)] for provider in self.providers
         }
         self.late_counts = {provider: 0 for provider in self.providers}
+        self.kinematics_history = {}
         logger = None if emit is not None else make_summary_logger()
         self.emit = emit or (
             lambda record: logger.info(
@@ -580,11 +647,27 @@ class MinuteCoordinator:
             return 0
         tracker = self.trackers[(provider, symbol)]
         applied = 0
-        for bar in sorted(bars, key=lambda item: item.timestamp):
+        sorted_bars = sorted(bars, key=lambda item: item.timestamp)
+        for bar in sorted_bars:
             before = tracker.changes
             tracker.process_bar(bar, "WARMUP_BACKFILL", warmup=True)
             if tracker.changes != before or tracker.previous_close is not None:
                 applied += 1
+        # Seed warmup kinematics history so initial live summaries have velocity context
+        if sorted_bars:
+            history = self.kinematics_history.setdefault((provider, symbol), [])
+            for b in sorted_bars[-10:]:
+                history.append(
+                    {
+                        "minute": minute_utc(b.timestamp),
+                        "close": b.close,
+                        "rsi": tracker.latest["rsi"] if tracker.latest else None,
+                        "price_velocity": tracker.latest_price_velocity,
+                        "price_velocity_pct": None,
+                        "rsi_velocity": tracker.latest_rsi_velocity,
+                        "rsi_acceleration": tracker.latest_rsi_acceleration,
+                    }
+                )
         logging.info(
             "RSI_WARMUP provider=%s symbol=%s bars=%d applied=%d changes=%d "
             "converged=%s",
@@ -681,6 +764,123 @@ class MinuteCoordinator:
                 base["partial"] = partial
                 if partial:
                     base["status"] = "partial"
+
+        # Compute 1-minute velocity, acceleration, and multi-period momentum metrics
+        history = self.kinematics_history.setdefault((provider, symbol), [])
+        curr_close = base.get("close")
+        curr_rsi = base.get("rsi")
+
+        price_velocity = None
+        price_velocity_pct = None
+        price_acceleration = None
+        price_acceleration_pct = None
+        rsi_velocity = None
+        rsi_acceleration = None
+        rsi_velocity_3m = None
+        price_velocity_3m_pct = None
+        regime = "neutral"
+
+        if curr_close is not None:
+            # Find the most recent history entry with a valid close
+            prev_entry = next(
+                (e for e in reversed(history) if e.get("close") is not None), None
+            )
+            if prev_entry is not None:
+                prev_close = prev_entry["close"]
+                price_velocity = round(curr_close - prev_close, 4)
+                if prev_close > 0:
+                    price_velocity_pct = round(
+                        ((curr_close - prev_close) / prev_close) * 100.0, 4
+                    )
+                if prev_entry.get("price_velocity") is not None:
+                    price_acceleration = round(
+                        price_velocity - prev_entry["price_velocity"], 4
+                    )
+                if (
+                    price_velocity_pct is not None
+                    and prev_entry.get("price_velocity_pct") is not None
+                ):
+                    price_acceleration_pct = round(
+                        price_velocity_pct - prev_entry["price_velocity_pct"], 4
+                    )
+
+            valid_closes = [e for e in history if e.get("close") is not None]
+            if len(valid_closes) >= 3:
+                c3m = valid_closes[-3]["close"]
+                if c3m > 0:
+                    price_velocity_3m_pct = round(((curr_close - c3m) / c3m) * 100.0, 4)
+
+        if curr_rsi is not None:
+            # Find the most recent history entry with a valid rsi
+            prev_rsi_entry = next(
+                (e for e in reversed(history) if e.get("rsi") is not None), None
+            )
+            if prev_rsi_entry is not None:
+                prev_rsi = prev_rsi_entry["rsi"]
+                rsi_velocity = round(curr_rsi - prev_rsi, 4)
+                if prev_rsi_entry.get("rsi_velocity") is not None:
+                    rsi_acceleration = round(
+                        rsi_velocity - prev_rsi_entry["rsi_velocity"], 4
+                    )
+
+            valid_rsis = [e for e in history if e.get("rsi") is not None]
+            if len(valid_rsis) >= 3:
+                r3m = valid_rsis[-3]["rsi"]
+                rsi_velocity_3m = round(curr_rsi - r3m, 4)
+
+        # Classify kinematics regime
+        if rsi_velocity is not None:
+            if rsi_velocity > 0:
+                regime = (
+                    "accelerating_bullish"
+                    if (rsi_acceleration is not None and rsi_acceleration > 0)
+                    else "decelerating_bullish"
+                )
+            elif rsi_velocity < 0:
+                regime = (
+                    "accelerating_bearish"
+                    if (rsi_acceleration is not None and rsi_acceleration < 0)
+                    else "decelerating_bearish"
+                )
+            else:
+                regime = "neutral"
+
+        if curr_close is not None or curr_rsi is not None:
+            history.append(
+                {
+                    "minute": minute,
+                    "close": curr_close,
+                    "rsi": curr_rsi,
+                    "price_velocity": price_velocity,
+                    "price_velocity_pct": price_velocity_pct,
+                    "rsi_velocity": rsi_velocity,
+                    "rsi_acceleration": rsi_acceleration,
+                }
+            )
+            if len(history) > 60:
+                del history[:-60]
+
+        base.update(
+            {
+                "price_velocity": price_velocity,
+                "price_velocity_pct": price_velocity_pct,
+                "price_acceleration": price_acceleration,
+                "rsi_velocity": rsi_velocity,
+                "rsi_acceleration": rsi_acceleration,
+                "kinematics": {
+                    "price_velocity_1m": price_velocity,
+                    "price_velocity_1m_pct": price_velocity_pct,
+                    "price_acceleration_1m": price_acceleration,
+                    "price_acceleration_1m_pct": price_acceleration_pct,
+                    "rsi_velocity_1m": rsi_velocity,
+                    "rsi_acceleration_1m": rsi_acceleration,
+                    "rsi_velocity_3m": rsi_velocity_3m,
+                    "price_velocity_3m_pct": price_velocity_3m_pct,
+                    "regime": regime,
+                },
+            }
+        )
+
         return base
 
     def finalize_due(self, now=None):
@@ -690,6 +890,71 @@ class MinuteCoordinator:
             minute = self.next_minute
             local = minute.astimezone(MARKET_TZ)
             for provider in self.providers:
+                symbols_data = {
+                    symbol: self._symbol_record(provider, symbol, minute)
+                    for symbol in self.symbols
+                }
+
+                # Compile kinematics summary across symbols for this provider
+                kinematics_summary = {
+                    "regimes": {
+                        "accelerating_bullish": 0,
+                        "decelerating_bullish": 0,
+                        "accelerating_bearish": 0,
+                        "decelerating_bearish": 0,
+                        "neutral": 0,
+                    },
+                    "max_rsi_velocity": None,
+                    "min_rsi_velocity": None,
+                    "max_price_velocity_pct": None,
+                    "min_price_velocity_pct": None,
+                }
+                for sym, rec in symbols_data.items():
+                    k = rec.get("kinematics") or {}
+                    r = k.get("regime")
+                    if r in kinematics_summary["regimes"]:
+                        kinematics_summary["regimes"][r] += 1
+
+                    rv = rec.get("rsi_velocity")
+                    if rv is not None:
+                        if (
+                            kinematics_summary["max_rsi_velocity"] is None
+                            or rv > kinematics_summary["max_rsi_velocity"]["value"]
+                        ):
+                            kinematics_summary["max_rsi_velocity"] = {
+                                "symbol": sym,
+                                "value": rv,
+                            }
+                        if (
+                            kinematics_summary["min_rsi_velocity"] is None
+                            or rv < kinematics_summary["min_rsi_velocity"]["value"]
+                        ):
+                            kinematics_summary["min_rsi_velocity"] = {
+                                "symbol": sym,
+                                "value": rv,
+                            }
+
+                    pv_pct = rec.get("price_velocity_pct")
+                    if pv_pct is not None:
+                        if (
+                            kinematics_summary["max_price_velocity_pct"] is None
+                            or pv_pct
+                            > kinematics_summary["max_price_velocity_pct"]["value"]
+                        ):
+                            kinematics_summary["max_price_velocity_pct"] = {
+                                "symbol": sym,
+                                "value": pv_pct,
+                            }
+                        if (
+                            kinematics_summary["min_price_velocity_pct"] is None
+                            or pv_pct
+                            < kinematics_summary["min_price_velocity_pct"]["value"]
+                        ):
+                            kinematics_summary["min_price_velocity_pct"] = {
+                                "symbol": sym,
+                                "value": pv_pct,
+                            }
+
                 record = {
                     "type": "MINUTE_SUMMARY",
                     "run_id": RUN_ID,
@@ -703,10 +968,8 @@ class MinuteCoordinator:
                         "connected" if self.connected[provider] else "disconnected"
                     ),
                     "late_records_since_previous_summary": self.late_counts[provider],
-                    "symbols": {
-                        symbol: self._symbol_record(provider, symbol, minute)
-                        for symbol in self.symbols
-                    },
+                    "symbols": symbols_data,
+                    "kinematics_summary": kinematics_summary,
                 }
                 self.emit(record)
                 self.late_counts[provider] = 0
@@ -1705,7 +1968,7 @@ def build_option_chain_client(keys):
 
     The option-chain call receives the key/secret alongside this client. If
     your lib.getOptionsContracts implementation expects a different client
-    type, adjust only this factory  the rest of the plumbing is unchanged.
+    type, adjust only this factory ? the rest of the plumbing is unchanged.
     Returns None when credentials are missing; the trigger then skips with a
     logged warning instead of failing the webhook loop.
     """
@@ -1769,6 +2032,37 @@ class TradingviewProvider:
                 ),
                 413,
             )
+
+        @app.get("/")
+        def index():
+            host_ip = request.host.split(":")[0]
+            dashboard_url = f"http://{host_ip}:5001/"
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradingView Webhook Gateway</title>
+    <meta http-equiv="refresh" content="2; url={dashboard_url}">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-6 antialiased">
+    <div class="max-w-md w-full bg-slate-900/90 border border-slate-800 rounded-2xl p-8 text-center shadow-2xl backdrop-blur">
+        <div class="w-14 h-14 bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-black">
+            K
+        </div>
+        <h1 class="text-xl font-bold mb-2">TradingView Webhook Gateway</h1>
+        <p class="text-xs text-slate-400 leading-relaxed mb-6">
+            Webhook ingestion active on port {self.port} (<code class="text-indigo-300">/webhook</code>).<br>
+            Redirecting to the <strong>RSI & Price Kinematics Dashboard</strong> on port 5001...
+        </p>
+        <a href="{dashboard_url}" class="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl text-sm transition shadow-lg shadow-indigo-600/30">
+            Open Kinematics Dashboard &rarr;
+        </a>
+    </div>
+</body>
+</html>"""
+            return html, 200, {"Content-Type": "text/html"}
 
         @app.get("/health")
         def health():
@@ -2100,6 +2394,34 @@ class AlpacaPositionMonitor:
         self.position_count = 0
         self.option_count = 0
 
+    def _is_option(self, position) -> bool:
+        """Helper to determine if an alpaca-py position is an option contract."""
+        asset_class = getattr(position, "asset_class", None)
+        return asset_class == AssetClass.US_OPTION or asset_class == "us_option"
+
+    def _num(self, obj, attr) -> float:
+        """Safely extract and parse numerical strings/floats from Alpaca payloads."""
+        val = getattr(obj, attr, 0.0)
+        try:
+            return float(val) if val is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _format_option(self, position) -> str:
+        """Extract and format option contract details into a standard log string."""
+        symbol = getattr(position, "symbol", "?")
+        qty = self._num(position, "qty")
+        avg_entry = self._num(position, "avg_entry_price")
+        current_price = self._num(position, "current_price")
+        market_value = self._num(position, "market_value")
+        unrealized_pl = self._num(position, "unrealized_pl")
+
+        return (
+            f"type=option symbol={symbol} qty={qty:.4g} "
+            f"avg_entry={avg_entry:.4f} current_price={current_price:.4f} "
+            f"market_value={market_value:.2f} unrealized_pl={unrealized_pl:.2f}"
+        )
+
     def poll(self):
         """Fetch account + positions and log the snapshot (blocking)."""
         # --- NEW: Set active state flag ---
@@ -2181,6 +2503,845 @@ class AlpacaPositionMonitor:
 PROVIDER_REGISTRY = {}
 
 
+DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RSI & Price Kinematics Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
+        @keyframes pulse-slow {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(0.98); }
+        }
+        .animate-pulse-slow { animation: pulse-slow 3s infinite ease-in-out; }
+    </style>
+</head>
+<body class="bg-[#080d19] text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+
+    <!-- Top Navigation Bar -->
+    <header class="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur sticky top-0 z-40">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center font-black text-white text-xl shadow-lg shadow-indigo-500/20">
+                    K
+                </div>
+                <div>
+                    <div class="flex items-center gap-2">
+                        <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">RSI & Price Kinematics Engine</h1>
+                        <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                            ACTIVE
+                        </span>
+                    </div>
+                    <p class="text-xs text-slate-400">Real-time Phase Regimes &bull; 1m Velocities &bull; Accelerations</p>
+                </div>
+            </div>
+
+            <!-- Engine Context & Controls -->
+            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                <div class="hidden md:flex items-center gap-2 px-3 py-1.5 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
+                    <span class="text-slate-400">Run ID:</span>
+                    <span id="runIdBadge" class="mono font-semibold text-indigo-300">__RUN_ID__</span>
+                </div>
+
+                <div class="flex items-center gap-2 px-3 py-1.5 bg-slate-800/70 border border-slate-700/60 rounded-lg text-xs">
+                    <span class="text-slate-400">Next Minute:</span>
+                    <span id="minuteCountdown" class="mono font-semibold text-amber-300">--s</span>
+                </div>
+
+                <button id="btnFlush" onclick="forceFinalize()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 rounded-lg text-xs font-semibold transition flex items-center gap-1.5">
+                    <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    Flush Minute
+                </button>
+
+                <button id="btnToggleInject" onclick="toggleInjectModal()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition flex items-center gap-1.5 shadow-md shadow-indigo-600/20">
+                    <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
+                    Inject Bar
+                </button>
+
+                <button id="btnRefresh" onclick="fetchAllData()" class="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
+                    <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 space-y-6">
+
+        <!-- Banner Toast for Actions -->
+        <div id="statusToast" class="hidden transition-all duration-300 p-3 rounded-xl text-xs font-medium border"></div>
+
+        <!-- KPI Metric Cards Grid -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <!-- Active Instruments -->
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400 flex items-center justify-between">
+                    Tracked Instruments
+                    <span id="activeProvidersCount" class="text-[10px] mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">0 Providers</span>
+                </span>
+                <div class="mt-2 flex items-baseline gap-2">
+                    <span id="totalInstrumentsCount" class="text-2xl sm:text-3xl font-extrabold text-white mono">0</span>
+                    <span class="text-xs text-slate-400">symbols</span>
+                </div>
+                <div class="mt-2 flex items-center gap-1.5 text-[10px] text-slate-400">
+                    <span id="bullCount" class="text-emerald-400 font-semibold">0 Bull</span> &bull;
+                    <span id="bearCount" class="text-rose-400 font-semibold">0 Bear</span> &bull;
+                    <span id="neutralCount" class="text-slate-400 font-semibold">0 Neutral</span>
+                </div>
+            </div>
+
+            <!-- Peak RSI Velocity -->
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Peak RSI Velocity (?RSI)</span>
+                <div class="mt-2 flex items-baseline gap-2">
+                    <span id="peakRsiVel" class="text-2xl sm:text-3xl font-extrabold text-emerald-400 mono">--</span>
+                    <span class="text-xs text-slate-400">/min</span>
+                </div>
+                <div class="mt-2 text-[11px] text-slate-400 truncate">
+                    Symbol: <span id="peakRsiVelSymbol" class="font-semibold text-slate-200 mono">None</span>
+                </div>
+            </div>
+
+            <!-- Peak Price Velocity -->
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Peak Price Velocity (?P/P%)</span>
+                <div class="mt-2 flex items-baseline gap-2">
+                    <span id="peakPriceVel" class="text-2xl sm:text-3xl font-extrabold text-indigo-400 mono">--</span>
+                    <span class="text-xs text-slate-400">%/min</span>
+                </div>
+                <div class="mt-2 text-[11px] text-slate-400 truncate">
+                    Symbol: <span id="peakPriceVelSymbol" class="font-semibold text-slate-200 mono">None</span>
+                </div>
+            </div>
+
+            <!-- Peak Acceleration -->
+            <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between">
+                <span class="text-xs font-medium text-slate-400">Max RSI Acceleration (a)</span>
+                <div class="mt-2 flex items-baseline gap-2">
+                    <span id="peakRsiAccel" class="text-2xl sm:text-3xl font-extrabold text-cyan-400 mono">--</span>
+                    <span class="text-xs text-slate-400">/min²</span>
+                </div>
+                <div class="mt-2 text-[11px] text-slate-400 truncate">
+                    Queue: <span id="pendingQueueSize" class="font-semibold text-slate-200 mono">0</span> &bull; Late: <span id="lateRecordsCount" class="font-semibold text-slate-200 mono">0</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4-Quadrant Kinematics Matrix Grid -->
+        <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+                <div>
+                    <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
+                        Kinematics 4-Quadrant Phase Matrix
+                    </h2>
+                    <p class="text-xs text-slate-400">Velocity (v) vs Acceleration (a) dynamic regime mapping across tracked instruments</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Quadrant II: Decelerating Bullish (Top Left) -->
+                <div class="bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-4">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
+                            <span>??</span> Decelerating Bullish
+                        </span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-200">v &gt; 0, a &lt; 0</span>
+                    </div>
+                    <p class="text-[11px] text-cyan-400/80 mt-1">Bullish exhaustion &bull; upward velocity slowing &bull; consolidation / top forming</p>
+                    <div id="quadDecBullish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    </div>
+                </div>
+
+                <!-- Quadrant I: Accelerating Bullish (Top Right) -->
+                <div class="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-4">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                            <span>??</span> Accelerating Bullish
+                        </span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-emerald-900/40 text-emerald-200">v &gt; 0, a &gt; 0</span>
+                    </div>
+                    <p class="text-[11px] text-emerald-400/80 mt-1">Aggressive momentum expansion &bull; buyers dominant &bull; strong trend thrust</p>
+                    <div id="quadAccBullish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    </div>
+                </div>
+
+                <!-- Quadrant III: Accelerating Bearish (Bottom Left) -->
+                <div class="bg-rose-950/20 border border-rose-800/40 rounded-xl p-4">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-rose-300 flex items-center gap-1.5">
+                            <span>??</span> Accelerating Bearish
+                        </span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-rose-900/40 text-rose-200">v &lt; 0, a &lt; 0</span>
+                    </div>
+                    <p class="text-[11px] text-rose-400/80 mt-1">Aggressive selling impulse &bull; downward velocity speeding up &bull; flush / breakdown</p>
+                    <div id="quadAccBearish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    </div>
+                </div>
+
+                <!-- Quadrant IV: Decelerating Bearish (Bottom Right) -->
+                <div class="bg-amber-950/20 border border-amber-800/40 rounded-xl p-4">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                            <span>??</span> Decelerating Bearish
+                        </span>
+                        <span class="text-[10px] mono px-2 py-0.5 rounded bg-amber-900/40 text-amber-200">v &lt; 0, a &gt; 0</span>
+                    </div>
+                    <p class="text-[11px] text-amber-400/80 mt-1">Downside absorption &bull; selling losing speed &bull; basing / potential recovery</p>
+                    <div id="quadDecBearish" class="mt-3 flex flex-wrap gap-1.5 min-h-[32px] items-center">
+                        <span class="text-xs text-slate-500 italic">No instruments</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filter & Search Controls -->
+        <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            <div class="relative flex-1 max-w-xs">
+                <input id="symbolSearch" oninput="applyFilters()" type="text" placeholder="Filter symbol (e.g. NVDA, SPY)..." class="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition">
+            </div>
+
+            <!-- Regime Filter Buttons -->
+            <div class="flex flex-wrap items-center gap-1.5 text-xs">
+                <button onclick="setFilter('all')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500" data-regime="all">All</button>
+                <button onclick="setFilter('accelerating_bullish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bullish">Acc Bullish</button>
+                <button onclick="setFilter('decelerating_bullish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bullish">Dec Bullish</button>
+                <button onclick="setFilter('accelerating_bearish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="accelerating_bearish">Acc Bearish</button>
+                <button onclick="setFilter('decelerating_bearish')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="decelerating_bearish">Dec Bearish</button>
+                <button onclick="setFilter('neutral')" class="filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white" data-regime="neutral">Neutral</button>
+            </div>
+        </div>
+
+        <!-- Main Instruments Kinematics Table -->
+        <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl overflow-hidden shadow-xl">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead>
+                        <tr class="bg-slate-950/60 border-b border-slate-800 text-slate-400 font-semibold">
+                            <th class="px-4 py-3">Symbol / Feed</th>
+                            <th class="px-4 py-3 text-right">Close ($)</th>
+                            <th class="px-4 py-3 text-right">Price Velocity (v)</th>
+                            <th class="px-4 py-3 text-right">Price Accel (a)</th>
+                            <th class="px-4 py-3 min-w-[140px]">RSI (14)</th>
+                            <th class="px-4 py-3 text-right">RSI Velocity (v_rsi)</th>
+                            <th class="px-4 py-3 text-right">RSI Accel (a_rsi)</th>
+                            <th class="px-4 py-3">Kinematics Regime</th>
+                            <th class="px-4 py-3 text-right">Momentum (3m)</th>
+                            <th class="px-4 py-3 text-center">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="kinematicsTableBody" class="divide-y divide-slate-800/60">
+                        <tr>
+                            <td colspan="10" class="px-4 py-8 text-center text-slate-500">
+                                <div class="flex flex-col items-center justify-center gap-2">
+                                    <svg class="w-6 h-6 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+                                    <span>Connecting to engine telemetry stream...</span>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Minute Summaries Feed & Raw Output Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Emitted Summaries Feed (2 cols) -->
+            <div class="lg:col-span-2 bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5">
+                <div class="flex items-center justify-between mb-4">
+                    <div>
+                        <h3 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                            Emitted Minute Summaries Log Feed
+                        </h3>
+                        <p class="text-xs text-slate-400">Records emitted to <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
+                    </div>
+                    <button onclick="fetchMinuteSummaries()" class="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition">Refresh Summaries</button>
+                </div>
+
+                <div id="summariesContainer" class="space-y-3 max-h-[460px] overflow-y-auto pr-1">
+                    <div class="text-center py-8 text-slate-500 text-xs">Waiting for first minute summary finalization...</div>
+                </div>
+            </div>
+
+            <!-- Position Monitor & Engine Diagnostic Info (1 col) -->
+            <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-5 space-y-4">
+                <div>
+                    <h3 class="text-sm font-bold text-white uppercase tracking-wider">Engine Diagnostic Telemetry</h3>
+                    <p class="text-xs text-slate-400">Positions monitor &amp; provider heartbeat</p>
+                </div>
+
+                <div class="space-y-3 text-xs">
+                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                        <span class="text-slate-400">Position Monitor</span>
+                        <span id="posMonitorStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                    </div>
+
+                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                        <span class="text-slate-400">Active Equity Positions</span>
+                        <span id="posMonitorEquity" class="mono font-semibold text-slate-200">0</span>
+                    </div>
+
+                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                        <span class="text-slate-400">Active Option Positions</span>
+                        <span id="posMonitorOption" class="mono font-semibold text-slate-200">0</span>
+                    </div>
+
+                    <div class="flex justify-between items-center p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                        <span class="text-slate-400">Last Telemetry Poll</span>
+                        <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
+                    </div>
+                </div>
+
+                <div class="pt-2 border-t border-slate-800/80">
+                    <h4 class="text-xs font-semibold text-slate-300 mb-2">Connected Feeds</h4>
+                    <div id="connectedFeedsList" class="flex flex-wrap gap-1.5 text-xs">
+                        <span class="text-slate-500">Checking...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Bar Injection Modal -->
+    <div id="injectModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div class="flex items-center justify-between">
+                <h3 class="text-base font-bold text-white flex items-center gap-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span>
+                    Inject Live Test Bar
+                </h3>
+                <button onclick="toggleInjectModal()" class="text-slate-400 hover:text-white">&times;</button>
+            </div>
+            <p class="text-xs text-slate-400">Simulate incoming bar or tick event directly through the MinuteCoordinator pipeline.</p>
+
+            <form id="injectForm" onsubmit="handleInjectSubmit(event)" class="space-y-3 text-xs">
+                <div>
+                    <label class="block text-slate-300 font-medium mb-1">Provider Feed</label>
+                    <select id="injectProvider" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500">
+                        <option value="TRADINGVIEW">TRADINGVIEW</option>
+                        <option value="ALPACA">ALPACA</option>
+                        <option value="TRADIER">TRADIER</option>
+                        <option value="YAHOOFINANCE">YAHOOFINANCE</option>
+                        <option value="TWELVEDATA">TWELVEDATA</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="block text-slate-300 font-medium mb-1">Symbol</label>
+                    <input id="injectSymbol" type="text" required placeholder="e.g. NVDA" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white uppercase font-mono focus:outline-none focus:border-indigo-500">
+                </div>
+
+                <div>
+                    <label class="block text-slate-300 font-medium mb-1">Close Price ($)</label>
+                    <input id="injectPrice" type="number" step="0.0001" required placeholder="185.50" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-indigo-500">
+                </div>
+
+                <div class="flex justify-end gap-2 pt-2">
+                    <button type="button" onclick="toggleInjectModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-medium transition">Cancel</button>
+                    <button type="submit" id="btnSubmitInject" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-semibold transition flex items-center gap-1.5 shadow-md shadow-indigo-600/30">
+                        Inject Bar &rarr;
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- JavaScript Application Engine -->
+    <script>
+        let currentFilter = 'all';
+        let latestData = null;
+        let nextMinuteUtc = null;
+        let countdownTimer = null;
+
+        const REGIME_CONFIG = {
+            accelerating_bullish: {
+                label: 'Accelerating Bullish',
+                badgeClass: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
+                icon: '??',
+                pillColor: 'text-emerald-400'
+            },
+            decelerating_bullish: {
+                label: 'Decelerating Bullish',
+                badgeClass: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30',
+                icon: '??',
+                pillColor: 'text-cyan-400'
+            },
+            accelerating_bearish: {
+                label: 'Accelerating Bearish',
+                badgeClass: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
+                icon: '??',
+                pillColor: 'text-rose-400'
+            },
+            decelerating_bearish: {
+                label: 'Decelerating Bearish',
+                badgeClass: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
+                icon: '??',
+                pillColor: 'text-amber-400'
+            },
+            neutral: {
+                label: 'Neutral',
+                badgeClass: 'bg-slate-700/30 text-slate-300 border-slate-700',
+                icon: '?',
+                pillColor: 'text-slate-400'
+            }
+        };
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('statusToast');
+            toast.textContent = message;
+            toast.className = `p-3 rounded-xl text-xs font-medium border block ${
+                type === 'success' 
+                    ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800' 
+                    : 'bg-rose-950/40 text-rose-300 border-rose-800'
+            }`;
+            setTimeout(() => { toast.classList.add('hidden'); }, 4000);
+        }
+
+        function setFilter(regime) {
+            currentFilter = regime;
+            document.querySelectorAll('.filter-btn').forEach(btn => {
+                if (btn.dataset.regime === regime) {
+                    btn.className = 'filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-indigo-600 text-white border-indigo-500';
+                } else {
+                    btn.className = 'filter-btn px-2.5 py-1.5 rounded-lg border font-medium transition bg-slate-800 text-slate-300 border-slate-700 hover:text-white';
+                }
+            });
+            applyFilters();
+        }
+
+        function toggleInjectModal(prefillSymbol = '') {
+            const modal = document.getElementById('injectModal');
+            modal.classList.toggle('hidden');
+            if (prefillSymbol) {
+                document.getElementById('injectSymbol').value = prefillSymbol;
+                document.getElementById('injectPrice').focus();
+            }
+        }
+
+        async function handleInjectSubmit(e) {
+            e.preventDefault();
+            const provider = document.getElementById('injectProvider').value;
+            const symbol = document.getElementById('injectSymbol').value.trim().toUpperCase();
+            const price = parseFloat(document.getElementById('injectPrice').value);
+            const btn = document.getElementById('btnSubmitInject');
+
+            btn.disabled = true;
+            btn.textContent = 'Injecting...';
+
+            try {
+                const res = await fetch('/cli/inject', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider, symbol, price })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(`Successfully injected bar for ${symbol} @ $${price.toFixed(2)}`);
+                    toggleInjectModal();
+                    await fetchAllData();
+                } else {
+                    showToast(`Injection failed: ${data.message || 'Error'}`, 'error');
+                }
+            } catch (err) {
+                showToast(`Network error: ${err.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = 'Inject Bar &rarr;';
+            }
+        }
+
+        async function forceFinalize() {
+            const btn = document.getElementById('btnFlush');
+            btn.disabled = true;
+            btn.textContent = 'Flushing...';
+
+            try {
+                const res = await fetch('/cli/finalize', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok) {
+                    showToast(data.message || 'Flushed due minute summaries successfully.');
+                    await fetchAllData();
+                    await fetchMinuteSummaries();
+                } else {
+                    showToast('Failed to flush summaries', 'error');
+                }
+            } catch (err) {
+                showToast(`Error: ${err.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = `<svg class="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> Flush Minute`;
+            }
+        }
+
+        function updateCountdown() {
+            if (!nextMinuteUtc) return;
+            const now = new Date();
+            const diff = Math.max(0, Math.floor((nextMinuteUtc - now) / 1000));
+            const el = document.getElementById('minuteCountdown');
+            if (el) {
+                el.textContent = `${diff}s`;
+                if (diff <= 5) {
+                    el.className = 'mono font-semibold text-rose-400 animate-pulse';
+                } else {
+                    el.className = 'mono font-semibold text-amber-300';
+                }
+            }
+        }
+
+        async function fetchAllData() {
+            const refreshIcon = document.getElementById('refreshIcon');
+            if (refreshIcon) refreshIcon.classList.add('animate-spin');
+
+            try {
+                const [statusRes, kinRes] = await Promise.all([
+                    fetch('/cli/status').then(r => r.json()).catch(() => null),
+                    fetch('/api/kinematics').then(r => r.json()).catch(() => null)
+                ]);
+
+                if (statusRes && statusRes.metrics) {
+                    renderStatusMetrics(statusRes.metrics);
+                }
+
+                if (kinRes && kinRes.instruments) {
+                    latestData = kinRes;
+                    renderKinematics(kinRes);
+                }
+            } catch (err) {
+                console.error("Telemetry fetch error:", err);
+            } finally {
+                if (refreshIcon) refreshIcon.classList.remove('animate-spin');
+            }
+        }
+
+        function renderStatusMetrics(m) {
+            document.getElementById('runIdBadge').textContent = m.run_id || '__RUN_ID__';
+            document.getElementById('pendingQueueSize').textContent = m.pending_queue_size ?? 0;
+
+            if (m.next_due_minute_utc) {
+                nextMinuteUtc = new Date(m.next_due_minute_utc);
+                updateCountdown();
+            }
+
+            if (m.position_monitor) {
+                document.getElementById('posMonitorStatus').textContent = m.position_monitor.status || 'not_loaded';
+                document.getElementById('posMonitorEquity').textContent = m.position_monitor.active_equity_positions ?? 0;
+                document.getElementById('posMonitorOption').textContent = m.position_monitor.active_option_positions ?? 0;
+                document.getElementById('posMonitorLastPoll').textContent = m.position_monitor.last_poll_utc ? new Date(m.position_monitor.last_poll_utc).toLocaleTimeString() : '--';
+            }
+
+            // Connected Providers
+            const feedsContainer = document.getElementById('connectedFeedsList');
+            if (feedsContainer && m.connected_providers) {
+                feedsContainer.innerHTML = '';
+                const providers = Object.entries(m.connected_providers);
+                document.getElementById('activeProvidersCount').textContent = `${providers.filter(([_, c]) => c).length} Providers Connected`;
+                providers.forEach(([prov, connected]) => {
+                    const badge = document.createElement('span');
+                    badge.className = `px-2 py-0.5 rounded text-[11px] font-mono font-medium border ${
+                        connected 
+                            ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800' 
+                            : 'bg-rose-950/40 text-rose-300 border-rose-800'
+                    }`;
+                    badge.textContent = `${prov}: ${connected ? 'ONLINE' : 'OFFLINE'}`;
+                    feedsContainer.appendChild(badge);
+                });
+            }
+        }
+
+        function renderKinematics(data) {
+            const instruments = data.instruments || [];
+            document.getElementById('totalInstrumentsCount').textContent = instruments.length;
+
+            const counts = data.regime_counts || {};
+            const bull = (counts.accelerating_bullish || 0) + (counts.decelerating_bullish || 0);
+            const bear = (counts.accelerating_bearish || 0) + (counts.decelerating_bearish || 0);
+            const neutral = counts.neutral || 0;
+
+            document.getElementById('bullCount').textContent = `${bull} Bull`;
+            document.getElementById('bearCount').textContent = `${bear} Bear`;
+            document.getElementById('neutralCount').textContent = `${neutral} Neutral`;
+
+            // Calculate peak values
+            let maxRsiVel = null, maxRsiVelSym = null;
+            let maxPriceVel = null, maxPriceVelSym = null;
+            let maxRsiAccel = null;
+
+            instruments.forEach(inst => {
+                const rv = inst.rsi_velocity;
+                if (rv !== null && (maxRsiVel === null || Math.abs(rv) > Math.abs(maxRsiVel))) {
+                    maxRsiVel = rv;
+                    maxRsiVelSym = inst.symbol;
+                }
+                const pv = inst.price_velocity_pct;
+                if (pv !== null && (maxPriceVel === null || Math.abs(pv) > Math.abs(maxPriceVel))) {
+                    maxPriceVel = pv;
+                    maxPriceVelSym = inst.symbol;
+                }
+                const ra = inst.rsi_acceleration;
+                if (ra !== null && (maxRsiAccel === null || Math.abs(ra) > Math.abs(maxRsiAccel))) {
+                    maxRsiAccel = ra;
+                }
+            });
+
+            if (maxRsiVel !== null) {
+                document.getElementById('peakRsiVel').textContent = (maxRsiVel >= 0 ? '+' : '') + maxRsiVel.toFixed(2);
+                document.getElementById('peakRsiVelSymbol').textContent = `${maxRsiVelSym} (${maxRsiVel >= 0 ? 'Bull' : 'Bear'})`;
+            }
+            if (maxPriceVel !== null) {
+                document.getElementById('peakPriceVel').textContent = (maxPriceVel >= 0 ? '+' : '') + maxPriceVel.toFixed(2);
+                document.getElementById('peakPriceVelSymbol').textContent = `${maxPriceVelSym} (${maxPriceVel >= 0 ? 'Bull' : 'Bear'})`;
+            }
+            if (maxRsiAccel !== null) {
+                document.getElementById('peakRsiAccel').textContent = (maxRsiAccel >= 0 ? '+' : '') + maxRsiAccel.toFixed(2);
+            }
+
+            // Render Quadrant Matrix
+            renderQuadrantMatrix(instruments);
+
+            // Render Table
+            applyFilters();
+        }
+
+        function renderQuadrantMatrix(instruments) {
+            const quads = {
+                accelerating_bullish: document.getElementById('quadAccBullish'),
+                decelerating_bullish: document.getElementById('quadDecBullish'),
+                accelerating_bearish: document.getElementById('quadAccBearish'),
+                decelerating_bearish: document.getElementById('quadDecBearish')
+            };
+
+            Object.values(quads).forEach(el => { el.innerHTML = ''; });
+
+            const grouped = {
+                accelerating_bullish: [],
+                decelerating_bullish: [],
+                accelerating_bearish: [],
+                decelerating_bearish: []
+            };
+
+            instruments.forEach(inst => {
+                if (grouped[inst.regime]) {
+                    grouped[inst.regime].push(inst);
+                }
+            });
+
+            Object.entries(grouped).forEach(([regime, items]) => {
+                const container = quads[regime];
+                if (!container) return;
+                if (items.length === 0) {
+                    container.innerHTML = `<span class="text-xs text-slate-500 italic">No instruments in this phase</span>`;
+                    return;
+                }
+                items.forEach(item => {
+                    const pill = document.createElement('span');
+                    const vText = item.rsi_velocity !== null ? `${item.rsi_velocity >= 0 ? '+' : ''}${item.rsi_velocity.toFixed(1)}/m` : '';
+                    pill.className = `cursor-pointer px-2 py-0.5 rounded text-[11px] font-mono font-medium border transition hover:scale-105 ${REGIME_CONFIG[regime].badgeClass}`;
+                    pill.textContent = `${item.symbol} ${vText}`;
+                    pill.title = `${item.symbol} (${item.provider})\nPrice: $${item.close}\nRSI: ${item.rsi}\nv_rsi: ${item.rsi_velocity}\na_rsi: ${item.rsi_acceleration}`;
+                    pill.onclick = () => toggleInjectModal(item.symbol);
+                    container.appendChild(pill);
+                });
+            });
+        }
+
+        function applyFilters() {
+            if (!latestData || !latestData.instruments) return;
+            const search = (document.getElementById('symbolSearch').value || '').trim().toUpperCase();
+            const tbody = document.getElementById('kinematicsTableBody');
+
+            let filtered = latestData.instruments;
+            if (currentFilter !== 'all') {
+                filtered = filtered.filter(i => i.regime === currentFilter);
+            }
+            if (search) {
+                filtered = filtered.filter(i => i.symbol.includes(search));
+            }
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="10" class="px-4 py-8 text-center text-slate-500">No instruments match current filter criteria.</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(inst => {
+                const rConf = REGIME_CONFIG[inst.regime] || REGIME_CONFIG.neutral;
+                const priceFormatted = inst.close !== null ? `$${inst.close.toFixed(2)}` : '--';
+                
+                // Price velocity & pct
+                let pVelText = '--';
+                let pVelColor = 'text-slate-400';
+                if (inst.price_velocity !== null) {
+                    const sign = inst.price_velocity >= 0 ? '+' : '';
+                    const pctText = inst.price_velocity_pct !== null ? ` (${sign}${inst.price_velocity_pct.toFixed(2)}%)` : '';
+                    pVelText = `${sign}$${inst.price_velocity.toFixed(2)}${pctText}`;
+                    pVelColor = inst.price_velocity > 0 ? 'text-emerald-400' : (inst.price_velocity < 0 ? 'text-rose-400' : 'text-slate-400');
+                }
+
+                // Price Accel
+                let pAccelText = '--';
+                if (inst.price_acceleration !== null) {
+                    const sign = inst.price_acceleration >= 0 ? '+' : '';
+                    pAccelText = `${sign}$${inst.price_acceleration.toFixed(2)}`;
+                }
+
+                // RSI progress
+                let rsiVal = inst.rsi !== null ? inst.rsi.toFixed(1) : '--';
+                let rsiBarWidth = inst.rsi !== null ? Math.min(100, Math.max(0, inst.rsi)) : 50;
+                let rsiBarColor = 'bg-indigo-500';
+                if (inst.rsi !== null) {
+                    if (inst.rsi >= 70) rsiBarColor = 'bg-rose-500';
+                    else if (inst.rsi <= 30) rsiBarColor = 'bg-emerald-500';
+                }
+
+                // RSI velocity
+                let rVelText = '--';
+                let rVelColor = 'text-slate-400';
+                if (inst.rsi_velocity !== null) {
+                    const sign = inst.rsi_velocity >= 0 ? '+' : '';
+                    rVelText = `${sign}${inst.rsi_velocity.toFixed(2)}/m`;
+                    rVelColor = inst.rsi_velocity > 0 ? 'text-emerald-400' : (inst.rsi_velocity < 0 ? 'text-rose-400' : 'text-slate-400');
+                }
+
+                // RSI Accel
+                let rAccelText = '--';
+                let rAccelColor = 'text-slate-400';
+                if (inst.rsi_acceleration !== null) {
+                    const sign = inst.rsi_acceleration >= 0 ? '+' : '';
+                    rAccelText = `${sign}${inst.rsi_acceleration.toFixed(2)}/m²`;
+                    rAccelColor = inst.rsi_acceleration > 0 ? 'text-cyan-400' : (inst.rsi_acceleration < 0 ? 'text-amber-400' : 'text-slate-400');
+                }
+
+                // Momentum 3m
+                let momText = '--';
+                if (inst.momentum_3m_pct !== null) {
+                    const sign = inst.momentum_3m_pct >= 0 ? '+' : '';
+                    momText = `${sign}${inst.momentum_3m_pct.toFixed(2)}%`;
+                }
+
+                return `
+                    <tr class="hover:bg-slate-800/40 transition">
+                        <td class="px-4 py-3">
+                            <div class="font-bold text-white mono">${inst.symbol}</div>
+                            <div class="text-[10px] text-slate-500 uppercase">${inst.provider}</div>
+                        </td>
+                        <td class="px-4 py-3 text-right mono font-semibold text-slate-200">${priceFormatted}</td>
+                        <td class="px-4 py-3 text-right mono font-semibold ${pVelColor}">${pVelText}</td>
+                        <td class="px-4 py-3 text-right mono text-slate-300">${pAccelText}</td>
+                        <td class="px-4 py-3">
+                            <div class="flex items-center gap-2">
+                                <span class="mono font-bold text-slate-200 w-10 text-right">${rsiVal}</span>
+                                <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                    <div class="h-full ${rsiBarColor} transition-all duration-300" style="width: ${rsiBarWidth}%"></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-4 py-3 text-right mono font-semibold ${rVelColor}">${rVelText}</td>
+                        <td class="px-4 py-3 text-right mono font-semibold ${rAccelColor}">${rAccelText}</td>
+                        <td class="px-4 py-3">
+                            <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${rConf.badgeClass}">
+                                <span>${rConf.icon}</span>
+                                ${rConf.label}
+                            </span>
+                        </td>
+                        <td class="px-4 py-3 text-right mono text-slate-300">${momText}</td>
+                        <td class="px-4 py-3 text-center">
+                            <button onclick="toggleInjectModal('${inst.symbol}')" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] font-mono transition" title="Inject Test Bar">
+                                Inject
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function fetchMinuteSummaries() {
+            const container = document.getElementById('summariesContainer');
+            try {
+                const res = await fetch('/api/minute-summaries');
+                const data = await res.json();
+                if (!res.ok || !data.summaries || data.summaries.length === 0) {
+                    container.innerHTML = `<div class="text-center py-8 text-slate-500 text-xs">No minute summaries emitted yet. They are written to <code>minute-summary-${document.getElementById('runIdBadge').textContent}.jsonl</code> upon each NYSE minute finalization.</div>`;
+                    return;
+                }
+
+                const reversed = [...data.summaries].reverse();
+                container.innerHTML = reversed.map((rec, idx) => {
+                    const minUtc = rec.minute_start_utc ? new Date(rec.minute_start_utc).toISOString().slice(11, 16) + ' UTC' : '--';
+                    const kin = rec.kinematics_summary || {};
+                    const regimes = kin.regimes || {};
+                    const symbolsCount = rec.symbols ? Object.keys(rec.symbols).length : 0;
+                    const maxRsi = kin.max_rsi_velocity;
+                    const maxPrice = kin.max_price_velocity_pct;
+
+                    return `
+                        <div class="p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-2">
+                            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                <div class="flex items-center gap-2">
+                                    <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 mono font-bold">${minUtc}</span>
+                                    <span class="text-slate-300 font-semibold uppercase">${rec.provider || 'ALL'}</span>
+                                    <span class="text-slate-500">&bull;</span>
+                                    <span class="text-slate-400">${symbolsCount} symbols</span>
+                                </div>
+                                <div class="flex items-center gap-2 text-[11px] mono">
+                                    <span class="text-slate-400">Late: <span class="font-bold text-slate-200">${rec.late_records_since_previous_summary ?? 0}</span></span>
+                                    <button onclick="copySummaryJson(${idx})" id="copyBtn_${idx}" class="text-indigo-400 hover:text-indigo-300 underline font-sans ml-2">Copy JSON</button>
+                                </div>
+                            </div>
+
+                            <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                                <span class="px-2 py-0.5 rounded bg-emerald-950/40 text-emerald-300 border border-emerald-900/40">?? Acc Bull: ${regimes.accelerating_bullish || 0}</span>
+                                <span class="px-2 py-0.5 rounded bg-cyan-950/40 text-cyan-300 border border-cyan-900/40">?? Dec Bull: ${regimes.decelerating_bullish || 0}</span>
+                                <span class="px-2 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">?? Acc Bear: ${regimes.accelerating_bearish || 0}</span>
+                                <span class="px-2 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">?? Dec Bear: ${regimes.decelerating_bearish || 0}</span>
+                            </div>
+
+                            ${maxRsi || maxPrice ? `
+                                <div class="text-[10px] mono text-slate-400 flex flex-wrap gap-3 pt-1 border-t border-slate-900">
+                                    ${maxRsi ? `<span>Max ?RSI: <strong class="text-emerald-400">${maxRsi.symbol} (+${maxRsi.value?.toFixed(2)})</strong></span>` : ''}
+                                    ${maxPrice ? `<span>Max ?P%: <strong class="text-indigo-400">${maxPrice.symbol} (+${maxPrice.value?.toFixed(2)}%)</strong></span>` : ''}
+                                </div>
+                            ` : ''}
+                            <input type="hidden" id="rawSummary_${idx}" value='${JSON.stringify(rec).replace(/'/g, "&apos;")}'>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                container.innerHTML = `<div class="text-rose-400 text-xs py-4">Error loading minute summaries: ${err.message}</div>`;
+            }
+        }
+
+        function copySummaryJson(idx) {
+            const raw = document.getElementById(`rawSummary_${idx}`).value;
+            navigator.clipboard.writeText(raw).then(() => {
+                const btn = document.getElementById(`copyBtn_${idx}`);
+                btn.textContent = 'Copied!';
+                setTimeout(() => { btn.textContent = 'Copy JSON'; }, 2000);
+            });
+        }
+
+        // Initialize engine telemetry loop
+        fetchAllData();
+        fetchMinuteSummaries();
+        setInterval(fetchAllData, 2500);
+        setInterval(fetchMinuteSummaries, 6000);
+        countdownTimer = setInterval(updateCountdown, 1000);
+    </script>
+</body>
+</html>
+"""
+
+
 class AdminCliProvider:
     def __init__(self, coordinator, host="127.0.0.1", port=5001):
         import threading
@@ -2200,6 +3361,79 @@ class AdminCliProvider:
         app = Flask("admin_cli_interface")
         app.config["MAX_CONTENT_LENGTH"] = 16384
 
+        @app.route("/", methods=["GET"])
+        @app.route("/dashboard", methods=["GET"])
+        @app.route("/kinematics", methods=["GET"])
+        def index():
+            html = DASHBOARD_HTML_TEMPLATE.replace("__RUN_ID__", RUN_ID)
+            return html, 200, {"Content-Type": "text/html"}
+
+        @app.get("/api/kinematics")
+        def get_kinematics():
+            latest = {}
+            regime_counts = {
+                "accelerating_bullish": 0,
+                "decelerating_bullish": 0,
+                "accelerating_bearish": 0,
+                "decelerating_bearish": 0,
+                "neutral": 0,
+            }
+            records_flat = []
+
+            for (provider, symbol), hist in self.coordinator.kinematics_history.items():
+                if hist:
+                    cur = hist[-1]
+                    regime = cur.get("regime", "neutral")
+                    if regime in regime_counts:
+                        regime_counts[regime] += 1
+
+                    entry = {
+                        "provider": provider,
+                        "symbol": symbol,
+                        "close": cur.get("close"),
+                        "rsi": cur.get("rsi"),
+                        "price_velocity": cur.get("price_velocity"),
+                        "price_velocity_pct": cur.get("price_velocity_pct"),
+                        "price_acceleration": cur.get("price_acceleration"),
+                        "rsi_velocity": cur.get("rsi_velocity"),
+                        "rsi_acceleration": cur.get("rsi_acceleration"),
+                        "momentum_3m_pct": cur.get("momentum_3m_pct"),
+                        "ema_slope": cur.get("ema_slope"),
+                        "regime": regime,
+                        "timestamp": cur.get("timestamp"),
+                    }
+                    latest.setdefault(provider, {})[symbol] = entry
+                    records_flat.append(entry)
+
+            return (
+                jsonify(
+                    status="ok",
+                    run_id=RUN_ID,
+                    regime_counts=regime_counts,
+                    latest_by_provider=latest,
+                    instruments=records_flat,
+                ),
+                200,
+            )
+
+        @app.get("/api/minute-summaries")
+        def get_minute_summaries():
+            path = LOG_ROOT / f"minute-summary-{RUN_ID}.jsonl"
+            if not path.exists():
+                return jsonify(status="ok", summaries=[]), 200
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                records = []
+                for line in lines[-30:]:
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        continue
+                return jsonify(status="ok", summaries=records), 200
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
+
         # @app.post("/cli/status")
         @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
@@ -2213,6 +3447,24 @@ class AdminCliProvider:
                 "active_equity_positions": pm.position_count if pm else 0,
                 "active_option_positions": pm.option_count if pm else 0,
             }
+            latest_kinematics = {}
+            for (provider, symbol), hist in self.coordinator.kinematics_history.items():
+                if hist:
+                    latest = hist[-1]
+                    latest_kinematics.setdefault(provider, {})[symbol] = {
+                        "close": latest.get("close"),
+                        "rsi": latest.get("rsi"),
+                        "price_velocity": latest.get("price_velocity"),
+                        "price_velocity_pct": latest.get("price_velocity_pct"),
+                        "price_acceleration": latest.get("price_acceleration"),
+                        "rsi_velocity": latest.get("rsi_velocity"),
+                        "rsi_acceleration": latest.get("rsi_acceleration"),
+                        "momentum_3m_pct": latest.get("momentum_3m_pct"),
+                        "ema_slope": latest.get("ema_slope"),
+                        "regime": latest.get("regime", "neutral"),
+                        "timestamp": latest.get("timestamp"),
+                    }
+
             status_report = {
                 "run_id": RUN_ID,
                 "connected_providers": self.coordinator.connected,
@@ -2223,6 +3475,7 @@ class AdminCliProvider:
                     k for k in PROVIDER_REGISTRY.keys() if k != "POSITIONS_MONITOR"
                 ],
                 "position_monitor": position_monitor_report,
+                "latest_kinematics": latest_kinematics,
             }
             return jsonify(status="ok", metrics=status_report), 200
 
