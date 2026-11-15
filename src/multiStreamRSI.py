@@ -4121,13 +4121,24 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }).join('');
         }
 
+        function formatMinuteTick(point, idx) {
+            const raw = point && (point.timestamp || point.minute);
+            if (!raw) return `t${idx}`;
+            const d = new Date(raw);
+            if (!Number.isNaN(d.getTime())) {
+                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+            }
+            const m = String(raw).match(/(\d{2}:\d{2})/);
+            return m ? m[1] : `t${idx}`;
+        }
+
         function renderCrossoverChart(container, points, projectedNext) {
             if (!container) return;
             if (!points || points.length < 2) {
                 container.innerHTML = '<div class="text-xs text-slate-500 py-8">Need at least 2 closed minute bars to draw synchronized Price / Velocity / Acceleration / RSI panels.</div>';
                 return;
             }
-            const W = 640, H = 220, padL = 44, padR = 24;
+            const W = 640, H = 232, padL = 44, padR = 26;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => padL + (i / Math.max(1, n)) * plotW;
@@ -4160,6 +4171,38 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const nextX = xAt(n);
             const nextY = projectedNext !== null ? yP(projectedNext) : lastY;
 
+            // Subtle 1-minute vertical boundaries drawn BEHIND all series
+            const labelStep = n <= 8 ? 1 : (n <= 15 ? 3 : 4);
+            let minuteGrid = '';
+            let lastLabelX = -999;
+            const latestBarX = xAt(n - 1);
+            for (let i = 0; i < n; i++) {
+                const xNum = xAt(i);
+                const x = xNum.toFixed(1);
+                const tickStr = formatMinuteTick(points[i], i);
+                const minNum = parseInt((tickStr.split(':')[1] || ''), 10);
+                const isMajor5m = !Number.isNaN(minNum) && minNum % 5 === 0;
+                const isLatest = i === n - 1;
+                const strokeColor = isMajor5m ? '#334155' : '#1e293b';
+                const strokeOpacity = isMajor5m ? '0.65' : '0.45';
+                const dash = isMajor5m ? '2,2' : '1,3';
+
+                minuteGrid += `<line x1="${x}" y1="10" x2="${x}" y2="212" stroke="${strokeColor}" stroke-opacity="${strokeOpacity}" stroke-dasharray="${dash}" stroke-width="1"><title>Bar ${tickStr}</title></line>`;
+
+                const fitsSpacing = (xNum - lastLabelX >= 38) && (isLatest || (latestBarX - xNum >= 38));
+                const isCandidate = i === 0 || isMajor5m || (i % labelStep === 0) || isLatest;
+                if (isCandidate && fitsSpacing) {
+                    const textColor = isLatest ? '#94a3b8' : '#64748b';
+                    minuteGrid += `<text x="${x}" y="225" text-anchor="middle" fill="${textColor}" font-size="8.5" font-family="monospace">${tickStr}</text>`;
+                    lastLabelX = xNum;
+                }
+            }
+            if (projectedNext !== null) {
+                const px = xAt(n).toFixed(1);
+                minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.20" stroke-dasharray="2,3" stroke-width="1" />`;
+                minuteGrid += `<text x="${px}" y="225" text-anchor="middle" fill="#22d3ee" fill-opacity="0.8" font-size="8.5" font-family="monospace">+1m</text>`;
+            }
+
             const crossMarkers = points.map((p, i) => {
                 if (p.crossover_signal === 'leading_bearish' || p.crossover_signal === 'leading_bullish') {
                     return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(accs[i]).toFixed(1)}" r="3.5" fill="#fb923c" stroke="#0f172a" stroke-width="1"><title>Leading Signal (${p.crossover_signal})</title></circle>`;
@@ -4172,6 +4215,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             container.innerHTML = `
                 <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto overflow-visible">
+                    ${minuteGrid}
+
                     <text x="4" y="20" fill="#94a3b8" font-size="9" font-family="monospace">Price</text>
                     <text x="4" y="102" fill="#94a3b8" font-size="9" font-family="monospace">v / a</text>
                     <text x="4" y="176" fill="#94a3b8" font-size="9" font-family="monospace">RSI</text>
