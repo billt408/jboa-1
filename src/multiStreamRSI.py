@@ -154,9 +154,7 @@ class Bar:
 KINEMATICS_SMOOTH_METHOD = os.getenv("KINEMATICS_SMOOTH_METHOD", "hma").strip().lower()
 if KINEMATICS_SMOOTH_METHOD not in {"hma", "ema", "none"}:
     KINEMATICS_SMOOTH_METHOD = "hma"
-KINEMATICS_SMOOTH_PERIOD = max(
-    2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD)))
-)
+KINEMATICS_SMOOTH_PERIOD = max(2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD))))
 KINEMATICS_RSI_OVERBOUGHT = float(os.getenv("KINEMATICS_RSI_OVERBOUGHT", "70.0"))
 KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
 
@@ -201,10 +199,12 @@ def compute_hma(values, period):
     return compute_wma(raw_hull, sqrt_n)
 
 
-def compute_smoothed_series(
-    values, period=KINEMATICS_SMOOTH_PERIOD, method=KINEMATICS_SMOOTH_METHOD
-):
+def compute_smoothed_series(values, period=None, method=None):
     """Return smoothed price series aligned to the given period (HMA, EMA, or raw)."""
+    if period is None:
+        period = KINEMATICS_SMOOTH_PERIOD
+    if method is None:
+        method = KINEMATICS_SMOOTH_METHOD
     clean = [float(v) for v in values]
     if not clean or method == "none":
         return clean
@@ -213,10 +213,12 @@ def compute_smoothed_series(
     return compute_hma(clean, period)
 
 
-def classify_rsi_zone(
-    rsi_val, overbought=KINEMATICS_RSI_OVERBOUGHT, oversold=KINEMATICS_RSI_OVERSOLD
-):
+def classify_rsi_zone(rsi_val, overbought=None, oversold=None):
     """Classify RSI into boundary friction zones."""
+    if overbought is None:
+        overbought = KINEMATICS_RSI_OVERBOUGHT
+    if oversold is None:
+        oversold = KINEMATICS_RSI_OVERSOLD
     if rsi_val is None or not math.isfinite(rsi_val):
         return "unknown"
     if rsi_val >= overbought:
@@ -237,26 +239,21 @@ def compute_kinematic_forecast(
     rsi,
     prev_velocity=None,
     prev_acceleration=None,
-    overbought=KINEMATICS_RSI_OVERBOUGHT,
-    oversold=KINEMATICS_RSI_OVERSOLD,
+    overbought=None,
+    oversold=None,
 ):
     """Compute next-step kinematic projection P_hat_{t+1} = P_t + v_t + 0.5*a_t,
     leading/confirmed crossover signals, and 4-state RSI-filtered trading action."""
+    if overbought is None:
+        overbought = KINEMATICS_RSI_OVERBOUGHT
+    if oversold is None:
+        oversold = KINEMATICS_RSI_OVERSOLD
     projected_price = None
     projected_delta = None
     projected_delta_pct = None
 
-    if (
-        close is not None
-        and math.isfinite(close)
-        and velocity is not None
-        and math.isfinite(velocity)
-    ):
-        acc = (
-            float(acceleration)
-            if (acceleration is not None and math.isfinite(acceleration))
-            else 0.0
-        )
+    if close is not None and math.isfinite(close) and velocity is not None and math.isfinite(velocity):
+        acc = float(acceleration) if (acceleration is not None and math.isfinite(acceleration)) else 0.0
         delta = float(velocity) + 0.5 * acc
         projected_delta = round(delta, 4)
         projected_price = round(float(close) + delta, 4)
@@ -269,22 +266,10 @@ def compute_kinematic_forecast(
             crossover_signal = "confirmed_bearish"
         elif prev_velocity <= 0 and velocity > 0:
             crossover_signal = "confirmed_bullish"
-    if (
-        crossover_signal == "none"
-        and acceleration is not None
-        and prev_acceleration is not None
-    ):
-        if (
-            prev_acceleration >= 0
-            and acceleration < 0
-            and (velocity is None or velocity > 0)
-        ):
+    if crossover_signal == "none" and acceleration is not None and prev_acceleration is not None:
+        if prev_acceleration >= 0 and acceleration < 0 and (velocity is None or velocity > 0):
             crossover_signal = "leading_bearish"
-        elif (
-            prev_acceleration <= 0
-            and acceleration > 0
-            and (velocity is None or velocity < 0)
-        ):
+        elif prev_acceleration <= 0 and acceleration > 0 and (velocity is None or velocity < 0):
             crossover_signal = "leading_bullish"
 
     rsi_zone = classify_rsi_zone(rsi, overbought=overbought, oversold=oversold)
@@ -414,7 +399,7 @@ class SessionRSI:
         With cross_session enabled and the averages already seeded (at least
         `period` changes observed), the averages, previous_close and change
         counter roll forward so the first bar of the day measures the overnight
-        gap from the prior close ? the same series TradingView smooths over.
+        gap from the prior close  the same series TradingView smooths over.
         Otherwise this falls back to a cold per-session reset.
         """
         if self.cross_session and self.average_gain is not None:
@@ -756,12 +741,70 @@ class MinuteCoordinator:
         }
         self.late_counts = {provider: 0 for provider in self.providers}
         self.kinematics_history = {}
+        self.option_chain_cache = {}
+        self.event_loop = None
+        self.minute_finalized_event = None
         logger = None if emit is not None else make_summary_logger()
         self.emit = emit or (
             lambda record: logger.info(
                 "%s", json.dumps(record, separators=(",", ":"), allow_nan=False)
             )
         )
+
+    def attach_event_loop(self, loop):
+        self.event_loop = loop
+        if self.minute_finalized_event is None:
+            self.minute_finalized_event = asyncio.Event()
+
+    def notify_minute_finalized(self):
+        if self.minute_finalized_event is None:
+            return
+        try:
+            running = asyncio.get_running_loop()
+            if running is self.event_loop:
+                self.minute_finalized_event.set()
+                return
+        except RuntimeError:
+            pass
+        if self.event_loop is not None and not self.event_loop.is_closed():
+            self.event_loop.call_soon_threadsafe(self.minute_finalized_event.set)
+
+    def record_option_contract(
+        self,
+        symbol,
+        contract,
+        signal,
+        event_time=None,
+        clean_payload=None,
+        source="collect_option_chain",
+    ):
+        """Cache the latest contract returned by collect_option_chain per symbol."""
+        sym = str(symbol).strip().upper()
+        self.option_chain_cache[sym] = {
+            "symbol": sym,
+            "contract": contract,
+            "signal": signal,
+            "event_time": event_time,
+            "clean_payload": clean_payload,
+            "source": source,
+            "collected_at_utc": datetime.now(UTC).isoformat(),
+        }
+
+    def latest_option_contract(self, symbol, max_age_seconds=None):
+        """Return cached collect_option_chain entry for symbol if fresh enough."""
+        sym = str(symbol).strip().upper()
+        entry = self.option_chain_cache.get(sym)
+        if not entry:
+            return None
+        if max_age_seconds is not None:
+            try:
+                collected = datetime.fromisoformat(entry["collected_at_utc"])
+                age = (datetime.now(UTC) - as_utc(collected)).total_seconds()
+                if age > max_age_seconds:
+                    return None
+            except Exception:
+                return None
+        return entry
 
     def set_connected(self, provider, connected, at=None):
         if self.connected[provider] == connected:
@@ -872,39 +915,15 @@ class MinuteCoordinator:
             for idx, b in enumerate(seed_slice):
                 sc = round(smoothed_seed[idx], 4)
                 sv = round(sc - smoothed_seed[idx - 1], 4) if idx >= 1 else None
-                sa = (
-                    round(sv - prev_sv, 4)
-                    if (sv is not None and prev_sv is not None)
-                    else None
+                sa = round(sv - prev_sv, 4) if (sv is not None and prev_sv is not None) else None
+                pv = tracker.latest_price_velocity if idx == len(seed_slice) - 1 else (
+                    round(b.close - seed_slice[idx - 1].close, 4) if idx >= 1 else None
                 )
-                pv = (
-                    tracker.latest_price_velocity
-                    if idx == len(seed_slice) - 1
-                    else (
-                        round(b.close - seed_slice[idx - 1].close, 4)
-                        if idx >= 1
-                        else None
-                    )
-                )
-                pa = (
-                    tracker.latest_price_acceleration
-                    if idx == len(seed_slice) - 1
-                    else None
-                )
+                pa = tracker.latest_price_acceleration if idx == len(seed_slice) - 1 else None
                 rv = tracker.latest_rsi_velocity if idx == len(seed_slice) - 1 else None
-                ra = (
-                    tracker.latest_rsi_acceleration
-                    if idx == len(seed_slice) - 1
-                    else None
-                )
-                rsi_val = (
-                    tracker.latest["rsi"]
-                    if (tracker.latest and idx == len(seed_slice) - 1)
-                    else None
-                )
-                reg = classify_kinematic_regime(
-                    rv, ra, sv if sv is not None else pv, sa if sa is not None else pa
-                )
+                ra = tracker.latest_rsi_acceleration if idx == len(seed_slice) - 1 else None
+                rsi_val = tracker.latest["rsi"] if (tracker.latest and idx == len(seed_slice) - 1) else None
+                reg = classify_kinematic_regime(rv, ra, sv if sv is not None else pv, sa if sa is not None else pa)
                 fc = compute_kinematic_forecast(
                     b.close,
                     sv if sv is not None else pv,
@@ -1107,9 +1126,7 @@ class MinuteCoordinator:
         smoothed_velocity = None
         smoothed_acceleration = None
         if curr_close is not None:
-            close_series = [
-                e["close"] for e in history if e.get("close") is not None
-            ] + [curr_close]
+            close_series = [e["close"] for e in history if e.get("close") is not None] + [curr_close]
             smoothed_vals = compute_smoothed_series(close_series)
             if smoothed_vals:
                 smoothed_close = round(smoothed_vals[-1], 4)
@@ -1117,20 +1134,13 @@ class MinuteCoordinator:
                     smoothed_velocity = round(smoothed_vals[-1] - smoothed_vals[-2], 4)
                 if len(smoothed_vals) >= 3:
                     prev_smoothed_vel = smoothed_vals[-2] - smoothed_vals[-3]
-                    smoothed_acceleration = round(
-                        smoothed_velocity - prev_smoothed_vel, 4
-                    )
+                    smoothed_acceleration = round(smoothed_velocity - prev_smoothed_vel, 4)
 
         prev_vel_for_cross = None
         prev_acc_for_cross = None
         if history:
             prev_hist = next(
-                (
-                    e
-                    for e in reversed(history)
-                    if e.get("smoothed_velocity") is not None
-                    or e.get("price_velocity") is not None
-                ),
+                (e for e in reversed(history) if e.get("smoothed_velocity") is not None or e.get("price_velocity") is not None),
                 None,
             )
             if prev_hist is not None:
@@ -1145,14 +1155,8 @@ class MinuteCoordinator:
                     else prev_hist.get("price_acceleration")
                 )
 
-        active_pv = (
-            smoothed_velocity if smoothed_velocity is not None else price_velocity
-        )
-        active_pa = (
-            smoothed_acceleration
-            if smoothed_acceleration is not None
-            else price_acceleration
-        )
+        active_pv = smoothed_velocity if smoothed_velocity is not None else price_velocity
+        active_pa = smoothed_acceleration if smoothed_acceleration is not None else price_acceleration
         forecast = compute_kinematic_forecast(
             curr_close,
             active_pv,
@@ -1360,9 +1364,12 @@ class MinuteCoordinator:
                 self.outages[provider] = [
                     (a, b) for a, b in self.outages[provider] if b is None or b > minute
                 ]
+        if emitted > 0:
+            self.notify_minute_finalized()
         return emitted
 
     async def run(self):
+        self.attach_event_loop(asyncio.get_running_loop())
         while True:
             self.finalize_due()
             await asyncio.sleep(0.25)
@@ -2104,6 +2111,181 @@ def parse_provider_enabled(value, provider):
     )
 
 
+def _strip_ini_value(value):
+    if not isinstance(value, str):
+        return value
+    cleaned = value.split(";", 1)[0].strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def _ini_str(cfg, section, option, env_name, default):
+    if cfg.has_option(section, option):
+        raw = _strip_ini_value(cfg.get(section, option, fallback=""))
+        if raw != "":
+            return str(raw)
+    return os.getenv(env_name, default)
+
+
+def _ini_bool(cfg, section, option, env_name, default):
+    if cfg.has_option(section, option):
+        raw = str(_strip_ini_value(cfg.get(section, option, fallback=""))).strip().lower()
+        if raw in {"1", "true", "yes"}:
+            return True
+        if raw in {"0", "false", "no"}:
+            return False
+        raise ValueError(f"[{section}] {option} must be true/false; got {raw!r}")
+    return os.getenv(env_name, "true" if default else "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _ini_int(cfg, section, option, env_name, default, minimum=None):
+    if cfg.has_option(section, option):
+        raw = _strip_ini_value(cfg.get(section, option, fallback=""))
+        val = int(raw)
+    else:
+        val = int(os.getenv(env_name, str(default)))
+    return max(minimum, val) if minimum is not None else val
+
+
+def _ini_float(cfg, section, option, env_name, default):
+    if cfg.has_option(section, option):
+        raw = _strip_ini_value(cfg.get(section, option, fallback=""))
+        return float(raw)
+    return float(os.getenv(env_name, str(default)))
+
+
+def _apply_ini_feature_settings(cfg):
+    """Load [kinematics] and [option_buyer] overrides from lib/parms.ini."""
+    global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
+    global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
+    global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
+    global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
+    global OPTION_BUY_QTY, OPTION_BUY_ORDER_TYPE, OPTION_BUY_COOLDOWN_MINUTES
+    global OPTION_BUY_MAX_OPEN_CONTRACTS, OPTION_BUY_MAX_AGE_SECONDS
+    global OPTION_BUY_FETCH_IF_MISSING, OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING
+    global OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT, OPTION_BUY_REQUIRE_RIGHT_MATCH
+    global OPTION_BUY_ALLOWED_FORECASTS
+
+    smooth_method = (
+        _ini_str(cfg, "kinematics", "smooth_method", "KINEMATICS_SMOOTH_METHOD", "hma")
+        .strip()
+        .lower()
+    )
+    if smooth_method not in {"hma", "ema", "none"}:
+        raise ValueError(
+            f"[kinematics] smooth_method must be hma, ema, or none; got {smooth_method!r}"
+        )
+    KINEMATICS_SMOOTH_METHOD = smooth_method
+    KINEMATICS_SMOOTH_PERIOD = _ini_int(
+        cfg, "kinematics", "smooth_period", "KINEMATICS_SMOOTH_PERIOD", RSI_PERIOD, minimum=2
+    )
+    KINEMATICS_RSI_OVERBOUGHT = _ini_float(
+        cfg, "kinematics", "rsi_overbought", "KINEMATICS_RSI_OVERBOUGHT", 70.0
+    )
+    KINEMATICS_RSI_OVERSOLD = _ini_float(
+        cfg, "kinematics", "rsi_oversold", "KINEMATICS_RSI_OVERSOLD", 30.0
+    )
+
+    OPTION_CHAIN_RSI_LOW = _ini_float(
+        cfg, "option_buyer", "rsi_low", "OPTION_CHAIN_RSI_LOW", 35.0
+    )
+    OPTION_CHAIN_RSI_HIGH = _ini_float(
+        cfg, "option_buyer", "rsi_high", "OPTION_CHAIN_RSI_HIGH", 65.0
+    )
+    ALPACA_PAPER = _ini_bool(cfg, "option_buyer", "paper", "ALPACA_PAPER", True)
+    OPTION_BUY_ENABLED = _ini_bool(
+        cfg, "option_buyer", "enabled", "OPTION_BUY_ENABLED", True
+    )
+    OPTION_BUY_DRY_RUN = _ini_bool(
+        cfg, "option_buyer", "dry_run", "OPTION_BUY_DRY_RUN", True
+    )
+    OPTION_BUY_QTY = _ini_int(
+        cfg, "option_buyer", "qty", "OPTION_BUY_QTY", 1, minimum=1
+    )
+    OPTION_BUY_ORDER_TYPE = (
+        _ini_str(cfg, "option_buyer", "order_type", "OPTION_BUY_ORDER_TYPE", "market")
+        .strip()
+        .lower()
+    )
+    OPTION_BUY_COOLDOWN_MINUTES = _ini_int(
+        cfg,
+        "option_buyer",
+        "cooldown_minutes",
+        "OPTION_BUY_COOLDOWN_MINUTES",
+        15,
+        minimum=0,
+    )
+    OPTION_BUY_MAX_OPEN_CONTRACTS = _ini_int(
+        cfg,
+        "option_buyer",
+        "max_open_contracts",
+        "OPTION_BUY_MAX_OPEN_CONTRACTS",
+        5,
+        minimum=1,
+    )
+    OPTION_BUY_MAX_AGE_SECONDS = _ini_int(
+        cfg,
+        "option_buyer",
+        "max_contract_age_seconds",
+        "OPTION_BUY_MAX_AGE_SECONDS",
+        180,
+        minimum=30,
+    )
+    OPTION_BUY_FETCH_IF_MISSING = _ini_bool(
+        cfg, "option_buyer", "fetch_if_missing", "OPTION_BUY_FETCH_IF_MISSING", True
+    )
+    OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING = _ini_bool(
+        cfg,
+        "option_buyer",
+        "allow_duplicate_underlying",
+        "OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING",
+        False,
+    )
+    OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT = _ini_bool(
+        cfg,
+        "option_buyer",
+        "require_projection_alignment",
+        "OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT",
+        True,
+    )
+    OPTION_BUY_REQUIRE_RIGHT_MATCH = _ini_bool(
+        cfg,
+        "option_buyer",
+        "require_right_match",
+        "OPTION_BUY_REQUIRE_RIGHT_MATCH",
+        True,
+    )
+    raw_forecasts = _ini_str(
+        cfg,
+        "option_buyer",
+        "allowed_forecasts",
+        "OPTION_BUY_ALLOWED_FORECASTS",
+        "bullish_reversal,bullish_continuation,bullish_momentum",
+    )
+    OPTION_BUY_ALLOWED_FORECASTS = {
+        s.strip().lower() for s in raw_forecasts.split(",") if s.strip()
+    }
+    logging.info(
+        "FEATURE_CONFIG smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f "
+        "buy_enabled=%s dry_run=%s paper=%s rsi_low=%.1f rsi_high=%.1f qty=%d",
+        KINEMATICS_SMOOTH_METHOD,
+        KINEMATICS_SMOOTH_PERIOD,
+        KINEMATICS_RSI_OVERBOUGHT,
+        KINEMATICS_RSI_OVERSOLD,
+        OPTION_BUY_ENABLED,
+        OPTION_BUY_DRY_RUN,
+        ALPACA_PAPER,
+        OPTION_CHAIN_RSI_LOW,
+        OPTION_CHAIN_RSI_HIGH,
+        OPTION_BUY_QTY,
+    )
+
+
 def load_settings():
     """Load enabled providers, symbols and credentials from project configuration.
 
@@ -2127,11 +2309,13 @@ def load_settings():
     if not config_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-    # Read provider flags with standard INI semantics, independent of how the
-    # project's JsonIniParser interprets dotted names or quoted values.
+    # Read provider and feature flags with standard INI semantics, independent of
+    # how the project's JsonIniParser interprets dotted names or quoted values.
     provider_config = configparser.ConfigParser(interpolation=None)
     with config_path.open("r", encoding="utf-8-sig") as handle:
         provider_config.read_file(handle)
+
+    _apply_ini_feature_settings(provider_config)
 
     if not provider_config.has_section("providers"):
         raise ValueError("Configuration is missing the [providers] section")
@@ -2189,7 +2373,7 @@ def load_settings():
         "twelvedata_key": "",
     }
 
-    if "ALPACA" in selected or "TRADINGVIEW" in selected:
+    if selected:
         keys["alpaca_key"] = credentials.get("api_key") or os.getenv(
             "ALPACA_API_KEY", ""
         )
@@ -2236,6 +2420,52 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 # chain and writes it to logs/optionchains/.
 OPTION_CHAIN_RSI_LOW = float(os.getenv("OPTION_CHAIN_RSI_LOW", "35"))
 OPTION_CHAIN_RSI_HIGH = float(os.getenv("OPTION_CHAIN_RSI_HIGH", "65"))
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+OPTION_BUY_ENABLED = os.getenv("OPTION_BUY_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OPTION_BUY_DRY_RUN = os.getenv("OPTION_BUY_DRY_RUN", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OPTION_BUY_QTY = max(1, int(os.getenv("OPTION_BUY_QTY", "1")))
+OPTION_BUY_ORDER_TYPE = os.getenv("OPTION_BUY_ORDER_TYPE", "market").strip().lower()
+OPTION_BUY_COOLDOWN_MINUTES = max(
+    0, int(os.getenv("OPTION_BUY_COOLDOWN_MINUTES", "15"))
+)
+OPTION_BUY_MAX_OPEN_CONTRACTS = max(
+    1, int(os.getenv("OPTION_BUY_MAX_OPEN_CONTRACTS", "5"))
+)
+OPTION_BUY_MAX_AGE_SECONDS = max(
+    30, int(os.getenv("OPTION_BUY_MAX_AGE_SECONDS", "180"))
+)
+OPTION_BUY_FETCH_IF_MISSING = os.getenv(
+    "OPTION_BUY_FETCH_IF_MISSING", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING = os.getenv(
+    "OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING", "false"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT = os.getenv(
+    "OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_REQUIRE_RIGHT_MATCH = os.getenv(
+    "OPTION_BUY_REQUIRE_RIGHT_MATCH", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_ALLOWED_FORECASTS = {
+    s.strip().lower()
+    for s in os.getenv(
+        "OPTION_BUY_ALLOWED_FORECASTS",
+        "bullish_reversal,bullish_continuation,bullish_momentum",
+    ).split(",")
+    if s.strip()
+}
 
 
 def rsi_signal(rsi):
@@ -2260,9 +2490,7 @@ def _parse_tv_bar_start(raw_time, now):
             "bar_start must be a timezone-aware ISO-8601 minute-start string"
         )
     try:
-        timestamp = as_utc(
-            datetime.fromisoformat(raw_time.strip().replace("Z", "+00:00"))
-        )
+        timestamp = as_utc(datetime.fromisoformat(raw_time.strip().replace("Z", "+00:00")))
         if timestamp != minute_utc(timestamp):
             raise ValueError()
         if now < timestamp:
@@ -2289,11 +2517,7 @@ def _validate_tradingview_item(
         raise ValueError("Each symbol item must be a JSON object")
 
     raw_ticker = item.get("ticker") if "ticker" in item else item.get("symbol")
-    if (
-        not isinstance(raw_ticker, str)
-        or not raw_ticker.strip()
-        or len(raw_ticker) > 100
-    ):
+    if not isinstance(raw_ticker, str) or not raw_ticker.strip() or len(raw_ticker) > 100:
         raise ValueError("ticker must be a nonempty string of at most 100 characters")
     ticker = raw_ticker.strip().upper()
     symbol = ticker if ticker in allowed_symbols else ticker.rsplit(":", 1)[-1]
@@ -2438,11 +2662,9 @@ def validate_tradingview_payload(payload, allowed_symbols):
         "events": events,
         "skipped": skipped,
         "errors": errors,
-        "bar_start": (
-            default_timestamp.isoformat()
-            if default_timestamp is not None
-            else events[0]["event_time"]
-        ),
+        "bar_start": default_timestamp.isoformat()
+        if default_timestamp is not None
+        else events[0]["event_time"],
     }
 
 
@@ -2464,7 +2686,7 @@ def build_option_chain_client(keys):
         return None
     from alpaca.trading.client import TradingClient
 
-    return TradingClient(keys["alpaca_key"], keys["alpaca_secret"])
+    return TradingClient(keys["alpaca_key"], keys["alpaca_secret"], paper=ALPACA_PAPER)
 
 
 class TradingviewProvider:
@@ -2780,6 +3002,14 @@ class TradingviewProvider:
                     exc,
                 )
                 return
+            self.coordinator.record_option_contract(
+                symbol=symbol,
+                contract=contract,
+                signal=signal,
+                event_time=event.get("event_time"),
+                clean_payload=clean_payload,
+                source=self.provider,
+            )
             self.logger.info(
                 "OPTION_CHAIN_CONTRACT provider=%s signal=%s symbol=%s rsi=%.4f contract=%s file=%s",
                 self.provider,
@@ -3053,6 +3283,583 @@ class AlpacaPositionMonitor:
             await asyncio.sleep(max(1.0, (target - now).total_seconds()))
 
 
+class AlpacaOptionBuyer:
+    """Async task synced to 1-minute finalization that uses kinematics to buy
+    an option contract returned in `contract` by collect_option_chain."""
+
+    def __init__(self, keys, coordinator, client=None):
+        self.provider = "OPTION_BUYER"
+        self.credentials = dict(keys or {})
+        self.coordinator = coordinator
+        self.logger = make_logger("OPTION_BUYER", "ALPACA")
+        self.client = (
+            client if client is not None else build_option_chain_client(self.credentials)
+        )
+        self.last_status = "uninitialized"
+        self.mode = "dry_run" if OPTION_BUY_DRY_RUN else ("paper" if ALPACA_PAPER else "live")
+        self.last_eval_minute_utc = None
+        self.last_order_utc = None
+        self.last_order_contract = None
+        self.last_order_symbol = None
+        self.last_order_reason = None
+        self.orders_submitted = 0
+        self.dry_run_orders = 0
+        self.last_buy_by_symbol = {}
+        self.attempted_minutes = set()
+
+    @staticmethod
+    def _infer_occ_right(contract_symbol):
+        import re
+
+        m = re.match(
+            r"^[A-Z]{1,6}\d{6}([CP])\d{8}$", str(contract_symbol or "").strip().upper()
+        )
+        if not m:
+            return None
+        return "CALL" if m.group(1) == "C" else "PUT"
+
+    @staticmethod
+    def _infer_occ_underlying(contract_symbol):
+        import re
+
+        m = re.match(
+            r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", str(contract_symbol or "").strip().upper()
+        )
+        return m.group(1) if m else None
+
+    @classmethod
+    def _extract_contract_details(cls, contract, clean_payload=None, desired_right=None):
+        """Extract (contract_symbol, limit_price, inferred_right) strictly from the
+        `contract` returned by get_pruned_option_chain / collect_option_chain."""
+        if contract is None:
+            return None, None, None
+        desired_key = desired_right.lower() if desired_right else None
+        candidates = [contract]
+
+        limit_price = None
+        for cand in candidates:
+            if isinstance(cand, str) and cand.strip():
+                sym = cand.strip().upper()
+                return sym, limit_price, cls._infer_occ_right(sym)
+            if isinstance(cand, dict):
+                if desired_key and cand.get(desired_key) is not None:
+                    nested = cand[desired_key]
+                    sym, lp, right = cls._extract_contract_details(
+                        nested, None, desired_right
+                    )
+                    if sym:
+                        return sym, lp, right
+                for key in ("symbol", "contract_symbol", "option_symbol", "contract"):
+                    raw_sym = cand.get(key)
+                    if isinstance(raw_sym, str) and raw_sym.strip():
+                        sym = raw_sym.strip().upper()
+                        for pk in ("limit_price", "ask_price", "ask", "close_price", "last_price"):
+                            try:
+                                pv = cand.get(pk)
+                                if pv is not None and not isinstance(pv, bool):
+                                    f = float(pv)
+                                    if math.isfinite(f) and f > 0:
+                                        limit_price = round(f, 2)
+                                        break
+                            except (TypeError, ValueError):
+                                pass
+                        return sym, limit_price, cls._infer_occ_right(sym)
+            elif hasattr(cand, "symbol") and getattr(cand, "symbol", None):
+                sym = str(getattr(cand, "symbol")).strip().upper()
+                for pk in ("limit_price", "ask_price", "close_price"):
+                    try:
+                        pv = getattr(cand, pk, None)
+                        if pv is not None and not isinstance(pv, bool):
+                            f = float(pv)
+                            if math.isfinite(f) and f > 0:
+                                limit_price = round(f, 2)
+                                break
+                    except (TypeError, ValueError):
+                        pass
+                return sym, limit_price, cls._infer_occ_right(sym)
+        return None, None, None
+
+    @staticmethod
+    def _evaluate_kinematics(entry):
+        """Determine whether a finalized 1m snapshot triggers an option BUY.
+
+        Mandatory rule:
+        1. RSI must be present and strictly <= OPTION_CHAIN_RSI_LOW.
+        2. Kinematic metrics must be favorable for buying (positive upward
+           acceleration a > 0 with either an oversold decelerating bottom or
+           upward velocity thrust, or a bullish zero-line crossover), and
+           projected P_hat_{t+1} must align > 0 when enabled.
+
+        Returns (qualifies: bool, desired_right: Optional[str], reason: str).
+        """
+        if not entry:
+            return False, None, "no_entry"
+
+        raw_rsi = entry.get("rsi")
+        if raw_rsi is None or isinstance(raw_rsi, bool):
+            return False, None, "rsi_unavailable"
+        try:
+            rsi = float(raw_rsi)
+        except (TypeError, ValueError):
+            return False, None, "rsi_invalid"
+        if not math.isfinite(rsi):
+            return False, None, "rsi_nonfinite"
+
+        if rsi > OPTION_CHAIN_RSI_LOW:
+            return (
+                False,
+                None,
+                f"rsi_above_buy_threshold(rsi={rsi:.2f}>{OPTION_CHAIN_RSI_LOW:.2f})",
+            )
+
+        raw_vel = (
+            entry.get("smoothed_velocity")
+            if entry.get("smoothed_velocity") is not None
+            else entry.get("price_velocity")
+        )
+        raw_acc = (
+            entry.get("smoothed_acceleration")
+            if entry.get("smoothed_acceleration") is not None
+            else entry.get("price_acceleration")
+        )
+        if raw_vel is None or raw_acc is None:
+            return False, None, "kinematics_unavailable"
+        try:
+            vel = float(raw_vel)
+            acc = float(raw_acc)
+        except (TypeError, ValueError):
+            return False, None, "kinematics_invalid"
+        if not (math.isfinite(vel) and math.isfinite(acc)):
+            return False, None, "kinematics_nonfinite"
+
+        forecast = str(entry.get("forecast_direction") or "").lower()
+        crossover = str(entry.get("crossover_signal") or "none").lower()
+        proj_delta = entry.get("projected_delta")
+
+        reason = None
+        if vel > 0 and acc > 0:
+            reason = f"rsi={rsi:.2f}<=low&bullish_thrust(v={vel:+.4f},a={acc:+.4f})"
+        elif vel < 0 and acc > 0:
+            tag = (
+                forecast
+                if forecast in OPTION_BUY_ALLOWED_FORECASTS
+                else "oversold_decel_bottom"
+            )
+            reason = f"rsi={rsi:.2f}<=low&{tag}(v={vel:+.4f},a={acc:+.4f})"
+        elif crossover in {"leading_bullish", "confirmed_bullish"} and acc >= 0:
+            reason = f"rsi={rsi:.2f}<=low&crossover={crossover}"
+        elif forecast in OPTION_BUY_ALLOWED_FORECASTS and acc > 0:
+            reason = f"rsi={rsi:.2f}<=low&forecast={forecast}"
+
+        if reason is None:
+            return (
+                False,
+                None,
+                f"kinematics_unfavorable(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f},cross={crossover})",
+            )
+
+        if OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT and proj_delta is not None:
+            try:
+                pdelta = float(proj_delta)
+                if pdelta <= 0:
+                    return (
+                        False,
+                        None,
+                        f"projection_misaligned(CALL,delta={pdelta:+.4f})",
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        return True, "CALL", reason
+
+    def _select_kinematics_entry(self, symbol):
+        """Return (provider, latest_entry) for symbol, preferring TRADINGVIEW if present."""
+        tv_hist = self.coordinator.kinematics_history.get(("TRADINGVIEW", symbol))
+        if tv_hist:
+            return "TRADINGVIEW", tv_hist[-1]
+        best_provider = None
+        best_entry = None
+        best_ts = ""
+        for (provider, sym), hist in self.coordinator.kinematics_history.items():
+            if sym != symbol or not hist:
+                continue
+            cand = hist[-1]
+            ts = str(cand.get("timestamp") or "")
+            if best_entry is None or ts >= best_ts:
+                best_provider = provider
+                best_entry = cand
+                best_ts = ts
+        return best_provider, best_entry
+
+    def _submit_option_order(self, contract_symbol, qty, limit_price=None):
+        """Place the option BUY order on Alpaca TradingClient (blocking)."""
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+
+        if OPTION_BUY_ORDER_TYPE == "limit" and limit_price is not None and limit_price > 0:
+            req = LimitOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+            )
+        else:
+            req = MarketOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+        return self.client.submit_order(order_data=req)
+
+    def _write_fallback_option_chain(self, symbol, rsi, signal, clean_payload):
+        """Persist fallback option-chain payload fetched directly by AlpacaOptionBuyer."""
+        directory = LOG_ROOT / "optionchains"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in symbol)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        rsi_tag = f"{rsi:.2f}" if rsi is not None else "na"
+        path = (
+            directory
+            / f"optionchain-OPTION_BUYER-{safe}-{signal.upper()}-rsi{rsi_tag}-{stamp}-{uuid4().hex[:6]}.json"
+        )
+        path.write_text(
+            json.dumps(clean_payload, indent=2, default=str), encoding="utf-8"
+        )
+        return path
+
+    async def evaluate_and_buy(self, target_minute=None):
+        """Evaluate all configured symbols on the 1-minute boundary and submit
+        qualifying option orders using contracts returned by collect_option_chain."""
+        now = datetime.now(UTC)
+        minute_key = (
+            target_minute.isoformat()
+            if hasattr(target_minute, "isoformat")
+            else str(target_minute or now.replace(second=0, microsecond=0).isoformat())
+        )
+        self.last_eval_minute_utc = now.isoformat()
+        self.last_status = "evaluating"
+
+        if len(self.attempted_minutes) > 1000:
+            self.attempted_minutes.clear()
+
+        positions_loaded = False
+        open_contracts = set()
+        open_underlyings = set()
+        open_option_count = 0
+
+        async def ensure_open_positions():
+            nonlocal positions_loaded, open_contracts, open_underlyings, open_option_count
+            if positions_loaded:
+                return
+            positions = list(await asyncio.to_thread(self.client.get_all_positions) or [])
+            for pos in positions:
+                if AlpacaPositionMonitor._is_option(pos):
+                    open_option_count += 1
+                    psym = str(getattr(pos, "symbol", "") or "").strip().upper()
+                    if psym:
+                        open_contracts.add(psym)
+                        und = self._infer_occ_underlying(psym)
+                        if und:
+                            open_underlyings.add(und)
+            positions_loaded = True
+
+        for symbol in self.coordinator.symbols:
+            dedup_key = (symbol, minute_key)
+            if dedup_key in self.attempted_minutes:
+                continue
+
+            provider, entry = self._select_kinematics_entry(symbol)
+            if not entry:
+                continue
+
+            qualifies, desired_right, reason = self._evaluate_kinematics(entry)
+            if not qualifies:
+                continue
+
+            self.attempted_minutes.add(dedup_key)
+
+            last_buy = self.last_buy_by_symbol.get(symbol)
+            if (
+                last_buy is not None
+                and OPTION_BUY_COOLDOWN_MINUTES > 0
+                and (now - last_buy).total_seconds() < OPTION_BUY_COOLDOWN_MINUTES * 60
+            ):
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s reason=cooldown_active minute=%s",
+                    symbol,
+                    minute_key,
+                )
+                continue
+
+            cached = self.coordinator.latest_option_contract(
+                symbol, max_age_seconds=OPTION_BUY_MAX_AGE_SECONDS
+            )
+            contract = cached["contract"] if cached else None
+            clean_payload = cached.get("clean_payload") if cached else None
+            contract_source = cached.get("source") if cached else None
+
+            if contract is None and OPTION_BUY_FETCH_IF_MISSING:
+                if not self.credentials.get("alpaca_key") or not self.credentials.get(
+                    "alpaca_secret"
+                ):
+                    self.logger.warning(
+                        "OPTION_BUY_SKIPPED symbol=%s reason=missing_alpaca_credentials",
+                        symbol,
+                    )
+                    continue
+                try:
+                    contract, clean_payload = await asyncio.to_thread(
+                        get_pruned_option_chain,
+                        symbol,
+                        self.credentials["alpaca_key"],
+                        self.credentials["alpaca_secret"],
+                        self.client,
+                    )
+                    signal_label = "buy" if desired_right == "CALL" else "sell"
+                    self.coordinator.record_option_contract(
+                        symbol=symbol,
+                        contract=contract,
+                        signal=signal_label,
+                        event_time=entry.get("timestamp"),
+                        clean_payload=clean_payload,
+                        source="ALPACA_OPTION_BUYER",
+                    )
+                    contract_source = "ALPACA_OPTION_BUYER"
+                    await asyncio.to_thread(
+                        self._write_fallback_option_chain,
+                        symbol,
+                        entry.get("rsi"),
+                        signal_label,
+                        clean_payload,
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        "OPTION_BUY_CHAIN_FAILED symbol=%s error_type=%s detail=%s",
+                        symbol,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+
+            if contract is None:
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s reason=no_contract_from_collect_option_chain trigger=%s",
+                    symbol,
+                    reason,
+                )
+                continue
+
+            contract_symbol, limit_price, inferred_right = self._extract_contract_details(
+                contract, clean_payload, desired_right=desired_right
+            )
+            if not contract_symbol:
+                self.logger.warning(
+                    "OPTION_BUY_SKIPPED symbol=%s reason=unparseable_contract raw_contract=%s",
+                    symbol,
+                    contract,
+                )
+                continue
+
+            if (
+                OPTION_BUY_REQUIRE_RIGHT_MATCH
+                and inferred_right is not None
+                and inferred_right != desired_right
+            ):
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=right_mismatch expected=%s got=%s",
+                    symbol,
+                    contract_symbol,
+                    desired_right,
+                    inferred_right,
+                )
+                continue
+
+            try:
+                await ensure_open_positions()
+            except Exception as exc:
+                self.logger.warning(
+                    "OPTION_BUY_POSITIONS_CHECK_FAILED symbol=%s error_type=%s detail=%s",
+                    symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+
+            if open_option_count >= OPTION_BUY_MAX_OPEN_CONTRACTS:
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=max_open_contracts count=%d limit=%d",
+                    symbol,
+                    contract_symbol,
+                    open_option_count,
+                    OPTION_BUY_MAX_OPEN_CONTRACTS,
+                )
+                continue
+
+            if contract_symbol in open_contracts:
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=contract_already_held",
+                    symbol,
+                    contract_symbol,
+                )
+                continue
+
+            if not OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING and symbol in open_underlyings:
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=underlying_option_already_held",
+                    symbol,
+                    contract_symbol,
+                )
+                continue
+
+            if OPTION_BUY_DRY_RUN:
+                self.dry_run_orders += 1
+                self.last_buy_by_symbol[symbol] = now
+                self.last_order_utc = now.isoformat()
+                self.last_order_contract = contract_symbol
+                self.last_order_symbol = symbol
+                self.last_order_reason = reason
+                self.logger.info(
+                    "OPTION_BUY_DRY_RUN provider=%s symbol=%s contract=%s qty=%d right=%s "
+                    "contract_source=%s trigger=%s p_hat=%s rsi=%s",
+                    provider,
+                    symbol,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    inferred_right or desired_right,
+                    contract_source,
+                    reason,
+                    entry.get("projected_price_next"),
+                    entry.get("rsi"),
+                )
+                logging.info(
+                    "OPTION_BUY_DRY_RUN symbol=%s contract=%s qty=%d trigger=%s",
+                    symbol,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    reason,
+                )
+                continue
+
+            try:
+                order = await asyncio.to_thread(
+                    self._submit_option_order,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    limit_price,
+                )
+                order_id = getattr(order, "id", None)
+                order_status = getattr(order, "status", "submitted")
+                self.orders_submitted += 1
+                open_option_count += 1
+                open_contracts.add(contract_symbol)
+                open_underlyings.add(symbol)
+                self.last_buy_by_symbol[symbol] = now
+                self.last_order_utc = now.isoformat()
+                self.last_order_contract = contract_symbol
+                self.last_order_symbol = symbol
+                self.last_order_reason = reason
+                self.logger.info(
+                    "OPTION_BUY_SUBMITTED order_id=%s status=%s provider=%s symbol=%s "
+                    "contract=%s qty=%d right=%s contract_source=%s trigger=%s p_hat=%s rsi=%s",
+                    order_id,
+                    order_status,
+                    provider,
+                    symbol,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    inferred_right or desired_right,
+                    contract_source,
+                    reason,
+                    entry.get("projected_price_next"),
+                    entry.get("rsi"),
+                )
+                logging.info(
+                    "OPTION_BUY_SUBMITTED order_id=%s symbol=%s contract=%s qty=%d trigger=%s",
+                    order_id,
+                    symbol,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    reason,
+                )
+            except Exception as exc:
+                self.last_status = f"order_error: {type(exc).__name__}"
+                self.logger.error(
+                    "OPTION_BUY_FAILED symbol=%s contract=%s error_type=%s detail=%s",
+                    symbol,
+                    contract_symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        if not str(self.last_status).startswith("order_error"):
+            self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
+
+    async def run(self):
+        self.coordinator.attach_event_loop(asyncio.get_running_loop())
+        if not OPTION_BUY_ENABLED:
+            self.last_status = "disabled"
+            self.logger.info("OPTION_BUYER_DISABLED reason=OPTION_BUY_ENABLED=false")
+            return
+        if self.client is None:
+            self.last_status = "disabled"
+            self.logger.warning(
+                "OPTION_BUYER_DISABLED reason=missing_alpaca_credentials "
+                "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
+                "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
+            )
+            return
+
+        self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
+        self.logger.info(
+            "OPTION_BUYER_START mode=%s rsi_low<=%.2f qty=%d cooldown_min=%d max_open=%d allowed=%s",
+            self.mode,
+            OPTION_CHAIN_RSI_LOW,
+            OPTION_BUY_QTY,
+            OPTION_BUY_COOLDOWN_MINUTES,
+            OPTION_BUY_MAX_OPEN_CONTRACTS,
+            sorted(OPTION_BUY_ALLOWED_FORECASTS),
+        )
+        last_processed_minute = self.coordinator.last_finalized
+        while True:
+            try:
+                now = datetime.now(UTC)
+                next_wake = (
+                    now.replace(second=0, microsecond=0)
+                    + MINUTE
+                    + self.coordinator.delay
+                    + timedelta(seconds=1)
+                )
+                wait_sec = max(1.0, (next_wake - now).total_seconds())
+                if self.coordinator.minute_finalized_event is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self.coordinator.minute_finalized_event.wait(),
+                            timeout=wait_sec,
+                        )
+                        self.coordinator.minute_finalized_event.clear()
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(wait_sec)
+
+                cur_finalized = self.coordinator.last_finalized
+                if cur_finalized is not None and cur_finalized != last_processed_minute:
+                    await self.evaluate_and_buy(cur_finalized)
+                    last_processed_minute = cur_finalized
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_status = f"error: {type(exc).__name__}"
+                self.logger.warning(
+                    "OPTION_BUYER_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(2.0)
+
+
 # Create a dictionary to keep track of active provider instances and tasks across the engine
 PROVIDER_REGISTRY = {}
 
@@ -3303,7 +4110,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <tr>
                             <th class="px-4 py-2.5" id="thSymbolCol">Symbol / Feeds</th>
                             <th class="px-4 py-2.5 text-right">Close ($)</th>
-                            <th class="px-4 py-2.5 text-right">Projected P^<sub>t+1</sub></th>
+                            <th class="px-4 py-2.5 text-right">Projected P̂<sub>t+1</sub></th>
                             <th class="px-4 py-2.5 text-right">Price Velocity (v)</th>
                             <th class="px-4 py-2.5 text-right">Price Accel (a)</th>
                             <th class="px-4 py-2.5 min-w-[130px]">RSI (14)</th>
@@ -3369,7 +4176,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                             <div class="flex items-baseline justify-between">
                                 <div>
-                                    <div class="text-[11px] text-slate-400">P^<sub>t+1</sub> = P<sub>t</sub> + v<sub>t</sub> + &frac12;a<sub>t</sub></div>
+                                    <div class="text-[11px] text-slate-400">P̂<sub>t+1</sub> = P<sub>t</sub> + v<sub>t</sub> + &frac12;a<sub>t</sub></div>
                                     <div id="detailProjectedPrice" class="text-2xl font-extrabold mono text-cyan-300 mt-0.5">--</div>
                                 </div>
                                 <div class="text-right">
@@ -3411,7 +4218,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <tr>
                                     <th class="px-3.5 py-2">Provider Feed</th>
                                     <th class="px-3.5 py-2 text-right">Close ($)</th>
-                                    <th class="px-3.5 py-2 text-right">P^<sub>t+1</sub> ($)</th>
+                                    <th class="px-3.5 py-2 text-right">P̂<sub>t+1</sub> ($)</th>
                                     <th class="px-3.5 py-2 text-right">Price Vel (v)</th>
                                     <th class="px-3.5 py-2 text-right">Price Acc (a)</th>
                                     <th class="px-3.5 py-2 text-right">RSI (14)</th>
@@ -3493,6 +4300,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="text-slate-400">Last Telemetry Poll</span>
                             <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
                         </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Option Buyer (1m Sync)</span>
+                            <span id="optionBuyerStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Last Option Order</span>
+                            <span id="optionBuyerLast" class="mono text-[11px] text-cyan-300 truncate max-w-[160px]">--</span>
+                        </div>
                     </div>
 
                     <div class="pt-2 border-t border-slate-800/80">
@@ -3564,35 +4381,35 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             accelerating_bullish: {
                 label: 'Accelerating Bullish',
                 badgeClass: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-                icon: '?',
+                icon: '↑',
                 pillColor: 'text-emerald-400',
                 desc: 'Strong buyer thrust & momentum expansion'
             },
             decelerating_bullish: {
                 label: 'Decelerating Bullish',
                 badgeClass: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30',
-                icon: '?',
+                icon: '↗',
                 pillColor: 'text-cyan-400',
                 desc: 'Upward momentum waning / consolidation'
             },
             accelerating_bearish: {
                 label: 'Accelerating Bearish',
                 badgeClass: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-                icon: '?',
+                icon: '↓',
                 pillColor: 'text-rose-400',
                 desc: 'Aggressive selling impulse accelerating'
             },
             decelerating_bearish: {
                 label: 'Decelerating Bearish',
                 badgeClass: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-                icon: '?',
+                icon: '↘',
                 pillColor: 'text-amber-400',
                 desc: 'Downside absorption / selling deceleration'
             },
             neutral: {
                 label: 'Neutral',
                 badgeClass: 'bg-slate-700/30 text-slate-300 border-slate-700',
-                icon: '',
+                icon: '•',
                 pillColor: 'text-slate-400',
                 desc: 'Equilibrium / no directional acceleration'
             }
@@ -3857,6 +4674,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById('posMonitorOption').textContent = m.position_monitor.active_option_positions ?? 0;
                 document.getElementById('posMonitorLastPoll').textContent = m.position_monitor.last_poll_utc ? new Date(m.position_monitor.last_poll_utc).toLocaleTimeString() : '--';
             }
+            if (m.option_buyer) {
+                const ob = m.option_buyer;
+                document.getElementById('optionBuyerStatus').textContent = `${ob.status || 'not_loaded'} (${ob.orders_submitted ?? 0}/${ob.dry_run_orders ?? 0})`;
+                document.getElementById('optionBuyerLast').textContent = ob.last_order_contract || '--';
+            }
 
             // Connected Feeds
             const feedsContainer = document.getElementById('connectedFeedsList');
@@ -4089,7 +4911,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <div class="flex items-center gap-2">
                                 <span class="font-bold text-white mono text-xs">${item.symbol}</span>
                                 <button onclick="event.stopPropagation(); toggleExpandSymbol('${item.symbol}')" class="px-1.5 py-0.5 rounded text-[10px] mono bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition" title="Toggle provider feed breakdown">
-                                    ${item.providers_count} feeds ${isExpanded ? '?' : '?'}
+                                    ${item.providers_count} feeds ${isExpanded ? '▲' : '▼'}
                                 </button>
                             </div>
                         </td>
@@ -4344,7 +5166,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             // Update Header Elements in Deep-Dive Panel
             document.getElementById('detailSymbolBadge').textContent = sym;
             document.getElementById('detailSymbolTitle').textContent = `${sym} Multi-Stream Kinematics Analysis`;
-            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds  Close ${fmtPrice(symbolData.close)}  RSI ${fmtNum(symbolData.rsi, 1)}`;
+            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds • Close ${fmtPrice(symbolData.close)} • RSI ${fmtNum(symbolData.rsi, 1)}`;
             
             const badgeEl = document.getElementById('detailRegimeBadge');
             badgeEl.className = `text-[10px] px-2 py-0.5 rounded-full font-semibold border ${rConf.badgeClass}`;
@@ -4374,7 +5196,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const ra = safeNum(symbolData.rsi_acceleration);
             let diag = `${rConf.desc}. `;
             if (symbolData.projected_price_next !== null && symbolData.projected_price_next !== undefined) {
-                diag += `Projected next close P^ = ${fmtPrice(symbolData.projected_price_next)}. `;
+                diag += `Projected next close P̂ = ${fmtPrice(symbolData.projected_price_next)}. `;
             }
             if (rv !== null) {
                 diag += `RSI velocity is ${fmtNum(rv, 2, '+')}/m. `;
@@ -4650,13 +5472,9 @@ class AdminCliProvider:
                             entry["price_acceleration"]
                         )
                     if entry["smoothed_velocity"] is not None:
-                        sym_group["smoothed_velocities"].append(
-                            entry["smoothed_velocity"]
-                        )
+                        sym_group["smoothed_velocities"].append(entry["smoothed_velocity"])
                     if entry["smoothed_acceleration"] is not None:
-                        sym_group["smoothed_accelerations"].append(
-                            entry["smoothed_acceleration"]
-                        )
+                        sym_group["smoothed_accelerations"].append(entry["smoothed_acceleration"])
                     if entry["rsi_velocity"] is not None:
                         sym_group["rsi_velocities"].append(entry["rsi_velocity"])
                     if entry["rsi_acceleration"] is not None:
@@ -4696,9 +5514,7 @@ class AdminCliProvider:
 
                 active_pv = c_sv if c_sv is not None else c_pv
                 active_pa = c_sa if c_sa is not None else c_pa
-                c_forecast = compute_kinematic_forecast(
-                    c_close, active_pv, active_pa, c_rsi
-                )
+                c_forecast = compute_kinematic_forecast(c_close, active_pv, active_pa, c_rsi)
                 c_regime = classify_kinematic_regime(c_rv, c_ra, active_pv, active_pa)
                 if c_regime in regime_counts:
                     regime_counts[c_regime] += 1
@@ -4717,12 +5533,8 @@ class AdminCliProvider:
                         "price_acceleration": (
                             round(c_pa, 2) if c_pa is not None else None
                         ),
-                        "smoothed_velocity": (
-                            round(c_sv, 2) if c_sv is not None else None
-                        ),
-                        "smoothed_acceleration": (
-                            round(c_sa, 2) if c_sa is not None else None
-                        ),
+                        "smoothed_velocity": round(c_sv, 2) if c_sv is not None else None,
+                        "smoothed_acceleration": round(c_sa, 2) if c_sa is not None else None,
                         "rsi_velocity": round(c_rv, 2) if c_rv is not None else None,
                         "rsi_acceleration": (
                             round(c_ra, 2) if c_ra is not None else None
@@ -4786,12 +5598,24 @@ class AdminCliProvider:
         def get_status():
             pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
             pm = pm_entry.get("router")
+            ob_entry = PROVIDER_REGISTRY.get("OPTION_BUYER", {})
+            ob = ob_entry.get("router")
 
             position_monitor_report = {
                 "status": pm.last_status if pm else "not_loaded",
                 "last_poll_utc": pm.last_poll_utc if pm else None,
                 "active_equity_positions": pm.position_count if pm else 0,
                 "active_option_positions": pm.option_count if pm else 0,
+            }
+            option_buyer_report = {
+                "status": ob.last_status if ob else "not_loaded",
+                "mode": ob.mode if ob else "disabled",
+                "orders_submitted": ob.orders_submitted if ob else 0,
+                "dry_run_orders": ob.dry_run_orders if ob else 0,
+                "last_order_utc": ob.last_order_utc if ob else None,
+                "last_order_contract": ob.last_order_contract if ob else None,
+                "last_order_reason": ob.last_order_reason if ob else None,
+                "cached_contracts": len(self.coordinator.option_chain_cache),
             }
             latest_kinematics = {}
             for (provider, symbol), hist in self.coordinator.kinematics_history.items():
@@ -4828,9 +5652,12 @@ class AdminCliProvider:
                 "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
                 "loaded_providers": [
-                    k for k in PROVIDER_REGISTRY.keys() if k != "POSITIONS_MONITOR"
+                    k
+                    for k in PROVIDER_REGISTRY.keys()
+                    if k not in {"POSITIONS_MONITOR", "OPTION_BUYER"}
                 ],
                 "position_monitor": position_monitor_report,
+                "option_buyer": option_buyer_report,
                 "latest_kinematics": latest_kinematics,
             }
             return jsonify(status="ok", metrics=status_report), 200
@@ -5079,6 +5906,13 @@ async def main():
     )
     tasks.append(pm_task)
 
+    option_buyer = AlpacaOptionBuyer(keys, coordinator)
+    ob_task = asyncio.create_task(
+        run_provider_isolated(option_buyer, coordinator),
+        name="ALPACA_OPTION_BUYER",
+    )
+    tasks.append(ob_task)
+
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
             run_provider_isolated(entry["router"], coordinator), name=provider
@@ -5089,6 +5923,10 @@ async def main():
     PROVIDER_REGISTRY["POSITIONS_MONITOR"] = {
         "router": position_monitor,
         "task": pm_task,
+    }
+    PROVIDER_REGISTRY["OPTION_BUYER"] = {
+        "router": option_buyer,
+        "task": ob_task,
     }
 
     # 5. Execute engine orchestration
