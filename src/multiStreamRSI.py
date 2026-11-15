@@ -2903,6 +2903,79 @@ class AlpacaPositionMonitor:
         self.position_count = 0
         self.option_count = 0
 
+    @staticmethod
+    def _num(obj, attr, default=0.0):
+        """Safely extract a finite float attribute or dict key from an Alpaca model."""
+        raw = obj.get(attr) if isinstance(obj, dict) else getattr(obj, attr, None)
+        if raw is None or isinstance(raw, bool):
+            return default
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return val if math.isfinite(val) else default
+
+    @staticmethod
+    def _is_option(position):
+        """Return True if an Alpaca position represents an options contract."""
+        raw_ac = (
+            position.get("asset_class")
+            if isinstance(position, dict)
+            else getattr(position, "asset_class", None)
+        )
+        if raw_ac is not None:
+            ac_val = getattr(raw_ac, "value", raw_ac)
+            if "option" in str(ac_val).lower():
+                return True
+        sym = (
+            position.get("symbol")
+            if isinstance(position, dict)
+            else getattr(position, "symbol", "")
+        ) or ""
+        import re
+
+        return bool(re.match(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", str(sym).strip().upper()))
+
+    def _format_option(self, position):
+        """Format an Alpaca option position into key=value log fields."""
+        import re
+
+        sym = str(
+            (
+                position.get("symbol")
+                if isinstance(position, dict)
+                else getattr(position, "symbol", "?")
+            )
+            or "?"
+        ).strip()
+        raw_side = (
+            position.get("side")
+            if isinstance(position, dict)
+            else getattr(position, "side", None)
+        )
+        side = str(getattr(raw_side, "value", raw_side) or "unknown").lower()
+
+        occ = re.match(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$", sym.upper())
+        if occ:
+            underlying, yy, mm, dd, cp, strike_raw = occ.groups()
+            contract_meta = (
+                f"underlying={underlying} "
+                f"right={'CALL' if cp == 'C' else 'PUT'} "
+                f"strike={int(strike_raw) / 1000.0:.2f} "
+                f"exp=20{yy}-{mm}-{dd} "
+            )
+        else:
+            contract_meta = ""
+
+        return (
+            f"symbol={sym} {contract_meta}side={side} "
+            f"qty={self._num(position, 'qty'):.4g} "
+            f"avg_entry={self._num(position, 'avg_entry_price'):.4f} "
+            f"current_price={self._num(position, 'current_price'):.4f} "
+            f"market_value={self._num(position, 'market_value'):.2f} "
+            f"unrealized_pl={self._num(position, 'unrealized_pl'):.2f}"
+        )
+
     def poll(self):
         """Fetch account + positions and log the snapshot (blocking)."""
         # --- NEW: Set active state flag ---
@@ -4183,24 +4256,24 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const minNum = parseInt((tickStr.split(':')[1] || ''), 10);
                 const isMajor5m = !Number.isNaN(minNum) && minNum % 5 === 0;
                 const isLatest = i === n - 1;
-                const strokeColor = isMajor5m ? '#334155' : '#1e293b';
-                const strokeOpacity = isMajor5m ? '0.65' : '0.45';
-                const dash = isMajor5m ? '2,2' : '1,3';
+                const strokeColor = isMajor5m ? '#64748b' : '#475569';
+                const strokeOpacity = isMajor5m ? '0.80' : '0.55';
+                const dash = isMajor5m ? '3,2' : '2,3';
 
                 minuteGrid += `<line x1="${x}" y1="10" x2="${x}" y2="212" stroke="${strokeColor}" stroke-opacity="${strokeOpacity}" stroke-dasharray="${dash}" stroke-width="1"><title>Bar ${tickStr}</title></line>`;
 
                 const fitsSpacing = (xNum - lastLabelX >= 38) && (isLatest || (latestBarX - xNum >= 38));
                 const isCandidate = i === 0 || isMajor5m || (i % labelStep === 0) || isLatest;
                 if (isCandidate && fitsSpacing) {
-                    const textColor = isLatest ? '#94a3b8' : '#64748b';
+                    const textColor = isLatest ? '#cbd5e1' : '#94a3b8';
                     minuteGrid += `<text x="${x}" y="225" text-anchor="middle" fill="${textColor}" font-size="8.5" font-family="monospace">${tickStr}</text>`;
                     lastLabelX = xNum;
                 }
             }
             if (projectedNext !== null) {
                 const px = xAt(n).toFixed(1);
-                minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.20" stroke-dasharray="2,3" stroke-width="1" />`;
-                minuteGrid += `<text x="${px}" y="225" text-anchor="middle" fill="#22d3ee" fill-opacity="0.8" font-size="8.5" font-family="monospace">+1m</text>`;
+                minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
+                minuteGrid += `<text x="${px}" y="225" text-anchor="middle" fill="#22d3ee" fill-opacity="0.90" font-size="8.5" font-family="monospace">+1m</text>`;
             }
 
             const crossMarkers = points.map((p, i) => {
@@ -5000,12 +5073,11 @@ async def main():
     # Starts whenever Alpaca credentials are available; otherwise it logs a
     # single disabled warning and exits.
     position_monitor = AlpacaPositionMonitor(keys)
-    tasks.append(
-        asyncio.create_task(
-            run_provider_isolated(position_monitor, coordinator),
-            name="ALPACA_POSITION_MONITOR",
-        )
+    pm_task = asyncio.create_task(
+        run_provider_isolated(position_monitor, coordinator),
+        name="ALPACA_POSITION_MONITOR",
     )
+    tasks.append(pm_task)
 
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
@@ -5013,6 +5085,11 @@ async def main():
         )
         entry["task"] = task
         tasks.append(task)
+
+    PROVIDER_REGISTRY["POSITIONS_MONITOR"] = {
+        "router": position_monitor,
+        "task": pm_task,
+    }
 
     # 5. Execute engine orchestration
     try:
