@@ -14,7 +14,8 @@ RSI state rolls over across sessions and is seeded at startup with the last
 RSI_WARMUP_SESSIONS prior sessions (default 5) so Wilder averages converge like
 TradingView's continuous-history RSI. Set RSI_WARMUP_SESSIONS=0 to skip the
 startup backfill; per-session cold resets return only if state is not carried.
-TradingView requires a 1m closed-bar payload with explicit bar_start.
+TradingView sends a consolidated 1m closed-bar multi-symbol batch payload
+(`rsi_batch`) once per minute with explicit bar_start and per-symbol RSI/price.
 TradingView webhook RSI values are classified as signals: rsi <=
 OPTION_CHAIN_RSI_LOW (default 35) is the BUY signal and rsi >=
 OPTION_CHAIN_RSI_HIGH (default 65) is the SELL signal. Each signal triggers
@@ -236,7 +237,7 @@ class SessionRSI:
         With cross_session enabled and the averages already seeded (at least
         `period` changes observed), the averages, previous_close and change
         counter roll forward so the first bar of the day measures the overnight
-        gap from the prior close  the same series TradingView smooths over.
+        gap from the prior close ? the same series TradingView smooths over.
         Otherwise this falls back to a cold per-session reset.
         """
         if self.cross_session and self.average_gain is not None:
@@ -1900,7 +1901,7 @@ def load_settings():
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 WEBHOOK_QUEUE_LIMIT = 2000
-WEBHOOK_MAX_BYTES = 16384
+WEBHOOK_MAX_BYTES = 65536
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 # Option-chain collection trigger: a TradingView webhook RSI at or below the
 # low threshold is the BUY signal (oversold); at or above the high threshold
@@ -1926,27 +1927,59 @@ def rsi_signal(rsi):
     return None
 
 
-def validate_tradingview_payload(payload, allowed_symbols):
-    from datetime import datetime, UTC
-    import math
+def _parse_tv_bar_start(raw_time, now):
+    if not isinstance(raw_time, str) or not raw_time.strip() or len(raw_time) > 100:
+        raise ValueError(
+            "bar_start must be a timezone-aware ISO-8601 minute-start string"
+        )
+    try:
+        timestamp = as_utc(
+            datetime.fromisoformat(raw_time.strip().replace("Z", "+00:00"))
+        )
+        if timestamp != minute_utc(timestamp):
+            raise ValueError()
+        if now < timestamp:
+            raise ValueError()
+        if not regular_session(timestamp):
+            raise ValueError()
+        return timestamp
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "bar_start must identify a completed regular-session minute"
+        ) from None
 
-    if not isinstance(payload, dict):
-        raise ValueError("JSON payload must be an object")
 
-    ticker = payload.get("ticker")
-    if not isinstance(ticker, str) or not ticker.strip() or len(ticker) > 100:
+def _validate_tradingview_item(
+    item,
+    allowed_symbols,
+    now,
+    *,
+    default_timestamp=None,
+    default_timeframe="1m",
+    default_bar_closed=True,
+):
+    if not isinstance(item, dict):
+        raise ValueError("Each symbol item must be a JSON object")
+
+    raw_ticker = item.get("ticker") if "ticker" in item else item.get("symbol")
+    if (
+        not isinstance(raw_ticker, str)
+        or not raw_ticker.strip()
+        or len(raw_ticker) > 100
+    ):
         raise ValueError("ticker must be a nonempty string of at most 100 characters")
-    ticker = ticker.strip().upper()
+    ticker = raw_ticker.strip().upper()
     symbol = ticker if ticker in allowed_symbols else ticker.rsplit(":", 1)[-1]
     if symbol not in allowed_symbols:
-        raise ValueError("ticker is not in configured target_symbols")
+        return None, symbol  # Unconfigured symbol; caller records as skipped
 
+    raw_price = item.get("price") if "price" in item else item.get("close")
     try:
-        price = positive_price(payload.get("price"))
+        price = positive_price(raw_price)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError("price must be finite and positive") from None
+        raise ValueError(f"{symbol}: price must be finite and positive") from None
 
-    raw_rsi = payload.get("rsi_value") if "rsi_value" in payload else payload.get("rsi")
+    raw_rsi = item.get("rsi_value") if "rsi_value" in item else item.get("rsi")
     if raw_rsi is None or raw_rsi == "" or raw_rsi == "N/A":
         rsi = None
     else:
@@ -1958,50 +1991,131 @@ def validate_tradingview_payload(payload, allowed_symbols):
                 raise ValueError()
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
-                "rsi_value must be between 0 and 100, or omitted"
+                f"{symbol}: rsi_value must be between 0 and 100, or omitted"
             ) from None
 
-    if payload.get("timeframe") != "1m":
-        raise ValueError('timeframe must be "1m"')
-    if payload.get("bar_closed") is not True:
-        raise ValueError("bar_closed must be JSON true")
+    timeframe = item.get("timeframe", default_timeframe)
+    if timeframe != "1m":
+        raise ValueError(f'{symbol}: timeframe must be "1m"')
 
-    raw_time = payload.get("bar_start")
-    if not isinstance(raw_time, str) or not raw_time or len(raw_time) > 100:
-        raise ValueError(
-            "bar_start must be a timezone-aware ISO-8601 minute-start string"
-        )
+    bar_closed = item.get("bar_closed", default_bar_closed)
+    if bar_closed is not True:
+        raise ValueError(f"{symbol}: bar_closed must be JSON true")
 
-    try:
-        # FIX: Keep TradingView's original baseline timestamp (e.g., 18:16:00)
-        # Your coordinator handles historical bucket alignment automatically.
-        timestamp = as_utc(datetime.fromisoformat(raw_time.replace("Z", "+00:00")))
+    raw_time = item.get("bar_start")
+    if raw_time is not None:
+        timestamp = _parse_tv_bar_start(raw_time, now)
+    elif default_timestamp is not None:
+        timestamp = default_timestamp
+    else:
+        raise ValueError(f"{symbol}: missing bar_start timestamp")
 
-        if timestamp != minute_utc(timestamp):
-            raise ValueError()
+    return (
+        {
+            "symbol": symbol,
+            "ticker": ticker,
+            "price": price,
+            "rsi_value": rsi,
+            "signal": item.get("signal"),
+            "event_time": timestamp.isoformat(),
+            "received_at": now.isoformat(),
+            "timeframe": "1m",
+            "bar_closed": True,
+        },
+        None,
+    )
 
-        now = datetime.now(UTC)
 
-        if now < timestamp:
-            raise ValueError()
+def validate_tradingview_payload(payload, allowed_symbols):
+    """Parse and validate a consolidated 1-minute TradingView batch webhook payload.
 
-        if not regular_session(timestamp):
-            raise ValueError()
+    Expected batch structure:
+      {
+        "event": "rsi_batch",
+        "timeframe": "1m",
+        "bar_start": "2026-11-15T14:30:00Z",
+        "bar_closed": true,
+        "count": 21,
+        "data": [
+          {"ticker": "NASDAQ:NVDA", "rsi_value": 54.32, "price": 142.50, "signal": "neutral"},
+          ...
+        ]
+      }
+    Also accepts top-level "symbols" or "items" lists.
+    """
+    now = datetime.now(UTC)
 
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(
-            "bar_start must identify a completed regular-session minute"
-        ) from None
+    if isinstance(payload, list):
+        raw_items = payload
+        envelope = {}
+    elif isinstance(payload, dict):
+        envelope = payload
+        raw_items = None
+        for key in ("data", "symbols", "items"):
+            if key in payload:
+                raw_items = payload[key]
+                break
+        if raw_items is None:
+            raise ValueError(
+                'Batch payload must be an object containing a "data" (or "symbols") array of 1m symbol records'
+            )
+    else:
+        raise ValueError("JSON payload must be a batch object")
+
+    if not isinstance(raw_items, list) or len(raw_items) == 0:
+        raise ValueError("Batch payload symbol list must be a non-empty JSON array")
+
+    default_timeframe = envelope.get("timeframe", "1m")
+    if default_timeframe != "1m":
+        raise ValueError('Batch timeframe must be "1m"')
+
+    default_bar_closed = envelope.get("bar_closed", True)
+    if default_bar_closed is not True:
+        raise ValueError("Batch bar_closed must be JSON true")
+
+    default_timestamp = None
+    if envelope.get("bar_start") is not None:
+        default_timestamp = _parse_tv_bar_start(envelope.get("bar_start"), now)
+
+    events = []
+    skipped = []
+    errors = []
+
+    for idx, item in enumerate(raw_items):
+        try:
+            event, skipped_sym = _validate_tradingview_item(
+                item,
+                allowed_symbols,
+                now,
+                default_timestamp=default_timestamp,
+                default_timeframe=default_timeframe,
+                default_bar_closed=default_bar_closed,
+            )
+            if skipped_sym is not None:
+                skipped.append(skipped_sym)
+            elif event is not None:
+                events.append(event)
+        except ValueError as exc:
+            errors.append(f"item[{idx}]: {exc}")
+
+    if not events:
+        if errors:
+            raise ValueError("; ".join(errors[:5]))
+        if skipped:
+            raise ValueError(
+                f"None of the submitted tickers match configured target_symbols: {', '.join(skipped[:10])}"
+            )
+        raise ValueError("No valid symbol records in batch payload")
 
     return {
-        "symbol": symbol,
-        "ticker": ticker,
-        "price": price,
-        "rsi_value": rsi,
-        "event_time": timestamp.isoformat(),
-        "received_at": now.isoformat(),
-        "timeframe": "1m",
-        "bar_closed": True,
+        "events": events,
+        "skipped": skipped,
+        "errors": errors,
+        "bar_start": (
+            default_timestamp.isoformat()
+            if default_timestamp is not None
+            else events[0]["event_time"]
+        ),
     }
 
 
@@ -2048,6 +2162,7 @@ class TradingviewProvider:
         self.credentials = dict(credentials or {})
         self.option_client = option_client
         self.option_chain_lock = asyncio.Lock()
+        self.option_chain_scheduled = set()
         self.queue = queue.Queue(maxsize=WEBHOOK_QUEUE_LIMIT)
         self.stop = threading.Event()
         self.server = None
@@ -2117,15 +2232,18 @@ class TradingviewProvider:
 
             payload = request.get_json(force=True, silent=True)
 
-            if not isinstance(payload, dict):
+            if not isinstance(payload, (dict, list)):
                 return (
-                    jsonify(status="error", message="JSON payload must be an object"),
+                    jsonify(
+                        status="error",
+                        message="JSON payload must be a batch object",
+                    ),
                     400,
                 )
 
             if WEBHOOK_TOKEN:
                 supplied = request.headers.get("X-Webhook-Token")
-                if supplied is None:
+                if supplied is None and isinstance(payload, dict):
                     supplied = payload.get("webhook_token", "")
                 if not isinstance(supplied, str) or not hmac.compare_digest(
                     supplied.encode("utf-8"), WEBHOOK_TOKEN.encode("utf-8")
@@ -2133,33 +2251,57 @@ class TradingviewProvider:
                     return jsonify(status="error", message="Unauthorized"), 401
 
             try:
-                # Execute your payload validation logic
-                event = validate_tradingview_payload(
+                parsed = validate_tradingview_payload(
                     payload,
                     self.symbols,
                 )
+                events = parsed.get("events") or []
+                skipped = parsed.get("skipped") or []
+                errors = parsed.get("errors") or []
 
-                # SAFEGUARD: Verify the exact type and key of the returned object
-                if not isinstance(event, dict) or "symbol" not in event:
-                    print(
-                        f"\n[CRITICAL ERROR]: validate_tradingview_payload returned an invalid structure."
-                    )
-                    print(f"Expected dict with 'symbol' key, but got: {event}\n")
+                if not events:
                     return (
                         jsonify(
                             status="error",
-                            message="Internal payload structural mismatch",
+                            message="Batch payload yielded no valid symbol events",
                         ),
-                        500,
+                        400,
                     )
 
-                self.queue.put_nowait(event)
+                queued_symbols = []
+                for event in events:
+                    self.queue.put_nowait(event)
+                    queued_symbols.append(event["symbol"])
+
+                if skipped:
+                    self.logger.warning(
+                        "WEBHOOK_BATCH_SKIPPED symbols=%s reason=not_in_target_symbols",
+                        ",".join(skipped),
+                    )
+                if errors:
+                    self.logger.warning(
+                        "WEBHOOK_BATCH_PARTIAL_ERRORS count=%d details=%s",
+                        len(errors),
+                        "; ".join(errors[:5]),
+                    )
+
+                self.logger.info(
+                    "WEBHOOK_BATCH_RECEIVED queued=%d skipped=%d errors=%d bar_start=%s",
+                    len(queued_symbols),
+                    len(skipped),
+                    len(errors),
+                    parsed.get("bar_start"),
+                )
 
                 return (
                     jsonify(
                         status="queued",
                         provider=self.provider,
-                        received=event["symbol"],
+                        event="rsi_batch",
+                        queued_count=len(queued_symbols),
+                        received=queued_symbols,
+                        skipped=skipped,
+                        errors=errors,
                     ),
                     200,
                 )
@@ -2174,7 +2316,7 @@ class TradingviewProvider:
                     503,
                 )
 
-            except Exception as system_err:
+            except Exception:
                 # This block captures exactly what line crashed inside your processing pipeline
                 print(
                     "\n=================== CRITICAL SERVER TRACEBACK (500) ==================="
@@ -2265,14 +2407,12 @@ class TradingviewProvider:
                 rsi,
             )
             return
-        if self.option_chain_lock.locked():
-            self.logger.info(
-                "OPTION_CHAIN_SKIPPED signal=%s symbol=%s rsi=%.4f reason=collection_in_progress",
-                signal.upper(),
-                symbol,
-                rsi,
-            )
+        dedup_key = (symbol, event.get("event_time"))
+        if dedup_key in self.option_chain_scheduled:
             return
+        if len(self.option_chain_scheduled) > 500:
+            self.option_chain_scheduled.clear()
+        self.option_chain_scheduled.add(dedup_key)
         asyncio.create_task(self.collect_option_chain(event, signal))
 
     async def collect_option_chain(self, event, signal):

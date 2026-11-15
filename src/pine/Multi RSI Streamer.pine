@@ -1,6 +1,6 @@
 // This Pine Script® code is subject to the terms of the
 // Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © billt408 / Merged 21-Symbol 1-Chart Webhook Streamer (<= 35 or >= 65)
+// © billt408 / Consolidated 21-Symbol 1-Minute Batch Webhook Streamer
 
 //@version=6
 indicator(
@@ -93,7 +93,7 @@ rsiLow = input.float(
      minval = 0.0,
      maxval = 50.0,
      group = GRP_RSI,
-     tooltip = "Alert triggers when a symbol's 1m closed RSI is <= this value."
+     tooltip = "Marks symbol signal as oversold when 1m closed RSI is <= this value."
 )
 
 rsiHigh = input.float(
@@ -101,14 +101,14 @@ rsiHigh = input.float(
      minval = 50.0,
      maxval = 100.0,
      group = GRP_RSI,
-     tooltip = "Alert triggers when a symbol's 1m closed RSI is >= this value."
+     tooltip = "Marks symbol signal as overbought when 1m closed RSI is >= this value."
 )
 
 alertOnlyExtremes = input.bool(
-     true,
-     "Alert ONLY on RSI <= 35 or >= 65",
+     false,
+     "Include ONLY extreme symbols (RSI <= 35 or >= 65)",
      group = GRP_RSI,
-     tooltip = "Critical: Prevents 'Alert triggered too often' by skipping neutral bars (35 < RSI < 65) and only alerting on extreme conditions."
+     tooltip = "Disabled by default: sends ALL enabled symbols' 1m RSI & price in one consolidated payload every minute. Enable to only include symbols in extreme zones."
 )
 
 includeExtended = input.bool(
@@ -173,6 +173,7 @@ if duplicateFound
 
 // ----------------------------- Persistent state -----------------------------
 
+varip int lastBatchSent = na
 varip array<int> lastSent = array.new_int(21, na)
 
 // ----------------------------- Functions -----------------------------
@@ -229,104 +230,6 @@ f_jsonEscape(string value) =>
     escaped := str.replace_all(escaped, "\t", "\\t")
     escaped
 
-f_payload(
-     string requestedSymbol,
-     int barStart,
-     float barPrice,
-     float barRsi
- ) =>
-    string timestamp = str.format_time(
-         barStart,
-         "yyyy-MM-dd'T'HH:mm:ss'Z'",
-         "UTC+0"
-    )
-
-    bool isOversold = barRsi <= rsiLow
-    string signalType = isOversold ? "oversold" : "overbought"
-    float thresholdUsed = isOversold ? rsiLow : rsiHigh
-
-    string message = (
-         "{\"ticker\":\"" + f_jsonEscape(requestedSymbol) + "\"" +
-         ",\"signal\":\"" + signalType + "\"" +
-         ",\"rsi_value\":" + str.tostring(barRsi, "#.##") +
-         ",\"price\":" + str.tostring(barPrice, "#.##") +
-         ",\"timeframe\":\"1m\"" +
-         ",\"bar_start\":\"" + timestamp + "\"" +
-         ",\"bar_closed\":true" +
-         ",\"threshold_used\":" + str.tostring(thresholdUsed, "#.##")
-    )
-
-    if str.length(webhookToken) > 0
-        message := (
-             message +
-             ",\"webhook_token\":\"" +
-             f_jsonEscape(webhookToken) +
-             "\""
-        )
-
-    message + "}"
-
-f_send(
-     bool enabled,
-     int slot,
-     string requestedSymbol,
-     int barStart,
-     int barEnd,
-     float barPrice,
-     float barRsi,
-     bool isRegular
- ) =>
-    bool sent = false
-
-    // STRICT CONDITION: Only alert when RSI <= 35 or >= 65
-    // Do NOT alert if RSI is between 35 and 65 (35 < RSI < 65)
-    bool isOversold = not na(barRsi) and barRsi <= rsiLow
-    bool isOverbought = not na(barRsi) and barRsi >= rsiHigh
-    bool inExtremeZone = isOversold or isOverbought
-
-    bool valid = (
-         enabled and
-         sendWebhooks and
-         barstate.isrealtime and
-         isRegular and
-         not na(barStart) and
-         not na(barEnd) and
-         not na(barPrice) and
-         not na(barRsi) and
-         barPrice > 0 and
-         inExtremeZone
-    )
-
-    if valid
-        int ageMs = timenow - barEnd
-        int previousMinute = array.get(lastSent, slot)
-
-        bool insideWindow = (
-             ageMs >= settleSeconds * 1000 and
-             ageMs <= maxAgeSeconds * 1000
-        )
-
-        bool newMinute = (
-             na(previousMinute) or
-             barStart > previousMinute
-        )
-
-        if insideWindow and newMinute
-            string message = f_payload(
-                 requestedSymbol,
-                 barStart,
-                 barPrice,
-                 barRsi
-            )
-
-            // Dispatches only when RSI <= 35 or >= 65
-            alert(message, alert.freq_all)
-
-            array.set(lastSent, slot, barStart)
-            sent := true
-
-    sent
-
 // ----------------------------- Source data (21 Symbols) -----------------------------
 
 [t1, e1, p1, r1, g1] = f_completedSample(symbol1)
@@ -351,29 +254,128 @@ f_send(
 [t20, e20, p20, r20, g20] = f_completedSample(symbol20)
 [t21, e21, p21, r21, g21] = f_completedSample(symbol21)
 
-// ----------------------------- Webhook dispatch -----------------------------
+allT = array.from(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21)
+allE = array.from(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21)
+allP = array.from(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21)
+allR = array.from(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21)
+allG = array.from(g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21)
 
-sent1 = f_send(enable1, 0, symbol1, t1, e1, p1, r1, g1)
-sent2 = f_send(enable2, 1, symbol2, t2, e2, p2, r2, g2)
-sent3 = f_send(enable3, 2, symbol3, t3, e3, p3, r3, g3)
-sent4 = f_send(enable4, 3, symbol4, t4, e4, p4, r4, g4)
-sent5 = f_send(enable5, 4, symbol5, t5, e5, p5, r5, g5)
-sent6 = f_send(enable6, 5, symbol6, t6, e6, p6, r6, g6)
-sent7 = f_send(enable7, 6, symbol7, t7, e7, p7, r7, g7)
-sent8 = f_send(enable8, 7, symbol8, t8, e8, p8, r8, g8)
-sent9 = f_send(enable9, 8, symbol9, t9, e9, p9, r9, g9)
-sent10 = f_send(enable10, 9, symbol10, t10, e10, p10, r10, g10)
-sent11 = f_send(enable11, 10, symbol11, t11, e11, p11, r11, g11)
-sent12 = f_send(enable12, 11, symbol12, t12, e12, p12, r12, g12)
-sent13 = f_send(enable13, 12, symbol13, t13, e13, p13, r13, g13)
-sent14 = f_send(enable14, 13, symbol14, t14, e14, p14, r14, g14)
-sent15 = f_send(enable15, 14, symbol15, t15, e15, p15, r15, g15)
-sent16 = f_send(enable16, 15, symbol16, t16, e16, p16, r16, g16)
-sent17 = f_send(enable17, 16, symbol17, t17, e17, p17, r17, g17)
-sent18 = f_send(enable18, 17, symbol18, t18, e18, p18, r18, g18)
-sent19 = f_send(enable19, 18, symbol19, t19, e19, p19, r19, g19)
-sent20 = f_send(enable20, 19, symbol20, t20, e20, p20, r20, g20)
-sent21 = f_send(enable21, 20, symbol21, t21, e21, p21, r21, g21)
+// ----------------------------- Single Batch Webhook Dispatch (1 Payload / Minute) -----------------------------
+
+eligible = array.new_bool(21, false)
+sentFlags = array.new_bool(21, false)
+int batchBarStart = na
+bool batchDispatched = false
+
+if sendWebhooks and barstate.isrealtime
+    // Pass 1: find all valid symbols settled inside the 1-minute dispatch window
+    for i = 0 to 20
+        bool isEnabled = array.get(allEnabled, i)
+        int barStart = array.get(allT, i)
+        int barEnd = array.get(allE, i)
+        float barPrice = array.get(allP, i)
+        float barRsi = array.get(allR, i)
+        bool isRegular = array.get(allG, i)
+        int prevSlotMinute = array.get(lastSent, i)
+
+        bool baseValid = (
+             isEnabled and
+             isRegular and
+             not na(barStart) and
+             not na(barEnd) and
+             not na(barPrice) and
+             not na(barRsi) and
+             barPrice > 0
+        )
+
+        if baseValid
+            int ageMs = timenow - barEnd
+            bool insideWindow = ageMs >= settleSeconds * 1000 and ageMs <= maxAgeSeconds * 1000
+            bool newForSlot = na(prevSlotMinute) or barStart > prevSlotMinute
+            bool extremeOk = not alertOnlyExtremes or (barRsi <= rsiLow or barRsi >= rsiHigh)
+
+            if insideWindow and newForSlot and extremeOk
+                array.set(eligible, i, true)
+                if na(batchBarStart) or barStart > batchBarStart
+                    batchBarStart := barStart
+
+    // Pass 2: assemble 1 consolidated JSON payload and fire alert() once per minute
+    if not na(batchBarStart) and (na(lastBatchSent) or batchBarStart > lastBatchSent)
+        batchItems = array.new_string()
+        string batchTimestamp = str.format_time(batchBarStart, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC+0")
+
+        for i = 0 to 20
+            if array.get(eligible, i)
+                string sym = array.get(allSymbols, i)
+                int barStart = array.get(allT, i)
+                float barPrice = array.get(allP, i)
+                float barRsi = array.get(allR, i)
+
+                bool isOversold = barRsi <= rsiLow
+                bool isOverbought = barRsi >= rsiHigh
+                string signalType = isOversold ? "oversold" : isOverbought ? "overbought" : "neutral"
+
+                string itemJson = (
+                     "{\"ticker\":\"" + f_jsonEscape(sym) + "\"" +
+                     ",\"signal\":\"" + signalType + "\"" +
+                     ",\"rsi_value\":" + str.tostring(barRsi, "#.##") +
+                     ",\"price\":" + str.tostring(barPrice, "#.##")
+                )
+
+                if isOversold or isOverbought
+                    float thresholdUsed = isOversold ? rsiLow : rsiHigh
+                    itemJson := itemJson + ",\"threshold_used\":" + str.tostring(thresholdUsed, "#.##")
+
+                if barStart != batchBarStart
+                    string itemTs = str.format_time(barStart, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC+0")
+                    itemJson := itemJson + ",\"bar_start\":\"" + itemTs + "\""
+
+                itemJson := itemJson + "}"
+
+                array.push(batchItems, itemJson)
+                array.set(lastSent, i, barStart)
+                array.set(sentFlags, i, true)
+
+        if array.size(batchItems) > 0
+            string batchMessage = (
+                 "{\"event\":\"rsi_batch\"" +
+                 ",\"timeframe\":\"1m\"" +
+                 ",\"bar_start\":\"" + batchTimestamp + "\"" +
+                 ",\"bar_closed\":true" +
+                 ",\"count\":" + str.tostring(array.size(batchItems))
+            )
+
+            if str.length(webhookToken) > 0
+                batchMessage := batchMessage + ",\"webhook_token\":\"" + f_jsonEscape(webhookToken) + "\""
+
+            batchMessage := batchMessage + ",\"data\":[" + array.join(batchItems, ",") + "]}"
+
+            // Single consolidated webhook alert once per minute for all enabled symbols
+            alert(batchMessage, alert.freq_all)
+            lastBatchSent := batchBarStart
+            batchDispatched := true
+
+sent1 = array.get(sentFlags, 0)
+sent2 = array.get(sentFlags, 1)
+sent3 = array.get(sentFlags, 2)
+sent4 = array.get(sentFlags, 3)
+sent5 = array.get(sentFlags, 4)
+sent6 = array.get(sentFlags, 5)
+sent7 = array.get(sentFlags, 6)
+sent8 = array.get(sentFlags, 7)
+sent9 = array.get(sentFlags, 8)
+sent10 = array.get(sentFlags, 9)
+sent11 = array.get(sentFlags, 10)
+sent12 = array.get(sentFlags, 11)
+sent13 = array.get(sentFlags, 12)
+sent14 = array.get(sentFlags, 13)
+sent15 = array.get(sentFlags, 14)
+sent16 = array.get(sentFlags, 15)
+sent17 = array.get(sentFlags, 16)
+sent18 = array.get(sentFlags, 17)
+sent19 = array.get(sentFlags, 18)
+sent20 = array.get(sentFlags, 19)
+sent21 = array.get(sentFlags, 20)
 
 // ----------------------------- Display & Guidelines -----------------------------
 
