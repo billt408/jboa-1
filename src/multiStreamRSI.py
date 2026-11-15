@@ -3131,6 +3131,7 @@ class AlpacaPositionMonitor:
         self.last_poll_utc = None
         self.last_status = "uninitialized"
         self.position_count = 0
+        self.equity_count = 0
         self.option_count = 0
 
     @staticmethod
@@ -3213,8 +3214,10 @@ class AlpacaPositionMonitor:
         account = self.client.get_account()
         positions = list(self.client.get_all_positions() or [])
         options = [p for p in positions if self._is_option(p)]
+        equities = [p for p in positions if not self._is_option(p)]
 
         self.position_count = len(positions)
+        self.equity_count = len(equities)
         self.option_count = len(options)
         self.last_poll_utc = datetime.now(timezone.utc).isoformat()
         self.last_status = "healthy"
@@ -5604,8 +5607,9 @@ class AdminCliProvider:
             position_monitor_report = {
                 "status": pm.last_status if pm else "not_loaded",
                 "last_poll_utc": pm.last_poll_utc if pm else None,
-                "active_equity_positions": pm.position_count if pm else 0,
+                "active_equity_positions": pm.equity_count if pm else 0,
                 "active_option_positions": pm.option_count if pm else 0,
+                "active_total_positions": pm.position_count if pm else 0,
             }
             option_buyer_report = {
                 "status": ob.last_status if ob else "not_loaded",
