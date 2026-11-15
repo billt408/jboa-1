@@ -151,6 +151,183 @@ class Bar:
     close: float
 
 
+KINEMATICS_SMOOTH_METHOD = os.getenv("KINEMATICS_SMOOTH_METHOD", "hma").strip().lower()
+if KINEMATICS_SMOOTH_METHOD not in {"hma", "ema", "none"}:
+    KINEMATICS_SMOOTH_METHOD = "hma"
+KINEMATICS_SMOOTH_PERIOD = max(
+    2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD)))
+)
+KINEMATICS_RSI_OVERBOUGHT = float(os.getenv("KINEMATICS_RSI_OVERBOUGHT", "70.0"))
+KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
+
+
+def compute_wma(values, period):
+    """Compute Weighted Moving Average series over values."""
+    if not values:
+        return []
+    n = max(1, int(period))
+    out = []
+    for i in range(len(values)):
+        window = values[max(0, i - n + 1) : i + 1]
+        k = len(window)
+        denom = k * (k + 1) / 2.0
+        weighted = sum(val * (idx + 1) for idx, val in enumerate(window))
+        out.append(weighted / denom)
+    return out
+
+
+def compute_ema(values, period):
+    """Compute Exponential Moving Average series over values."""
+    if not values:
+        return []
+    n = max(1, int(period))
+    alpha = 2.0 / (n + 1.0)
+    out = [float(values[0])]
+    for val in values[1:]:
+        out.append(alpha * float(val) + (1.0 - alpha) * out[-1])
+    return out
+
+
+def compute_hma(values, period):
+    """Compute Hull Moving Average (HMA) series: WMA(2*WMA(n/2) - WMA(n), sqrt(n))."""
+    if not values:
+        return []
+    n = max(2, int(period))
+    half_n = max(1, n // 2)
+    sqrt_n = max(1, int(round(math.sqrt(n))))
+    wma_half = compute_wma(values, half_n)
+    wma_full = compute_wma(values, n)
+    raw_hull = [2.0 * h - f for h, f in zip(wma_half, wma_full)]
+    return compute_wma(raw_hull, sqrt_n)
+
+
+def compute_smoothed_series(
+    values, period=KINEMATICS_SMOOTH_PERIOD, method=KINEMATICS_SMOOTH_METHOD
+):
+    """Return smoothed price series aligned to the given period (HMA, EMA, or raw)."""
+    clean = [float(v) for v in values]
+    if not clean or method == "none":
+        return clean
+    if method == "ema":
+        return compute_ema(clean, period)
+    return compute_hma(clean, period)
+
+
+def classify_rsi_zone(
+    rsi_val, overbought=KINEMATICS_RSI_OVERBOUGHT, oversold=KINEMATICS_RSI_OVERSOLD
+):
+    """Classify RSI into boundary friction zones."""
+    if rsi_val is None or not math.isfinite(rsi_val):
+        return "unknown"
+    if rsi_val >= overbought:
+        return "overbought"
+    if rsi_val <= oversold:
+        return "oversold"
+    if 40.0 <= rsi_val <= 60.0:
+        return "neutral_band"
+    if rsi_val > 60.0:
+        return "upper_expansion"
+    return "lower_expansion"
+
+
+def compute_kinematic_forecast(
+    close,
+    velocity,
+    acceleration,
+    rsi,
+    prev_velocity=None,
+    prev_acceleration=None,
+    overbought=KINEMATICS_RSI_OVERBOUGHT,
+    oversold=KINEMATICS_RSI_OVERSOLD,
+):
+    """Compute next-step kinematic projection P_hat_{t+1} = P_t + v_t + 0.5*a_t,
+    leading/confirmed crossover signals, and 4-state RSI-filtered trading action."""
+    projected_price = None
+    projected_delta = None
+    projected_delta_pct = None
+
+    if (
+        close is not None
+        and math.isfinite(close)
+        and velocity is not None
+        and math.isfinite(velocity)
+    ):
+        acc = (
+            float(acceleration)
+            if (acceleration is not None and math.isfinite(acceleration))
+            else 0.0
+        )
+        delta = float(velocity) + 0.5 * acc
+        projected_delta = round(delta, 4)
+        projected_price = round(float(close) + delta, 4)
+        if close > 0:
+            projected_delta_pct = round((delta / float(close)) * 100.0, 4)
+
+    crossover_signal = "none"
+    if velocity is not None and prev_velocity is not None:
+        if prev_velocity >= 0 and velocity < 0:
+            crossover_signal = "confirmed_bearish"
+        elif prev_velocity <= 0 and velocity > 0:
+            crossover_signal = "confirmed_bullish"
+    if (
+        crossover_signal == "none"
+        and acceleration is not None
+        and prev_acceleration is not None
+    ):
+        if (
+            prev_acceleration >= 0
+            and acceleration < 0
+            and (velocity is None or velocity > 0)
+        ):
+            crossover_signal = "leading_bearish"
+        elif (
+            prev_acceleration <= 0
+            and acceleration > 0
+            and (velocity is None or velocity < 0)
+        ):
+            crossover_signal = "leading_bullish"
+
+    rsi_zone = classify_rsi_zone(rsi, overbought=overbought, oversold=oversold)
+    forecast_direction = "neutral"
+    trading_action = "Hold / Monitor"
+
+    if velocity is not None and acceleration is not None and rsi is not None:
+        if velocity > 0 and acceleration < 0 and rsi >= overbought:
+            forecast_direction = "bearish_reversal"
+            trading_action = "Prepare to Short / Exit Longs"
+        elif velocity < 0 and acceleration > 0 and rsi <= oversold:
+            forecast_direction = "bullish_reversal"
+            trading_action = "Prepare to Buy / Exit Shorts"
+        elif velocity > 0 and acceleration > 0 and 40.0 <= rsi <= 60.0:
+            forecast_direction = "bullish_continuation"
+            trading_action = "Hold Long / Trend Follow"
+        elif velocity < 0 and acceleration < 0 and 40.0 <= rsi <= 60.0:
+            forecast_direction = "bearish_continuation"
+            trading_action = "Hold Short / Trend Follow"
+        elif velocity > 0 and acceleration > 0 and rsi > 60.0 and rsi < overbought:
+            forecast_direction = "bullish_momentum"
+            trading_action = "Trail Long / Watch 70 Friction"
+        elif velocity < 0 and acceleration < 0 and rsi < 40.0 and rsi > oversold:
+            forecast_direction = "bearish_momentum"
+            trading_action = "Trail Short / Watch 30 Support"
+        elif velocity > 0 and acceleration < 0:
+            forecast_direction = "bullish_decelerating"
+            trading_action = "Tighten Stops / Watch Crossover"
+        elif velocity < 0 and acceleration > 0:
+            forecast_direction = "bearish_decelerating"
+            trading_action = "Watch for Bottom Crossover"
+
+    return {
+        "projected_price_next": projected_price,
+        "projected_delta": projected_delta,
+        "projected_delta_pct": projected_delta_pct,
+        "rsi_zone": rsi_zone,
+        "forecast_direction": forecast_direction,
+        "trading_action": trading_action,
+        "crossover_signal": crossover_signal,
+    }
+
+
 def classify_kinematic_regime(
     rsi_velocity, rsi_acceleration, price_velocity=None, price_acceleration=None
 ):
@@ -684,33 +861,88 @@ class MinuteCoordinator:
             tracker.process_bar(bar, "WARMUP_BACKFILL", warmup=True)
             if tracker.changes != before or tracker.previous_close is not None:
                 applied += 1
-        # Seed warmup kinematics history so initial live summaries have velocity context
+        # Seed warmup kinematics history so initial live summaries have velocity & smoothed context
         if sorted_bars:
             history = self.kinematics_history.setdefault((provider, symbol), [])
-            for b in sorted_bars[-10:]:
-                pv = tracker.latest_price_velocity
-                pa = tracker.latest_price_acceleration
-                rv = tracker.latest_rsi_velocity
-                ra = tracker.latest_rsi_acceleration
-                reg = classify_kinematic_regime(rv, ra, pv, pa)
-                history.append(
-                    {
-                        "minute": minute_utc(b.timestamp),
-                        "timestamp": (
-                            b.timestamp.isoformat()
-                            if hasattr(b.timestamp, "isoformat")
-                            else str(b.timestamp)
-                        ),
-                        "close": b.close,
-                        "rsi": tracker.latest["rsi"] if tracker.latest else None,
-                        "price_velocity": pv,
-                        "price_velocity_pct": None,
-                        "price_acceleration": pa,
-                        "rsi_velocity": rv,
-                        "rsi_acceleration": ra,
-                        "regime": reg,
-                    }
+            seed_slice = sorted_bars[-60:]
+            seed_closes = [b.close for b in seed_slice]
+            smoothed_seed = compute_smoothed_series(seed_closes)
+            prev_sv = None
+            prev_sa = None
+            for idx, b in enumerate(seed_slice):
+                sc = round(smoothed_seed[idx], 4)
+                sv = round(sc - smoothed_seed[idx - 1], 4) if idx >= 1 else None
+                sa = (
+                    round(sv - prev_sv, 4)
+                    if (sv is not None and prev_sv is not None)
+                    else None
                 )
+                pv = (
+                    tracker.latest_price_velocity
+                    if idx == len(seed_slice) - 1
+                    else (
+                        round(b.close - seed_slice[idx - 1].close, 4)
+                        if idx >= 1
+                        else None
+                    )
+                )
+                pa = (
+                    tracker.latest_price_acceleration
+                    if idx == len(seed_slice) - 1
+                    else None
+                )
+                rv = tracker.latest_rsi_velocity if idx == len(seed_slice) - 1 else None
+                ra = (
+                    tracker.latest_rsi_acceleration
+                    if idx == len(seed_slice) - 1
+                    else None
+                )
+                rsi_val = (
+                    tracker.latest["rsi"]
+                    if (tracker.latest and idx == len(seed_slice) - 1)
+                    else None
+                )
+                reg = classify_kinematic_regime(
+                    rv, ra, sv if sv is not None else pv, sa if sa is not None else pa
+                )
+                fc = compute_kinematic_forecast(
+                    b.close,
+                    sv if sv is not None else pv,
+                    sa if sa is not None else pa,
+                    rsi_val,
+                    prev_velocity=prev_sv,
+                    prev_acceleration=prev_sa,
+                )
+                if idx >= len(seed_slice) - 20:
+                    history.append(
+                        {
+                            "minute": minute_utc(b.timestamp),
+                            "timestamp": (
+                                b.timestamp.isoformat()
+                                if hasattr(b.timestamp, "isoformat")
+                                else str(b.timestamp)
+                            ),
+                            "close": b.close,
+                            "smoothed_close": sc,
+                            "rsi": rsi_val,
+                            "price_velocity": pv,
+                            "price_velocity_pct": None,
+                            "price_acceleration": pa,
+                            "smoothed_velocity": sv,
+                            "smoothed_acceleration": sa,
+                            "rsi_velocity": rv,
+                            "rsi_acceleration": ra,
+                            "projected_price_next": fc["projected_price_next"],
+                            "projected_delta_pct": fc["projected_delta_pct"],
+                            "rsi_zone": fc["rsi_zone"],
+                            "forecast_direction": fc["forecast_direction"],
+                            "trading_action": fc["trading_action"],
+                            "crossover_signal": fc["crossover_signal"],
+                            "regime": reg,
+                        }
+                    )
+                prev_sv = sv
+                prev_sa = sa
         logging.info(
             "RSI_WARMUP provider=%s symbol=%s bars=%d applied=%d changes=%d "
             "converged=%s",
@@ -871,12 +1103,71 @@ class MinuteCoordinator:
                 r3m = valid_rsis[-3]["rsi"]
                 rsi_velocity_3m = round(curr_rsi - r3m, 4)
 
+        smoothed_close = None
+        smoothed_velocity = None
+        smoothed_acceleration = None
+        if curr_close is not None:
+            close_series = [
+                e["close"] for e in history if e.get("close") is not None
+            ] + [curr_close]
+            smoothed_vals = compute_smoothed_series(close_series)
+            if smoothed_vals:
+                smoothed_close = round(smoothed_vals[-1], 4)
+                if len(smoothed_vals) >= 2:
+                    smoothed_velocity = round(smoothed_vals[-1] - smoothed_vals[-2], 4)
+                if len(smoothed_vals) >= 3:
+                    prev_smoothed_vel = smoothed_vals[-2] - smoothed_vals[-3]
+                    smoothed_acceleration = round(
+                        smoothed_velocity - prev_smoothed_vel, 4
+                    )
+
+        prev_vel_for_cross = None
+        prev_acc_for_cross = None
+        if history:
+            prev_hist = next(
+                (
+                    e
+                    for e in reversed(history)
+                    if e.get("smoothed_velocity") is not None
+                    or e.get("price_velocity") is not None
+                ),
+                None,
+            )
+            if prev_hist is not None:
+                prev_vel_for_cross = (
+                    prev_hist.get("smoothed_velocity")
+                    if prev_hist.get("smoothed_velocity") is not None
+                    else prev_hist.get("price_velocity")
+                )
+                prev_acc_for_cross = (
+                    prev_hist.get("smoothed_acceleration")
+                    if prev_hist.get("smoothed_acceleration") is not None
+                    else prev_hist.get("price_acceleration")
+                )
+
+        active_pv = (
+            smoothed_velocity if smoothed_velocity is not None else price_velocity
+        )
+        active_pa = (
+            smoothed_acceleration
+            if smoothed_acceleration is not None
+            else price_acceleration
+        )
+        forecast = compute_kinematic_forecast(
+            curr_close,
+            active_pv,
+            active_pa,
+            curr_rsi,
+            prev_velocity=prev_vel_for_cross,
+            prev_acceleration=prev_acc_for_cross,
+        )
+
         # Classify kinematics regime
         regime = classify_kinematic_regime(
             rsi_velocity,
             rsi_acceleration,
-            price_velocity,
-            price_acceleration,
+            active_pv,
+            active_pa,
         )
 
         if curr_close is not None or curr_rsi is not None:
@@ -889,14 +1180,24 @@ class MinuteCoordinator:
                         else str(minute)
                     ),
                     "close": curr_close,
+                    "smoothed_close": smoothed_close,
                     "rsi": curr_rsi,
                     "price_velocity": price_velocity,
                     "price_velocity_pct": price_velocity_pct,
                     "price_acceleration": price_acceleration,
                     "price_acceleration_pct": price_acceleration_pct,
+                    "smoothed_velocity": smoothed_velocity,
+                    "smoothed_acceleration": smoothed_acceleration,
                     "rsi_velocity": rsi_velocity,
                     "rsi_acceleration": rsi_acceleration,
                     "momentum_3m_pct": price_velocity_3m_pct,
+                    "projected_price_next": forecast["projected_price_next"],
+                    "projected_delta": forecast["projected_delta"],
+                    "projected_delta_pct": forecast["projected_delta_pct"],
+                    "rsi_zone": forecast["rsi_zone"],
+                    "forecast_direction": forecast["forecast_direction"],
+                    "trading_action": forecast["trading_action"],
+                    "crossover_signal": forecast["crossover_signal"],
                     "regime": regime,
                 }
             )
@@ -908,17 +1209,34 @@ class MinuteCoordinator:
                 "price_velocity": price_velocity,
                 "price_velocity_pct": price_velocity_pct,
                 "price_acceleration": price_acceleration,
+                "smoothed_close": smoothed_close,
+                "smoothed_velocity": smoothed_velocity,
+                "smoothed_acceleration": smoothed_acceleration,
                 "rsi_velocity": rsi_velocity,
                 "rsi_acceleration": rsi_acceleration,
+                "projected_price_next": forecast["projected_price_next"],
+                "forecast_direction": forecast["forecast_direction"],
                 "kinematics": {
                     "price_velocity_1m": price_velocity,
                     "price_velocity_1m_pct": price_velocity_pct,
                     "price_acceleration_1m": price_acceleration,
                     "price_acceleration_1m_pct": price_acceleration_pct,
+                    "smooth_method": KINEMATICS_SMOOTH_METHOD,
+                    "smooth_period": KINEMATICS_SMOOTH_PERIOD,
+                    "smoothed_close": smoothed_close,
+                    "smoothed_velocity": smoothed_velocity,
+                    "smoothed_acceleration": smoothed_acceleration,
                     "rsi_velocity_1m": rsi_velocity,
                     "rsi_acceleration_1m": rsi_acceleration,
                     "rsi_velocity_3m": rsi_velocity_3m,
                     "price_velocity_3m_pct": price_velocity_3m_pct,
+                    "projected_price_next": forecast["projected_price_next"],
+                    "projected_delta": forecast["projected_delta"],
+                    "projected_delta_pct": forecast["projected_delta_pct"],
+                    "rsi_zone": forecast["rsi_zone"],
+                    "forecast_direction": forecast["forecast_direction"],
+                    "trading_action": forecast["trading_action"],
+                    "crossover_signal": forecast["crossover_signal"],
                     "regime": regime,
                 },
             }
@@ -947,6 +1265,12 @@ class MinuteCoordinator:
                         "decelerating_bearish": 0,
                         "neutral": 0,
                     },
+                    "forecasts": {
+                        "bearish_reversal": 0,
+                        "bullish_reversal": 0,
+                        "bullish_continuation": 0,
+                        "bearish_continuation": 0,
+                    },
                     "max_rsi_velocity": None,
                     "min_rsi_velocity": None,
                     "max_price_velocity_pct": None,
@@ -957,6 +1281,9 @@ class MinuteCoordinator:
                     r = k.get("regime")
                     if r in kinematics_summary["regimes"]:
                         kinematics_summary["regimes"][r] += 1
+                    fc_dir = k.get("forecast_direction")
+                    if fc_dir in kinematics_summary["forecasts"]:
+                        kinematics_summary["forecasts"][fc_dir] += 1
 
                     rv = rec.get("rsi_velocity")
                     if rv is not None:
@@ -2811,11 +3138,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
-                            <span>??</span> Decelerating Bullish
+                            <span>&nearr;</span> Decelerating Bullish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-cyan-900/40 text-cyan-200">v &gt; 0, a &le; 0</span>
                     </div>
-                    <p class="text-[10px] text-cyan-400/80 mt-0.5">Bullish exhaustion &bull; upward velocity slowing &bull; consolidation / potential top</p>
+                    <p class="text-[10px] text-cyan-400/80 mt-0.5">Bullish exhaustion &bull; upward velocity slowing &bull; Overbought (&ge;70) = Bearish Reversal watch</p>
                     <div id="quadDecBullish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
                         <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
@@ -2825,11 +3152,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                            <span>??</span> Accelerating Bullish
+                            <span>&uarr;</span> Accelerating Bullish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-emerald-900/40 text-emerald-200">v &gt; 0, a &gt; 0</span>
                     </div>
-                    <p class="text-[10px] text-emerald-400/80 mt-0.5">Aggressive momentum expansion &bull; buyers dominant &bull; trend thrust</p>
+                    <p class="text-[10px] text-emerald-400/80 mt-0.5">Aggressive momentum expansion &bull; Neutral RSI (40-60) = Strong Bullish Continuation</p>
                     <div id="quadAccBullish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
                         <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
@@ -2839,11 +3166,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="bg-rose-950/20 border border-rose-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-rose-300 flex items-center gap-1.5">
-                            <span>??</span> Accelerating Bearish
+                            <span>&darr;</span> Accelerating Bearish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-rose-900/40 text-rose-200">v &lt; 0, a &lt; 0</span>
                     </div>
-                    <p class="text-[10px] text-rose-400/80 mt-0.5">Aggressive selling impulse &bull; downward velocity speeding up &bull; breakdown</p>
+                    <p class="text-[10px] text-rose-400/80 mt-0.5">Aggressive selling impulse &bull; Neutral RSI (40-60) = Strong Bearish Continuation</p>
                     <div id="quadAccBearish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
                         <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
@@ -2853,11 +3180,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="bg-amber-950/20 border border-amber-800/40 rounded-xl p-3">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                            <span>??</span> Decelerating Bearish
+                            <span>&searr;</span> Decelerating Bearish
                         </span>
                         <span class="text-[10px] mono px-2 py-0.5 rounded bg-amber-900/40 text-amber-200">v &lt; 0, a &ge; 0</span>
                     </div>
-                    <p class="text-[10px] text-amber-400/80 mt-0.5">Downside absorption &bull; selling losing speed &bull; basing / potential reversal</p>
+                    <p class="text-[10px] text-amber-400/80 mt-0.5">Downside absorption &bull; Oversold (&le;30) = Bullish Reversal watch</p>
                     <div id="quadDecBearish" class="mt-2.5 flex flex-wrap gap-1.5 min-h-[28px] items-center">
                         <span class="text-xs text-slate-500 italic">No instruments in this phase</span>
                     </div>
@@ -2903,13 +3230,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <tr>
                             <th class="px-4 py-2.5" id="thSymbolCol">Symbol / Feeds</th>
                             <th class="px-4 py-2.5 text-right">Close ($)</th>
+                            <th class="px-4 py-2.5 text-right">Projected P^<sub>t+1</sub></th>
                             <th class="px-4 py-2.5 text-right">Price Velocity (v)</th>
                             <th class="px-4 py-2.5 text-right">Price Accel (a)</th>
                             <th class="px-4 py-2.5 min-w-[130px]">RSI (14)</th>
-                            <th class="px-4 py-2.5 text-right">RSI Velocity (v_rsi)</th>
-                            <th class="px-4 py-2.5 text-right">RSI Accel (a_rsi)</th>
-                            <th class="px-4 py-2.5">Kinematics Regime</th>
-                            <th class="px-4 py-2.5 text-right">Momentum (3m)</th>
+                            <th class="px-4 py-2.5 text-right">RSI Vel / Acc</th>
+                            <th class="px-4 py-2.5">Forecast Matrix Signal</th>
                             <th class="px-4 py-2.5 text-center">Inspect / Test</th>
                         </tr>
                     </thead>
@@ -2961,6 +3287,50 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <!-- Deep-Dive Content Container (Always renders content) -->
                 <div id="symbolDeepDiveContent" class="mt-4 space-y-4">
+                    <!-- Kinematic Projection & 3-Panel Synchronized Crossover Chart -->
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                        <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-4 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Next-Step Projection</span>
+                                <span id="detailSmoothTag" class="text-[10px] mono text-indigo-300">HMA(14) Synced</span>
+                            </div>
+                            <div class="flex items-baseline justify-between">
+                                <div>
+                                    <div class="text-[11px] text-slate-400">P^<sub>t+1</sub> = P<sub>t</sub> + v<sub>t</sub> + &frac12;a<sub>t</sub></div>
+                                    <div id="detailProjectedPrice" class="text-2xl font-extrabold mono text-cyan-300 mt-0.5">--</div>
+                                </div>
+                                <div class="text-right">
+                                    <div class="text-[11px] text-slate-400">Expected &Delta;</div>
+                                    <div id="detailProjectedDelta" class="text-sm font-bold mono text-slate-300 mt-0.5">--</div>
+                                </div>
+                            </div>
+                            <div class="pt-2.5 border-t border-slate-800/80 space-y-1.5 text-[11px]">
+                                <div class="flex justify-between">
+                                    <span class="text-slate-400">RSI Boundary Zone:</span>
+                                    <span id="detailRsiZone" class="mono font-semibold text-slate-200">--</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-slate-400">Crossover Event:</span>
+                                    <span id="detailCrossoverSignal" class="mono font-semibold text-slate-200">none</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-slate-400">Forecast Action:</span>
+                                    <span id="detailTradingAction" class="font-semibold text-amber-300 text-right">--</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="lg:col-span-2 bg-slate-950/70 border border-slate-800/80 rounded-xl p-4">
+                            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                                <span class="text-[11px] font-bold uppercase tracking-wider text-slate-300">3-Panel Synchronized Kinematic Crossover (Price · v/a · RSI)</span>
+                                <span class="text-[10px] text-slate-400 mono">a crosses 0 = Leading · v crosses 0 = Confirmed</span>
+                            </div>
+                            <div id="detailCrossoverChart" class="w-full min-h-[210px] flex items-center justify-center text-xs text-slate-500">
+                                Collecting multi-bar history...
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Provider Comparison Table for Selected Symbol -->
                     <div class="overflow-x-auto rounded-xl border border-slate-800/80 bg-slate-950/50">
                         <table class="w-full text-left text-xs">
@@ -2968,12 +3338,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <tr>
                                     <th class="px-3.5 py-2">Provider Feed</th>
                                     <th class="px-3.5 py-2 text-right">Close ($)</th>
-                                    <th class="px-3.5 py-2 text-right">Price Velocity (v)</th>
-                                    <th class="px-3.5 py-2 text-right">Price Accel (a)</th>
+                                    <th class="px-3.5 py-2 text-right">P^<sub>t+1</sub> ($)</th>
+                                    <th class="px-3.5 py-2 text-right">Price Vel (v)</th>
+                                    <th class="px-3.5 py-2 text-right">Price Acc (a)</th>
                                     <th class="px-3.5 py-2 text-right">RSI (14)</th>
-                                    <th class="px-3.5 py-2 text-right">RSI Velocity (v_rsi)</th>
-                                    <th class="px-3.5 py-2 text-right">RSI Accel (a_rsi)</th>
-                                    <th class="px-3.5 py-2">Phase Regime</th>
+                                    <th class="px-3.5 py-2 text-right">RSI Vel / Acc</th>
+                                    <th class="px-3.5 py-2">Forecast Action</th>
                                     <th class="px-3.5 py-2 text-center">Status</th>
                                 </tr>
                             </thead>
@@ -3121,38 +3491,50 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             accelerating_bullish: {
                 label: 'Accelerating Bullish',
                 badgeClass: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-                icon: '??',
+                icon: '?',
                 pillColor: 'text-emerald-400',
                 desc: 'Strong buyer thrust & momentum expansion'
             },
             decelerating_bullish: {
                 label: 'Decelerating Bullish',
                 badgeClass: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30',
-                icon: '??',
+                icon: '?',
                 pillColor: 'text-cyan-400',
                 desc: 'Upward momentum waning / consolidation'
             },
             accelerating_bearish: {
                 label: 'Accelerating Bearish',
                 badgeClass: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-                icon: '??',
+                icon: '?',
                 pillColor: 'text-rose-400',
                 desc: 'Aggressive selling impulse accelerating'
             },
             decelerating_bearish: {
                 label: 'Decelerating Bearish',
                 badgeClass: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-                icon: '??',
+                icon: '?',
                 pillColor: 'text-amber-400',
                 desc: 'Downside absorption / selling deceleration'
             },
             neutral: {
                 label: 'Neutral',
                 badgeClass: 'bg-slate-700/30 text-slate-300 border-slate-700',
-                icon: '?',
+                icon: '',
                 pillColor: 'text-slate-400',
                 desc: 'Equilibrium / no directional acceleration'
             }
+        };
+
+        const FORECAST_CONFIG = {
+            bearish_reversal: { label: 'Bearish Reversal', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40' },
+            bullish_reversal: { label: 'Bullish Reversal', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
+            bullish_continuation: { label: 'Bullish Continuation', cls: 'bg-teal-500/15 text-teal-300 border-teal-500/40' },
+            bearish_continuation: { label: 'Bearish Continuation', cls: 'bg-orange-500/15 text-orange-300 border-orange-500/40' },
+            bullish_momentum: { label: 'Bullish Momentum', cls: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' },
+            bearish_momentum: { label: 'Bearish Momentum', cls: 'bg-rose-500/10 text-rose-300 border-rose-500/20' },
+            bullish_decelerating: { label: 'Bullish Decel', cls: 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20' },
+            bearish_decelerating: { label: 'Bearish Decel', cls: 'bg-amber-500/10 text-amber-300 border-amber-500/20' },
+            neutral: { label: 'Neutral / Hold', cls: 'bg-slate-800 text-slate-400 border-slate-700' }
         };
 
         // Safe format helpers that NEVER throw on null/undefined
@@ -3590,20 +3972,24 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         function renderConsolidatedTableRows(tbody, symbolsList) {
             tbody.innerHTML = symbolsList.map(item => {
                 const rConf = REGIME_CONFIG[item.regime] || REGIME_CONFIG.neutral;
+                const fConf = FORECAST_CONFIG[item.forecast_direction] || FORECAST_CONFIG.neutral;
                 const priceFormatted = fmtPrice(item.close);
-                
-                // Price velocity
-                const pv = safeNum(item.price_velocity);
+                const projPrice = safeNum(item.projected_price_next);
+                const projPct = safeNum(item.projected_delta_pct);
+                const projColor = projPct !== null ? (projPct > 0 ? 'text-emerald-300' : (projPct < 0 ? 'text-rose-300' : 'text-slate-300')) : 'text-slate-400';
+
+                // Price velocity (prefer smoothed if present, else raw)
+                const pv = safeNum(item.smoothed_velocity !== null && item.smoothed_velocity !== undefined ? item.smoothed_velocity : item.price_velocity);
                 const pvPct = safeNum(item.price_velocity_pct);
                 let pVelText = '--';
                 let pVelColor = 'text-slate-400';
                 if (pv !== null) {
-                    pVelText = `${fmtNum(pv, 2, '+')} (${fmtPct(pvPct, 2, '+')})`;
+                    pVelText = `${fmtNum(pv, 2, '+')}${pvPct !== null ? ` (${fmtPct(pvPct, 2, '+')})` : ''}`;
                     pVelColor = pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400');
                 }
 
                 // Price Accel
-                const pa = safeNum(item.price_acceleration);
+                const pa = safeNum(item.smoothed_acceleration !== null && item.smoothed_acceleration !== undefined ? item.smoothed_acceleration : item.price_acceleration);
                 const pAccelText = pa !== null ? fmtNum(pa, 2, '+') : '--';
 
                 // RSI
@@ -3618,21 +4004,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 // RSI velocity & accel
                 const rv = safeNum(item.rsi_velocity);
-                const rvText = rv !== null ? `${fmtNum(rv, 2, '+')}/m` : '--';
-                const rvColor = rv !== null ? (rv > 0 ? 'text-emerald-400' : (rv < 0 ? 'text-rose-400' : 'text-slate-400')) : 'text-slate-400';
-
                 const ra = safeNum(item.rsi_acceleration);
-                const raText = ra !== null ? `${fmtNum(ra, 2, '+')}/m²` : '--';
-                const raColor = ra !== null ? (ra > 0 ? 'text-cyan-400' : (ra < 0 ? 'text-amber-400' : 'text-slate-400')) : 'text-slate-400';
-
-                const mom = safeNum(item.momentum_3m_pct);
-                const momText = mom !== null ? fmtPct(mom, 2, '+') : '--';
+                const rvColor = rv !== null ? (rv > 0 ? 'text-emerald-400' : (rv < 0 ? 'text-rose-400' : 'text-slate-400')) : 'text-slate-400';
 
                 const isExpanded = expandedSymbols.has(item.symbol);
                 const isSelected = selectedSymbol === item.symbol;
 
                 let rowHtml = `
-                    <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-indigo-950/20 border-l-2 border-indigo-500' : ''}" onclick="selectAndInspectSymbol('${item.symbol}')">
+                    <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-indigo-950/20' : ''}" onclick="selectAndInspectSymbol('${item.symbol}')">
                         <td class="px-4 py-2.5">
                             <div class="flex items-center gap-2">
                                 <span class="font-bold text-white mono text-xs">${item.symbol}</span>
@@ -3642,6 +4021,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                         </td>
                         <td class="px-4 py-2.5 text-right mono font-semibold text-slate-200">${priceFormatted}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${projColor}">
+                            ${projPrice !== null ? fmtPrice(projPrice) : '--'}
+                            ${projPct !== null ? `<div class="text-[10px] opacity-80">${fmtPct(projPct, 2, '+')}</div>` : ''}
+                        </td>
                         <td class="px-4 py-2.5 text-right mono font-semibold ${pVelColor}">${pVelText}</td>
                         <td class="px-4 py-2.5 text-right mono text-slate-300">${pAccelText}</td>
                         <td class="px-4 py-2.5">
@@ -3652,15 +4035,18 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </div>
                             </div>
                         </td>
-                        <td class="px-4 py-2.5 text-right mono font-semibold ${rvColor}">${rvText}</td>
-                        <td class="px-4 py-2.5 text-right mono font-semibold ${raColor}">${raText}</td>
-                        <td class="px-4 py-2.5">
-                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${rConf.badgeClass}">
-                                <span>${rConf.icon}</span>
-                                ${rConf.label}
-                            </span>
+                        <td class="px-4 py-2.5 text-right mono">
+                            <div class="font-semibold ${rvColor}">${rv !== null ? fmtNum(rv, 2, '+') + '/m' : '--'}</div>
+                            <div class="text-[10px] text-slate-400">${ra !== null ? fmtNum(ra, 2, '+') + '/m²' : '--'}</div>
                         </td>
-                        <td class="px-4 py-2.5 text-right mono text-slate-300">${momText}</td>
+                        <td class="px-4 py-2.5">
+                            <div class="space-y-0.5">
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border ${fConf.cls}">
+                                    ${fConf.label}
+                                </span>
+                                <div class="text-[10px] text-slate-400">${rConf.icon} ${rConf.label}</div>
+                            </div>
+                        </td>
                         <td class="px-4 py-2.5 text-center">
                             <div class="flex items-center justify-center gap-1">
                                 <button onclick="event.stopPropagation(); selectAndInspectSymbol('${item.symbol}')" class="px-2 py-0.5 bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 rounded border border-indigo-800 text-[10px] mono transition">
@@ -3677,23 +4063,20 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 // If expanded, show nested rows for each provider
                 if (isExpanded && item.provider_entries) {
                     item.provider_entries.forEach(sub => {
-                        const sRConf = REGIME_CONFIG[getRegime(sub)] || REGIME_CONFIG.neutral;
+                        const sFConf = FORECAST_CONFIG[sub.forecast_direction] || FORECAST_CONFIG.neutral;
                         const sPv = safeNum(sub.price_velocity);
                         const sRv = safeNum(sub.rsi_velocity);
                         const sRa = safeNum(sub.rsi_acceleration);
                         rowHtml += `
-                            <tr class="bg-slate-950/60 text-slate-400 text-[11px] border-l-2 border-cyan-500/50">
-                                <td class="px-4 py-1.5 pl-8 mono text-cyan-300">? ${sub.provider}</td>
+                            <tr class="bg-slate-950/60 text-slate-400 text-[11px]">
+                                <td class="px-4 py-1.5 pl-8 mono text-cyan-300">&bull; ${sub.provider}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtPrice(sub.close)}</td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtPrice(sub.projected_price_next)}</td>
                                 <td class="px-4 py-1.5 text-right mono ${sPv > 0 ? 'text-emerald-400' : (sPv < 0 ? 'text-rose-400' : '')}">${fmtNum(sPv, 2, '+')}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtNum(sub.price_acceleration, 2, '+')}</td>
                                 <td class="px-4 py-1.5 mono">${fmtNum(sub.rsi, 1)}</td>
-                                <td class="px-4 py-1.5 text-right mono ${sRv > 0 ? 'text-emerald-400' : (sRv < 0 ? 'text-rose-400' : '')}">${fmtNum(sRv, 2, '+')}</td>
-                                <td class="px-4 py-1.5 text-right mono">${fmtNum(sRa, 2, '+')}</td>
-                                <td class="px-4 py-1.5">
-                                    <span class="text-[9px] px-1.5 py-0.2 rounded border ${sRConf.badgeClass}">${sRConf.label}</span>
-                                </td>
-                                <td class="px-4 py-1.5 text-right mono">${fmtPct(sub.momentum_3m_pct, 2, '+')}</td>
+                                <td class="px-4 py-1.5 text-right mono">${fmtNum(sRv, 2, '+')} / ${fmtNum(sRa, 2, '+')}</td>
+                                <td class="px-4 py-1.5"><span class="text-[10px] px-1.5 py-0.5 rounded border ${sFConf.cls}">${sFConf.label}</span></td>
                                 <td class="px-4 py-1.5 text-center mono text-slate-500">feed</td>
                             </tr>
                         `;
@@ -3706,9 +4089,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function renderStreamTableRows(tbody, streamList) {
             tbody.innerHTML = streamList.map(inst => {
-                const rConf = REGIME_CONFIG[getRegime(inst)] || REGIME_CONFIG.neutral;
+                const fConf = FORECAST_CONFIG[inst.forecast_direction] || FORECAST_CONFIG.neutral;
                 const pv = safeNum(inst.price_velocity);
-                const pvPct = safeNum(inst.price_velocity_pct);
                 const rv = safeNum(inst.rsi_velocity);
                 const ra = safeNum(inst.rsi_acceleration);
                 const rsi = safeNum(inst.rsi);
@@ -3721,20 +4103,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <div class="text-[10px] text-slate-500 uppercase">${inst.provider}</div>
                         </td>
                         <td class="px-4 py-2.5 text-right mono font-semibold text-slate-200">${fmtPrice(inst.close)}</td>
-                        <td class="px-4 py-2.5 text-right mono font-semibold ${pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400')}">
-                            ${fmtNum(pv, 2, '+')} (${fmtPct(pvPct, 2, '+')})
-                        </td>
+                        <td class="px-4 py-2.5 text-right mono text-cyan-300">${fmtPrice(inst.projected_price_next)}</td>
+                        <td class="px-4 py-2.5 text-right mono font-semibold ${pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(pv, 2, '+')}</td>
                         <td class="px-4 py-2.5 text-right mono text-slate-300">${fmtNum(inst.price_acceleration, 2, '+')}</td>
                         <td class="px-4 py-2.5 mono font-semibold text-slate-200">${fmtNum(rsi, 1)}</td>
-                        <td class="px-4 py-2.5 text-right mono font-semibold ${rv > 0 ? 'text-emerald-400' : (rv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(rv, 2, '+')}/m</td>
-                        <td class="px-4 py-2.5 text-right mono font-semibold ${ra > 0 ? 'text-cyan-400' : (ra < 0 ? 'text-amber-400' : 'text-slate-400')}">${fmtNum(ra, 2, '+')}/m²</td>
+                        <td class="px-4 py-2.5 text-right mono">${fmtNum(rv, 2, '+')} / ${fmtNum(ra, 2, '+')}</td>
                         <td class="px-4 py-2.5">
-                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${rConf.badgeClass}">
-                                <span>${rConf.icon}</span>
-                                ${rConf.label}
-                            </span>
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold border ${fConf.cls}">${fConf.label}</span>
                         </td>
-                        <td class="px-4 py-2.5 text-right mono text-slate-300">${fmtPct(inst.momentum_3m_pct, 2, '+')}</td>
                         <td class="px-4 py-2.5 text-center">
                             <button onclick="event.stopPropagation(); toggleInjectModal('${inst.symbol}')" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition">
                                 Inject
@@ -3743,6 +4119,83 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </tr>
                 `;
             }).join('');
+        }
+
+        function renderCrossoverChart(container, points, projectedNext) {
+            if (!container) return;
+            if (!points || points.length < 2) {
+                container.innerHTML = '<div class="text-xs text-slate-500 py-8">Need at least 2 closed minute bars to draw synchronized Price / Velocity / Acceleration / RSI panels.</div>';
+                return;
+            }
+            const W = 640, H = 220, padL = 44, padR = 24;
+            const plotW = W - padL - padR;
+            const n = points.length;
+            const xAt = (i) => padL + (i / Math.max(1, n)) * plotW;
+
+            const prices = points.map(p => safeNum(p.close)).filter(v => v !== null);
+            const smooths = points.map(p => safeNum(p.smoothed_close)).filter(v => v !== null);
+            const allP = [...prices, ...smooths];
+            if (projectedNext !== null) allP.push(projectedNext);
+            const minP = Math.min(...allP), maxP = Math.max(...allP);
+            const spanP = Math.max(0.01, maxP - minP);
+            const yP = (val) => 12 + (1 - (val - minP) / spanP) * 52;
+
+            const vels = points.map(p => safeNum(p.smoothed_velocity ?? p.price_velocity) ?? 0);
+            const accs = points.map(p => safeNum(p.smoothed_acceleration ?? p.price_acceleration) ?? 0);
+            const maxVA = Math.max(0.05, ...vels.map(Math.abs), ...accs.map(Math.abs));
+            const yVA = (val) => 112 - (val / maxVA) * 28;
+
+            const yR = (val) => 162 + (1 - Math.min(100, Math.max(0, val)) / 100) * 48;
+
+            const poly = (vals, yFn, offset = 0) => vals.map((v, i) => v === null ? null : `${xAt(i + offset).toFixed(1)},${yFn(v).toFixed(1)}`).filter(Boolean).join(' ');
+
+            const closePts = poly(points.map(p => safeNum(p.close)), yP);
+            const smoothPts = poly(points.map(p => safeNum(p.smoothed_close)), yP);
+            const velPts = poly(vels, yVA);
+            const accPts = poly(accs, yVA);
+            const rsiPts = poly(points.map(p => safeNum(p.rsi)), yR);
+
+            const lastX = xAt(n - 1);
+            const lastY = yP(points[n - 1].close);
+            const nextX = xAt(n);
+            const nextY = projectedNext !== null ? yP(projectedNext) : lastY;
+
+            const crossMarkers = points.map((p, i) => {
+                if (p.crossover_signal === 'leading_bearish' || p.crossover_signal === 'leading_bullish') {
+                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(accs[i]).toFixed(1)}" r="3.5" fill="#fb923c" stroke="#0f172a" stroke-width="1"><title>Leading Signal (${p.crossover_signal})</title></circle>`;
+                }
+                if (p.crossover_signal === 'confirmed_bearish' || p.crossover_signal === 'confirmed_bullish') {
+                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(vels[i]).toFixed(1)}" r="3.5" fill="#38bdf8" stroke="#0f172a" stroke-width="1"><title>Velocity Crossover (${p.crossover_signal})</title></circle>`;
+                }
+                return '';
+            }).join('');
+
+            container.innerHTML = `
+                <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto overflow-visible">
+                    <text x="4" y="20" fill="#94a3b8" font-size="9" font-family="monospace">Price</text>
+                    <text x="4" y="102" fill="#94a3b8" font-size="9" font-family="monospace">v / a</text>
+                    <text x="4" y="176" fill="#94a3b8" font-size="9" font-family="monospace">RSI</text>
+
+                    <line x1="${padL}" y1="74" x2="${W - padR}" y2="74" stroke="#1e293b" stroke-width="1" />
+                    <line x1="${padL}" y1="112" x2="${W - padR}" y2="112" stroke="#334155" stroke-dasharray="3,3" stroke-width="1" />
+                    <line x1="${padL}" y1="150" x2="${W - padR}" y2="150" stroke="#1e293b" stroke-width="1" />
+
+                    <rect x="${padL}" y="${yR(100).toFixed(1)}" width="${plotW}" height="${(yR(70) - yR(100)).toFixed(1)}" fill="#f43f5e" fill-opacity="0.08" />
+                    <rect x="${padL}" y="${yR(30).toFixed(1)}" width="${plotW}" height="${(yR(0) - yR(30)).toFixed(1)}" fill="#10b981" fill-opacity="0.08" />
+                    <line x1="${padL}" y1="${yR(70).toFixed(1)}" x2="${W - padR}" y2="${yR(70).toFixed(1)}" stroke="#f43f5e" stroke-dasharray="2,2" stroke-opacity="0.5" />
+                    <line x1="${padL}" y1="${yR(30).toFixed(1)}" x2="${W - padR}" y2="${yR(30).toFixed(1)}" stroke="#10b981" stroke-dasharray="2,2" stroke-opacity="0.5" />
+
+                    <polyline fill="none" stroke="#e2e8f0" stroke-width="1.6" points="${closePts}" />
+                    ${smoothPts ? `<polyline fill="none" stroke="#818cf8" stroke-width="1.4" stroke-dasharray="4,2" points="${smoothPts}" />` : ''}
+                    ${projectedNext !== null ? `<line x1="${lastX.toFixed(1)}" y1="${lastY.toFixed(1)}" x2="${nextX.toFixed(1)}" y2="${nextY.toFixed(1)}" stroke="#22d3ee" stroke-dasharray="3,2" stroke-width="1.5" /><circle cx="${nextX.toFixed(1)}" cy="${nextY.toFixed(1)}" r="3.5" fill="#22d3ee" />` : ''}
+
+                    <polyline fill="none" stroke="#38bdf8" stroke-width="1.5" points="${velPts}" />
+                    <polyline fill="none" stroke="#fb923c" stroke-width="1.5" points="${accPts}" />
+                    ${crossMarkers}
+
+                    ${rsiPts ? `<polyline fill="none" stroke="#c084fc" stroke-width="1.6" points="${rsiPts}" />` : ''}
+                </svg>
+            `;
         }
 
         // =========================================================================================
@@ -3768,20 +4221,43 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const sym = symbolData.symbol;
             const regime = getRegime(symbolData);
             const rConf = REGIME_CONFIG[regime] || REGIME_CONFIG.neutral;
+            const fConf = FORECAST_CONFIG[symbolData.forecast_direction] || FORECAST_CONFIG.neutral;
 
             // Update Header Elements in Deep-Dive Panel
             document.getElementById('detailSymbolBadge').textContent = sym;
             document.getElementById('detailSymbolTitle').textContent = `${sym} Multi-Stream Kinematics Analysis`;
-            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds &bull; Close ${fmtPrice(symbolData.close)} &bull; RSI ${fmtNum(symbolData.rsi, 1)}`;
+            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds  Close ${fmtPrice(symbolData.close)}  RSI ${fmtNum(symbolData.rsi, 1)}`;
             
             const badgeEl = document.getElementById('detailRegimeBadge');
             badgeEl.className = `text-[10px] px-2 py-0.5 rounded-full font-semibold border ${rConf.badgeClass}`;
             badgeEl.innerHTML = `${rConf.icon} ${rConf.label}`;
 
+            // Next-step projection & forecast cards
+            const scfg = latestData.smooth_config || {};
+            const smoothLabel = (scfg.method || 'hma').toUpperCase() + `(${scfg.period || 14}) Synced`;
+            document.getElementById('detailSmoothTag').textContent = smoothLabel;
+            document.getElementById('detailProjectedPrice').textContent = fmtPrice(symbolData.projected_price_next);
+            const pDeltaPct = safeNum(symbolData.projected_delta_pct);
+            const deltaEl = document.getElementById('detailProjectedDelta');
+            deltaEl.textContent = pDeltaPct !== null ? `${fmtNum(symbolData.projected_delta, 2, '+')} (${fmtPct(pDeltaPct, 2, '+')})` : '--';
+            deltaEl.className = `text-sm font-bold mono mt-0.5 ${pDeltaPct > 0 ? 'text-emerald-400' : (pDeltaPct < 0 ? 'text-rose-400' : 'text-slate-300')}`;
+            document.getElementById('detailRsiZone').textContent = (symbolData.rsi_zone || 'unknown').replace('_', ' ');
+            document.getElementById('detailCrossoverSignal').textContent = (symbolData.crossover_signal || 'none').replace('_', ' ');
+            document.getElementById('detailTradingAction').textContent = symbolData.trading_action || fConf.label;
+
+            renderCrossoverChart(
+                document.getElementById('detailCrossoverChart'),
+                symbolData.history_window || [],
+                safeNum(symbolData.projected_price_next)
+            );
+
             // Diagnosis sentence
             const rv = safeNum(symbolData.rsi_velocity);
             const ra = safeNum(symbolData.rsi_acceleration);
             let diag = `${rConf.desc}. `;
+            if (symbolData.projected_price_next !== null && symbolData.projected_price_next !== undefined) {
+                diag += `Projected next close P^ = ${fmtPrice(symbolData.projected_price_next)}. `;
+            }
             if (rv !== null) {
                 diag += `RSI velocity is ${fmtNum(rv, 2, '+')}/m. `;
             }
@@ -3800,31 +4276,23 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             tbody.innerHTML = entries.map(e => {
-                const pRConf = REGIME_CONFIG[getRegime(e)] || REGIME_CONFIG.neutral;
-                const pClose = safeNum(e.close);
+                const pFConf = FORECAST_CONFIG[e.forecast_direction] || FORECAST_CONFIG.neutral;
                 const pRsi = safeNum(e.rsi);
                 const pRv = safeNum(e.rsi_velocity);
                 const pRa = safeNum(e.rsi_acceleration);
-
-                // Calculate drift vs consensus
-                let priceDrift = '--';
-                if (pClose !== null && symbolData.close !== null) {
-                    const diff = pClose - symbolData.close;
-                    priceDrift = `${diff >= 0 ? '+' : ''}$${diff.toFixed(2)}`;
-                }
 
                 return `
                     <tr class="hover:bg-slate-900/60 transition">
                         <td class="px-3.5 py-2 font-bold text-white">${e.provider}</td>
                         <td class="px-3.5 py-2 text-right text-slate-200">${fmtPrice(e.close)}</td>
-                        <td class="px-3.5 py-2 text-right ${pRv > 0 ? 'text-emerald-400' : (pRv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(e.price_velocity, 2, '+')}</td>
+                        <td class="px-3.5 py-2 text-right text-cyan-300">${fmtPrice(e.projected_price_next)}</td>
+                        <td class="px-3.5 py-2 text-right ${safeNum(e.price_velocity) > 0 ? 'text-emerald-400' : (safeNum(e.price_velocity) < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(e.price_velocity, 2, '+')}</td>
                         <td class="px-3.5 py-2 text-right text-slate-300">${fmtNum(e.price_acceleration, 2, '+')}</td>
                         <td class="px-3.5 py-2 text-right text-slate-200">${fmtNum(pRsi, 1)}</td>
-                        <td class="px-3.5 py-2 text-right ${pRv > 0 ? 'text-emerald-400' : (pRv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(pRv, 2, '+')}</td>
-                        <td class="px-3.5 py-2 text-right ${pRa > 0 ? 'text-cyan-400' : (pRa < 0 ? 'text-amber-400' : 'text-slate-400')}">${fmtNum(pRa, 2, '+')}</td>
+                        <td class="px-3.5 py-2 text-right">${fmtNum(pRv, 2, '+')} / ${fmtNum(pRa, 2, '+')}</td>
                         <td class="px-3.5 py-2">
-                            <span class="text-[10px] px-2 py-0.5 rounded-full border ${pRConf.badgeClass}">
-                                ${pRConf.icon} ${pRConf.label}
+                            <span class="text-[10px] px-2 py-0.5 rounded border ${pFConf.cls}">
+                                ${pFConf.label}
                             </span>
                         </td>
                         <td class="px-3.5 py-2 text-center text-emerald-400 font-semibold">LIVE</td>
@@ -3856,6 +4324,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const minUtc = rec.minute_start_utc ? new Date(rec.minute_start_utc).toISOString().slice(11, 16) + ' UTC' : '--';
                     const kin = rec.kinematics_summary || {};
                     const regimes = kin.regimes || {};
+                    const forecasts = kin.forecasts || {};
                     const symbolsCount = rec.symbols ? Object.keys(rec.symbols).length : 0;
                     const maxRsi = kin.max_rsi_velocity;
                     const maxPrice = kin.max_price_velocity_pct;
@@ -3876,10 +4345,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
 
                             <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
-                                <span class="px-1.5 py-0.5 rounded bg-emerald-950/40 text-emerald-300 border border-emerald-900/40">?? Acc Bull: ${regimes.accelerating_bullish || 0}</span>
-                                <span class="px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-300 border border-cyan-900/40">?? Dec Bull: ${regimes.decelerating_bullish || 0}</span>
-                                <span class="px-1.5 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">?? Acc Bear: ${regimes.accelerating_bearish || 0}</span>
-                                <span class="px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">?? Dec Bear: ${regimes.decelerating_bearish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-emerald-950/40 text-emerald-300 border border-emerald-900/40">&uarr; Acc Bull: ${regimes.accelerating_bullish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-300 border border-cyan-900/40">&nearr; Dec Bull: ${regimes.decelerating_bullish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">&darr; Acc Bear: ${regimes.accelerating_bearish || 0}</span>
+                                <span class="px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">&searr; Dec Bear: ${regimes.decelerating_bearish || 0}</span>
+                                ${(forecasts.bearish_reversal || forecasts.bullish_reversal) ? `<span class="px-1.5 py-0.5 rounded bg-purple-950/40 text-purple-300 border border-purple-900/40">Reversals: &darr;${forecasts.bearish_reversal || 0} / &uarr;${forecasts.bullish_reversal || 0}</span>` : ''}
                             </div>
 
                             ${maxRsi || maxPrice ? `
@@ -3985,13 +4455,23 @@ class AdminCliProvider:
                         "provider": provider,
                         "symbol": symbol,
                         "close": cur.get("close"),
+                        "smoothed_close": cur.get("smoothed_close"),
                         "rsi": cur.get("rsi"),
                         "price_velocity": cur.get("price_velocity"),
                         "price_velocity_pct": cur.get("price_velocity_pct"),
                         "price_acceleration": cur.get("price_acceleration"),
+                        "smoothed_velocity": cur.get("smoothed_velocity"),
+                        "smoothed_acceleration": cur.get("smoothed_acceleration"),
                         "rsi_velocity": cur.get("rsi_velocity"),
                         "rsi_acceleration": cur.get("rsi_acceleration"),
                         "momentum_3m_pct": cur.get("momentum_3m_pct"),
+                        "projected_price_next": cur.get("projected_price_next"),
+                        "projected_delta": cur.get("projected_delta"),
+                        "projected_delta_pct": cur.get("projected_delta_pct"),
+                        "rsi_zone": cur.get("rsi_zone"),
+                        "forecast_direction": cur.get("forecast_direction"),
+                        "trading_action": cur.get("trading_action"),
+                        "crossover_signal": cur.get("crossover_signal"),
                         "ema_slope": cur.get("ema_slope"),
                         "regime": regime,
                         "timestamp": cur.get("timestamp"),
@@ -4011,14 +4491,32 @@ class AdminCliProvider:
                             "price_velocities": [],
                             "price_velocity_pcts": [],
                             "price_accelerations": [],
+                            "smoothed_velocities": [],
+                            "smoothed_accelerations": [],
                             "rsi_velocities": [],
                             "rsi_accelerations": [],
                             "momentums": [],
                             "regimes": [],
+                            "best_history": [],
                         },
                     )
                     sym_group["providers"].append(provider)
                     sym_group["entries"].append(entry)
+                    if len(hist) > len(sym_group["best_history"]):
+                        sym_group["best_history"] = [
+                            {
+                                "timestamp": h.get("timestamp"),
+                                "close": h.get("close"),
+                                "smoothed_close": h.get("smoothed_close"),
+                                "price_velocity": h.get("price_velocity"),
+                                "price_acceleration": h.get("price_acceleration"),
+                                "smoothed_velocity": h.get("smoothed_velocity"),
+                                "smoothed_acceleration": h.get("smoothed_acceleration"),
+                                "rsi": h.get("rsi"),
+                                "crossover_signal": h.get("crossover_signal"),
+                            }
+                            for h in hist[-20:]
+                        ]
                     if entry["close"] is not None:
                         sym_group["closes"].append(entry["close"])
                     if entry["rsi"] is not None:
@@ -4032,6 +4530,14 @@ class AdminCliProvider:
                     if entry["price_acceleration"] is not None:
                         sym_group["price_accelerations"].append(
                             entry["price_acceleration"]
+                        )
+                    if entry["smoothed_velocity"] is not None:
+                        sym_group["smoothed_velocities"].append(
+                            entry["smoothed_velocity"]
+                        )
+                    if entry["smoothed_acceleration"] is not None:
+                        sym_group["smoothed_accelerations"].append(
+                            entry["smoothed_acceleration"]
                         )
                     if entry["rsi_velocity"] is not None:
                         sym_group["rsi_velocities"].append(entry["rsi_velocity"])
@@ -4064,11 +4570,18 @@ class AdminCliProvider:
                 c_pv = median_or_none(g["price_velocities"])
                 c_pv_pct = median_or_none(g["price_velocity_pcts"])
                 c_pa = median_or_none(g["price_accelerations"])
+                c_sv = median_or_none(g["smoothed_velocities"])
+                c_sa = median_or_none(g["smoothed_accelerations"])
                 c_rv = median_or_none(g["rsi_velocities"])
                 c_ra = median_or_none(g["rsi_accelerations"])
                 c_mom = median_or_none(g["momentums"])
 
-                c_regime = classify_kinematic_regime(c_rv, c_ra, c_pv, c_pa)
+                active_pv = c_sv if c_sv is not None else c_pv
+                active_pa = c_sa if c_sa is not None else c_pa
+                c_forecast = compute_kinematic_forecast(
+                    c_close, active_pv, active_pa, c_rsi
+                )
+                c_regime = classify_kinematic_regime(c_rv, c_ra, active_pv, active_pa)
                 if c_regime in regime_counts:
                     regime_counts[c_regime] += 1
 
@@ -4086,6 +4599,12 @@ class AdminCliProvider:
                         "price_acceleration": (
                             round(c_pa, 2) if c_pa is not None else None
                         ),
+                        "smoothed_velocity": (
+                            round(c_sv, 2) if c_sv is not None else None
+                        ),
+                        "smoothed_acceleration": (
+                            round(c_sa, 2) if c_sa is not None else None
+                        ),
                         "rsi_velocity": round(c_rv, 2) if c_rv is not None else None,
                         "rsi_acceleration": (
                             round(c_ra, 2) if c_ra is not None else None
@@ -4093,7 +4612,15 @@ class AdminCliProvider:
                         "momentum_3m_pct": (
                             round(c_mom, 2) if c_mom is not None else None
                         ),
+                        "projected_price_next": c_forecast["projected_price_next"],
+                        "projected_delta": c_forecast["projected_delta"],
+                        "projected_delta_pct": c_forecast["projected_delta_pct"],
+                        "rsi_zone": c_forecast["rsi_zone"],
+                        "forecast_direction": c_forecast["forecast_direction"],
+                        "trading_action": c_forecast["trading_action"],
+                        "crossover_signal": c_forecast["crossover_signal"],
                         "regime": c_regime,
+                        "history_window": g["best_history"],
                         "provider_entries": g["entries"],
                     }
                 )
@@ -4105,6 +4632,12 @@ class AdminCliProvider:
                     total_unique_symbols=len(consolidated_symbols),
                     total_provider_streams=len(records_flat),
                     configured_symbols=list(self.coordinator.symbols),
+                    smooth_config={
+                        "method": KINEMATICS_SMOOTH_METHOD,
+                        "period": KINEMATICS_SMOOTH_PERIOD,
+                        "overbought": KINEMATICS_RSI_OVERBOUGHT,
+                        "oversold": KINEMATICS_RSI_OVERSOLD,
+                    },
                     regime_counts=regime_counts,
                     latest_by_provider=latest,
                     consolidated_symbols=consolidated_symbols,
