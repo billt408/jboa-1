@@ -3778,13 +3778,32 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", os.getenv("ADMIN_HOST", "0.0.0.0"))
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", os.getenv("ADMIN_PORT", "5001")))
+
+
+def get_lan_ip():
+    """Detect LAN IP of current machine for subnet/remote browser access."""
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 class AdminCliProvider:
-    def __init__(self, coordinator, host="127.0.0.1", port=5001):
+    def __init__(self, coordinator, host=None, port=None):
         import threading
 
         self.coordinator = coordinator
-        self.host = host
-        self.port = port
+        self.host = host or DASHBOARD_HOST
+        self.port = port or DASHBOARD_PORT
         self.loop = asyncio.get_running_loop()
         self.stop = threading.Event()
         self.server = None
@@ -4156,8 +4175,28 @@ class AdminCliProvider:
         )
         self.thread.start()
 
+        lan_ip = get_lan_ip()
         logging.info(
-            "CLI Engine interface running on http://%s:%d", self.host, self.port
+            "=================================================================="
+        )
+        logging.info("RSI & Kinematics Web Dashboard Ready:")
+        logging.info("  -> Local Machine:   http://127.0.0.1:%d/", self.port)
+        if self.host == "0.0.0.0":
+            if lan_ip and lan_ip != "127.0.0.1":
+                logging.info(
+                    "  -> Subnet / LAN:    http://%s:%d/ (accessible from other machines)",
+                    lan_ip,
+                    self.port,
+                )
+            else:
+                logging.info(
+                    "  -> Subnet / LAN:    http://<HOST_IP>:%d/ (bound to 0.0.0.0)",
+                    self.port,
+                )
+        else:
+            logging.info("  -> Bound Host:      http://%s:%d/", self.host, self.port)
+        logging.info(
+            "=================================================================="
         )
         try:
             while not self.stop.is_set():
@@ -4204,8 +4243,9 @@ async def main():
     coordinator = MinuteCoordinator(selected, symbols)
 
     # 2. START THE ADMIN CLI SERVER FIRST
-    # We explicitly launch this on local interfaces to ensure the port binds immediately
-    cli_admin = AdminCliProvider(coordinator, host="127.0.0.1", port=5001)
+    # Binds to 0.0.0.0:5001 by default (override with DASHBOARD_HOST / DASHBOARD_PORT)
+    # allowing access from both localhost and other machines on the same subnet
+    cli_admin = AdminCliProvider(coordinator, host=DASHBOARD_HOST, port=DASHBOARD_PORT)
 
     logging.info(
         "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
