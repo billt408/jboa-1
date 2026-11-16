@@ -4,7 +4,7 @@
 << /Type /Catalog /Pages 2 0 R >>
 endobj
 2 0 obj
-<< /Type /Pages /Kids [7 0 R 9 0 R 11 0 R 13 0 R 15 0 R 17 0 R] /Count 6 >>
+<< /Type /Pages /Kids [7 0 R 9 0 R 11 0 R 13 0 R 15 0 R 17 0 R 19 0 R 21 0 R 23 0 R] /Count 9 >>
 endobj
 3 0 obj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
@@ -22,16 +22,16 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 8 0 R >>
 endobj
 8 0 obj
-<< /Length 7434 >>
+<< /Length 7426 >>
 stream
 BT /F2 16.50 Tf 0.060 0.090 0.160 rg 1 0 0 1 46.00 746.00 Tm (MultiStreamRSI Session Transcript & Archive) Tj ET
-BT /F1 8.80 Tf 0.280 0.330 0.410 rg 1 0 0 1 46.00 728.00 Tm (Generated: 2026-11-15T12:32:00-08:00  |  Scope: Compacted Summary \(Turns 1-9\) + Verbatim Recent Turns \(Turns 10-16\)) Tj ET
+BT /F1 8.80 Tf 0.280 0.330 0.410 rg 1 0 0 1 46.00 728.00 Tm (Generated: 2026-11-15T19:10:00-08:00  |  Scope: Compacted Summary \(Turns 1-9\) + Verbatim Recent Turns \(Turns 10-20\)) Tj ET
 q 0.80 w 0.780 0.820 0.880 RG 46.00 719.00 m 566.00 719.00 l S Q
 0.945 0.960 0.985 rg 46.00 659.50 520.00 51.50 re f
 0.388 0.400 0.945 rg 46.00 659.50 3.00 51.50 re f
 BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 697.00 Tm (Note: Earlier turns prior to Turn 10 were compacted by the runtime into a summary. Part I) Tj ET
 BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 684.50 Tm (preserves that compacted summary in full; Part II preserves the verbatim user prompts and) Tj ET
-BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 672.00 Tm (assistant responses still in session context.) Tj ET
+BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 672.00 Tm (assistant responses from Turns 10-20.) Tj ET
 0.080 0.110 0.190 rg 46.00 629.50 520.00 20.00 re f
 BT /F2 9.60 Tf 1.000 1.000 1.000 rg 1 0 0 1 55.00 636.00 Tm (PART I: COMPACTED SUMMARY \(EARLIER TURNS 1-9\)) Tj ET
 BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 616.50 Tm (Chronological User Requests \(1-9\)) Tj ET
@@ -87,7 +87,7 @@ BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 140.10 Tm (dynamically at call
 BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 127.50 Tm (dashboard.) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 1 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 1 of 9) Tj ET
 endstream
 endobj
 9 0 obj
@@ -97,7 +97,7 @@ endobj
 << /Length 6859 >>
 stream
 0.080 0.110 0.190 rg 46.00 726.00 520.00 20.00 re f
-BT /F2 9.60 Tf 1.000 1.000 1.000 rg 1 0 0 1 55.00 732.50 Tm (PART II: VERBATIM RECENT TURNS \(TURNS 10-16\)) Tj ET
+BT /F2 9.60 Tf 1.000 1.000 1.000 rg 1 0 0 1 55.00 732.50 Tm (PART II: VERBATIM RECENT TURNS \(TURNS 10-20\)) Tj ET
 0.933 0.949 1.000 rg 46.00 699.00 520.00 18.00 re f
 0.310 0.275 0.898 rg 46.00 699.00 3.50 18.00 re f
 BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 704.50 Tm (TURN 10 -- USER  \(Attachment: image_b496ac1a.png\)) Tj ET
@@ -156,7 +156,7 @@ BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 136.80 Tm ([2026-11-15T11:52:3
 BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 126.20 Tm (\(\(.venv\) \) [billt@localhost src]$) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 2 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 2 of 9) Tj ET
 endstream
 endobj
 11 0 obj
@@ -234,7 +234,7 @@ BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 89.20 Tm (1. Confirm multiStre
 BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 68.10 Tm (head -n 5 /home/billt/jboa-1/src/multiStreamRSI.py) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 3 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 3 of 9) Tj ET
 endstream
 endobj
 13 0 obj
@@ -311,7 +311,7 @@ BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 88.00 Tm (self.stream._ws \(cl
 BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 75.40 Tm (open and drops back to OFFLINE if the socket closes or disconnects.) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 4 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 4 of 9) Tj ET
 endstream
 endobj
 15 0 obj
@@ -386,14 +386,14 @@ BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 87.20 Tm (OPTION_CHAIN_RSI_HIG
 BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 74.60 Tm (evaluation, cooldowns, and independent MinuteCoordinator wakeups.) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 5 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 5 of 9) Tj ET
 endstream
 endobj
 17 0 obj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 18 0 R >>
 endobj
 18 0 obj
-<< /Length 2231 >>
+<< /Length 7216 >>
 stream
 BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 746.00 Tm (*) Tj ET
 BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 746.00 Tm (Verified compile_applet and lint_applet both succeeded cleanly. Download the updated) Tj ET
@@ -414,34 +414,243 @@ BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 604.30 Tm (build a downloadabl
 0.310 0.275 0.898 rg 46.00 572.70 3.50 18.00 re f
 BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 578.20 Tm (TURN 16 -- USER) Tj ET
 BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 564.70 Tm (build a pdf from PDF built from the compacted summary + verbatim recent turns) Tj ET
+0.925 0.992 0.961 rg 46.00 533.10 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 533.10 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 538.60 Tm (TURN 16 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 525.10 Tm (Built the 6-page session transcript PDF) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 512.50 Tm (\(public/assets/aistudio/multiStreamRSI_chat_transcript.pdf\) containing Part I \(Compacted) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 499.90 Tm (Summary Turns 1-9\) and Part II \(Verbatim Recent Turns 10-16\), and added a validated Download) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 487.30 Tm (Chat PDF button \(handleDownloadChatPdf with %PDF- header check and Blob download\) in the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 474.70 Tm (MultiStreamRSIViewer header banner.) Tj ET
+0.933 0.949 1.000 rg 46.00 443.10 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 443.10 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 448.60 Tm (TURN 17 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 435.10 Tm (we need to add a stop loss mechanism to the sell task. Something like down > 4% for 3) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 422.50 Tm (consecutive minutes and the kinmatics metric are showing downward price pressure, any other) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 409.90 Tm (thoughts?) Tj ET
+0.925 0.992 0.961 rg 46.00 378.30 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 378.30 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 383.80 Tm (TURN 17 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 370.30 Tm (Added the configurable consecutive-minute stop-loss mechanism with downward-pressure) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 357.70 Tm (kinematics to AlpacaOptionSeller in public/assets/aistudio/multiStreamRSI_60be797f.py.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 340.10 Tm (How the Stop-Loss Works) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 326.60 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 326.60 Tm (Per-Position Unrealized Loss & Consecutive-Minute Tracking \(_position_pnl_pct,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 314.00 Tm (_update_stop_loss_streak\): Every finalized 1-minute evaluation, computes each held long) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 301.40 Tm (position's return \(unrealized_plpc * 100, falling back to current_price vs avg_entry_price) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 288.80 Tm (or unrealized_pl / cost_basis\). Tracks consecutive 1-minute bars where loss is strictly) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 276.20 Tm (down > 4.0% \(pnl_pct < -stop_loss_pct\). Resets cleanly to 0 if P&L recovers above -4.0%,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 263.60 Tm (if there is a multi-minute gap \(> 95s\), or once the position closes.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 249.50 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 249.50 Tm (Downward Price Pressure Kinematics \(_evaluate_stop_loss_kinematics\): Unlike take-profit) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 236.90 Tm (exits \(_evaluate_sell_kinematics\), the stop-loss path bypasses rsi >=) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 224.30 Tm (OPTION_CHAIN_RSI_HIGH \(since losing positions usually have low/falling RSI\). Once streak) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 211.70 Tm (>= stop_loss_consecutive_minutes \(default 3\), requires downward kinematic pressure on the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 199.10 Tm (underlying: v < 0 and a <= 0 \(active downward thrust\), or v < 0 and next-step projection) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 186.50 Tm (P_hat_{t+1} - P_t < 0 \(continuing downward bleed\), or v <= 0, a < 0, and a bearish) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 173.90 Tm (crossover/forecast. If the underlying is already bouncing \(v >= 0 or positive rebound) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 161.30 Tm (projection\), it holds instead of selling at the bottom \(OPTION_SELL_STOP_LOSS_HOLD\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 147.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 147.20 Tm (Telemetry & Pending-Order Safety: Skips positions with qty_available <= 0 so open DAY sell) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 134.60 Tm (orders do not trigger duplicate-sell errors. Reports stop_loss_orders and active) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 122.00 Tm (stop_loss_watches in /cli/status \(option_seller\) and the Stop Loss Watches row under) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 109.40 Tm (Engine Diagnostic Telemetry.) Tj ET
 q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
 BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
-BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 6 of 6) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 6 of 9) Tj ET
+endstream
+endobj
+19 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 20 0 R >>
+endobj
+20 0 obj
+<< /Length 7241 >>
+stream
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 743.00 Tm (lib/parms.ini Configuration \([option_seller]\)) Tj ET
+0.945 0.955 0.968 rg 46.00 651.30 520.00 84.20 re f
+0.580 0.640 0.720 rg 46.00 651.30 2.50 84.20 re f
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 722.50 Tm ([option_seller]) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 711.90 Tm (stop_loss_enabled = true) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 701.30 Tm (stop_loss_pct = 4.0                  ; Trigger watch when unrealized P&L < -4.0%) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 690.70 Tm (stop_loss_consecutive_minutes = 3    ; Required consecutive 1m evaluations below -4.0%) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 680.10 Tm (stop_loss_require_kinematics = true  ; Require downward underlying velocity/projection) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 669.50 Tm (stop_loss_hard_pct = 0.0             ; Optional emergency hard stop % bypassing wait/kinematics \(0 =) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 658.90 Tm (  disabled\)) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 640.30 Tm (Additional Thoughts for Options Stop Losses) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 626.80 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 626.80 Tm (1. Options Bid/Ask Noise vs. 4% Equity Moves: A 4% premium fluctuation on an option \(e.g.,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 614.20 Tm ($0.50 -> $0.48\) can happen on normal bid/ask spread movement, making the 3-consecutive-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 601.60 Tm (minute + downward underlying kinematics filter well suited for avoiding false stop-outs.) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 589.00 Tm (For cheaper contracts \(< $1.00\), consider tuning stop_loss_pct higher \(e.g., 8.0-15.0\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 574.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 574.90 Tm (2. Hard Catastrophic Circuit Breaker \(stop_loss_hard_pct\): Waiting 3 consecutive minutes +) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 562.30 Tm (bearish smoothed velocity can lag on sudden news/gap-downs; setting e.g.) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 549.70 Tm (stop_loss_hard_pct = 15.0 or 20.0 gives an immediate single-minute circuit breaker.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 535.60 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 535.60 Tm (3. Peak-Profit Protection \(Future Enhancement\): A fixed -4% stop only triggers after a) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 523.00 Tm (winning trade turns negative. Adding a configurable profit target % and session high-water) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 510.40 Tm (mark trailing stop locks in gains on reversals that stall short of overbought.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 496.30 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 496.30 Tm (4. Liquidity & Limit-Order Fills on Exits: With order_type = market, fast stop-losses fill) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 483.70 Tm (reliably on liquid underlyings, whereas wide option spreads can suffer slippage --) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 471.10 Tm (consider fetching live bid or marketable limits.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 454.00 Tm (Verification) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 440.50 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 440.50 Tm (Verified py_compile, stop-loss unit tests \(-4.00% ignored vs -4.01% tracked, recovery/gap) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 427.90 Tm (resets, 3m streak + downward kinematics while bypassing rsi_high, hard_pct override\), and) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 415.30 Tm (compile_applet + lint_applet.) Tj ET
+0.933 0.949 1.000 rg 46.00 384.20 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 384.20 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 389.70 Tm (TURN 18 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 376.20 Tm (what price do you sell at if order type is limit?) Tj ET
+0.925 0.992 0.961 rg 46.00 344.60 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 344.60 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 350.10 Tm (TURN 18 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 336.60 Tm (When order_type = limit in [option_seller], AlpacaOptionSeller sets the sell limit price to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 324.00 Tm (the position's current_price returned by Alpaca \(get_all_positions\(\)\), rounded to 2 decimal) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 311.40 Tm (places:) Tj ET
+0.945 0.955 0.968 rg 46.00 271.60 520.00 31.20 re f
+0.580 0.640 0.720 rg 46.00 271.60 2.50 31.20 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 289.80 Tm (cur_price = AlpacaPositionMonitor._num\(pos, "current_price", 0.0\)) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 279.20 Tm (limit_price = round\(cur_price, 2\) if cur_price > 0 else None) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 263.60 Tm (And submits LimitOrderRequest\(symbol=..., qty=..., side=OrderSide.SELL,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 251.00 Tm (time_in_force=TimeInForce.DAY, limit_price=limit_price\).) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 233.40 Tm (Two Practical Notes) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 219.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 219.90 Tm (Fallback when price is unavailable: If pos.current_price <= 0 or missing \(limit_price is) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 207.30 Tm (None\), _submit_sell_order automatically falls back to a MarketOrderRequest so an exit or) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 194.70 Tm (stop-loss signal is not dropped.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 180.60 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 180.60 Tm (Fill risk on options stop-losses: Because pos.current_price for options is generally the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 168.00 Tm (last trade / mark rather than the live bid, a limit sell at round\(current_price, 2\) during) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 155.40 Tm (a falling market or wide bid-ask spread may sit unfilled as a resting DAY order \(while) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 142.80 Tm (locking qty_available = 0\). Fetching a live bid and applying a small marketable discount) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 130.20 Tm (gives much higher fill certainty on stop-losses.) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 7 of 9) Tj ET
+endstream
+endobj
+21 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 22 0 R >>
+endobj
+22 0 obj
+<< /Length 8207 >>
+stream
+0.933 0.949 1.000 rg 46.00 729.00 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 729.00 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 734.50 Tm (TURN 19 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 721.00 Tm (ok, change the code to fetch a live bid & apply a small marketable discount below) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 708.40 Tm (current_price to get marketable limits\) and a much higher fill certainty on stop-losses. also) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 695.80 Tm (add the Peak-Profit Protection \(Future Enhancement\): Sell calls that hit a confiurable profit) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 683.20 Tm (% gain. So we can profit on spikes before RSI reaches OPTION_CHAIN_RSI_HIGH is reached. Add) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 670.60 Tm (trailing stop from each position's session high-water mark \(e.g., exit if drawdown from peak) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 658.00 Tm (exceeds X% with v < 0\) would lock in gains on reversals that stall short of overbought) Tj ET
+0.925 0.992 0.961 rg 46.00 626.40 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 626.40 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 631.90 Tm (TURN 19 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 618.40 Tm (Updated AlpacaOptionSeller in public/assets/aistudio/multiStreamRSI_60be797f.py with live-bid) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 605.80 Tm (marketable limit pricing and Peak-Profit Protection \(profit-target exits + session high-water) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 593.20 Tm (mark trailing stops\).) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 575.60 Tm (1. Live-Bid Marketable Limit Pricing \(_fetch_live_bid, _resolve_sell_order_params\)) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 562.10 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 562.10 Tm (Live Bid Lookup: When order_type = limit, fetches the live latest quote via Alpaca) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 549.50 Tm (OptionHistoricalDataClient \(OptionLatestQuoteRequest\) for option contracts or) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 536.90 Tm (StockHistoricalDataClient \(StockLatestQuoteRequest\) for equities, falling back to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 524.30 Tm (pos.current_price if a quote is unavailable.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 510.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 510.20 Tm (Marketable Discount: Uses ref_price = min\(live_bid, current_price\) and discounts below it.) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 497.60 Tm (Regular profit/RSI exits use limit_discount_pct \(default 1.0%, guaranteed at least $0.01) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 485.00 Tm (step-down on low-priced contracts\). Stop-loss exits use a deeper) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 472.40 Tm (stop_loss_limit_discount_pct \(default 3.0%\) for higher fill certainty, plus an optional) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 459.80 Tm (stop_loss_force_market = true flag to submit stop-losses as MarketOrderRequest even when) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 447.20 Tm (order_type = limit.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 430.10 Tm (2. Peak-Profit Protection \(_update_peak_profit_state, _evaluate_trailing_stop_velocity\)) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 416.60 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 416.60 Tm (Fixed Profit Target \(profit_target\): Exits winning positions immediately when unrealized) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 404.00 Tm (gain reaches profit_target_pct \(default +25.0%\), capturing profit spikes before RSI) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 391.40 Tm (reaches OPTION_CHAIN_RSI_HIGH.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 377.30 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 377.30 Tm (Session High-Water Mark Trailing Stop \(trailing_stop\): Tracks each open position's session) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 364.70 Tm (peak return \(peak_pnl_pct\). Once profit reaches trailing_activation_pct \(default +10.0% --) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 352.10 Tm (preventing interference with the -4% stop-loss\), exits if drawdown from the peak exceeds) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 339.50 Tm (trailing_drawdown_pct \(default 5.0%\) and underlying velocity confirms downward momentum \(v) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 326.90 Tm (< 0 when trailing_require_negative_velocity = true\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 312.80 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 312.80 Tm (Telemetry: Exposes profit_target_orders, trailing_stop_orders, and peak_profit_watches in) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 300.20 Tm (/cli/status \(option_seller\) and the Peak Profit Guard row under Engine Diagnostic) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 287.60 Tm (Telemetry.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 270.50 Tm (lib/parms.ini Configuration \([option_seller]\)) Tj ET
+0.945 0.955 0.968 rg 46.00 115.20 520.00 147.80 re f
+0.580 0.640 0.720 rg 46.00 115.20 2.50 147.80 re f
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 250.00 Tm ([option_seller]) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 239.40 Tm (order_type = limit) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 228.80 Tm (limit_discount_pct = 1.0                   ; Marketable discount % below min\(live_bid, current_price\)) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 218.20 Tm (stop_loss_limit_discount_pct = 3.0         ; Deeper discount % on stop-loss limit sells) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 207.60 Tm (stop_loss_force_market = false             ; True forces market orders on stop-losses only) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 197.00 Tm () Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 186.40 Tm (profit_target_enabled = true) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 175.80 Tm (profit_target_pct = 25.0                   ; Sell immediately at >= +25.0% unrealized gain) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 165.20 Tm (trailing_stop_enabled = true) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 154.60 Tm (trailing_activation_pct = 10.0             ; Arm trailing stop after peak >= +10.0%) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 144.00 Tm (trailing_drawdown_pct = 5.0                ; Exit if drawdown from session peak > 5.0%) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 133.40 Tm (trailing_require_negative_velocity = true  ; Require underlying velocity v < 0) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 122.80 Tm (peak_profit_calls_only = false             ; Set true to limit target/trailing to CALL options only) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 104.20 Tm (Verification) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 90.70 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 90.70 Tm (Verified py_compile and unit tests covering [option_seller] INI parsing, live-bid) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 78.10 Tm (marketable discount calculation \(1% regular, 3% stop-loss, $0.01 tick step-down, missing-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 65.50 Tm (bid fallback, stop_loss_force_market\), profit_target_pct before OPTION_CHAIN_RSI_HIGH, HWM) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 8 of 9) Tj ET
+endstream
+endobj
+23 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 24 0 R >>
+endobj
+24 0 obj
+<< /Length 741 >>
+stream
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 746.00 Tm (trailing-stop hold \(v >= 0\) vs trigger \(v < 0\), plus compile_applet and lint_applet.) Tj ET
+0.933 0.949 1.000 rg 46.00 714.90 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 714.90 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 720.40 Tm (TURN 20 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 706.90 Tm (can you update the previous pdf with these newer turns?) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 9 of 9) Tj ET
 endstream
 endobj
 xref
-0 19
+0 25
 0000000000 65535 f 
 0000000015 00000 n 
 0000000064 00000 n 
-0000000155 00000 n 
-0000000252 00000 n 
-0000000354 00000 n 
-0000000459 00000 n 
-0000000554 00000 n 
-0000000710 00000 n 
-0000008195 00000 n 
-0000008352 00000 n 
-0000015263 00000 n 
-0000015421 00000 n 
-0000023076 00000 n 
-0000023234 00000 n 
-0000031238 00000 n 
-0000031396 00000 n 
-0000039540 00000 n 
-0000039698 00000 n 
+0000000176 00000 n 
+0000000273 00000 n 
+0000000375 00000 n 
+0000000480 00000 n 
+0000000575 00000 n 
+0000000731 00000 n 
+0000008208 00000 n 
+0000008365 00000 n 
+0000015276 00000 n 
+0000015434 00000 n 
+0000023089 00000 n 
+0000023247 00000 n 
+0000031251 00000 n 
+0000031409 00000 n 
+0000039553 00000 n 
+0000039711 00000 n 
+0000046979 00000 n 
+0000047137 00000 n 
+0000054430 00000 n 
+0000054588 00000 n 
+0000062847 00000 n 
+0000063005 00000 n 
 trailer
-<< /Size 19 /Root 1 0 R >>
+<< /Size 25 /Root 1 0 R >>
 startxref
-41981
+63797
 %%EOF
