@@ -1,0 +1,447 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [7 0 R 9 0 R 11 0 R 13 0 R 15 0 R 17 0 R] /Count 6 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 7434 >>
+stream
+BT /F2 16.50 Tf 0.060 0.090 0.160 rg 1 0 0 1 46.00 746.00 Tm (MultiStreamRSI Session Transcript & Archive) Tj ET
+BT /F1 8.80 Tf 0.280 0.330 0.410 rg 1 0 0 1 46.00 728.00 Tm (Generated: 2026-11-15T12:32:00-08:00  |  Scope: Compacted Summary \(Turns 1-9\) + Verbatim Recent Turns \(Turns 10-16\)) Tj ET
+q 0.80 w 0.780 0.820 0.880 RG 46.00 719.00 m 566.00 719.00 l S Q
+0.945 0.960 0.985 rg 46.00 659.50 520.00 51.50 re f
+0.388 0.400 0.945 rg 46.00 659.50 3.00 51.50 re f
+BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 697.00 Tm (Note: Earlier turns prior to Turn 10 were compacted by the runtime into a summary. Part I) Tj ET
+BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 684.50 Tm (preserves that compacted summary in full; Part II preserves the verbatim user prompts and) Tj ET
+BT /F1 8.80 Tf 0.190 0.230 0.300 rg 1 0 0 1 56.00 672.00 Tm (assistant responses still in session context.) Tj ET
+0.080 0.110 0.190 rg 46.00 629.50 520.00 20.00 re f
+BT /F2 9.60 Tf 1.000 1.000 1.000 rg 1 0 0 1 55.00 636.00 Tm (PART I: COMPACTED SUMMARY \(EARLIER TURNS 1-9\)) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 616.50 Tm (Chronological User Requests \(1-9\)) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 603.00 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 603.00 Tm (1. describe how the AlpacaPositionMonitor thread works.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 588.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 588.90 Tm (2. implement _is_option, _format_option, _num, and register POSITIONS_MONITOR in) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 576.30 Tm (PROVIDER_REGISTRY in multiStreamRSI.py) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 562.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 562.20 Tm (3. we need to implement the buy logic, we will use the alpaca api/provider for buying) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 549.60 Tm (options. We should we a new async task that is sync'd to the one minute and uses the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 537.00 Tm (kinematics that we have identified to buy an option contract that is returned in contract) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 524.40 Tm (by collect_option_chain) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 510.30 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 510.30 Tm (4. explain the logic that actually makes the purchase decison) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 496.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 496.20 Tm (5. we have to change the buy logic, we want to always consider RSI in any buy decision, it) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 483.60 Tm (has to be only consider BUY when rsi <= OPTION_CHAIN_RSI_LOW And the knimatic metrics are) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 471.00 Tm (favorable for buying.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 456.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 456.90 Tm (6. show me the entries to add to the parms.ini file to control these new features - you) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 444.30 Tm (are reading them from the file correct?) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 430.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 430.20 Tm (7. we are only buying call options, correct? we are only buying the contract returned from) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 417.60 Tm (get_pruned_option_chain, correct?) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 403.50 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 403.50 Tm (8. I can turn off buying options , by setting [option_buyer], enabled to false, correct?) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 389.40 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 389.40 Tm (9. we have a defect, the dashboard is showing an equity position count of 1, but we don't) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 376.80 Tm (have any [Attachments: image_fc448ded.png, image_28e90952.png]) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 359.70 Tm (Summary of Completed Engineering Work \(Turns 1-9\)) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 346.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 346.20 Tm (Kinematics & Crossover Dashboard: Added HMA/EMA smoothing synced to 14-period RSI,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 333.60 Tm (P_hat_{t+1} = P_t + v_t + 0.5*a_t, 4-state Forecast Matrix, leading/confirmed zero-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 321.00 Tm (crossings, and 3-panel crossover charts with 1m/5m vertical gridlines in) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 308.40 Tm (multiStreamRSI_60be797f.py and MultiStreamRSIViewer.tsx \(plus Pine v6 color.green /) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 295.80 Tm (color.red fixes\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 281.70 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 281.70 Tm (AlpacaPositionMonitor & Equity Count Fix: Implemented _num, _is_option, _format_option,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 269.10 Tm (separated equity_count from option_count \(fixing the defect where active_equity_positions) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 256.50 Tm (showed 1 while holding only option ETOR261120C00025000\), and registered POSITIONS_MONITOR) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 243.90 Tm (in PROVIDER_REGISTRY.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 229.80 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 229.80 Tm (1-Minute Synced AlpacaOptionBuyer: Added MinuteCoordinator option_chain_cache +) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 217.20 Tm (AlpacaOptionBuyer \(PROVIDER_REGISTRY['OPTION_BUYER']\), logging to logs/option_buyer/,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 204.60 Tm (strictly enforcing rsi <= OPTION_CHAIN_RSI_LOW + favorable bullish kinematics, CALL-only) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 192.00 Tm (\(OPTION_BUY_REQUIRE_RIGHT_MATCH=true\), and using only contracts returned by) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 179.40 Tm (collect_option_chain / get_pruned_option_chain.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 165.30 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 165.30 Tm (lib/parms.ini Integration: Wired [kinematics] and [option_buyer] INI parsing into) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 152.70 Tm (load_settings\(\) via _apply_ini_feature_settings\(cfg\), resolving smoothed parameters) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 140.10 Tm (dynamically at call time and surfacing Option Buyer telemetry in /cli/status and the Flask) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 127.50 Tm (dashboard.) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 1 of 6) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 6859 >>
+stream
+0.080 0.110 0.190 rg 46.00 726.00 520.00 20.00 re f
+BT /F2 9.60 Tf 1.000 1.000 1.000 rg 1 0 0 1 55.00 732.50 Tm (PART II: VERBATIM RECENT TURNS \(TURNS 10-16\)) Tj ET
+0.933 0.949 1.000 rg 46.00 699.00 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 699.00 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 704.50 Tm (TURN 10 -- USER  \(Attachment: image_b496ac1a.png\)) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 691.00 Tm (can we add a red start onto this panel when we execute a buy, place it on the precise minute) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 678.40 Tm (of the buy order?) Tj ET
+0.925 0.992 0.961 rg 46.00 646.80 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 646.80 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 652.30 Tm (TURN 10 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 638.80 Tm (Added a red 5-point SVG star marker \(*\) to the 3-Panel Synchronized Kinematic Crossover \(Price) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 626.20 Tm (* v/a * RSI\) panel on the exact minute of every executed option buy order:) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 608.60 Tm (Summary of Changes) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 595.10 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 595.10 Tm (Executed Buy Timestamp Tracking \(MinuteCoordinator & AlpacaOptionBuyer\): Added) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 582.50 Tm (option_buy_events storage and record_option_buy_event\(\) on MinuteCoordinator, flooring) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 569.90 Tm (execution timestamps \(minute_utc\) to the exact UTC minute while preserving) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 557.30 Tm (executed_at_utc, contract, qty, order_id, trigger_minute_utc, and rsi. When) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 544.70 Tm (AlpacaOptionBuyer.evaluate_and_buy\(\) submits a live/paper order \(OPTION_BUY_SUBMITTED\), it) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 532.10 Tm (resolves the order's submitted_at / created_at timestamp \(falling back to current UTC) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 519.50 Tm (time\) and records the buy event with dry_run=False. Simulated dry-run checks do not render) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 506.90 Tm (red stars.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 492.80 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 492.80 Tm (Dashboard API & Chart Rendering \(/api/kinematics & renderCrossoverChart\): Exposed) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 480.20 Tm (buy_events per symbol in /api/kinematics \(consolidated_symbols\). Updated) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 467.60 Tm (renderCrossoverChart\(\) to match each buy event by UTC minute epoch index) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 455.00 Tm (\(Math.floor\(Date.parse\(...\) / 60000\)\): renders a crisp 5-point red star \(#ef4444 with dark) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 442.40 Tm (#020617 outline\) on the Price curve along with a dashed red vertical guide line down) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 429.80 Tm (through all three panels \(Price * v/a * RSI\) on the exact minute column. If an order) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 417.20 Tm (executes during the current minute before that bar finalizes \(due to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 404.60 Tm (SUMMARY_DELAY_SECONDS\), the star appears on the +1m column \(nextX\) immediately and locks) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 392.00 Tm (onto that minute's settled bar once it closes. Hovering over the star displays the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 379.40 Tm (contract, quantity, execution time \(HH:MM:SS\), and order ID, and the chart header includes) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 366.80 Tm (the Executed Buy red star legend.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 349.70 Tm (Verification) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 336.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 336.20 Tm (Verified Python syntax \(python3 -m py_compile\) and ran async unit tests verifying) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 323.60 Tm (MinuteCoordinator.record_option_buy_event\(\) exact minute alignment \(submitted_at ->) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 311.00 Tm (minute_utc\) and dry-run exclusion.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 296.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 296.90 Tm (Verified the TypeScript/Vite build \(compile_applet and lint_applet both succeeded\).) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 282.80 Tm (Note: Since the live dashboard chart runs inside multiStreamRSI.py, download/replace your) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 270.20 Tm (local copy of the script and restart the engine so the port 5001 dashboard picks up the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 257.60 Tm (changes.) Tj ET
+0.933 0.949 1.000 rg 46.00 226.00 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 226.00 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 231.50 Tm (TURN 11 -- USER) Tj ET
+0.945 0.955 0.968 rg 46.00 118.60 520.00 105.40 re f
+0.580 0.640 0.720 rg 46.00 118.60 2.50 105.40 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 211.00 Tm (resovle) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 200.40 Tm (2026-11-15T11:52:38-08:00] Starting Python: /home/billt/jboa-1/.venv/bin/python) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 189.80 Tm (Python PID=2290341 ngrok PID=2290335) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 179.20 Tm (  File "/home/billt/jboa-1/src/./multiStreamRSI.py", line 27) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 168.60 Tm (    min-height: 100vh;) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 158.00 Tm (                  ^) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 147.40 Tm (SyntaxError: invalid decimal literal) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 136.80 Tm ([2026-11-15T11:52:38-08:00] A child process exited; status=1) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 126.20 Tm (\(\(.venv\) \) [billt@localhost src]$) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 2 of 6) Tj ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 12 0 R >>
+endobj
+12 0 obj
+<< /Length 7603 >>
+stream
+0.925 0.992 0.961 rg 46.00 729.00 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 729.00 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 734.50 Tm (TURN 11 -- ASSISTANT) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 718.00 Tm (Root Cause) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 704.50 Tm (Your local file /home/billt/jboa-1/src/multiStreamRSI.py was overwritten with an HTML/CSS page) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 691.90 Tm (\(likely an AI Studio / Cloud Run sign-in or redirect page saved when fetching the download URL) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 679.30 Tm (with curl/wget without browser auth, or when clicking a direct <a download> link across an) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 666.70 Tm (iframe/proxy\). The actual Python file in the workspace has no CSS and passes python3 -m) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 654.10 Tm (py_compile cleanly \(line 27 is 'option position.' inside the module docstring\).) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 636.50 Tm (What Was Fixed in the App) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 623.00 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 623.00 Tm (Validated Python Fetch & Blob Downloads: Updated the viewer so fetched code is checked to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 610.40 Tm (confirm it is valid Python \(class MinuteCoordinator + def load_settings\) and never HTML) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 597.80 Tm (\(<!doctype / <html\). Replaced the raw <a href="..." download="multiStreamRSI.py"> links) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 585.20 Tm (with validated Blob download buttons \(Download Updated .py and Download .py File\) so) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 572.60 Tm (HTML/auth pages cannot be saved as multiStreamRSI.py.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 558.50 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 558.50 Tm (Verification: Verified Python compilation \(python3 -m py_compile\), TypeScript check \(tsc) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 545.90 Tm (--noEmit\), and Vite build \(compile_applet\).) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 528.80 Tm (What to Do on Your Machine \(/home/billt/jboa-1/src\)) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 515.30 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 515.30 Tm (1. Remove/replace the HTML-corrupted /home/billt/jboa-1/src/multiStreamRSI.py by clicking) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 502.70 Tm (Download Updated .py \(under the Flask Web App tab\) or Copy Code / Download \(under Updated) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 490.10 Tm (multiStreamRSI.py\) directly inside the authenticated app UI -- avoid running curl or wget) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 477.50 Tm (from the terminal against the preview URL.) Tj ET
+0.945 0.955 0.968 rg 46.00 438.20 520.00 31.20 re f
+0.580 0.640 0.720 rg 46.00 438.20 2.50 31.20 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 456.40 Tm (head -n 5 /home/billt/jboa-1/src/multiStreamRSI.py) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 445.80 Tm (/home/billt/jboa-1/.venv/bin/python -m py_compile /home/billt/jboa-1/src/multiStreamRSI.py) Tj ET
+0.933 0.949 1.000 rg 46.00 413.20 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 413.20 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 418.70 Tm (TURN 12 -- USER) Tj ET
+0.945 0.955 0.968 rg 46.00 189.20 520.00 222.00 re f
+0.580 0.640 0.720 rg 46.00 189.20 2.50 222.00 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 398.20 Tm (resolve) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 387.60 Tm (Nov 15 11:55:04 localhost.localdomain systemd[1]: jboa-rsi.service: Start request repeated too) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 377.00 Tm (  quickly.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 366.40 Tm (Nov 15 11:55:04 localhost.localdomain systemd[1]: jboa-rsi.service: Failed with result 'exit-) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 355.80 Tm (  code'.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 345.20 Tm (?? Subject: Unit failed) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 334.60 Tm (?? Defined-By: systemd) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 324.00 Tm (?? Support: https://access.redhat.com/support) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 313.40 Tm (??) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 302.80 Tm (?? The unit jboa-rsi.service has entered the 'failed' state with result 'exit-code'.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 292.20 Tm (Nov 15 11:55:04 localhost.localdomain systemd[1]: Failed to start JBOA multi-provider RSI) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 281.60 Tm (  application and ngrok tunnel.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 271.00 Tm (?? Subject: A start job for unit jboa-rsi.service has failed) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 260.40 Tm (?? Defined-By: systemd) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 249.80 Tm (?? Support: https://access.redhat.com/support) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 239.20 Tm (??) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 228.60 Tm (?? A start job for unit jboa-rsi.service has finished with a failure.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 218.00 Tm (??) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 207.40 Tm (?? The job identifier is 175234 and the job result is failed.) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 196.80 Tm (\(\(.venv\) \) [billt@localhost src]$) Tj ET
+0.925 0.992 0.961 rg 46.00 164.20 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 164.20 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 169.70 Tm (TURN 12 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 156.20 Tm (That message means systemd hit its restart rate limit \(StartLimitBurst\) because jboa-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 143.60 Tm (rsi.service crashed repeatedly in quick succession \(from the earlier SyntaxError on min-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 131.00 Tm (height: 100vh; when multiStreamRSI.py contained HTML instead of Python\). Once systemd locks) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 118.40 Tm (the unit in that failed state, it blocks new start attempts until you clear the failure state.) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 103.80 Tm (Run these steps in /home/billt/jboa-1/src on your machine:) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 89.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 89.20 Tm (1. Confirm multiStreamRSI.py is valid Python \(not HTML\):) Tj ET
+0.945 0.955 0.968 rg 46.00 60.50 520.00 20.60 re f
+0.580 0.640 0.720 rg 46.00 60.50 2.50 20.60 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 68.10 Tm (head -n 5 /home/billt/jboa-1/src/multiStreamRSI.py) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 3 of 6) Tj ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 14 0 R >>
+endobj
+14 0 obj
+<< /Length 7952 >>
+stream
+0.945 0.955 0.968 rg 46.00 731.40 520.00 20.60 re f
+0.580 0.640 0.720 rg 46.00 731.40 2.50 20.60 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 739.00 Tm (/home/billt/jboa-1/.venv/bin/python -m py_compile /home/billt/jboa-1/src/multiStreamRSI.py) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 723.40 Tm (If head -n 5 still shows <!doctype html> or HTML/CSS, overwrite it using the Download Updated) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 710.80 Tm (.py \(or Copy Code\) button inside the app UI first \(avoid curl/wget against the preview URL\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 696.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 696.20 Tm (2. Clear any stale port bindings \(optional check\):  ss -tulpn | grep -E '5000|5001') Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 682.10 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 682.10 Tm (3. Reset the systemd failure limit and restart the service:) Tj ET
+0.945 0.955 0.968 rg 46.00 632.20 520.00 41.80 re f
+0.580 0.640 0.720 rg 46.00 632.20 2.50 41.80 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 661.00 Tm (sudo systemctl reset-failed jboa-rsi.service) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 650.40 Tm (sudo systemctl start jboa-rsi.service) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 639.80 Tm (sudo systemctl status jboa-rsi.service --no-pager) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 624.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 624.20 Tm (4. If it still fails, check the underlying Python/ngrok error:  sudo journalctl -u jboa-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 611.60 Tm (rsi.service -n 60 --no-pager) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 597.50 Tm (\(Tip: If you ever want systemd to wait longer between retries rather than locking out quickly,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 584.90 Tm (ensure RestartSec=5 is set under [Service] in your unit file, then run sudo systemctl daemon-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 572.30 Tm (reload.\)) Tj ET
+0.933 0.949 1.000 rg 46.00 540.70 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 540.70 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 546.20 Tm (TURN 13 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 532.70 Tm (why is the alpaca provider showing as OFFLINE? Here is a log excerpt) Tj ET
+0.945 0.955 0.968 rg 46.00 323.30 520.00 200.80 re f
+0.580 0.640 0.720 rg 46.00 323.30 2.50 200.80 re f
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 511.10 Tm (2026-11-15 11:58:41,872 INFO RSI_WARMUP provider=ALPACA symbol=AAPL bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 500.50 Tm (  changes=1169 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 489.90 Tm (2026-11-15 11:58:42,031 INFO RSI_WARMUP provider=ALPACA symbol=AAPL bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 479.30 Tm (  changes=1559 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 468.70 Tm (2026-11-15 11:58:42,212 INFO RSI_WARMUP provider=ALPACA symbol=AAPL bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 458.10 Tm (  changes=1949 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 447.50 Tm (2026-11-15 11:58:42,391 INFO RSI_WARMUP provider=ALPACA symbol=GOOG bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 436.90 Tm (  changes=389 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 426.30 Tm (2026-11-15 11:58:42,547 INFO RSI_WARMUP provider=ALPACA symbol=GOOG bars=386 applied=386) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 415.70 Tm (  changes=775 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 405.10 Tm (2026-11-15 11:58:42,706 INFO RSI_WARMUP provider=ALPACA symbol=GOOG bars=389 applied=389) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 394.50 Tm (  changes=1164 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 383.90 Tm (2026-11-15 11:58:42,869 INFO RSI_WARMUP provider=ALPACA symbol=GOOG bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 373.30 Tm (  changes=1554 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 362.70 Tm (2026-11-15 11:58:43,037 INFO RSI_WARMUP provider=ALPACA symbol=GOOG bars=390 applied=390) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 352.10 Tm (  changes=1944 converged=True) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 341.50 Tm (2026-11-15 11:58:43,038 INFO connecting to wss://stream.data.alpaca.markets/v2/iex) Tj ET
+BT /F4 7.70 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 330.90 Tm (2026-11-15 11:58:43,465 INFO connected to wss://stream.data.alpaca.markets/v2/iex) Tj ET
+0.925 0.992 0.961 rg 46.00 298.30 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 298.30 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 303.80 Tm (TURN 13 -- ASSISTANT) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 287.30 Tm (Why ALPACA Showed as OFFLINE) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 273.80 Tm (Your log shows that Alpaca historical warmup and WebSocket authentication \(connected to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 261.20 Tm (wss://stream.data.alpaca.markets/v2/iex\) succeeded cleanly. However, unlike TRADIER and) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 248.60 Tm (TWELVEDATA \(which call coordinator.set_connected\(..., True\) immediately upon opening the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 236.00 Tm (WebSocket\), ProviderRouter.run_alpaca\(\) previously only called) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 223.40 Tm (self.coordinator.set_connected\(self.provider, True\) inside callback\(bar\). Outside regular) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 210.80 Tm (market hours \(e.g., Sunday 11:58 AM\) or before the first live 1-minute IEX trade bar closes,) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 198.20 Tm (callback\(bar\) never fires, so coordinator.connected["ALPACA"] stayed False \(ALPACA: OFFLINE\)) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 185.60 Tm (even though the stream was connected.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 168.00 Tm (What Was Fixed) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 154.50 Tm (Updated ProviderRouter.run_alpaca\(\) in multiStreamRSI_60be797f.py:) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 139.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 139.90 Tm (Mark ONLINE on WebSocket Authentication/Subscription: Wraps self.stream._subscribe_all so) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 127.30 Tm (ALPACA is marked ONLINE as soon as StockDataStream finishes connecting and subscribing --) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 114.70 Tm (without waiting for the first live market-hours bar.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 100.60 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 100.60 Tm (Live WebSocket State Watcher: Adds a lightweight watch_connection\(\) loop monitoring) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 88.00 Tm (self.stream._ws \(closed / state\) so ALPACA transitions to ONLINE whenever the socket is) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 75.40 Tm (open and drops back to OFFLINE if the socket closes or disconnects.) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 4 of 6) Tj ET
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 16 0 R >>
+endobj
+16 0 obj
+<< /Length 8092 >>
+stream
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 743.00 Tm (Verification & Next Step) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 729.50 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 729.50 Tm (Verified Python compilation \(python3 -m py_compile\) and an async unit test confirming) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 716.90 Tm (ALPACA transitions to True immediately on connection \(with zero live bars\) and back to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 704.30 Tm (False when the WebSocket closes.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 690.20 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 690.20 Tm (Verified compile_applet and lint_applet succeeded.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 676.10 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 676.10 Tm (Re-download the updated script via Download Updated .py in the app and restart jboa-) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 663.50 Tm (rsi.service \(sudo systemctl restart jboa-rsi.service\) for ALPACA: ONLINE to appear on the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 650.90 Tm (dashboard.) Tj ET
+0.933 0.949 1.000 rg 46.00 619.80 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 619.80 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 625.30 Tm (TURN 14 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 611.80 Tm (now we need a sell task, every minute look at all positions in the alpaca paper account and) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 599.20 Tm (make a sell decision like, buying, selling is done with the alpaca api/credentials, only sell) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 586.60 Tm (if rsi >= OPTION_CHAIN_RSI_HIGH and the kinematic metrics are favorable, make it configurable) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 574.00 Tm (like the buy task) Tj ET
+0.925 0.992 0.961 rg 46.00 542.40 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 542.40 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 547.90 Tm (TURN 14 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 534.40 Tm (Added the configurable 1-minute AlpacaOptionSeller async task) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 521.80 Tm (\(PROVIDER_REGISTRY["OPTION_SELLER"]\) synced to minute finalization alongside the buy task.) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 504.20 Tm (How the Sell Task Works) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 490.70 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 490.70 Tm (1-Minute Sync & Position Scan \(AlpacaOptionSeller\): Uses) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 478.10 Tm (MinuteCoordinator.subscribe_minute_finalized\(\) \(independent listener events so buyer and) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 465.50 Tm (seller wakeups never interfere with each other\). Every finalized minute, calls Alpaca) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 452.90 Tm (get_all_positions\(\) using the configured Alpaca paper credentials \(OPTION_SELL_PAPER /) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 440.30 Tm (ALPACA_PAPER\). Evaluates all long positions \(qty > 0\), automatically extracting the) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 427.70 Tm (underlying ticker from OCC option symbols \(e.g., ETOR261120C00025000 -> ETOR\) as well as) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 415.10 Tm (equity tickers \(or restricting to options via options_only = true\).) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 401.00 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 401.00 Tm (Mandatory Sell Decision Gates \(_evaluate_sell_kinematics\): Mandatory RSI Gate requires) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 388.40 Tm (underlying rsi >= OPTION_CHAIN_RSI_HIGH \(default 65.0\). Favorable Bearish Kinematics) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 375.80 Tm (requires smoothed v < 0 and a < 0 \(downward bearish thrust\), or v > 0 and a < 0) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 363.20 Tm (\(overbought decelerating top\), or crossover_signal in {leading_bearish, confirmed_bearish}) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 350.60 Tm (with a <= 0, or forecast_direction in OPTION_SELL_ALLOWED_FORECASTS with a < 0. Projection) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 338.00 Tm (Alignment requires P_hat_{t+1} - P_t < 0 when require_projection_alignment = true.) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 323.90 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 323.90 Tm (Execution & Telemetry: Submits OrderSide.SELL via Alpaca TradingClient, logs to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 311.30 Tm (logs/option_seller/ALPACA-OPTION-SELLER-{RUN_ID}.log, and reports status in /cli/status) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 298.70 Tm (\(option_seller\) and Engine Diagnostic Telemetry \(Option Seller \(1m Sync\) / Last Sell) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 286.10 Tm (Order\).) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 269.00 Tm (lib/parms.ini Configuration \([option_seller]\)) Tj ET
+0.945 0.955 0.968 rg 46.00 124.30 520.00 137.20 re f
+0.580 0.640 0.720 rg 46.00 124.30 2.50 137.20 re f
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 248.50 Tm ([option_seller]) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 237.90 Tm (enabled = true) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 227.30 Tm (dry_run = true                        ; Set to false to submit live/paper SELL orders) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 216.70 Tm (paper = true                          ; Uses Alpaca paper account \(defaults to [option_buyer] paper\)) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 206.10 Tm (rsi_high = 65                         ; Overrides OPTION_CHAIN_RSI_HIGH sell threshold) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 195.50 Tm (close_full_position = true            ; True closes full held qty; false sells up to qty) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 184.90 Tm (qty = 1                               ; Contracts/shares per sell when close_full_position = false) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 174.30 Tm (order_type = market                   ; market or limit \(uses current_price for limit\)) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 163.70 Tm (cooldown_minutes = 15                 ; Per-symbol cooldown between sell orders) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 153.10 Tm (options_only = false                  ; Set to true to evaluate option positions only) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 142.50 Tm (require_projection_alignment = true   ; Require projected P_hat\(t+1\) < P_t) Tj ET
+BT /F4 7.40 Tf 0.100 0.140 0.210 rg 1 0 0 1 54.00 131.90 Tm (allowed_forecasts = bearish_reversal,bearish_continuation,bearish_momentum) Tj ET
+BT /F2 9.50 Tf 0.070 0.090 0.150 rg 1 0 0 1 46.00 113.30 Tm (Verification) Tj ET
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 99.80 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 99.80 Tm (Verified python3 -m py_compile and unit tests covering [option_seller] INI loading, rsi >=) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 87.20 Tm (OPTION_CHAIN_RSI_HIGH gating, bearish kinematic rules, option + equity position) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 74.60 Tm (evaluation, cooldowns, and independent MinuteCoordinator wakeups.) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 5 of 6) Tj ET
+endstream
+endobj
+17 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> >> /Contents 18 0 R >>
+endobj
+18 0 obj
+<< /Length 2231 >>
+stream
+BT /F2 9.00 Tf 0.250 0.300 0.400 rg 1 0 0 1 53.00 746.00 Tm (*) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 746.00 Tm (Verified compile_applet and lint_applet both succeeded cleanly. Download the updated) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 733.40 Tm (script via Download Updated .py in the app and restart jboa-rsi.service on your host to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 62.00 720.80 Tm (activate it.) Tj ET
+0.933 0.949 1.000 rg 46.00 689.70 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 689.70 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 695.20 Tm (TURN 15 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 681.70 Tm (make me a pdf of this entire chat exactly as it is, I want to preserve it exactly as-is) Tj ET
+0.925 0.992 0.961 rg 46.00 650.10 520.00 18.00 re f
+0.020 0.588 0.412 rg 46.00 650.10 3.50 18.00 re f
+BT /F2 9.20 Tf 0.024 0.373 0.275 rg 1 0 0 1 55.00 655.60 Tm (TURN 15 -- ASSISTANT) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 642.10 Tm (Explained that earlier turns prior to Turn 10 were compacted into a summary and that the agent) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 629.50 Tm (runs inside the workspace container without browser tab DOM access, gave instructions for) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 616.90 Tm (Chrome Print -> Save as PDF \(Ctrl+P / Cmd+P, Background graphics enabled\), and offered to) Tj ET
+BT /F1 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 604.30 Tm (build a downloadable PDF containing the compacted summary + verbatim recent turns.) Tj ET
+0.933 0.949 1.000 rg 46.00 572.70 520.00 18.00 re f
+0.310 0.275 0.898 rg 46.00 572.70 3.50 18.00 re f
+BT /F2 9.20 Tf 0.216 0.188 0.639 rg 1 0 0 1 55.00 578.20 Tm (TURN 16 -- USER) Tj ET
+BT /F3 9.00 Tf 0.120 0.160 0.230 rg 1 0 0 1 46.00 564.70 Tm (build a pdf from PDF built from the compacted summary + verbatim recent turns) Tj ET
+q 0.5 w 0.85 0.88 0.92 RG 46.00 40.00 m 566.00 40.00 l S Q
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 46.00 27.00 Tm (MultiStreamRSI Session Record \(Compacted Summary + Verbatim Recent Turns\)) Tj ET
+BT /F1 7.8 Tf 0.42 0.47 0.54 rg 1 0 0 1 518.00 27.00 Tm (Page 6 of 6) Tj ET
+endstream
+endobj
+xref
+0 19
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000155 00000 n 
+0000000252 00000 n 
+0000000354 00000 n 
+0000000459 00000 n 
+0000000554 00000 n 
+0000000710 00000 n 
+0000008195 00000 n 
+0000008352 00000 n 
+0000015263 00000 n 
+0000015421 00000 n 
+0000023076 00000 n 
+0000023234 00000 n 
+0000031238 00000 n 
+0000031396 00000 n 
+0000039540 00000 n 
+0000039698 00000 n 
+trailer
+<< /Size 19 /Root 1 0 R >>
+startxref
+41981
+%%EOF
