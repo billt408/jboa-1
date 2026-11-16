@@ -32,15 +32,20 @@ load_settings populates module globals selected and required; disabled providers
 are not instantiated or included in minute summaries.
 """
 
+import argparse
 import asyncio
 import configparser
 import json
 import logging
 import math
 import os
+import queue
 import re
+import struct
 import sys
 import tempfile
+import threading
+import zlib
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as clock_time, timezone
@@ -1056,7 +1061,12 @@ class MinuteCoordinator:
                 pa = tracker.latest_price_acceleration if idx == len(seed_slice) - 1 else None
                 rv = tracker.latest_rsi_velocity if idx == len(seed_slice) - 1 else None
                 ra = tracker.latest_rsi_acceleration if idx == len(seed_slice) - 1 else None
-                rsi_val = tracker.latest["rsi"] if (tracker.latest and idx == len(seed_slice) - 1) else None
+                seed_rsi = (
+                    tracker.latest["rsi"]
+                    if tracker.latest is not None
+                    else tracker.previous_rsi
+                )
+                rsi_val = seed_rsi if idx == len(seed_slice) - 1 else None
                 reg = classify_kinematic_regime(rv, ra, sv if sv is not None else pv, sa if sa is not None else pa)
                 fc = compute_kinematic_forecast(
                     b.close,
@@ -2266,7 +2276,7 @@ def load_tradier_token(config, credentials):
 
 _INI_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[;#].*)?$")
 _INI_FEATURE_SECTIONS = frozenset(
-    {"providers", "kinematics", "option_buyer", "option_seller"}
+    {"providers", "kinematics", "option_buyer", "option_seller", "chart_capture"}
 )
 
 
@@ -2350,6 +2360,126 @@ def _sanitize_parms_for_json_ini(raw_text):
             continue
         out_lines.append(line)
     return "".join(out_lines)
+
+
+def get_default_parms_ini_path():
+    return Path(__file__).resolve().parent / "lib" / "parms.ini"
+
+
+def _read_chart_capture_ini_enabled(ini_path=None):
+    """Read [chart_capture] enabled from lib/parms.ini without raising on missing file."""
+    cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
+    if not cfg_path.is_file():
+        return None
+    try:
+        raw_text = cfg_path.read_text(encoding="utf-8-sig")
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read_string(raw_text)
+        if cfg.has_option("chart_capture", "enabled"):
+            raw = str(_strip_ini_value(cfg.get("chart_capture", "enabled", fallback=""))).strip().lower()
+            if raw in {"1", "true", "yes"}:
+                return True
+            if raw in {"0", "false", "no"}:
+                return False
+    except Exception:
+        return None
+    return None
+
+
+def update_chart_capture_ini(enabled, ini_path=None):
+    """Atomically persist [chart_capture] enabled = true/false in lib/parms.ini.
+
+    Preserves all comments, blank lines, line endings, and JSON-formatted sections.
+    """
+    global CHART_CAPTURE_ENABLED
+
+    target_bool = bool(enabled)
+    target_val = "true" if target_bool else "false"
+    CHART_CAPTURE_ENABLED = target_bool
+
+    cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
+    if not cfg_path.is_file():
+        if ini_path is None:
+            logging.warning("CHART_CAPTURE_INI_SKIPPED reason=missing_file path=%s", cfg_path)
+            return False
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(f"[chart_capture]\nenabled = {target_val}\n", encoding="utf-8")
+        return True
+
+    raw_bytes = cfg_path.read_bytes()
+    has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+    raw_text = raw_bytes.decode("utf-8-sig")
+    default_nl = "\r\n" if "\r\n" in raw_text else "\n"
+
+    lines = raw_text.splitlines(keepends=True)
+    out_lines = []
+    in_chart_capture = False
+    found_section = False
+    updated_option = False
+
+    for line in lines:
+        nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+        body = line[:-len(nl)] if nl else line
+        sec_match = _INI_SECTION_RE.match(body)
+        if sec_match:
+            sec_name = sec_match.group(1).strip().lower()
+            if in_chart_capture and not updated_option:
+                out_lines.append(f"enabled = {target_val}{nl or default_nl}")
+                updated_option = True
+            in_chart_capture = sec_name == "chart_capture"
+            if in_chart_capture:
+                found_section = True
+            out_lines.append(line)
+            continue
+
+        if in_chart_capture and "=" in body and not body.lstrip().startswith((";", "#")):
+            key_part = body.split("=", 1)[0]
+            if key_part.strip().lower() == "enabled":
+                if not updated_option:
+                    indent = key_part[: len(key_part) - len(key_part.lstrip())]
+                    out_lines.append(f"{indent}enabled = {target_val}{nl or default_nl}")
+                    updated_option = True
+                continue
+
+        out_lines.append(line)
+
+    if in_chart_capture and not updated_option:
+        if out_lines and not out_lines[-1].endswith(("\n", "\r")):
+            out_lines[-1] = out_lines[-1] + default_nl
+        out_lines.append(f"enabled = {target_val}{default_nl}")
+        updated_option = True
+
+    if not found_section:
+        if out_lines and not out_lines[-1].endswith(("\n", "\r")):
+            out_lines[-1] = out_lines[-1] + default_nl
+        if out_lines and out_lines[-1].strip():
+            out_lines.append(default_nl)
+        out_lines.append(f"[chart_capture]{default_nl}")
+        out_lines.append(f"enabled = {target_val}{default_nl}")
+
+    new_text = "".join(out_lines)
+    new_bytes = (b"\xef\xbb\xbf" if has_bom else b"") + new_text.encode("utf-8")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".parms_cc_",
+            suffix=".ini",
+            dir=str(cfg_path.parent),
+            delete=False,
+        ) as tmp_file:
+            tmp_file.write(new_bytes)
+            tmp_path = Path(tmp_file.name)
+        os.replace(tmp_path, cfg_path)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    logging.info("CHART_CAPTURE_INI_UPDATED path=%s enabled=%s", cfg_path, target_val)
+    return True
 
 
 def parse_provider_enabled(value, provider):
@@ -2446,6 +2576,9 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_SELL_STOP_LOSS_ENABLED, OPTION_SELL_STOP_LOSS_PCT
     global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES
     global OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS, OPTION_SELL_STOP_LOSS_HARD_PCT
+    global CHART_CAPTURE_ENABLED, CHART_CAPTURE_DIR, CHART_CAPTURE_HISTORY_BARS
+    global CHART_CAPTURE_WIDTH, CHART_CAPTURE_HEIGHT
+    global CHART_CAPTURE_ONLY_UPDATED, CHART_CAPTURE_WRITE_LATEST
 
     smooth_method = (
         _ini_str(cfg, "kinematics", "smooth_method", "KINEMATICS_SMOOTH_METHOD", "hma")
@@ -2744,12 +2877,48 @@ def _apply_ini_feature_settings(cfg):
             )
         ),
     )
+    CHART_CAPTURE_ENABLED = _ini_bool(
+        cfg, "chart_capture", "enabled", "CHART_CAPTURE_ENABLED", True
+    )
+    CHART_CAPTURE_DIR = _ini_str(
+        cfg, "chart_capture", "output_dir", "CHART_CAPTURE_DIR", "logs/charts"
+    ).strip()
+    CHART_CAPTURE_HISTORY_BARS = min(
+        120,
+        _ini_int(
+            cfg,
+            "chart_capture",
+            "history_bars",
+            "CHART_CAPTURE_HISTORY_BARS",
+            20,
+            minimum=5,
+        ),
+    )
+    CHART_CAPTURE_WIDTH = min(
+        2560,
+        _ini_int(
+            cfg, "chart_capture", "width", "CHART_CAPTURE_WIDTH", 1440, minimum=960
+        ),
+    )
+    CHART_CAPTURE_HEIGHT = min(
+        1600,
+        _ini_int(
+            cfg, "chart_capture", "height", "CHART_CAPTURE_HEIGHT", 860, minimum=620
+        ),
+    )
+    CHART_CAPTURE_ONLY_UPDATED = _ini_bool(
+        cfg, "chart_capture", "only_updated", "CHART_CAPTURE_ONLY_UPDATED", True
+    )
+    CHART_CAPTURE_WRITE_LATEST = _ini_bool(
+        cfg, "chart_capture", "write_latest", "CHART_CAPTURE_WRITE_LATEST", True
+    )
     logging.info(
         "FEATURE_CONFIG smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
-        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%%",
+        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
+        "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d",
         KINEMATICS_SMOOTH_METHOD,
         KINEMATICS_SMOOTH_PERIOD,
         KINEMATICS_RSI_OVERBOUGHT,
@@ -2775,6 +2944,11 @@ def _apply_ini_feature_settings(cfg):
         OPTION_SELL_STOP_LOSS_PCT,
         OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
         OPTION_SELL_STOP_LOSS_HARD_PCT,
+        CHART_CAPTURE_ENABLED,
+        CHART_CAPTURE_DIR or "logs/charts",
+        CHART_CAPTURE_HISTORY_BARS,
+        CHART_CAPTURE_WIDTH,
+        CHART_CAPTURE_HEIGHT,
     )
 
 
@@ -3062,6 +3236,25 @@ OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS = os.getenv(
 OPTION_SELL_STOP_LOSS_HARD_PCT = max(
     0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_HARD_PCT", "0.0")))
 )
+CHART_CAPTURE_ENABLED = os.getenv("CHART_CAPTURE_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+CHART_CAPTURE_DIR = os.getenv("CHART_CAPTURE_DIR", "logs/charts").strip()
+CHART_CAPTURE_HISTORY_BARS = min(
+    120, max(5, int(os.getenv("CHART_CAPTURE_HISTORY_BARS", "20")))
+)
+CHART_CAPTURE_WIDTH = min(2560, max(960, int(os.getenv("CHART_CAPTURE_WIDTH", "1440"))))
+CHART_CAPTURE_HEIGHT = min(
+    1600, max(620, int(os.getenv("CHART_CAPTURE_HEIGHT", "860")))
+)
+CHART_CAPTURE_ONLY_UPDATED = os.getenv(
+    "CHART_CAPTURE_ONLY_UPDATED", "true"
+).strip().lower() in {"1", "true", "yes"}
+CHART_CAPTURE_WRITE_LATEST = os.getenv(
+    "CHART_CAPTURE_WRITE_LATEST", "true"
+).strip().lower() in {"1", "true", "yes"}
 
 
 def rsi_signal(rsi):
@@ -3135,7 +3328,16 @@ def _validate_tradingview_item(
     if not isinstance(raw_ticker, str) or not raw_ticker.strip() or len(raw_ticker) > 100:
         raise ValueError("ticker must be a nonempty string of at most 100 characters")
     ticker = raw_ticker.strip().upper()
-    symbol = ticker if ticker in allowed_symbols else ticker.rsplit(":", 1)[-1]
+    if ticker in allowed_symbols:
+        symbol = ticker
+    else:
+        base_ticker = ticker.rsplit(":", 1)[-1].strip()
+        if base_ticker in allowed_symbols:
+            symbol = base_ticker
+        elif base_ticker.endswith(".US") and base_ticker[:-3] in allowed_symbols:
+            symbol = base_ticker[:-3]
+        else:
+            symbol = base_ticker
     if symbol not in allowed_symbols:
         return None, symbol  # Unconfigured symbol; caller records as skipped
 
@@ -3389,11 +3591,37 @@ class TradingviewProvider:
         self.thread_error = None
         self.logger = make_logger(self.provider, "_STREAM")
         self.latest = {}
+        self.stats_lock = threading.Lock()
+        self.stats = {
+            "requests_total": 0,
+            "events_queued": 0,
+            "rejected_count": 0,
+            "last_webhook_utc": None,
+            "last_received_symbols": [],
+            "last_skipped_symbols": [],
+            "last_error": None,
+        }
         self.app = self.create_app()
 
-    def create_app(self):
-        import queue
+    def get_stats(self):
+        with self.stats_lock:
+            return {
+                "requests_total": self.stats["requests_total"],
+                "events_queued": self.stats["events_queued"],
+                "rejected_count": self.stats["rejected_count"],
+                "last_webhook_utc": self.stats["last_webhook_utc"],
+                "last_received_symbols": list(self.stats["last_received_symbols"]),
+                "last_skipped_symbols": list(self.stats["last_skipped_symbols"]),
+                "last_error": self.stats["last_error"],
+                "latest_symbols": sorted(list(self.latest.keys())),
+            }
 
+    def _record_stat_error(self, message):
+        with self.stats_lock:
+            self.stats["rejected_count"] += 1
+            self.stats["last_error"] = str(message)[:160]
+
+    def create_app(self):
         from flask import Flask, request, jsonify
 
         app = Flask("tradingview_webhook")
@@ -3412,7 +3640,8 @@ class TradingviewProvider:
         @app.get("/")
         def index():
             host_ip = request.host.split(":")[0]
-            dashboard_url = f"http://{host_ip}:5001/"
+            dashboard_url = f"http://{host_ip}:{DASHBOARD_PORT}/"
+            tv_stats = self.get_stats()
             html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3428,9 +3657,10 @@ class TradingviewProvider:
             K
         </div>
         <h1 class="text-xl font-bold mb-2">TradingView Webhook Gateway</h1>
-        <p class="text-xs text-slate-400 leading-relaxed mb-6">
+        <p class="text-xs text-slate-400 leading-relaxed mb-4">
             Webhook ingestion active on port {self.port} (<code class="text-indigo-300">/webhook</code>).<br>
-            Redirecting to the <strong>RSI & Price Kinematics Dashboard</strong> on port 5001...
+            Requests: <strong>{tv_stats['requests_total']}</strong> &bull; Events queued: <strong>{tv_stats['events_queued']}</strong><br>
+            Redirecting to the <strong>RSI & Price Kinematics Dashboard</strong> on port {DASHBOARD_PORT}...
         </p>
         <a href="{dashboard_url}" class="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl text-sm transition shadow-lg shadow-indigo-600/30">
             Open Kinematics Dashboard &rarr;
@@ -3442,20 +3672,37 @@ class TradingviewProvider:
 
         @app.get("/health")
         def health():
-            return jsonify(status="ok", provider=self.provider), 200
+            return jsonify(status="ok", provider=self.provider, **self.get_stats()), 200
 
         @app.post("/webhook")
         def receive():
             import traceback
-            import hmac
+
+            with self.stats_lock:
+                self.stats["requests_total"] += 1
+                self.stats["last_webhook_utc"] = datetime.now(UTC).isoformat()
 
             payload = request.get_json(force=True, silent=True)
+            if payload is None:
+                raw_text = request.get_data(as_text=True) or ""
+                if raw_text.strip():
+                    try:
+                        payload = json.loads(raw_text.strip().lstrip("\ufeff"))
+                    except Exception:
+                        payload = None
+
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = None
 
             if not isinstance(payload, (dict, list)):
+                self._record_stat_error("JSON payload must be a batch or symbol object")
                 return (
                     jsonify(
                         status="error",
-                        message="JSON payload must be a batch object",
+                        message="JSON payload must be a batch or symbol object",
                     ),
                     400,
                 )
@@ -3467,6 +3714,7 @@ class TradingviewProvider:
                 if not isinstance(supplied, str) or not hmac.compare_digest(
                     supplied.encode("utf-8"), WEBHOOK_TOKEN.encode("utf-8")
                 ):
+                    self._record_stat_error("Unauthorized (invalid webhook token)")
                     return jsonify(status="error", message="Unauthorized"), 401
 
             try:
@@ -3479,6 +3727,7 @@ class TradingviewProvider:
                 errors = parsed.get("errors") or []
 
                 if not events:
+                    self._record_stat_error("Batch payload yielded no valid symbol events")
                     return (
                         jsonify(
                             status="error",
@@ -3491,6 +3740,13 @@ class TradingviewProvider:
                 for event in events:
                     self.queue.put_nowait(event)
                     queued_symbols.append(event["symbol"])
+
+                with self.stats_lock:
+                    self.stats["events_queued"] += len(queued_symbols)
+                    self.stats["last_received_symbols"] = list(queued_symbols[:50])
+                    if skipped:
+                        self.stats["last_skipped_symbols"] = list(dict.fromkeys(skipped))[:30]
+                    self.stats["last_error"] = "; ".join(errors[:3]) if errors else None
 
                 if skipped:
                     self.logger.warning(
@@ -3526,6 +3782,7 @@ class TradingviewProvider:
                 )
 
             except ValueError as exc:
+                self._record_stat_error(str(exc))
                 payload_keys = (
                     list(payload.keys())[:12]
                     if isinstance(payload, dict)
@@ -3540,12 +3797,14 @@ class TradingviewProvider:
                 return jsonify(status="error", message=str(exc)), 400
 
             except queue.Full:
+                self._record_stat_error("Receiver busy; alert not queued")
                 return (
                     jsonify(status="error", message="Receiver busy; alert not queued"),
                     503,
                 )
 
-            except Exception:
+            except Exception as exc:
+                self._record_stat_error(f"Internal error: {type(exc).__name__}")
                 # This block captures exactly what line crashed inside your processing pipeline
                 print(
                     "\n=================== CRITICAL SERVER TRACEBACK (500) ==================="
@@ -3737,9 +3996,10 @@ class TradingviewProvider:
             self.host,
             self.port,
             self.app,
-            threaded=False,
+            threaded=True,
             request_handler=BoundedRequestHandler,
         )
+        self.server.request_queue_size = 128
         self.server.timeout = 0.5
         self.thread = threading.Thread(
             target=self.serve,
@@ -3966,11 +4226,52 @@ class AlpacaPositionMonitor:
             await asyncio.sleep(max(1.0, (target - now).total_seconds()))
 
 
+def _fmt_log_price(val):
+    if val is None or isinstance(val, bool):
+        return "n/a"
+    try:
+        f = float(val)
+        return f"{f:.2f}" if math.isfinite(f) and f > 0 else "n/a"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _compute_order_total(unit_price, qty, is_option=True):
+    if unit_price is None or qty is None or isinstance(unit_price, bool) or isinstance(qty, bool):
+        return None
+    try:
+        p = float(unit_price)
+        q = float(qty)
+        if not (math.isfinite(p) and math.isfinite(q)) or p <= 0 or q <= 0:
+            return None
+        mult = 100.0 if is_option else 1.0
+        return round(p * q * mult, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_log_total(val):
+    if val is None or isinstance(val, bool):
+        return "n/a"
+    try:
+        f = float(val)
+        return f"${f:.2f}" if math.isfinite(f) and f >= 0 else "n/a"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 class AlpacaOptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
 
-    def __init__(self, keys, coordinator, client=None, option_chain_client=None):
+    def __init__(
+        self,
+        keys,
+        coordinator,
+        client=None,
+        option_chain_client=None,
+        option_data_client=None,
+    ):
         self.provider = "OPTION_BUYER"
         self.credentials = dict(keys or {})
         self.coordinator = coordinator
@@ -3983,6 +4284,7 @@ class AlpacaOptionBuyer:
         else:
             data_client = build_option_chain_client(self.credentials)
             self.option_chain_client = data_client if data_client is not None else self.client
+        self.option_data_client = option_data_client
         self.last_status = "uninitialized"
         self.mode = "dry_run" if OPTION_BUY_DRY_RUN else ("paper" if ALPACA_PAPER else "live")
         self.last_eval_minute_utc = None
@@ -4066,6 +4368,123 @@ class AlpacaOptionBuyer:
                         pass
                 return sym, limit_price, cls._infer_occ_right(sym)
         return None, None, None
+
+    @staticmethod
+    def _first_pos_float(obj, keys):
+        if obj is None:
+            return None
+        for key in keys:
+            raw = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                f = float(raw)
+                if math.isfinite(f) and f > 0:
+                    return round(f, 4)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _extract_contract_quote(
+        cls, contract, clean_payload=None, contract_symbol=None, desired_right=None
+    ):
+        """Extract best-effort (bid, ask) from contract or option-chain payload."""
+        bid_keys = ("bid_price", "bid", "bp")
+        ask_keys = ("ask_price", "ask", "ap")
+        target_sym = str(contract_symbol or "").strip().upper()
+        right_key = str(desired_right or "").strip().lower()
+
+        bid = None
+        ask = None
+
+        def _scan_item(item):
+            nonlocal bid, ask
+            if item is None:
+                return
+            if isinstance(item, dict) and right_key and isinstance(item.get(right_key), (dict, object)):
+                nested = item.get(right_key)
+                if nested is not None and not isinstance(nested, (str, int, float, bool)):
+                    _scan_item(nested)
+            b = cls._first_pos_float(item, bid_keys)
+            a = cls._first_pos_float(item, ask_keys)
+            if bid is None and b is not None:
+                bid = b
+            if ask is None and a is not None:
+                ask = a
+            if isinstance(item, dict) and isinstance(item.get("latest_quote"), (dict, object)):
+                lq = item.get("latest_quote")
+                if lq is not None and not isinstance(lq, (str, int, float, bool)):
+                    _scan_item(lq)
+            elif hasattr(item, "latest_quote") and getattr(item, "latest_quote", None) is not None:
+                _scan_item(getattr(item, "latest_quote"))
+
+        _scan_item(contract)
+
+        def _walk_payload(node):
+            nonlocal bid, ask
+            if (bid is not None and ask is not None) or node is None:
+                return
+            if isinstance(node, list):
+                for el in node:
+                    _walk_payload(el)
+                    if bid is not None and ask is not None:
+                        return
+            elif isinstance(node, dict):
+                node_sym = ""
+                for sk in ("symbol", "contract_symbol", "option_symbol", "contract"):
+                    sv = node.get(sk)
+                    if isinstance(sv, str) and sv.strip():
+                        node_sym = sv.strip().upper()
+                        break
+                if not target_sym or node_sym == target_sym:
+                    _scan_item(node)
+                for val in node.values():
+                    if isinstance(val, (dict, list)):
+                        _walk_payload(val)
+                        if bid is not None and ask is not None:
+                            return
+
+        if (bid is None or ask is None) and clean_payload is not None:
+            _walk_payload(clean_payload)
+
+        return bid, ask
+
+    def _fetch_option_quote(self, contract_symbol):
+        """Fetch live (bid, ask) for an OCC option contract via Alpaca OptionHistoricalDataClient."""
+        key = self.credentials.get("alpaca_key")
+        secret = self.credentials.get("alpaca_secret")
+        try:
+            if self.option_data_client is None:
+                if not key or not secret:
+                    return None, None
+                try:
+                    from alpaca.data.historical.option import OptionHistoricalDataClient
+                except ImportError:
+                    from alpaca.data.historical import OptionHistoricalDataClient
+                self.option_data_client = OptionHistoricalDataClient(key, secret)
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            quotes = self.option_data_client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "OPTION_BUY_QUOTE_FAILED contract=%s error_type=%s detail=%s",
+                contract_symbol,
+                type(exc).__name__,
+                exc,
+            )
+            return None, None
+
+        quote = quotes.get(contract_symbol) if isinstance(quotes, dict) else None
+        if quote is None and isinstance(quotes, dict) and quotes:
+            quote = next(iter(quotes.values()), None)
+        if quote is None:
+            return None, None
+        bid = self._first_pos_float(quote, ("bid_price", "bid"))
+        ask = self._first_pos_float(quote, ("ask_price", "ask"))
+        return bid, ask
 
     @staticmethod
     def _evaluate_kinematics(entry):
@@ -4401,6 +4820,41 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
+            contract_bid, contract_ask = self._extract_contract_quote(
+                contract,
+                clean_payload,
+                contract_symbol=contract_symbol,
+                desired_right=desired_right,
+            )
+            if contract_bid is None or contract_ask is None:
+                live_bid, live_ask = await asyncio.to_thread(
+                    self._fetch_option_quote, contract_symbol
+                )
+                if contract_bid is None:
+                    contract_bid = live_bid
+                if contract_ask is None:
+                    contract_ask = live_ask
+
+            if (
+                OPTION_BUY_ORDER_TYPE == "limit"
+                and (limit_price is None or limit_price <= 0)
+                and contract_ask is not None
+            ):
+                limit_price = round(contract_ask, 2)
+
+            est_unit_price = (
+                limit_price
+                if (OPTION_BUY_ORDER_TYPE == "limit" and limit_price is not None and limit_price > 0)
+                else (
+                    contract_ask
+                    if contract_ask is not None
+                    else (contract_bid if contract_bid is not None else limit_price)
+                )
+            )
+            total_purchase = _compute_order_total(
+                est_unit_price, OPTION_BUY_QTY, is_option=True
+            )
+
             if OPTION_BUY_DRY_RUN:
                 self.dry_run_orders += 1
                 self.last_buy_by_symbol[symbol] = now
@@ -4409,12 +4863,18 @@ class AlpacaOptionBuyer:
                 self.last_order_symbol = symbol
                 self.last_order_reason = reason
                 self.logger.info(
-                    "OPTION_BUY_DRY_RUN provider=%s symbol=%s contract=%s qty=%d right=%s "
-                    "contract_source=%s trigger=%s p_hat=%s rsi=%s",
+                    "OPTION_BUY_DRY_RUN provider=%s symbol=%s contract=%s qty=%d "
+                    "order_type=%s bid=%s ask=%s limit_price=%s total_purchase=%s "
+                    "right=%s contract_source=%s trigger=%s p_hat=%s rsi=%s",
                     provider,
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
+                    OPTION_BUY_ORDER_TYPE,
+                    _fmt_log_price(contract_bid),
+                    _fmt_log_price(contract_ask),
+                    _fmt_log_price(limit_price) if OPTION_BUY_ORDER_TYPE == "limit" else "n/a",
+                    _fmt_log_total(total_purchase),
                     inferred_right or desired_right,
                     contract_source,
                     reason,
@@ -4422,10 +4882,15 @@ class AlpacaOptionBuyer:
                     entry.get("rsi"),
                 )
                 logging.info(
-                    "OPTION_BUY_DRY_RUN symbol=%s contract=%s qty=%d trigger=%s",
+                    "OPTION_BUY_DRY_RUN symbol=%s contract=%s qty=%d order_type=%s "
+                    "bid=%s ask=%s total_purchase=%s trigger=%s",
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
+                    OPTION_BUY_ORDER_TYPE,
+                    _fmt_log_price(contract_bid),
+                    _fmt_log_price(contract_ask),
+                    _fmt_log_total(total_purchase),
                     reason,
                 )
                 continue
@@ -4439,6 +4904,11 @@ class AlpacaOptionBuyer:
                 )
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
+                filled_avg = self._first_pos_float(order, ("filled_avg_price",))
+                actual_unit_price = filled_avg if filled_avg is not None else est_unit_price
+                actual_total_purchase = _compute_order_total(
+                    actual_unit_price, OPTION_BUY_QTY, is_option=True
+                )
                 exec_at = datetime.now(UTC)
                 raw_submitted = getattr(order, "submitted_at", None) or getattr(
                     order, "created_at", None
@@ -4477,13 +4947,19 @@ class AlpacaOptionBuyer:
                 )
                 self.logger.info(
                     "OPTION_BUY_SUBMITTED order_id=%s status=%s provider=%s symbol=%s "
-                    "contract=%s qty=%d right=%s contract_source=%s trigger=%s p_hat=%s rsi=%s",
+                    "contract=%s qty=%d order_type=%s bid=%s ask=%s limit_price=%s "
+                    "total_purchase=%s right=%s contract_source=%s trigger=%s p_hat=%s rsi=%s",
                     order_id,
                     order_status,
                     provider,
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
+                    OPTION_BUY_ORDER_TYPE,
+                    _fmt_log_price(contract_bid),
+                    _fmt_log_price(contract_ask),
+                    _fmt_log_price(limit_price) if OPTION_BUY_ORDER_TYPE == "limit" else "n/a",
+                    _fmt_log_total(actual_total_purchase),
                     inferred_right or desired_right,
                     contract_source,
                     reason,
@@ -4491,11 +4967,16 @@ class AlpacaOptionBuyer:
                     entry.get("rsi"),
                 )
                 logging.info(
-                    "OPTION_BUY_SUBMITTED order_id=%s symbol=%s contract=%s qty=%d trigger=%s",
+                    "OPTION_BUY_SUBMITTED order_id=%s symbol=%s contract=%s qty=%d "
+                    "order_type=%s bid=%s ask=%s total_purchase=%s trigger=%s",
                     order_id,
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
+                    OPTION_BUY_ORDER_TYPE,
+                    _fmt_log_price(contract_bid),
+                    _fmt_log_price(contract_ask),
+                    _fmt_log_total(actual_total_purchase),
                     reason,
                 )
             except Exception as exc:
@@ -4924,15 +5405,15 @@ class AlpacaOptionSeller:
                 best_ts = ts
         return best_provider, best_entry
 
-    def _fetch_live_bid(self, pos_sym, is_option):
-        """Fetch the latest live bid price for an option contract or equity symbol."""
+    def _fetch_live_quote(self, pos_sym, is_option):
+        """Fetch latest live (bid, ask) prices for an option contract or equity symbol."""
         key = self.credentials.get("alpaca_key")
         secret = self.credentials.get("alpaca_secret")
         try:
             if is_option:
                 if self.option_data_client is None:
                     if not key or not secret:
-                        return None
+                        return None, None
                     try:
                         from alpaca.data.historical.option import OptionHistoricalDataClient
                     except ImportError:
@@ -4946,7 +5427,7 @@ class AlpacaOptionSeller:
             else:
                 if self.stock_data_client is None:
                     if not key or not secret:
-                        return None
+                        return None, None
                     from alpaca.data.historical import StockHistoricalDataClient
 
                     self.stock_data_client = StockHistoricalDataClient(key, secret)
@@ -4963,30 +5444,44 @@ class AlpacaOptionSeller:
                 type(exc).__name__,
                 exc,
             )
-            return None
+            return None, None
 
         quote = quotes.get(pos_sym) if isinstance(quotes, dict) else None
         if quote is None and isinstance(quotes, dict) and quotes:
             quote = next(iter(quotes.values()), None)
-        bid = AlpacaPositionMonitor._num(quote, "bid_price", None) if quote is not None else None
-        if bid is None and quote is not None:
+        if quote is None:
+            return None, None
+        bid = AlpacaPositionMonitor._num(quote, "bid_price", None)
+        if bid is None:
             bid = AlpacaPositionMonitor._num(quote, "bid", None)
-        return bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
+        ask = AlpacaPositionMonitor._num(quote, "ask_price", None)
+        if ask is None:
+            ask = AlpacaPositionMonitor._num(quote, "ask", None)
+        valid_bid = bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
+        valid_ask = ask if (ask is not None and math.isfinite(ask) and ask > 0) else None
+        return valid_bid, valid_ask
+
+    def _fetch_live_bid(self, pos_sym, is_option):
+        """Fetch the latest live bid price for an option contract or equity symbol."""
+        bid, _ = self._fetch_live_quote(pos_sym, is_option)
+        return bid
 
     async def _resolve_sell_order_params(self, pos_sym, cur_price, is_option, trigger_kind):
-        """Compute (order_type, live_bid, limit_price) with marketable discount below
-        min(live_bid, current_price), and deeper discount / optional market override
+        """Compute (order_type, live_bid, live_ask, limit_price) with marketable discount
+        below min(live_bid, current_price), and deeper discount / optional market override
         for stop-loss exits."""
+        live_bid, live_ask = await asyncio.to_thread(
+            self._fetch_live_quote, pos_sym, is_option
+        )
         if OPTION_SELL_ORDER_TYPE != "limit":
-            return "market", None, None
+            return "market", live_bid, live_ask, None
         if trigger_kind == "stop_loss" and OPTION_SELL_STOP_LOSS_FORCE_MARKET:
-            return "market", None, None
+            return "market", live_bid, live_ask, None
 
-        live_bid = await asyncio.to_thread(self._fetch_live_bid, pos_sym, is_option)
         cur_val = cur_price if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0) else None
         candidates = [p for p in (live_bid, cur_val) if p is not None]
         if not candidates:
-            return "market", live_bid, None
+            return "market", live_bid, live_ask, None
 
         ref_price = min(candidates)
         discount_pct = (
@@ -4998,7 +5493,7 @@ class AlpacaOptionSeller:
         limit_price = round(max(0.01, discounted), 2)
         if discount_pct > 0 and limit_price >= round(ref_price, 2) and ref_price > 0.01:
             limit_price = round(max(0.01, ref_price - 0.01), 2)
-        return "limit", live_bid, limit_price
+        return "limit", live_bid, live_ask, limit_price
 
     def _submit_sell_order(self, contract_or_symbol, qty, limit_price=None, order_type=None):
         """Place a SELL order on Alpaca TradingClient (blocking)."""
@@ -5266,8 +5761,24 @@ class AlpacaOptionSeller:
                 order_qty = round(target_qty, 6)
 
             cur_price = AlpacaPositionMonitor._num(pos, "current_price", 0.0)
-            eff_order_type, live_bid, limit_price = await self._resolve_sell_order_params(
+            eff_order_type, live_bid, live_ask, limit_price = await self._resolve_sell_order_params(
                 pos_sym, cur_price, is_option, trigger_kind
+            )
+            est_sell_unit = (
+                limit_price
+                if (eff_order_type == "limit" and limit_price is not None and limit_price > 0)
+                else (
+                    live_bid
+                    if live_bid is not None
+                    else (
+                        cur_price
+                        if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0)
+                        else live_ask
+                    )
+                )
+            )
+            est_total_sale = _compute_order_total(
+                est_sell_unit, order_qty, is_option=is_option
             )
 
             if OPTION_SELL_DRY_RUN:
@@ -5286,12 +5797,15 @@ class AlpacaOptionSeller:
                 self.last_order_symbol = underlying
                 self.last_order_reason = reason
                 self.logger.info(
-                    "OPTION_SELL_DRY_RUN kind=%s order_type=%s live_bid=%s limit_price=%s "
-                    "provider=%s underlying=%s symbol=%s is_option=%s qty=%s trigger=%s p_hat=%s rsi=%s",
+                    "OPTION_SELL_DRY_RUN kind=%s order_type=%s bid=%s ask=%s "
+                    "limit_price=%s total_sale=%s provider=%s underlying=%s symbol=%s "
+                    "is_option=%s qty=%s trigger=%s p_hat=%s rsi=%s",
                     trigger_kind,
                     eff_order_type,
-                    live_bid,
-                    limit_price,
+                    _fmt_log_price(live_bid),
+                    _fmt_log_price(live_ask),
+                    _fmt_log_price(limit_price),
+                    _fmt_log_total(est_total_sale),
                     provider,
                     underlying,
                     pos_sym,
@@ -5302,11 +5816,14 @@ class AlpacaOptionSeller:
                     entry.get("rsi") if entry else None,
                 )
                 logging.info(
-                    "OPTION_SELL_DRY_RUN kind=%s order_type=%s limit_price=%s "
-                    "underlying=%s symbol=%s qty=%s trigger=%s",
+                    "OPTION_SELL_DRY_RUN kind=%s order_type=%s bid=%s ask=%s "
+                    "limit_price=%s total_sale=%s underlying=%s symbol=%s qty=%s trigger=%s",
                     trigger_kind,
                     eff_order_type,
-                    limit_price,
+                    _fmt_log_price(live_bid),
+                    _fmt_log_price(live_ask),
+                    _fmt_log_price(limit_price),
+                    _fmt_log_total(est_total_sale),
                     underlying,
                     pos_sym,
                     order_qty,
@@ -5324,6 +5841,15 @@ class AlpacaOptionSeller:
                 )
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
+                filled_avg = AlpacaPositionMonitor._num(order, "filled_avg_price", None)
+                actual_sell_unit = (
+                    filled_avg
+                    if (filled_avg is not None and math.isfinite(filled_avg) and filled_avg > 0)
+                    else est_sell_unit
+                )
+                actual_total_sale = _compute_order_total(
+                    actual_sell_unit, order_qty, is_option=is_option
+                )
                 exec_at = datetime.now(UTC)
                 raw_submitted = getattr(order, "submitted_at", None) or getattr(
                     order, "created_at", None
@@ -5366,13 +5892,15 @@ class AlpacaOptionSeller:
                     dry_run=False,
                 )
                 self.logger.info(
-                    "OPTION_SELL_SUBMITTED kind=%s order_type=%s live_bid=%s limit_price=%s "
-                    "order_id=%s status=%s provider=%s underlying=%s symbol=%s is_option=%s "
-                    "qty=%s trigger=%s p_hat=%s rsi=%s",
+                    "OPTION_SELL_SUBMITTED kind=%s order_type=%s bid=%s ask=%s "
+                    "limit_price=%s total_sale=%s order_id=%s status=%s provider=%s "
+                    "underlying=%s symbol=%s is_option=%s qty=%s trigger=%s p_hat=%s rsi=%s",
                     trigger_kind,
                     eff_order_type,
-                    live_bid,
-                    limit_price,
+                    _fmt_log_price(live_bid),
+                    _fmt_log_price(live_ask),
+                    _fmt_log_price(limit_price),
+                    _fmt_log_total(actual_total_sale),
                     order_id,
                     order_status,
                     provider,
@@ -5385,11 +5913,15 @@ class AlpacaOptionSeller:
                     entry.get("rsi") if entry else None,
                 )
                 logging.info(
-                    "OPTION_SELL_SUBMITTED kind=%s order_type=%s limit_price=%s order_id=%s "
-                    "underlying=%s symbol=%s qty=%s trigger=%s",
+                    "OPTION_SELL_SUBMITTED kind=%s order_type=%s bid=%s ask=%s "
+                    "limit_price=%s total_sale=%s order_id=%s underlying=%s symbol=%s "
+                    "qty=%s trigger=%s",
                     trigger_kind,
                     eff_order_type,
-                    limit_price,
+                    _fmt_log_price(live_bid),
+                    _fmt_log_price(live_ask),
+                    _fmt_log_price(limit_price),
+                    _fmt_log_total(actual_total_sale),
                     order_id,
                     underlying,
                     pos_sym,
@@ -5491,6 +6023,1968 @@ class AlpacaOptionSeller:
                     exc,
                 )
                 await asyncio.sleep(2.0)
+
+
+def _median_or_none(vals):
+    if not vals:
+        return None
+    s = sorted(vals)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 != 0 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _build_provider_entry_from_state(provider, symbol, cur, feed_status="LIVE"):
+    regime = cur.get("regime")
+    if not regime or regime == "neutral":
+        regime = classify_kinematic_regime(
+            cur.get("rsi_velocity"),
+            cur.get("rsi_acceleration"),
+            cur.get("price_velocity"),
+            cur.get("price_acceleration"),
+        )
+    return {
+        "provider": provider,
+        "symbol": symbol,
+        "close": cur.get("close"),
+        "smoothed_close": cur.get("smoothed_close"),
+        "rsi": cur.get("rsi"),
+        "price_velocity": cur.get("price_velocity"),
+        "price_velocity_pct": cur.get("price_velocity_pct"),
+        "price_acceleration": cur.get("price_acceleration"),
+        "smoothed_velocity": cur.get("smoothed_velocity"),
+        "smoothed_acceleration": cur.get("smoothed_acceleration"),
+        "rsi_velocity": cur.get("rsi_velocity"),
+        "rsi_acceleration": cur.get("rsi_acceleration"),
+        "momentum_3m_pct": cur.get("momentum_3m_pct"),
+        "projected_price_next": cur.get("projected_price_next"),
+        "projected_delta": cur.get("projected_delta"),
+        "projected_delta_pct": cur.get("projected_delta_pct"),
+        "rsi_zone": cur.get("rsi_zone"),
+        "forecast_direction": cur.get("forecast_direction"),
+        "trading_action": cur.get("trading_action"),
+        "crossover_signal": cur.get("crossover_signal"),
+        "ema_slope": cur.get("ema_slope"),
+        "regime": regime,
+        "timestamp": cur.get("timestamp"),
+        "feed_status": feed_status,
+    }
+
+
+def _preview_pending_candidate_point(provider, hist, p_minute, cand):
+    """Build a non-mutating live preview bar state from a pending MinuteCandidate."""
+    curr_close = cand.close
+    if provider == "TRADINGVIEW":
+        curr_rsi = cand.reported_rsi
+    else:
+        curr_rsi = hist[-1].get("rsi") if hist else None
+
+    price_velocity = None
+    price_velocity_pct = None
+    price_acceleration = None
+    rsi_velocity = None
+    rsi_acceleration = None
+    momentum_3m_pct = None
+
+    if curr_close is not None:
+        prev_entry = next(
+            (e for e in reversed(hist) if e.get("close") is not None), None
+        )
+        if prev_entry is not None:
+            prev_close = prev_entry["close"]
+            price_velocity = round(curr_close - prev_close, 4)
+            if prev_close > 0:
+                price_velocity_pct = round(
+                    ((curr_close - prev_close) / prev_close) * 100.0, 4
+                )
+            if prev_entry.get("price_velocity") is not None:
+                price_acceleration = round(
+                    price_velocity - prev_entry["price_velocity"], 4
+                )
+        valid_closes = [e for e in hist if e.get("close") is not None]
+        if len(valid_closes) >= 3:
+            c3m = valid_closes[-3]["close"]
+            if c3m > 0:
+                momentum_3m_pct = round(((curr_close - c3m) / c3m) * 100.0, 4)
+
+    if curr_rsi is not None:
+        prev_rsi_entry = next(
+            (e for e in reversed(hist) if e.get("rsi") is not None), None
+        )
+        if prev_rsi_entry is not None:
+            rsi_velocity = round(curr_rsi - prev_rsi_entry["rsi"], 4)
+            if prev_rsi_entry.get("rsi_velocity") is not None:
+                rsi_acceleration = round(
+                    rsi_velocity - prev_rsi_entry["rsi_velocity"], 4
+                )
+
+    smoothed_close = None
+    smoothed_velocity = None
+    smoothed_acceleration = None
+    if curr_close is not None:
+        close_series = [e["close"] for e in hist if e.get("close") is not None] + [
+            curr_close
+        ]
+        smoothed_vals = compute_smoothed_series(close_series)
+        if smoothed_vals:
+            smoothed_close = round(smoothed_vals[-1], 4)
+            if len(smoothed_vals) >= 2:
+                smoothed_velocity = round(smoothed_vals[-1] - smoothed_vals[-2], 4)
+            if len(smoothed_vals) >= 3:
+                prev_smoothed_vel = smoothed_vals[-2] - smoothed_vals[-3]
+                smoothed_acceleration = round(smoothed_velocity - prev_smoothed_vel, 4)
+
+    prev_vel_for_cross = None
+    prev_acc_for_cross = None
+    if hist:
+        prev_hist = next(
+            (
+                e
+                for e in reversed(hist)
+                if e.get("smoothed_velocity") is not None
+                or e.get("price_velocity") is not None
+            ),
+            None,
+        )
+        if prev_hist is not None:
+            prev_vel_for_cross = (
+                prev_hist.get("smoothed_velocity")
+                if prev_hist.get("smoothed_velocity") is not None
+                else prev_hist.get("price_velocity")
+            )
+            prev_acc_for_cross = (
+                prev_hist.get("smoothed_acceleration")
+                if prev_hist.get("smoothed_acceleration") is not None
+                else prev_hist.get("price_acceleration")
+            )
+
+    active_pv = smoothed_velocity if smoothed_velocity is not None else price_velocity
+    active_pa = (
+        smoothed_acceleration if smoothed_acceleration is not None else price_acceleration
+    )
+    forecast = compute_kinematic_forecast(
+        curr_close,
+        active_pv,
+        active_pa,
+        curr_rsi,
+        prev_velocity=prev_vel_for_cross,
+        prev_acceleration=prev_acc_for_cross,
+    )
+    regime = classify_kinematic_regime(
+        rsi_velocity,
+        rsi_acceleration,
+        active_pv,
+        active_pa,
+    )
+    return {
+        "minute": p_minute,
+        "timestamp": (
+            p_minute.isoformat()
+            if hasattr(p_minute, "isoformat")
+            else str(p_minute)
+        ),
+        "close": curr_close,
+        "smoothed_close": smoothed_close,
+        "rsi": curr_rsi,
+        "price_velocity": price_velocity,
+        "price_velocity_pct": price_velocity_pct,
+        "price_acceleration": price_acceleration,
+        "smoothed_velocity": smoothed_velocity,
+        "smoothed_acceleration": smoothed_acceleration,
+        "rsi_velocity": rsi_velocity,
+        "rsi_acceleration": rsi_acceleration,
+        "momentum_3m_pct": momentum_3m_pct,
+        "projected_price_next": forecast["projected_price_next"],
+        "projected_delta": forecast["projected_delta"],
+        "projected_delta_pct": forecast["projected_delta_pct"],
+        "rsi_zone": forecast["rsi_zone"],
+        "forecast_direction": forecast["forecast_direction"],
+        "trading_action": forecast["trading_action"],
+        "crossover_signal": forecast["crossover_signal"],
+        "regime": regime,
+    }
+
+
+def _hist_minute_utc(hist_entry):
+    if not hist_entry:
+        return None
+    m = hist_entry.get("minute")
+    if isinstance(m, datetime):
+        return as_utc(m)
+    raw = hist_entry.get("timestamp")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return minute_utc(as_utc(datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))))
+        except Exception:
+            return None
+    return None
+
+
+def build_kinematics_snapshot_data(coordinator, history_limit=20):
+    """Build unified per-symbol and per-provider kinematics snapshot for both UI and PNG capture."""
+    latest = {}
+    records_flat = []
+    symbols_map = {}
+    hist_cap = max(2, int(history_limit or 20))
+    configured_providers = list(getattr(coordinator, "providers", ()) or ())
+    connected_map = getattr(coordinator, "connected", {}) or {}
+
+    # Index latest closed/pending candidate per (provider, symbol) so newly received
+    # TradingView webhooks appear immediately instead of waiting up to +45s finalization.
+    latest_pending = {}
+    for (p_prov, p_sym, p_min), p_cand in list(getattr(coordinator, "pending", {}).items()):
+        existing = latest_pending.get((p_prov, p_sym))
+        if existing is None or p_min > existing[0]:
+            latest_pending[(p_prov, p_sym)] = (p_min, p_cand)
+
+    tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {}) if "PROVIDER_REGISTRY" in globals() else {}
+    tv_router = tv_entry.get("router") if isinstance(tv_entry, dict) else None
+    tv_latest_map = getattr(tv_router, "latest", {}) if tv_router is not None else {}
+
+    all_stream_keys = list(
+        dict.fromkeys(
+            list(coordinator.kinematics_history.keys()) + list(latest_pending.keys())
+        )
+    )
+
+    for (provider, symbol) in all_stream_keys:
+        hist = list(coordinator.kinematics_history.get((provider, symbol), []) or [])
+        pending_pair = latest_pending.get((provider, symbol))
+        feed_status = "LIVE"
+        eff_hist = hist
+
+        if pending_pair is not None:
+            p_min, p_cand = pending_pair
+            last_hist_min = _hist_minute_utc(hist[-1]) if hist else None
+            is_newer = last_hist_min is None or p_min > last_hist_min
+            should_preview = p_cand.kind != "tick" or not hist
+            if is_newer and should_preview:
+                preview_cur = _preview_pending_candidate_point(provider, hist, p_min, p_cand)
+                eff_hist = hist + [preview_cur]
+                feed_status = "PENDING"
+
+        if not eff_hist:
+            continue
+
+        cur = eff_hist[-1]
+        entry = _build_provider_entry_from_state(
+            provider, symbol, cur, feed_status=feed_status
+        )
+        regime = entry["regime"]
+        latest.setdefault(provider, {})[symbol] = entry
+        records_flat.append(entry)
+
+        sym_group = symbols_map.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "providers": [],
+                "entries": [],
+                "closes": [],
+                "smoothed_closes": [],
+                "rsis": [],
+                "price_velocities": [],
+                "price_velocity_pcts": [],
+                "price_accelerations": [],
+                "smoothed_velocities": [],
+                "smoothed_accelerations": [],
+                "rsi_velocities": [],
+                "rsi_accelerations": [],
+                "momentums": [],
+                "regimes": [],
+                "best_history": [],
+                "latest_timestamps": [],
+            },
+        )
+        sym_group["providers"].append(provider)
+        sym_group["entries"].append(entry)
+        if entry["timestamp"]:
+            sym_group["latest_timestamps"].append(str(entry["timestamp"]))
+        if len(eff_hist) > len(sym_group["best_history"]):
+            sym_group["best_history"] = [
+                {
+                    "timestamp": h.get("timestamp"),
+                    "close": h.get("close"),
+                    "smoothed_close": h.get("smoothed_close"),
+                    "price_velocity": h.get("price_velocity"),
+                    "price_acceleration": h.get("price_acceleration"),
+                    "smoothed_velocity": h.get("smoothed_velocity"),
+                    "smoothed_acceleration": h.get("smoothed_acceleration"),
+                    "rsi": h.get("rsi"),
+                    "crossover_signal": h.get("crossover_signal"),
+                }
+                for h in eff_hist[-hist_cap:]
+            ]
+        if entry["close"] is not None:
+            sym_group["closes"].append(entry["close"])
+        if entry["smoothed_close"] is not None:
+            sym_group["smoothed_closes"].append(entry["smoothed_close"])
+        if entry["rsi"] is not None:
+            sym_group["rsis"].append(entry["rsi"])
+        if entry["price_velocity"] is not None:
+            sym_group["price_velocities"].append(entry["price_velocity"])
+        if entry["price_velocity_pct"] is not None:
+            sym_group["price_velocity_pcts"].append(entry["price_velocity_pct"])
+        if entry["price_acceleration"] is not None:
+            sym_group["price_accelerations"].append(entry["price_acceleration"])
+        if entry["smoothed_velocity"] is not None:
+            sym_group["smoothed_velocities"].append(entry["smoothed_velocity"])
+        if entry["smoothed_acceleration"] is not None:
+            sym_group["smoothed_accelerations"].append(entry["smoothed_acceleration"])
+        if entry["rsi_velocity"] is not None:
+            sym_group["rsi_velocities"].append(entry["rsi_velocity"])
+        if entry["rsi_acceleration"] is not None:
+            sym_group["rsi_accelerations"].append(entry["rsi_acceleration"])
+        if entry["momentum_3m_pct"] is not None:
+            sym_group["momentums"].append(entry["momentum_3m_pct"])
+        sym_group["regimes"].append(regime)
+
+    consolidated_symbols = []
+    regime_counts = {
+        "accelerating_bullish": 0,
+        "decelerating_bullish": 0,
+        "accelerating_bearish": 0,
+        "decelerating_bearish": 0,
+        "neutral": 0,
+    }
+
+    tv_stats = (
+        tv_router.get_stats()
+        if tv_router is not None and hasattr(tv_router, "get_stats")
+        else {}
+    )
+    tv_reporting_symbols = sorted(list(latest.get("TRADINGVIEW", {}).keys()))
+    tv_reporting_count = len(tv_reporting_symbols)
+    tv_configured_count = len(coordinator.symbols)
+
+    for sym, g in sorted(symbols_map.items()):
+        c_close = _median_or_none(g["closes"])
+        c_smooth = _median_or_none(g["smoothed_closes"])
+        c_rsi = _median_or_none(g["rsis"])
+        c_pv = _median_or_none(g["price_velocities"])
+        c_pv_pct = _median_or_none(g["price_velocity_pcts"])
+        c_pa = _median_or_none(g["price_accelerations"])
+        c_sv = _median_or_none(g["smoothed_velocities"])
+        c_sa = _median_or_none(g["smoothed_accelerations"])
+        c_rv = _median_or_none(g["rsi_velocities"])
+        c_ra = _median_or_none(g["rsi_accelerations"])
+        c_mom = _median_or_none(g["momentums"])
+
+        active_pv = c_sv if c_sv is not None else c_pv
+        active_pa = c_sa if c_sa is not None else c_pa
+        c_forecast = compute_kinematic_forecast(c_close, active_pv, active_pa, c_rsi)
+        c_regime = classify_kinematic_regime(c_rv, c_ra, active_pv, active_pa)
+        if c_regime in regime_counts:
+            regime_counts[c_regime] += 1
+
+        # Include configured providers with no bar yet for this symbol so the
+        # Provider Feed comparison table explicitly displays AWAITING_WEBHOOK /
+        # LATE / OFFLINE / NO_DATA instead of silently hiding the provider.
+        reporting_set = set(g["providers"])
+        all_provider_entries = list(g["entries"])
+        for prov in configured_providers:
+            if prov in reporting_set:
+                continue
+            is_conn = bool(connected_map.get(prov, False))
+            tv_latest = tv_latest_map.get(sym) if prov == "TRADINGVIEW" else None
+            if prov == "TRADINGVIEW" and isinstance(tv_latest, dict) and tv_latest.get("accepted_for_summary") is False:
+                placeholder_status = "LATE"
+                placeholder_action = "Webhook Arrived Past Deadline"
+                p_close = tv_latest.get("price")
+                p_rsi = tv_latest.get("rsi_value")
+                p_ts = tv_latest.get("event_time")
+            else:
+                if not is_conn:
+                    placeholder_status = "OFFLINE"
+                    placeholder_action = "Provider Disconnected"
+                elif prov == "TRADINGVIEW":
+                    placeholder_status = "AWAITING_WEBHOOK"
+                    if tv_reporting_count > 0:
+                        placeholder_action = (
+                            f"Not Sent by TV ({tv_reporting_count}/{tv_configured_count} active)"
+                        )
+                    elif tv_stats.get("last_skipped_symbols"):
+                        placeholder_action = (
+                            "TV Ticker Unconfigured ("
+                            + ",".join(tv_stats["last_skipped_symbols"][:3])
+                            + ")"
+                        )
+                    elif tv_stats.get("last_error"):
+                        placeholder_action = (
+                            f"TV Webhook Error ({str(tv_stats['last_error'])[:26]})"
+                        )
+                    else:
+                        placeholder_action = "No Webhook For Symbol Yet"
+                else:
+                    placeholder_status = "NO_DATA"
+                    placeholder_action = "No Bar Data"
+                p_close = None
+                p_rsi = None
+                p_ts = None
+
+            all_provider_entries.append(
+                {
+                    "provider": prov,
+                    "symbol": sym,
+                    "close": p_close,
+                    "smoothed_close": None,
+                    "rsi": p_rsi,
+                    "price_velocity": None,
+                    "price_velocity_pct": None,
+                    "price_acceleration": None,
+                    "smoothed_velocity": None,
+                    "smoothed_acceleration": None,
+                    "rsi_velocity": None,
+                    "rsi_acceleration": None,
+                    "momentum_3m_pct": None,
+                    "projected_price_next": None,
+                    "projected_delta": None,
+                    "projected_delta_pct": None,
+                    "rsi_zone": "unknown",
+                    "forecast_direction": "neutral",
+                    "trading_action": placeholder_action,
+                    "crossover_signal": "none",
+                    "ema_slope": None,
+                    "regime": "neutral",
+                    "timestamp": p_ts,
+                    "feed_status": placeholder_status,
+                }
+            )
+
+        latest_ts = max(g["latest_timestamps"]) if g["latest_timestamps"] else None
+        consolidated_symbols.append(
+            {
+                "symbol": sym,
+                "providers_count": len(g["providers"]),
+                "configured_providers_count": len(configured_providers),
+                "providers": sorted(g["providers"]),
+                "configured_providers": configured_providers,
+                "latest_bar_timestamp": latest_ts,
+                "close": round(c_close, 2) if c_close is not None else None,
+                "smoothed_close": round(c_smooth, 2) if c_smooth is not None else None,
+                "rsi": round(c_rsi, 2) if c_rsi is not None else None,
+                "price_velocity": round(c_pv, 2) if c_pv is not None else None,
+                "price_velocity_pct": (
+                    round(c_pv_pct, 4) if c_pv_pct is not None else None
+                ),
+                "price_acceleration": round(c_pa, 2) if c_pa is not None else None,
+                "smoothed_velocity": round(c_sv, 2) if c_sv is not None else None,
+                "smoothed_acceleration": round(c_sa, 2) if c_sa is not None else None,
+                "rsi_velocity": round(c_rv, 2) if c_rv is not None else None,
+                "rsi_acceleration": round(c_ra, 2) if c_ra is not None else None,
+                "momentum_3m_pct": round(c_mom, 2) if c_mom is not None else None,
+                "projected_price_next": c_forecast["projected_price_next"],
+                "projected_delta": c_forecast["projected_delta"],
+                "projected_delta_pct": c_forecast["projected_delta_pct"],
+                "rsi_zone": c_forecast["rsi_zone"],
+                "forecast_direction": c_forecast["forecast_direction"],
+                "trading_action": c_forecast["trading_action"],
+                "crossover_signal": c_forecast["crossover_signal"],
+                "regime": c_regime,
+                "history_window": g["best_history"],
+                "buy_events": [
+                    e
+                    for e in coordinator.option_buy_events.get(sym, [])
+                    if not e.get("dry_run")
+                ],
+                "sell_events": [
+                    e
+                    for e in coordinator.option_sell_events.get(sym, [])
+                    if not e.get("dry_run")
+                ],
+                "provider_entries": sorted(
+                    all_provider_entries,
+                    key=lambda item: str(item.get("provider") or ""),
+                ),
+            }
+        )
+
+    provider_coverage = {}
+    for prov in configured_providers:
+        cov = {
+            "reporting_symbols": sorted(list(latest.get(prov, {}).keys())),
+            "reporting_count": len(latest.get(prov, {})),
+            "configured_count": len(coordinator.symbols),
+            "connected": bool(connected_map.get(prov, False)),
+            "late_count": int((getattr(coordinator, "late_counts", {}) or {}).get(prov, 0)),
+        }
+        if prov == "TRADINGVIEW" and tv_stats:
+            cov.update(
+                {
+                    "requests_total": tv_stats.get("requests_total", 0),
+                    "events_queued": tv_stats.get("events_queued", 0),
+                    "rejected_count": tv_stats.get("rejected_count", 0),
+                    "last_webhook_utc": tv_stats.get("last_webhook_utc"),
+                    "last_skipped_symbols": tv_stats.get("last_skipped_symbols", []),
+                    "last_error": tv_stats.get("last_error"),
+                }
+            )
+        provider_coverage[prov] = cov
+    total_late = sum(int(v or 0) for v in (getattr(coordinator, "late_counts", {}) or {}).values())
+
+    return {
+        "total_unique_symbols": len(consolidated_symbols),
+        "total_provider_streams": len(records_flat),
+        "configured_symbols": list(coordinator.symbols),
+        "configured_providers": configured_providers,
+        "provider_coverage": provider_coverage,
+        "total_late_records": total_late,
+        "smooth_config": {
+            "method": KINEMATICS_SMOOTH_METHOD,
+            "period": KINEMATICS_SMOOTH_PERIOD,
+            "overbought": KINEMATICS_RSI_OVERBOUGHT,
+            "oversold": KINEMATICS_RSI_OVERSOLD,
+        },
+        "regime_counts": regime_counts,
+        "latest_by_provider": latest,
+        "consolidated_symbols": consolidated_symbols,
+        "instruments": records_flat,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python Anti-Aliased PNG Renderer & 1-Minute Per-Symbol Chart Capture
+# ---------------------------------------------------------------------------
+
+# Compact crisp 5x7 pixel font covering printable ASCII (32..126).
+_FONT_5X7 = {
+    " ": (0, 0, 0, 0, 0, 0, 0),
+    "!": (4, 4, 4, 4, 4, 0, 4),
+    '"': (10, 10, 10, 0, 0, 0, 0),
+    "#": (10, 10, 31, 10, 31, 10, 10),
+    "$": (4, 15, 20, 14, 5, 30, 4),
+    "%": (24, 25, 2, 4, 8, 19, 3),
+    "&": (12, 18, 20, 8, 21, 18, 13),
+    "'": (4, 4, 8, 0, 0, 0, 0),
+    "(": (2, 4, 8, 8, 8, 4, 2),
+    ")": (8, 4, 2, 2, 2, 4, 8),
+    "*": (0, 4, 21, 14, 21, 4, 0),
+    "+": (0, 4, 4, 31, 4, 4, 0),
+    ",": (0, 0, 0, 0, 4, 4, 8),
+    "-": (0, 0, 0, 31, 0, 0, 0),
+    ".": (0, 0, 0, 0, 0, 12, 12),
+    "/": (1, 2, 2, 4, 8, 8, 16),
+    "0": (14, 17, 19, 21, 25, 17, 14),
+    "1": (4, 12, 4, 4, 4, 4, 14),
+    "2": (14, 17, 1, 2, 4, 8, 31),
+    "3": (31, 2, 4, 2, 1, 17, 14),
+    "4": (2, 6, 10, 18, 31, 2, 2),
+    "5": (31, 16, 30, 1, 1, 17, 14),
+    "6": (6, 8, 16, 30, 17, 17, 14),
+    "7": (31, 1, 2, 4, 8, 8, 8),
+    "8": (14, 17, 17, 14, 17, 17, 14),
+    "9": (14, 17, 17, 15, 1, 2, 12),
+    ":": (0, 12, 12, 0, 12, 12, 0),
+    ";": (0, 12, 12, 0, 12, 4, 8),
+    "<": (2, 4, 8, 16, 8, 4, 2),
+    "=": (0, 0, 31, 0, 31, 0, 0),
+    ">": (8, 4, 2, 1, 2, 4, 8),
+    "?": (14, 17, 1, 2, 4, 0, 4),
+    "@": (14, 17, 23, 21, 23, 16, 14),
+    "A": (14, 17, 17, 31, 17, 17, 17),
+    "B": (30, 17, 17, 30, 17, 17, 30),
+    "C": (14, 17, 16, 16, 16, 17, 14),
+    "D": (28, 18, 17, 17, 17, 18, 28),
+    "E": (31, 16, 16, 30, 16, 16, 31),
+    "F": (31, 16, 16, 30, 16, 16, 16),
+    "G": (14, 17, 16, 23, 17, 17, 15),
+    "H": (17, 17, 17, 31, 17, 17, 17),
+    "I": (14, 4, 4, 4, 4, 4, 14),
+    "J": (7, 2, 2, 2, 2, 18, 12),
+    "K": (17, 18, 20, 24, 20, 18, 17),
+    "L": (16, 16, 16, 16, 16, 16, 31),
+    "M": (17, 27, 21, 21, 17, 17, 17),
+    "N": (17, 25, 21, 19, 17, 17, 17),
+    "O": (14, 17, 17, 17, 17, 17, 14),
+    "P": (30, 17, 17, 30, 16, 16, 16),
+    "Q": (14, 17, 17, 17, 21, 18, 13),
+    "R": (30, 17, 17, 30, 20, 18, 17),
+    "S": (15, 16, 16, 14, 1, 1, 30),
+    "T": (31, 4, 4, 4, 4, 4, 4),
+    "U": (17, 17, 17, 17, 17, 17, 14),
+    "V": (17, 17, 17, 17, 17, 10, 4),
+    "W": (17, 17, 17, 21, 21, 27, 17),
+    "X": (17, 17, 10, 4, 10, 17, 17),
+    "Y": (17, 17, 10, 4, 4, 4, 4),
+    "Z": (31, 1, 2, 4, 8, 16, 31),
+    "[": (14, 8, 8, 8, 8, 8, 14),
+    "\\": (16, 8, 8, 4, 2, 2, 1),
+    "]": (14, 2, 2, 2, 2, 2, 14),
+    "^": (4, 10, 17, 0, 0, 0, 0),
+    "_": (0, 0, 0, 0, 0, 0, 31),
+    "`": (8, 4, 2, 0, 0, 0, 0),
+    "a": (0, 0, 14, 1, 15, 17, 15),
+    "b": (16, 16, 22, 25, 17, 17, 30),
+    "c": (0, 0, 14, 16, 16, 17, 14),
+    "d": (1, 1, 13, 19, 17, 17, 15),
+    "e": (0, 0, 14, 17, 31, 16, 14),
+    "f": (6, 9, 8, 28, 8, 8, 8),
+    "g": (0, 15, 17, 17, 15, 1, 14),
+    "h": (16, 16, 22, 25, 17, 17, 17),
+    "i": (4, 0, 12, 4, 4, 4, 14),
+    "j": (2, 0, 6, 2, 2, 18, 12),
+    "k": (16, 16, 18, 20, 24, 20, 18),
+    "l": (12, 4, 4, 4, 4, 4, 14),
+    "m": (0, 0, 26, 21, 21, 21, 17),
+    "n": (0, 0, 22, 25, 17, 17, 17),
+    "o": (0, 0, 14, 17, 17, 17, 14),
+    "p": (0, 0, 30, 17, 30, 16, 16),
+    "q": (0, 0, 13, 19, 15, 1, 1),
+    "r": (0, 0, 22, 25, 16, 16, 16),
+    "s": (0, 0, 15, 16, 14, 1, 30),
+    "t": (8, 8, 28, 8, 8, 9, 6),
+    "u": (0, 0, 17, 17, 17, 19, 13),
+    "v": (0, 0, 17, 17, 17, 10, 4),
+    "w": (0, 0, 17, 17, 21, 21, 10),
+    "x": (0, 0, 17, 10, 4, 10, 17),
+    "y": (0, 0, 17, 17, 15, 1, 14),
+    "z": (0, 0, 31, 2, 4, 8, 31),
+    "{": (6, 8, 8, 16, 8, 8, 6),
+    "|": (4, 4, 4, 4, 4, 4, 4),
+    "}": (12, 2, 2, 1, 2, 2, 12),
+    "~": (0, 0, 8, 21, 2, 0, 0),
+}
+
+
+def _sanitize_ascii_text(text):
+    if text is None:
+        return ""
+    s = str(text)
+    replacements = {
+        "\u2022": "|",
+        "\u00b7": "|",
+        "\u0394": "Delta",
+        "\u00b2": "^2",
+        "\u2265": ">=",
+        "\u2264": "<=",
+        "\u2191": "^",
+        "\u2197": "/^",
+        "\u2193": "v",
+        "\u2198": "\\v",
+        "\u2605": "*",
+        "\u00bd": "0.5",
+        "\u2014": "-",
+        "\u2013": "-",
+        "\u00a0": " ",
+        "P\u0302": "P^",
+    }
+    for src, dst in replacements.items():
+        s = s.replace(src, dst)
+    return "".join(ch if 32 <= ord(ch) <= 126 else "?" for ch in s)
+
+
+class _PngCanvas:
+    """Self-contained pure-Python RGBA canvas with anti-aliased drawing and PNG encoder."""
+
+    def __init__(self, width, height, bg_rgb=(8, 13, 25)):
+        self.width = int(width)
+        self.height = int(height)
+        r, g, b = bg_rgb
+        self.buf = bytearray(bytes((r, g, b, 255)) * (self.width * self.height))
+
+    def blend_pixel(self, x, y, color, alpha=1.0):
+        if x < 0 or y < 0 or x >= self.width or y >= self.height or alpha <= 0.0:
+            return
+        if len(color) == 4:
+            cr, cg, cb, ca = color
+            a = (ca / 255.0) * alpha
+        else:
+            cr, cg, cb = color
+            a = alpha
+        if a <= 0.0:
+            return
+        idx = (y * self.width + x) * 4
+        if a >= 0.999:
+            self.buf[idx] = cr
+            self.buf[idx + 1] = cg
+            self.buf[idx + 2] = cb
+            self.buf[idx + 3] = 255
+            return
+        inv = 1.0 - a
+        buf = self.buf
+        buf[idx] = int(cr * a + buf[idx] * inv + 0.5)
+        buf[idx + 1] = int(cg * a + buf[idx + 1] * inv + 0.5)
+        buf[idx + 2] = int(cb * a + buf[idx + 2] * inv + 0.5)
+        buf[idx + 3] = 255
+
+    def fill_rect(self, x0, y0, x1, y1, color, alpha=1.0):
+        ix0 = max(0, int(round(min(x0, x1))))
+        iy0 = max(0, int(round(min(y0, y1))))
+        ix1 = min(self.width, int(round(max(x0, x1))))
+        iy1 = min(self.height, int(round(max(y0, y1))))
+        if ix0 >= ix1 or iy0 >= iy1 or alpha <= 0.0:
+            return
+        if len(color) == 4:
+            cr, cg, cb, ca = color
+            a = (ca / 255.0) * alpha
+        else:
+            cr, cg, cb = color
+            a = alpha
+        if a >= 0.999:
+            row_bytes = bytes((cr, cg, cb, 255)) * (ix1 - ix0)
+            stride = self.width * 4
+            buf = self.buf
+            start = iy0 * stride + ix0 * 4
+            end = start + (ix1 - ix0) * 4
+            for _ in range(iy0, iy1):
+                buf[start:end] = row_bytes
+                start += stride
+                end += stride
+            return
+        inv = 1.0 - a
+        buf = self.buf
+        stride = self.width * 4
+        rc = cr * a
+        gc = cg * a
+        bc = cb * a
+        for y in range(iy0, iy1):
+            idx = y * stride + ix0 * 4
+            for _ in range(ix0, ix1):
+                buf[idx] = int(rc + buf[idx] * inv + 0.5)
+                buf[idx + 1] = int(gc + buf[idx + 1] * inv + 0.5)
+                buf[idx + 2] = int(bc + buf[idx + 2] * inv + 0.5)
+                idx += 4
+
+    def draw_rect_border(self, x0, y0, x1, y1, color, thickness=1, alpha=1.0):
+        t = max(1, int(thickness))
+        self.fill_rect(x0, y0, x1, y0 + t, color, alpha=alpha)
+        self.fill_rect(x0, y1 - t, x1, y1, color, alpha=alpha)
+        self.fill_rect(x0, y0, x0 + t, y1, color, alpha=alpha)
+        self.fill_rect(x1 - t, y0, x1, y1, color, alpha=alpha)
+
+    def draw_card(self, x0, y0, x1, y1, fill_rgb, border_rgb):
+        self.fill_rect(x0, y0, x1, y1, fill_rgb)
+        self.draw_rect_border(x0, y0, x1, y1, border_rgb, thickness=1)
+
+    def draw_line(self, x0, y0, x1, y1, color, width=1.6, alpha=1.0):
+        x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+        dx = x1f - x0f
+        dy = y1f - y0f
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= 1e-6:
+            self.draw_circle(x0f, y0f, max(0.8, width * 0.5), color, alpha=alpha)
+            return
+        half_w = max(0.5, float(width) * 0.5)
+        pad = half_w + 1.2
+        min_x = max(0, int(math.floor(min(x0f, x1f) - pad)))
+        max_x = min(self.width - 1, int(math.ceil(max(x0f, x1f) + pad)))
+        min_y = max(0, int(math.floor(min(y0f, y1f) - pad)))
+        max_y = min(self.height - 1, int(math.ceil(max(y0f, y1f) + pad)))
+        inv_len_sq = 1.0 / seg_len_sq
+        for py in range(min_y, max_y + 1):
+            oy = py - y0f
+            for px in range(min_x, max_x + 1):
+                ox = px - x0f
+                t = (ox * dx + oy * dy) * inv_len_sq
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                cx = x0f + t * dx
+                cy = y0f + t * dy
+                dist = math.hypot(px - cx, py - cy)
+                cov = half_w + 0.5 - dist
+                if cov > 0.0:
+                    self.blend_pixel(px, py, color, alpha=alpha * min(1.0, cov))
+
+    def draw_dashed_line(
+        self, x0, y0, x1, y1, color, width=1.2, dash=6.0, gap=4.0, alpha=1.0
+    ):
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        total = math.hypot(dx, dy)
+        if total <= 1e-6:
+            return
+        ux = dx / total
+        uy = dy / total
+        pos = 0.0
+        while pos < total:
+            end = min(total, pos + dash)
+            self.draw_line(
+                x0 + ux * pos,
+                y0 + uy * pos,
+                x0 + ux * end,
+                y0 + uy * end,
+                color,
+                width=width,
+                alpha=alpha,
+            )
+            pos = end + gap
+
+    def draw_polyline(self, pts, color, width=1.8, dashed=False, dash=6.0, gap=4.0, alpha=1.0):
+        if len(pts) < 2:
+            return
+        for idx in range(len(pts) - 1):
+            x0, y0 = pts[idx]
+            x1, y1 = pts[idx + 1]
+            if dashed:
+                self.draw_dashed_line(x0, y0, x1, y1, color, width=width, dash=dash, gap=gap, alpha=alpha)
+            else:
+                self.draw_line(x0, y0, x1, y1, color, width=width, alpha=alpha)
+
+    def draw_circle(self, cx, cy, radius, fill_color, border_color=None, border_width=1.2, alpha=1.0):
+        r = float(radius)
+        bw = float(border_width) if border_color is not None else 0.0
+        outer = r + bw
+        min_x = max(0, int(math.floor(cx - outer - 1)))
+        max_x = min(self.width - 1, int(math.ceil(cx + outer + 1)))
+        min_y = max(0, int(math.floor(cy - outer - 1)))
+        max_y = min(self.height - 1, int(math.ceil(cy + outer + 1)))
+        for py in range(min_y, max_y + 1):
+            dy = py - cy
+            for px in range(min_x, max_x + 1):
+                dist = math.hypot(px - cx, dy)
+                if dist <= r + 0.5:
+                    cov = min(1.0, r + 0.5 - dist)
+                    self.blend_pixel(px, py, fill_color, alpha=alpha * cov)
+                elif border_color is not None and dist <= outer + 0.5:
+                    cov = min(1.0, outer + 0.5 - dist)
+                    self.blend_pixel(px, py, border_color, alpha=alpha * cov)
+
+    def draw_star(self, cx, cy, outer_r, inner_r, fill_color, border_color=None):
+        verts = []
+        for i in range(10):
+            r = outer_r if i % 2 == 0 else inner_r
+            ang = (-math.pi / 2.0) + (i * math.pi / 5.0)
+            verts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        min_x = max(0, int(math.floor(cx - outer_r - 2)))
+        max_x = min(self.width - 1, int(math.ceil(cx + outer_r + 2)))
+        min_y = max(0, int(math.floor(cy - outer_r - 2)))
+        max_y = min(self.height - 1, int(math.ceil(cy + outer_r + 2)))
+        nv = len(verts)
+        for py in range(min_y, max_y + 1):
+            for px in range(min_x, max_x + 1):
+                inside = False
+                j = nv - 1
+                for i in range(nv):
+                    xi, yi = verts[i]
+                    xj, yj = verts[j]
+                    if ((yi > py) != (yj > py)) and (
+                        px < (xj - xi) * (py - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-9) + xi
+                    ):
+                        inside = not inside
+                    j = i
+                if inside:
+                    self.blend_pixel(px, py, fill_color, alpha=1.0)
+        if border_color is not None:
+            for i in range(nv):
+                x0, y0 = verts[i]
+                x1, y1 = verts[(i + 1) % nv]
+                self.draw_line(x0, y0, x1, y1, border_color, width=1.1)
+
+    def measure_text(self, text, scale=2, spacing=2):
+        s = _sanitize_ascii_text(text)
+        if not s:
+            return 0
+        return len(s) * (5 * scale + spacing) - spacing
+
+    def draw_text(self, x, y, text, color, scale=2, spacing=2, align="left", bold=False, alpha=1.0):
+        s = _sanitize_ascii_text(text)
+        if not s:
+            return
+        sc = max(1, int(scale))
+        step = 5 * sc + spacing
+        total_w = len(s) * step - spacing
+        if align == "center":
+            cur_x = int(round(x - total_w / 2.0))
+        elif align == "right":
+            cur_x = int(round(x - total_w))
+        else:
+            cur_x = int(round(x))
+        base_y = int(round(y))
+        cr, cg, cb = color[:3]
+        for ch in s:
+            glyph = _FONT_5X7.get(ch, _FONT_5X7["?"])
+            for row_i, row_bits in enumerate(glyph):
+                if not row_bits:
+                    continue
+                py = base_y + row_i * sc
+                for col_i in range(5):
+                    if row_bits & (1 << (4 - col_i)):
+                        px = cur_x + col_i * sc
+                        self.fill_rect(px, py, px + sc, py + sc, (cr, cg, cb), alpha=alpha)
+                        if bold:
+                            self.fill_rect(
+                                px + 1, py, px + sc + 1, py + sc, (cr, cg, cb), alpha=alpha
+                            )
+            cur_x += step
+
+    def to_png_bytes(self):
+        row_len = self.width * 4
+        raw = bytearray((row_len + 1) * self.height)
+        buf = self.buf
+        out_pos = 0
+        for y in range(self.height):
+            raw[out_pos] = 0
+            in_start = y * row_len
+            raw[out_pos + 1 : out_pos + 1 + row_len] = buf[in_start : in_start + row_len]
+            out_pos += 1 + row_len
+
+        compressed = zlib.compress(bytes(raw), level=4)
+
+        def chunk(tag, data):
+            head = tag + data
+            return (
+                struct.pack("!I", len(data))
+                + head
+                + struct.pack("!I", zlib.crc32(head) & 0xFFFFFFFF)
+            )
+
+        ihdr = struct.pack("!IIBBBBB", self.width, self.height, 8, 6, 0, 0, 0)
+        return b"".join(
+            [
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", ihdr),
+                chunk(b"IDAT", compressed),
+                chunk(b"IEND", b""),
+            ]
+        )
+
+
+def _fmt_price_val(val):
+    if val is None or not math.isfinite(val):
+        return "--"
+    if abs(val) >= 100.0:
+        return f"${val:.2f}"
+    if abs(val) >= 10.0:
+        return f"${val:.2f}"
+    return f"${val:.3f}"
+
+
+def _fmt_signed(val, dec=2, suffix=""):
+    if val is None or not math.isfinite(val):
+        return "--"
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{val:.{dec}f}{suffix}"
+
+
+def _wrap_text_lines(text, max_chars):
+    words = _sanitize_ascii_text(text).split()
+    if not words:
+        return []
+    lines = []
+    cur = words[0]
+    for w in words[1:]:
+        if len(cur) + 1 + len(w) <= max_chars:
+            cur = f"{cur} {w}"
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    return lines
+
+
+def _safe_num(val):
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bar_label_utc(raw_ts, idx):
+    if not raw_ts:
+        return f"t{idx}", None
+    s = str(raw_ts).strip()
+    try:
+        dt = as_utc(datetime.fromisoformat(s.replace("Z", "+00:00")))
+        return dt.strftime("%H:%M"), int(dt.timestamp() // 60)
+    except Exception:
+        m = re.search(r"(\d{2}:\d{2})", s)
+        return (m.group(1) if m else f"t{idx}"), None
+
+
+def render_kinematics_chart_png(
+    symbol_data,
+    smooth_config=None,
+    finalized_minute=None,
+    width=1440,
+    height=860,
+):
+    """Render a complete 3-panel + projection + provider table PNG snapshot for one symbol."""
+    W = max(960, int(width))
+    H = max(620, int(height))
+    canvas = _PngCanvas(W, H, bg_rgb=(8, 13, 25))
+
+    scfg = smooth_config or {}
+    smooth_method = str(scfg.get("method") or KINEMATICS_SMOOTH_METHOD or "hma").upper()
+    smooth_period = int(scfg.get("period") or KINEMATICS_SMOOTH_PERIOD or RSI_PERIOD)
+    rsi_ob = float(scfg.get("overbought") or KINEMATICS_RSI_OVERBOUGHT or 70.0)
+    rsi_os = float(scfg.get("oversold") or KINEMATICS_RSI_OVERSOLD or 30.0)
+
+    sym = str(symbol_data.get("symbol") or "--").upper()
+    providers = symbol_data.get("providers") or []
+    regime = str(symbol_data.get("regime") or "neutral").lower()
+    points = symbol_data.get("history_window") or []
+    buy_events = symbol_data.get("buy_events") or []
+    sell_events = symbol_data.get("sell_events") or []
+    entries = symbol_data.get("provider_entries") or []
+
+    REGIME_STYLES = {
+        "accelerating_bullish": ("ACCELERATING BULLISH", (52, 211, 153), (6, 78, 59), "Strong buyer thrust & momentum expansion"),
+        "decelerating_bullish": ("DECELERATING BULLISH", (34, 211, 238), (22, 78, 99), "Upward momentum waning / consolidation"),
+        "accelerating_bearish": ("ACCELERATING BEARISH", (251, 113, 133), (76, 5, 25), "Aggressive selling impulse accelerating"),
+        "decelerating_bearish": ("DECELERATING BEARISH", (251, 191, 36), (69, 26, 3), "Downside absorption / selling deceleration"),
+        "neutral": ("NEUTRAL", (148, 163, 184), (30, 41, 59), "Equilibrium / no directional acceleration"),
+    }
+    r_label, r_fg, r_bg, r_desc = REGIME_STYLES.get(regime, REGIME_STYLES["neutral"])
+
+    C_CARD = (12, 19, 36)
+    C_PANEL_BG = (9, 14, 28)
+    C_BORDER = (30, 41, 59)
+    C_TEXT = (226, 232, 240)
+    C_MUTED = (148, 163, 184)
+    C_DIM = (100, 116, 139)
+    C_CYAN = (34, 211, 238)
+    C_CYAN_SOFT = (103, 232, 249)
+    C_SKY = (56, 189, 248)
+    C_ORANGE = (251, 146, 60)
+    C_AMBER = (251, 191, 36)
+    C_PURPLE = (192, 132, 252)
+    C_INDIGO = (129, 140, 248)
+    C_EMERALD = (52, 211, 153)
+    C_ROSE = (251, 113, 133)
+    C_RED = (239, 68, 68)
+
+    margin = 22
+    # ------------------------------------------------------------------
+    # HEADER BAR
+    # ------------------------------------------------------------------
+    badge_w = max(72, canvas.measure_text(sym, scale=2, spacing=1) + 22)
+    canvas.draw_card(margin, 12, margin + badge_w, 56, (30, 41, 82), (99, 102, 241))
+    canvas.draw_text(
+        margin + badge_w // 2,
+        27,
+        sym,
+        (199, 210, 254),
+        scale=2,
+        spacing=1,
+        align="center",
+        bold=True,
+    )
+
+    title_x = margin + badge_w + 14
+    title_str = f"{sym} MULTI-STREAM KINEMATICS ANALYSIS"
+    canvas.draw_text(title_x, 14, title_str, (248, 250, 252), scale=2, spacing=1, bold=True)
+
+    title_end_x = title_x + canvas.measure_text(title_str, scale=2, spacing=1) + 14
+    pill_w = canvas.measure_text(r_label, scale=1, spacing=1) + 18
+    canvas.draw_card(title_end_x, 13, title_end_x + pill_w, 31, r_bg, r_fg)
+    canvas.draw_text(
+        title_end_x + pill_w // 2,
+        18,
+        r_label,
+        r_fg,
+        scale=1,
+        spacing=1,
+        align="center",
+        bold=True,
+    )
+
+    c_close = _safe_num(symbol_data.get("close"))
+    c_rsi = _safe_num(symbol_data.get("rsi"))
+    ts_str = "--"
+    if finalized_minute is not None:
+        dt_utc = as_utc(finalized_minute)
+        dt_et = dt_utc.astimezone(MARKET_TZ)
+        ts_str = f"{dt_utc.strftime('%Y-%m-%d %H:%M')} UTC ({dt_et.strftime('%H:%M')} ET)"
+    elif symbol_data.get("latest_bar_timestamp"):
+        ts_str = str(symbol_data.get("latest_bar_timestamp"))[:19]
+
+    feeds_desc = ",".join(providers) if providers else "NONE"
+    sub_str = (
+        f"Bar: {ts_str}  |  Close: {_fmt_price_val(c_close)}  |  "
+        f"RSI(14): {f'{c_rsi:.1f}' if c_rsi is not None else '--'}  |  Feeds({len(providers)}): {feeds_desc}"
+    )
+    max_sub_chars = max(40, (W - margin - title_x) // 11)
+    if len(sub_str) > max_sub_chars:
+        sub_str = sub_str[: max_sub_chars - 3] + "..."
+    canvas.draw_text(title_x, 40, sub_str, C_MUTED, scale=2, spacing=1)
+
+    # ------------------------------------------------------------------
+    # MAIN ROW: LEFT PROJECTION CARD & RIGHT 3-PANEL CHART CARD
+    # ------------------------------------------------------------------
+    top_y = 66
+    main_h = 468
+    bot_y = top_y + main_h
+    left_w = min(440, max(380, int((W - 2 * margin - 16) * 0.31)))
+    left_x0 = margin
+    left_x1 = left_x0 + left_w
+    right_x0 = left_x1 + 16
+    right_x1 = W - margin
+
+    # Left Card: NEXT-STEP PROJECTION
+    canvas.draw_card(left_x0, top_y, left_x1, bot_y, C_CARD, C_BORDER)
+    lx = left_x0 + 16
+    rx = left_x1 - 16
+    canvas.draw_text(lx, top_y + 14, "NEXT-STEP PROJECTION", C_MUTED, scale=2, spacing=1, bold=True)
+    canvas.draw_text(
+        rx,
+        top_y + 16,
+        f"{smooth_method}({smooth_period}) SYNCED",
+        C_INDIGO,
+        scale=1,
+        spacing=2,
+        align="right",
+        bold=True,
+    )
+
+    canvas.draw_text(lx, top_y + 42, "P(t+1) = P(t) + v(t) + 0.5*a(t)", C_DIM, scale=1, spacing=2)
+    proj_price = _safe_num(symbol_data.get("projected_price_next"))
+    proj_delta = _safe_num(symbol_data.get("projected_delta"))
+    proj_delta_pct = _safe_num(symbol_data.get("projected_delta_pct"))
+
+    canvas.draw_text(
+        lx,
+        top_y + 62,
+        _fmt_price_val(proj_price),
+        C_CYAN_SOFT,
+        scale=4,
+        spacing=2,
+        bold=True,
+    )
+    canvas.draw_text(rx, top_y + 56, "Expected Delta", C_MUTED, scale=1, spacing=2, align="right")
+    if proj_delta is not None and proj_delta_pct is not None:
+        d_col = C_EMERALD if proj_delta > 0 else (C_ROSE if proj_delta < 0 else C_TEXT)
+        d_str = f"{_fmt_signed(proj_delta, 2)} ({_fmt_signed(proj_delta_pct, 2, '%')})"
+    else:
+        d_col = C_MUTED
+        d_str = "--"
+    canvas.draw_text(rx, top_y + 74, d_str, d_col, scale=2, spacing=1, align="right", bold=True)
+
+    canvas.fill_rect(lx, top_y + 104, rx, top_y + 105, C_BORDER)
+
+    c_smooth = _safe_num(symbol_data.get("smoothed_close"))
+    if c_smooth is None and points:
+        c_smooth = _safe_num(points[-1].get("smoothed_close"))
+    c_pv = _safe_num(symbol_data.get("smoothed_velocity"))
+    if c_pv is None:
+        c_pv = _safe_num(symbol_data.get("price_velocity"))
+    c_pa = _safe_num(symbol_data.get("smoothed_acceleration"))
+    if c_pa is None:
+        c_pa = _safe_num(symbol_data.get("price_acceleration"))
+    c_rv = _safe_num(symbol_data.get("rsi_velocity"))
+    c_ra = _safe_num(symbol_data.get("rsi_acceleration"))
+    rsi_zone_str = str(symbol_data.get("rsi_zone") or "unknown").replace("_", " ")
+    cross_str = str(symbol_data.get("crossover_signal") or "none").replace("_", " ")
+    action_str = str(symbol_data.get("trading_action") or "Hold / Monitor")
+
+    kv_rows = [
+        ("Current Close:", _fmt_price_val(c_close), C_TEXT),
+        ("Smoothed Close:", _fmt_price_val(c_smooth), C_INDIGO),
+        (
+            "Price Vel (v):",
+            _fmt_signed(c_pv, 2, "/m"),
+            C_EMERALD if (c_pv or 0) > 0 else (C_ROSE if (c_pv or 0) < 0 else C_TEXT),
+        ),
+        ("Price Acc (a):", _fmt_signed(c_pa, 2, "/m2"), C_ORANGE),
+        (
+            "RSI (14):",
+            f"{c_rsi:.2f}" if c_rsi is not None else "--",
+            C_ROSE if (c_rsi is not None and c_rsi >= rsi_ob) else (C_EMERALD if (c_rsi is not None and c_rsi <= rsi_os) else C_PURPLE),
+        ),
+        (
+            "RSI Vel / Acc:",
+            f"{_fmt_signed(c_rv, 2)} / {_fmt_signed(c_ra, 2)}",
+            C_TEXT,
+        ),
+        ("RSI Boundary:", rsi_zone_str, C_TEXT),
+        ("Crossover:", cross_str, C_CYAN if cross_str != "none" else C_MUTED),
+        ("Action:", action_str[:22], C_AMBER),
+    ]
+    cur_ky = top_y + 116
+    for k_lbl, k_val, k_col in kv_rows:
+        canvas.draw_text(lx, cur_ky, k_lbl, C_MUTED, scale=2, spacing=1)
+        canvas.draw_text(rx, cur_ky, k_val, k_col, scale=2, spacing=1, align="right", bold=True)
+        cur_ky += 26
+
+    canvas.fill_rect(lx, top_y + 356, rx, top_y + 357, C_BORDER)
+    canvas.draw_text(lx, top_y + 365, "CHART KEY (ALL 3 PANELS)", C_DIM, scale=1, spacing=2, bold=True)
+    legend_items = [
+        (lx, top_y + 382, (226, 232, 240), "line", "Close Price"),
+        (lx + 200, top_y + 382, C_INDIGO, "dash", f"{smooth_method} Smooth"),
+        (lx, top_y + 402, C_CYAN, "dot", "Proj +1m"),
+        (lx + 200, top_y + 402, C_RED, "star", "Executed Buy"),
+        (lx, top_y + 422, C_SKY, "line", "Velocity (v)"),
+        (lx + 200, top_y + 422, C_ORANGE, "line", "Accel (a)"),
+        (lx, top_y + 442, C_PURPLE, "line", f"RSI ({int(rsi_os)}/{int(rsi_ob)})"),
+        (lx + 200, top_y + 442, C_AMBER, "star", "Executed Sell"),
+    ]
+    for item_x, item_y, col, shape, lbl in legend_items:
+        mid_y = item_y + 6
+        if shape == "line":
+            canvas.draw_line(item_x, mid_y, item_x + 18, mid_y, col, width=2.2)
+        elif shape == "dash":
+            canvas.draw_dashed_line(item_x, mid_y, item_x + 18, mid_y, col, width=2.0, dash=4, gap=3)
+        elif shape == "dot":
+            canvas.draw_circle(item_x + 9, mid_y, 4.0, col)
+        elif shape == "star":
+            canvas.draw_star(item_x + 9, mid_y, 6.0, 2.6, col)
+        canvas.draw_text(item_x + 24, item_y, lbl, C_MUTED, scale=2, spacing=1)
+
+    # ------------------------------------------------------------------
+    # RIGHT CARD: 3-PANEL SYNCHRONIZED KINEMATIC CROSSOVER
+    # ------------------------------------------------------------------
+    canvas.draw_card(right_x0, top_y, right_x1, bot_y, C_CARD, C_BORDER)
+    rcx0 = right_x0 + 16
+    rcx1 = right_x1 - 16
+    canvas.draw_text(
+        rcx0,
+        top_y + 14,
+        "3-PANEL KINEMATIC CROSSOVER",
+        C_TEXT,
+        scale=2,
+        spacing=1,
+        bold=True,
+    )
+    canvas.draw_circle(rcx1 - 310, top_y + 20, 4.0, C_ORANGE)
+    canvas.draw_text(rcx1 - 301, top_y + 16, "a=0 Lead", C_MUTED, scale=1, spacing=2)
+    canvas.draw_circle(rcx1 - 216, top_y + 20, 4.0, C_SKY)
+    canvas.draw_text(rcx1 - 207, top_y + 16, "v=0 Conf", C_MUTED, scale=1, spacing=2)
+    canvas.draw_star(rcx1 - 122, top_y + 20, 5.5, 2.4, C_RED)
+    canvas.draw_text(rcx1 - 112, top_y + 16, "Buy", C_ROSE, scale=1, spacing=2)
+    canvas.draw_star(rcx1 - 62, top_y + 20, 5.5, 2.4, C_AMBER)
+    canvas.draw_text(rcx1 - 52, top_y + 16, "Sell", C_AMBER, scale=1, spacing=2)
+
+    # Panel plot geometry inside right card (left gutter holds Panel Name + Y-ticks with zero overlap)
+    plot_x0 = right_x0 + 140
+    plot_x1 = right_x1 - 22
+    plot_w = plot_x1 - plot_x0
+
+    p1_top, p1_bot = top_y + 52, top_y + 168
+    p2_top, p2_bot = top_y + 190, top_y + 298
+    p3_top, p3_bot = top_y + 320, top_y + 428
+    axis_y = top_y + 440
+
+    # Panel backgrounds
+    canvas.draw_card(plot_x0, p1_top, plot_x1, p1_bot, C_PANEL_BG, (24, 34, 54))
+    canvas.draw_card(plot_x0, p2_top, plot_x1, p2_bot, C_PANEL_BG, (24, 34, 54))
+    canvas.draw_card(plot_x0, p3_top, plot_x1, p3_bot, C_PANEL_BG, (24, 34, 54))
+
+    if not points:
+        canvas.draw_text(
+            (plot_x0 + plot_x1) // 2,
+            (p2_top + p2_bot) // 2 - 7,
+            "Waiting for closed minute bars...",
+            C_MUTED,
+            scale=2,
+            spacing=1,
+            align="center",
+        )
+    else:
+        n = len(points)
+        usable_w = max(60.0, plot_w - 76.0)
+        if n == 1:
+            x_at = lambda i: plot_x0 + 28.0 + i * min(48.0, usable_w * 0.5)
+            next_x = plot_x1 - 30.0
+        else:
+            x_at = lambda i: plot_x0 + 16.0 + (i / float(max(1, n - 1))) * (usable_w - 28.0)
+            next_x = plot_x1 - 30.0
+
+        # Compute Y ranges for all 3 panels
+        closes = [_safe_num(p.get("close")) for p in points]
+        smooths = [_safe_num(p.get("smoothed_close")) for p in points]
+        all_p = [v for v in closes + smooths if v is not None]
+        if proj_price is not None:
+            all_p.append(proj_price)
+        if not all_p:
+            all_p = [c_close or 100.0]
+        min_p = min(all_p)
+        max_p = max(all_p)
+        pad_p = max(0.02, (max_p - min_p) * 0.10)
+        lo_p = min_p - pad_p
+        hi_p = max_p + pad_p
+        span_p = max(0.02, hi_p - lo_p)
+        mid_p = (lo_p + hi_p) * 0.5
+
+        def y_price(val):
+            return p1_top + 8 + (1.0 - (val - lo_p) / span_p) * (p1_bot - p1_top - 16)
+
+        vels = [
+            _safe_num(p.get("smoothed_velocity"))
+            if _safe_num(p.get("smoothed_velocity")) is not None
+            else (_safe_num(p.get("price_velocity")) or 0.0)
+            for p in points
+        ]
+        accs = [
+            _safe_num(p.get("smoothed_acceleration"))
+            if _safe_num(p.get("smoothed_acceleration")) is not None
+            else (_safe_num(p.get("price_acceleration")) or 0.0)
+            for p in points
+        ]
+        max_va = max([0.05] + [abs(v) for v in vels] + [abs(a) for a in accs]) * 1.15
+        mid_va_y = (p2_top + p2_bot) * 0.5
+        half_va_h = (p2_bot - p2_top - 16) * 0.5
+
+        def y_va(val):
+            return mid_va_y - (val / max_va) * half_va_h
+
+        def y_rsi(val):
+            clamped = min(100.0, max(0.0, val))
+            return p3_top + 6 + (1.0 - clamped / 100.0) * (p3_bot - p3_top - 12)
+
+        # Synchronized vertical minute grid lines (behind series across all 3 panels)
+        tick_labels = []
+        bar_min_indices = []
+        last_lbl_x = -999.0
+        latest_bar_x = x_at(n - 1)
+        lbl_step = 1 if n <= 8 else (3 if n <= 15 else 4)
+        for i, pt in enumerate(points):
+            bx = x_at(i)
+            lbl, min_idx = _parse_bar_label_utc(pt.get("timestamp") or pt.get("minute"), i)
+            bar_min_indices.append(min_idx)
+            min_num = None
+            if ":" in lbl:
+                try:
+                    min_num = int(lbl.split(":")[1])
+                except ValueError:
+                    min_num = None
+            is_5m = min_num is not None and (min_num % 5 == 0)
+            is_last = i == n - 1
+            grid_col = (71, 85, 105) if is_5m else (38, 49, 70)
+            for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
+                canvas.draw_dashed_line(bx, py0 + 2, bx, py1 - 2, grid_col, width=1.0, dash=3, gap=3)
+
+            fits_prev = bx - last_lbl_x >= 72.0
+            fits_latest = is_last or (latest_bar_x - bx >= 72.0)
+            fits_next = (next_x - bx >= 60.0) or (proj_price is None)
+            if (i == 0 or is_5m or (i % lbl_step == 0) or is_last) and fits_prev and fits_latest and fits_next:
+                tick_labels.append((bx, lbl, C_TEXT if is_last else C_MUTED))
+                last_lbl_x = bx
+
+        if proj_price is not None:
+            for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
+                canvas.draw_dashed_line(
+                    next_x, py0 + 2, next_x, py1 - 2, C_CYAN, width=1.0, dash=3, gap=3, alpha=0.55
+                )
+            tick_labels.append((next_x, "+1m", C_CYAN))
+
+        for tx, tlbl, tcol in tick_labels:
+            canvas.draw_text(tx, axis_y, tlbl, tcol, scale=2, spacing=1, align="center")
+
+        # --------------------------------------------------------------
+        # PANEL 1: PRICE HEADER, LEFT Y-TICKS, GRID, CURVES, +1M, BUY/SELL
+        # --------------------------------------------------------------
+        canvas.draw_text(plot_x0, p1_top - 15, "PANEL 1: PRICE ($)", C_TEXT, scale=1, spacing=2, bold=True)
+        p1_readout = (
+            f"Close:{_fmt_price_val(closes[-1])}  Smooth:{_fmt_price_val(smooths[-1])}  "
+            f"Proj+1m:{_fmt_price_val(proj_price)}"
+        )
+        canvas.draw_text(plot_x1, p1_top - 15, p1_readout, C_CYAN_SOFT, scale=1, spacing=2, align="right")
+
+        canvas.draw_text(right_x0 + 12, (p1_top + p1_bot) // 2 - 7, "Price", C_INDIGO, scale=2, spacing=1, bold=True)
+        canvas.draw_text(plot_x0 - 8, p1_top + 4, _fmt_price_val(hi_p), C_MUTED, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, (p1_top + p1_bot) // 2 - 3, _fmt_price_val(mid_p), C_DIM, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, p1_bot - 11, _fmt_price_val(lo_p), C_MUTED, scale=1, spacing=2, align="right")
+        canvas.draw_dashed_line(plot_x0 + 2, (p1_top + p1_bot) * 0.5, plot_x1 - 2, (p1_top + p1_bot) * 0.5, (30, 41, 59), width=1.0, dash=4, gap=4)
+
+        close_pts = [(x_at(i), y_price(v)) for i, v in enumerate(closes) if v is not None]
+        smooth_pts = [(x_at(i), y_price(v)) for i, v in enumerate(smooths) if v is not None]
+        if smooth_pts:
+            canvas.draw_polyline(smooth_pts, C_INDIGO, width=1.8, dashed=True, dash=5, gap=3)
+        if close_pts:
+            canvas.draw_polyline(close_pts, (241, 245, 249), width=2.1)
+            lx_pt, ly_pt = close_pts[-1]
+            canvas.draw_circle(lx_pt, ly_pt, 3.5, (241, 245, 249), border_color=C_CARD)
+            if proj_price is not None:
+                ny_pt = y_price(proj_price)
+                canvas.draw_dashed_line(lx_pt, ly_pt, next_x, ny_pt, C_CYAN, width=1.8, dash=4, gap=3)
+                canvas.draw_circle(next_x, ny_pt, 4.5, C_CYAN, border_color=C_CARD, border_width=1.4)
+
+        # Executed option buy/sell markers pinned to bar minutes
+        last_bar_min_idx = bar_min_indices[-1] if bar_min_indices else None
+
+        def _draw_trade_events(events, star_color, label_prefix):
+            for ev in events:
+                if not isinstance(ev, dict) or ev.get("dry_run"):
+                    continue
+                _, ev_min = _parse_bar_label_utc(
+                    ev.get("minute_utc") or ev.get("executed_at_utc"), 0
+                )
+                if ev_min is None:
+                    continue
+                bx = None
+                by = None
+                if ev_min in bar_min_indices:
+                    b_idx = bar_min_indices.index(ev_min)
+                    bx = x_at(b_idx)
+                    bp = closes[b_idx] if closes[b_idx] is not None else c_close
+                    by = y_price(bp) if bp is not None else (p1_top + p1_bot) * 0.5
+                elif last_bar_min_idx is not None and ev_min == last_bar_min_idx + 1 and proj_price is not None:
+                    bx = next_x
+                    by = y_price(proj_price)
+                else:
+                    continue
+                for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
+                    canvas.draw_dashed_line(
+                        bx, py0 + 2, bx, py1 - 2, star_color, width=1.2, dash=3, gap=3, alpha=0.55
+                    )
+                canvas.draw_star(bx, by, 7.5, 3.2, star_color, border_color=(2, 6, 23))
+                canvas.draw_text(bx, max(p1_top + 4, by - 16), label_prefix, star_color, scale=1, spacing=1, align="center", bold=True)
+
+        _draw_trade_events(buy_events, C_RED, "BUY")
+        _draw_trade_events(sell_events, C_AMBER, "SELL")
+
+        # --------------------------------------------------------------
+        # PANEL 2: VELOCITY (v) / ACCELERATION (a)
+        # --------------------------------------------------------------
+        canvas.draw_text(
+            plot_x0,
+            p2_top - 15,
+            "PANEL 2: SMOOTHED VELOCITY (v) / ACCEL (a)",
+            C_TEXT,
+            scale=1,
+            spacing=2,
+            bold=True,
+        )
+        p2_readout = f"v:{_fmt_signed(vels[-1], 2, '/m')}   a:{_fmt_signed(accs[-1], 2, '/m2')}"
+        canvas.draw_text(plot_x1, p2_top - 15, p2_readout, C_SKY, scale=1, spacing=2, align="right")
+
+        canvas.draw_text(right_x0 + 12, (p2_top + p2_bot) // 2 - 7, "v / a", C_SKY, scale=2, spacing=1, bold=True)
+        canvas.draw_text(plot_x0 - 8, p2_top + 4, f"+{max_va:.2f}", C_MUTED, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, int(mid_va_y) - 3, "0.00", C_TEXT, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, p2_bot - 11, f"-{max_va:.2f}", C_MUTED, scale=1, spacing=2, align="right")
+
+        canvas.draw_dashed_line(plot_x0 + 2, mid_va_y, plot_x1 - 2, mid_va_y, (71, 85, 105), width=1.2, dash=5, gap=4)
+        vel_pts = [(x_at(i), y_va(v)) for i, v in enumerate(vels)]
+        acc_pts = [(x_at(i), y_va(a)) for i, a in enumerate(accs)]
+        canvas.draw_polyline(vel_pts, C_SKY, width=2.0)
+        canvas.draw_polyline(acc_pts, C_ORANGE, width=2.0)
+
+        for i, pt in enumerate(points):
+            cs = str(pt.get("crossover_signal") or "none")
+            if cs in {"leading_bearish", "leading_bullish"}:
+                canvas.draw_circle(x_at(i), y_va(accs[i]), 4.5, C_ORANGE, border_color=(15, 23, 42), border_width=1.3)
+            elif cs in {"confirmed_bearish", "confirmed_bullish"}:
+                canvas.draw_circle(x_at(i), y_va(vels[i]), 4.5, C_SKY, border_color=(15, 23, 42), border_width=1.3)
+
+        # --------------------------------------------------------------
+        # PANEL 3: RSI(14) WITH OB/OS BANDS & COMPLETE THRESHOLDS
+        # --------------------------------------------------------------
+        canvas.draw_text(
+            plot_x0,
+            p3_top - 15,
+            f"PANEL 3: RSI (14)  [OB>={rsi_ob:.0f} | OS<={rsi_os:.0f}]",
+            C_TEXT,
+            scale=1,
+            spacing=2,
+            bold=True,
+        )
+        last_r = _safe_num(points[-1].get("rsi")) or c_rsi
+        p3_readout = (
+            f"RSI:{last_r:.2f} ({rsi_zone_str})" if last_r is not None else "RSI:--"
+        )
+        canvas.draw_text(plot_x1, p3_top - 15, p3_readout, C_PURPLE, scale=1, spacing=2, align="right")
+
+        canvas.draw_text(right_x0 + 12, (p3_top + p3_bot) // 2 - 7, "RSI", C_PURPLE, scale=2, spacing=1, bold=True)
+        canvas.draw_text(plot_x0 - 8, p3_top + 4, "100", C_DIM, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, int(y_rsi(rsi_ob)) - 3, f"OB {int(rsi_ob)}", C_ROSE, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, int(y_rsi(50.0)) - 3, "50", C_DIM, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, int(y_rsi(rsi_os)) - 3, f"OS {int(rsi_os)}", C_EMERALD, scale=1, spacing=2, align="right")
+        canvas.draw_text(plot_x0 - 8, p3_bot - 11, "0", C_DIM, scale=1, spacing=2, align="right")
+
+        # Overbought / Oversold shaded zones
+        canvas.fill_rect(plot_x0 + 1, y_rsi(100.0), plot_x1 - 1, y_rsi(rsi_ob), (244, 63, 94), alpha=0.11)
+        canvas.fill_rect(plot_x0 + 1, y_rsi(rsi_os), plot_x1 - 1, y_rsi(0.0), (16, 185, 129), alpha=0.11)
+        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(rsi_ob), plot_x1 - 2, y_rsi(rsi_ob), (244, 63, 94), width=1.1, dash=4, gap=3, alpha=0.75)
+        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(50.0), plot_x1 - 2, y_rsi(50.0), (51, 65, 85), width=1.0, dash=3, gap=4, alpha=0.65)
+        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(rsi_os), plot_x1 - 2, y_rsi(rsi_os), (16, 185, 129), width=1.1, dash=4, gap=3, alpha=0.75)
+
+        rsi_pts = [
+            (x_at(i), y_rsi(_safe_num(pt.get("rsi"))))
+            for i, pt in enumerate(points)
+            if _safe_num(pt.get("rsi")) is not None
+        ]
+        if rsi_pts:
+            canvas.draw_polyline(rsi_pts, C_PURPLE, width=2.1)
+            canvas.draw_circle(rsi_pts[-1][0], rsi_pts[-1][1], 4.0, C_PURPLE, border_color=C_CARD)
+
+    # ------------------------------------------------------------------
+    # PROVIDER FEEDS TABLE (MIDDLE-BOTTOM ROW)
+    # ------------------------------------------------------------------
+    tbl_top = bot_y + 14
+    tbl_bot = H - 82
+    canvas.draw_card(margin, tbl_top, W - margin, tbl_bot, (10, 15, 29), C_BORDER)
+    canvas.fill_rect(margin + 1, tbl_top + 1, W - margin - 1, tbl_top + 32, (8, 12, 24))
+    canvas.fill_rect(margin + 1, tbl_top + 32, W - margin - 1, tbl_top + 33, C_BORDER)
+
+    col_pcts = [0.015, 0.215, 0.305, 0.405, 0.505, 0.595, 0.725, 0.855, 0.960]
+    tw = W - 2 * margin
+    cols = [margin + int(tw * p) for p in col_pcts]
+    headers = [
+        ("Provider Feed", "left"),
+        ("Close ($)", "right"),
+        ("P(t+1) ($)", "right"),
+        ("Price Vel", "right"),
+        ("Price Acc", "right"),
+        ("RSI (14)", "right"),
+        ("RSI Vel / Acc", "right"),
+        ("Forecast Action", "center"),
+        ("Status", "center"),
+    ]
+    for idx_h, (htxt, halign) in enumerate(headers):
+        canvas.draw_text(cols[idx_h], tbl_top + 10, htxt, C_MUTED, scale=2, spacing=1, align=halign, bold=True)
+
+    FORECAST_LABELS = {
+        "bearish_reversal": ("Bearish Reversal", C_ROSE, (76, 5, 25)),
+        "bullish_reversal": ("Bullish Reversal", C_EMERALD, (6, 78, 59)),
+        "bullish_continuation": ("Bullish Cont", C_CYAN, (19, 78, 74)),
+        "bearish_continuation": ("Bearish Cont", C_ORANGE, (67, 20, 7)),
+        "bullish_momentum": ("Bullish Mom", C_EMERALD, (6, 78, 59)),
+        "bearish_momentum": ("Bearish Mom", C_ROSE, (76, 5, 25)),
+        "bullish_decelerating": ("Bullish Decel", C_CYAN_SOFT, (22, 78, 99)),
+        "bearish_decelerating": ("Bearish Decel", C_AMBER, (69, 26, 3)),
+        "neutral": ("Neutral / Hold", C_MUTED, (30, 41, 59)),
+    }
+
+    max_rows = max(1, (tbl_bot - tbl_top - 42) // 32)
+    visible_entries = entries[:max_rows]
+    if not visible_entries:
+        canvas.draw_text(
+            W // 2,
+            (tbl_top + 34 + tbl_bot) // 2 - 7,
+            f"No provider feed rows reported for {sym}",
+            C_DIM,
+            scale=2,
+            spacing=1,
+            align="center",
+        )
+    else:
+        for r_idx, e in enumerate(visible_entries):
+            ry = tbl_top + 40 + r_idx * 32
+            if r_idx > 0:
+                canvas.fill_rect(margin + 12, ry - 4, W - margin - 12, ry - 3, (22, 32, 50))
+            prov_name = str(e.get("provider") or "--")[:14]
+            ec = _safe_num(e.get("close"))
+            ep = _safe_num(e.get("projected_price_next"))
+            ev = _safe_num(e.get("smoothed_velocity"))
+            if ev is None:
+                ev = _safe_num(e.get("price_velocity"))
+            ea = _safe_num(e.get("smoothed_acceleration"))
+            if ea is None:
+                ea = _safe_num(e.get("price_acceleration"))
+            er = _safe_num(e.get("rsi"))
+            erv = _safe_num(e.get("rsi_velocity"))
+            era = _safe_num(e.get("rsi_acceleration"))
+            fdir = str(e.get("forecast_direction") or "neutral").lower()
+            flbl, ffg, fbg = FORECAST_LABELS.get(fdir, FORECAST_LABELS["neutral"])
+
+            canvas.draw_text(cols[0], ry + 4, prov_name, (248, 250, 252), scale=2, spacing=1, bold=True)
+            canvas.draw_text(cols[1], ry + 4, _fmt_price_val(ec), C_TEXT, scale=2, spacing=1, align="right")
+            canvas.draw_text(cols[2], ry + 4, _fmt_price_val(ep), C_CYAN_SOFT, scale=2, spacing=1, align="right")
+            canvas.draw_text(
+                cols[3],
+                ry + 4,
+                _fmt_signed(ev, 2),
+                C_EMERALD if (ev or 0) > 0 else (C_ROSE if (ev or 0) < 0 else C_MUTED),
+                scale=2,
+                spacing=1,
+                align="right",
+            )
+            canvas.draw_text(cols[4], ry + 4, _fmt_signed(ea, 2), C_TEXT, scale=2, spacing=1, align="right")
+            canvas.draw_text(cols[5], ry + 4, f"{er:.1f}" if er is not None else "--", C_TEXT, scale=2, spacing=1, align="right")
+            canvas.draw_text(cols[6], ry + 4, f"{_fmt_signed(erv, 2)} / {_fmt_signed(era, 2)}", C_MUTED, scale=2, spacing=1, align="right")
+
+            bw = min(195, canvas.measure_text(flbl, scale=2, spacing=1) + 18)
+            bx0 = cols[7] - bw // 2
+            canvas.draw_card(bx0, ry, bx0 + bw, ry + 22, fbg, ffg)
+            canvas.draw_text(cols[7], ry + 5, flbl, ffg, scale=2, spacing=1, align="center")
+            fstatus = str(e.get("feed_status") or "LIVE").upper()
+            st_map = {
+                "LIVE": ("LIVE", C_EMERALD),
+                "PENDING": ("PENDING", C_CYAN),
+                "LATE": ("LATE", C_AMBER),
+                "AWAITING_WEBHOOK": ("WAIT TV", C_AMBER),
+                "NO_DATA": ("NO DATA", C_MUTED),
+                "OFFLINE": ("OFFLINE", C_ROSE),
+            }
+            st_lbl, st_col = st_map.get(fstatus, (fstatus[:8], C_MUTED))
+            canvas.draw_text(cols[8], ry + 4, st_lbl, st_col, scale=2, spacing=1, align="center", bold=True)
+
+    # ------------------------------------------------------------------
+    # BOTTOM KINEMATIC DIAGNOSIS BANNER
+    # ------------------------------------------------------------------
+    diag_top = H - 70
+    diag_bot = H - 14
+    canvas.draw_card(margin, diag_top, W - margin, diag_bot, C_CARD, C_BORDER)
+
+    diag_parts = [f"{r_desc}."]
+    if proj_price is not None:
+        diag_parts.append(f"Projected next close P(t+1) = {_fmt_price_val(proj_price)}.")
+    if c_rv is not None:
+        diag_parts.append(f"RSI velocity is {_fmt_signed(c_rv, 2, '/m')}.")
+    if c_ra is not None:
+        diag_parts.append(
+            f"Acceleration is {_fmt_signed(c_ra, 2, '/m2')} "
+            f"({'accelerating upward' if c_ra > 0 else 'decelerating / slowing'})."
+        )
+    diag_full = " ".join(diag_parts)
+    diag_title = "Kinematic Diagnosis:"
+    canvas.draw_text(margin + 14, diag_top + 11, diag_title, C_INDIGO, scale=2, spacing=1, bold=True)
+    tag_txt = "1m Auto-Capture"
+    tag_w = canvas.measure_text(tag_txt, scale=2, spacing=1) + 22
+    tag_x0 = W - margin - 14 - tag_w
+    canvas.draw_card(tag_x0, diag_top + 12, tag_x0 + tag_w, diag_bot - 12, (37, 45, 96), (99, 102, 241))
+    canvas.draw_text(tag_x0 + tag_w // 2, diag_top + 21, tag_txt, (199, 210, 254), scale=2, spacing=1, align="center", bold=True)
+
+    diag_text_x = margin + 14 + canvas.measure_text(diag_title, scale=2, spacing=1) + 12
+    avail_diag_px = max(240, tag_x0 - diag_text_x - 16)
+    max_diag_chars = max(40, avail_diag_px // 11)
+    diag_lines = _wrap_text_lines(diag_full, max_diag_chars)[:2]
+    for li, dline in enumerate(diag_lines):
+        canvas.draw_text(diag_text_x, diag_top + 11 + li * 19, dline, C_TEXT, scale=2, spacing=1)
+
+    return canvas.to_png_bytes()
+
+
+def _safe_symbol_folder(symbol):
+    clean = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(symbol or "UNKNOWN").upper())
+    return clean or "UNKNOWN"
+
+
+def _write_png_file_atomic(target_path, png_bytes):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f".tmp_{target_path.name}_{uuid4().hex[:6]}")
+    try:
+        tmp_path.write_bytes(png_bytes)
+        os.replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+class ChartCaptureManager:
+    """Dedicated start/stop-configurable thread saving per-symbol 3-panel PNG chart snapshots."""
+
+    def __init__(self, coordinator, output_dir=None, enabled=None):
+        self.provider = "CHART_CAPTURE"
+        self.coordinator = coordinator
+        base_dir = Path(__file__).resolve().parent
+        raw_dir = output_dir or CHART_CAPTURE_DIR or str(LOG_ROOT / "charts")
+        cfg_path = Path(raw_dir)
+        self.output_dir = cfg_path if cfg_path.is_absolute() else (base_dir / cfg_path)
+        self.enabled = bool(CHART_CAPTURE_ENABLED if enabled is None else enabled)
+        self.only_updated = bool(CHART_CAPTURE_ONLY_UPDATED)
+        self.write_latest = bool(CHART_CAPTURE_WRITE_LATEST)
+        self.width = int(CHART_CAPTURE_WIDTH)
+        self.height = int(CHART_CAPTURE_HEIGHT)
+        self.history_bars = int(CHART_CAPTURE_HISTORY_BARS)
+        self.last_status = "idle" if self.enabled else "disabled"
+        self.captures_total = 0
+        self.last_capture_utc = None
+        self.last_capture_symbol_count = 0
+        self.last_captured_files = {}
+        self._last_seen_signature = {}
+
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._task_queue = queue.Queue(maxsize=32)
+        self._worker_thread = None
+        self._event_loop = None
+        self._async_wake = None
+        self._trigger_immediate_capture = False
+
+    def _wake_async_loop(self):
+        if self._async_wake is None or self._event_loop is None:
+            return
+        try:
+            if not self._event_loop.is_closed():
+                self._event_loop.call_soon_threadsafe(self._async_wake.set)
+        except Exception:
+            pass
+
+    def _capture_symbol_sync(self, sym_data, smooth_cfg, minute_dt):
+        sym = str(sym_data.get("symbol") or "").upper()
+        folder = self.output_dir / _safe_symbol_folder(sym)
+        stamp_dt = as_utc(minute_dt) if minute_dt is not None else datetime.now(UTC)
+        fname = f"{_safe_symbol_folder(sym)}_{stamp_dt.strftime('%Y%m%d_%H%M')}Z.png"
+        png_bytes = render_kinematics_chart_png(
+            sym_data,
+            smooth_config=smooth_cfg,
+            finalized_minute=stamp_dt,
+            width=self.width,
+            height=self.height,
+        )
+        out_path = folder / fname
+        _write_png_file_atomic(out_path, png_bytes)
+        if self.write_latest:
+            _write_png_file_atomic(folder / "latest.png", png_bytes)
+        return str(out_path)
+
+    def _process_snapshot_sync(self, minute_dt, snapshot):
+        if not self.enabled:
+            return 0
+        smooth_cfg = snapshot.get("smooth_config") or {}
+        candidates = snapshot.get("consolidated_symbols") or []
+        saved_count = 0
+        for sym_data in candidates:
+            if self._stop_event.is_set() or not self.enabled:
+                break
+            sym = sym_data.get("symbol")
+            if not sym:
+                continue
+            pts = sym_data.get("history_window") or []
+            if not pts:
+                continue
+            sig = (
+                sym_data.get("latest_bar_timestamp"),
+                len(pts),
+                len(sym_data.get("buy_events") or []),
+                len(sym_data.get("sell_events") or []),
+            )
+            if self.only_updated and self._last_seen_signature.get(sym) == sig:
+                continue
+            saved_path = self._capture_symbol_sync(sym_data, smooth_cfg, minute_dt)
+            with self._state_lock:
+                self._last_seen_signature[sym] = sig
+                self.last_captured_files[sym] = saved_path
+                self.captures_total += 1
+            saved_count += 1
+
+        if saved_count > 0:
+            with self._state_lock:
+                self.last_capture_symbol_count = saved_count
+                self.last_capture_utc = datetime.now(UTC).isoformat()
+                self.last_status = "captured"
+            logging.info(
+                "CHART_CAPTURE_SAVED minute=%s symbols_saved=%d total=%d dir=%s",
+                as_utc(minute_dt).isoformat() if minute_dt is not None else "n/a",
+                saved_count,
+                self.captures_total,
+                self.output_dir,
+            )
+        elif self.enabled:
+            with self._state_lock:
+                if self.last_status != "stopped":
+                    self.last_status = "idle_no_updates"
+        return saved_count
+
+    def _thread_worker(self):
+        logging.info("CHART_CAPTURE_THREAD_STARTED thread=%s", threading.current_thread().name)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    item = self._task_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    if item is None:
+                        break
+                    minute_dt, snapshot = item
+                    self._process_snapshot_sync(minute_dt, snapshot)
+                except Exception as exc:
+                    with self._state_lock:
+                        self.last_status = f"error: {type(exc).__name__}"
+                    logging.warning(
+                        "CHART_CAPTURE_WORKER_ERROR error_type=%s detail=%s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                finally:
+                    self._task_queue.task_done()
+        finally:
+            logging.info("CHART_CAPTURE_THREAD_STOPPED thread=%s", threading.current_thread().name)
+
+    def _drain_task_queue_unlocked(self):
+        while True:
+            try:
+                self._task_queue.get_nowait()
+                self._task_queue.task_done()
+            except queue.Empty:
+                break
+
+    def start_capture(self, persist_ini=True, ini_path=None):
+        """Start the dedicated chart-capture worker thread and optionally persist to .ini."""
+        if persist_ini:
+            update_chart_capture_ini(True, ini_path=ini_path)
+        with self._state_lock:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.enabled = True
+            self._stop_event.clear()
+            if self._worker_thread is None or not self._worker_thread.is_alive():
+                self._drain_task_queue_unlocked()
+                self._worker_thread = threading.Thread(
+                    target=self._thread_worker,
+                    name="CHART_CAPTURE-worker",
+                    daemon=True,
+                )
+                self._worker_thread.start()
+            self.last_status = "running"
+            self._trigger_immediate_capture = True
+        self._wake_async_loop()
+        logging.info("CHART_CAPTURE_STARTED persist_ini=%s dir=%s", persist_ini, self.output_dir)
+        return self.get_status()
+
+    def stop_capture(self, persist_ini=True, ini_path=None, join_timeout=5.0):
+        """Stop and join the dedicated chart-capture worker thread and optionally persist to .ini."""
+        with self._state_lock:
+            self.enabled = False
+            self._trigger_immediate_capture = False
+            self._stop_event.set()
+            worker = self._worker_thread
+            if worker is not None and worker.is_alive():
+                self._drain_task_queue_unlocked()
+                try:
+                    self._task_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=join_timeout)
+
+        with self._state_lock:
+            if worker is None or not worker.is_alive():
+                self._worker_thread = None
+            self.last_status = "stopped"
+
+        if persist_ini:
+            update_chart_capture_ini(False, ini_path=ini_path)
+        self._wake_async_loop()
+        logging.info("CHART_CAPTURE_STOPPED persist_ini=%s", persist_ini)
+        return self.get_status()
+
+    def get_status(self):
+        with self._state_lock:
+            alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
+            tname = self._worker_thread.name if alive else None
+            return {
+                "status": self.last_status,
+                "enabled": bool(self.enabled),
+                "thread_alive": alive,
+                "thread_name": tname,
+                "ini_enabled": _read_chart_capture_ini_enabled(),
+                "output_dir": str(self.output_dir),
+                "captures_total": self.captures_total,
+                "last_capture_utc": self.last_capture_utc,
+                "last_capture_symbol_count": self.last_capture_symbol_count,
+            }
+
+    def enqueue_snapshot(self, minute_dt, snapshot):
+        if not self.enabled:
+            return False
+        with self._state_lock:
+            if self._worker_thread is None or not self._worker_thread.is_alive():
+                return False
+        try:
+            self._task_queue.put_nowait((minute_dt, snapshot))
+            return True
+        except queue.Full:
+            # Drop stale unrendered frame and keep the latest snapshot
+            try:
+                self._task_queue.get_nowait()
+                self._task_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._task_queue.put_nowait((minute_dt, snapshot))
+                return True
+            except queue.Full:
+                return False
+
+    async def capture_minute(self, minute_dt):
+        if not self.enabled:
+            self.last_status = "disabled"
+            return 0
+        snapshot = build_kinematics_snapshot_data(
+            self.coordinator, history_limit=self.history_bars
+        )
+        with self._state_lock:
+            worker_alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
+        if worker_alive:
+            return 1 if self.enqueue_snapshot(minute_dt, snapshot) else 0
+        return await asyncio.to_thread(self._process_snapshot_sync, minute_dt, snapshot)
+
+    async def run(self):
+        self._event_loop = asyncio.get_running_loop()
+        self._async_wake = asyncio.Event()
+
+        if self.enabled:
+            self.start_capture(persist_ini=False)
+            logging.info(
+                "CHART_CAPTURE_READY dir=%s bars=%d size=%dx%d only_updated=%s",
+                self.output_dir,
+                self.history_bars,
+                self.width,
+                self.height,
+                self.only_updated,
+            )
+        else:
+            with self._state_lock:
+                self.last_status = "disabled"
+            logging.info("CHART_CAPTURE_DISABLED enabled=False")
+
+        wake_event = self.coordinator.subscribe_minute_finalized()
+        last_processed_minute = self.coordinator.last_finalized
+        try:
+            while True:
+                try:
+                    if not self.enabled:
+                        self._async_wake.clear()
+                        if not self.enabled:
+                            await self._async_wake.wait()
+                            continue
+
+                    now = datetime.now(UTC)
+                    next_wake = (
+                        now.replace(second=0, microsecond=0)
+                        + MINUTE
+                        + self.coordinator.delay
+                        + timedelta(seconds=2)
+                    )
+                    wait_sec = max(1.0, (next_wake - now).total_seconds())
+                    if self._trigger_immediate_capture:
+                        wait_sec = 0.05
+
+                    wait_finalized = asyncio.create_task(wake_event.wait())
+                    wait_ctrl = asyncio.create_task(self._async_wake.wait())
+                    try:
+                        done, pending = await asyncio.wait(
+                            {wait_finalized, wait_ctrl},
+                            timeout=wait_sec,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                        if done:
+                            await asyncio.gather(*done, return_exceptions=True)
+                    except Exception:
+                        for t in (wait_finalized, wait_ctrl):
+                            if not t.done():
+                                t.cancel()
+                        raise
+
+                    if wake_event.is_set():
+                        wake_event.clear()
+                    if self._async_wake.is_set():
+                        self._async_wake.clear()
+
+                    if not self.enabled:
+                        continue
+
+                    cur_finalized = self.coordinator.last_finalized
+                    force_now = bool(self._trigger_immediate_capture)
+                    if force_now:
+                        self._trigger_immediate_capture = False
+
+                    if cur_finalized is not None and (cur_finalized != last_processed_minute or force_now):
+                        await self.capture_minute(cur_finalized)
+                        last_processed_minute = cur_finalized
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_status = f"error: {type(exc).__name__}"
+                    logging.warning(
+                        "CHART_CAPTURE_ERROR error_type=%s detail=%s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    await asyncio.sleep(2.0)
+        finally:
+            self.stop_capture(persist_ini=False, join_timeout=2.0)
 
 
 # Create a dictionary to keep track of active provider instances and tasks across the engine
@@ -5876,6 +8370,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </table>
                     </div>
 
+                    <!-- TradingView Webhook Diagnostic Banner (Shown when TV is Awaiting Webhook on selected symbol) -->
+                    <div id="detailTvDiagnosticBanner" class="hidden p-3 rounded-xl bg-amber-950/20 border border-amber-800/40 text-[11px] text-amber-200/90 space-y-1.5">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <span class="font-semibold text-amber-300" id="detailTvDiagTitle">TradingView Webhook Diagnostics</span>
+                            <div id="detailTvQuickSwitch" class="flex flex-wrap items-center gap-1"></div>
+                        </div>
+                        <p id="detailTvDiagBody" class="text-slate-300 leading-relaxed"></p>
+                    </div>
+
                     <!-- Phase Explanation Banner -->
                     <div id="detailPhaseExplanation" class="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80 text-xs flex items-center justify-between gap-4">
                         <div class="flex items-center gap-2">
@@ -5969,6 +8472,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="text-slate-400">Peak Profit Guard</span>
                             <span id="optionSellerPeakProfit" class="mono text-[11px] text-emerald-300 truncate max-w-[160px]">0 tracked</span>
                         </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 gap-2">
+                            <span class="text-slate-400">Chart Capture (1m PNG)</span>
+                            <div class="flex items-center gap-2">
+                                <span id="chartCaptureStatus" class="mono text-[11px] text-indigo-300 truncate max-w-[140px]">not_loaded</span>
+                                <button id="btnChartCaptureToggle" onclick="toggleChartCapture()" class="px-2 py-0.5 rounded text-[10px] font-semibold border border-slate-700 bg-slate-800 text-slate-300 hover:text-white transition">
+                                    ...
+                                </button>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="pt-2 border-t border-slate-800/80">
@@ -6031,6 +8544,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let currentFilter = 'all';
         let currentViewMode = 'consolidated'; // 'consolidated' or 'streams'
         let selectedSymbol = null;
+        let userSelectedSymbol = false;
+        let chartCaptureEnabledState = null;
         let latestData = null;
         let nextMinuteUtc = null;
         let countdownTimer = null;
@@ -6173,6 +8688,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('btnClearSearch').classList.toggle('hidden', !val);
             if (val) {
                 selectedSymbol = val;
+                userSelectedSymbol = true;
             }
             applyFilters();
             renderSymbolDeepDive();
@@ -6204,11 +8720,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         function selectSymbolFromDropdown(sym) {
             if (!sym) return;
             selectedSymbol = sym;
+            userSelectedSymbol = true;
             renderSymbolDeepDive();
         }
 
         function selectAndInspectSymbol(sym) {
             selectedSymbol = sym;
+            userSelectedSymbol = true;
             renderSymbolDeepDive();
             const el = document.getElementById('bottomInspectorSection');
             if (el) {
@@ -6363,24 +8881,69 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 }
             }
+            if (m.chart_capture) {
+                const cc = m.chart_capture;
+                chartCaptureEnabledState = Boolean(cc.enabled);
+                const ccEl = document.getElementById('chartCaptureStatus');
+                if (ccEl) {
+                    ccEl.textContent = `${cc.status || 'not_loaded'} (${cc.captures_total ?? 0} PNGs)`;
+                }
+                const btnCc = document.getElementById('btnChartCaptureToggle');
+                if (btnCc) {
+                    if (chartCaptureEnabledState) {
+                        btnCc.textContent = 'Stop';
+                        btnCc.className = 'px-2 py-0.5 rounded text-[10px] font-semibold border border-rose-700/60 bg-rose-950/50 text-rose-300 hover:bg-rose-900/60 transition';
+                    } else {
+                        btnCc.textContent = 'Start';
+                        btnCc.className = 'px-2 py-0.5 rounded text-[10px] font-semibold border border-emerald-700/60 bg-emerald-950/50 text-emerald-300 hover:bg-emerald-900/60 transition';
+                    }
+                }
+            }
 
-            // Connected Feeds
+            // Connected Feeds & Coverage
             const feedsContainer = document.getElementById('connectedFeedsList');
             if (feedsContainer && m.connected_providers) {
                 feedsContainer.innerHTML = '';
                 const providers = Object.entries(m.connected_providers);
+                const covMap = (latestData && latestData.provider_coverage) ? latestData.provider_coverage : {};
                 document.getElementById('activeProvidersCount').textContent = `${providers.filter(([_, c]) => c).length} Providers Online`;
                 providers.forEach(([prov, connected]) => {
+                    const cov = covMap[prov];
+                    const covLabel = cov ? ` (${cov.reporting_count}/${cov.configured_count})` : '';
+                    const covSyms = cov && cov.reporting_symbols && cov.reporting_symbols.length > 0
+                        ? `Reporting: ${cov.reporting_symbols.join(', ')}`
+                        : (prov === 'TRADINGVIEW' ? 'No TradingView webhooks received yet' : 'No symbols reporting yet');
                     const badge = document.createElement('span');
                     badge.className = `px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border ${
                         connected 
                             ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800' 
                             : 'bg-rose-950/40 text-rose-300 border-rose-800'
                     }`;
-                    badge.textContent = `${prov}: ${connected ? 'ONLINE' : 'OFFLINE'}`;
+                    badge.title = covSyms;
+                    badge.textContent = `${prov}: ${connected ? 'ONLINE' : 'OFFLINE'}${covLabel}`;
                     feedsContainer.appendChild(badge);
                 });
             }
+        }
+
+        function formatFeedStatusBadge(status, compact = false) {
+            const st = String(status || 'LIVE').toUpperCase();
+            if (st === 'LIVE') {
+                return `<span class="text-emerald-400 font-semibold">LIVE</span>`;
+            }
+            if (st === 'PENDING') {
+                return `<span class="text-cyan-300 font-semibold" title="Received in current minute; awaiting minute-close finalization">PENDING</span>`;
+            }
+            if (st === 'LATE') {
+                return `<span class="text-amber-300 font-semibold" title="Webhook arrived past the minute finalization deadline">LATE</span>`;
+            }
+            if (st === 'AWAITING_WEBHOOK') {
+                return `<span class="text-amber-400 font-semibold" title="TradingView webhook listener is online; no webhook received for this symbol yet">${compact ? 'AWAIT TV' : 'AWAITING WEBHOOK'}</span>`;
+            }
+            if (st === 'OFFLINE') {
+                return `<span class="text-rose-400 font-semibold">OFFLINE</span>`;
+            }
+            return `<span class="text-slate-500 font-semibold">NO DATA</span>`;
         }
 
         function renderKinematics(data) {
@@ -6394,6 +8957,34 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('streamFeedsCount').textContent = streamsCount;
             document.getElementById('tabConsolidatedCount').textContent = uniqueCount;
             document.getElementById('tabStreamsCount').textContent = streamsCount;
+            const lateEl = document.getElementById('lateRecordsCount');
+            if (lateEl && data.total_late_records !== undefined) {
+                lateEl.textContent = data.total_late_records;
+            }
+
+            // Update Connected Feeds coverage counts immediately when kinematics updates
+            const feedsContainer = document.getElementById('connectedFeedsList');
+            if (feedsContainer && data.provider_coverage) {
+                const covEntries = Object.entries(data.provider_coverage);
+                if (covEntries.length > 0) {
+                    feedsContainer.innerHTML = '';
+                    covEntries.forEach(([prov, cov]) => {
+                        const connected = Boolean(cov.connected);
+                        const covSyms = cov.reporting_symbols && cov.reporting_symbols.length > 0
+                            ? `Reporting (${cov.reporting_count}/${cov.configured_count}): ${cov.reporting_symbols.join(', ')}`
+                            : (prov === 'TRADINGVIEW' ? 'Listener online — no matching TradingView webhooks received yet' : 'No symbols reporting yet');
+                        const badge = document.createElement('span');
+                        badge.className = `px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border ${
+                            connected
+                                ? 'bg-emerald-950/40 text-emerald-300 border-emerald-800'
+                                : 'bg-rose-950/40 text-rose-300 border-rose-800'
+                        }`;
+                        badge.title = covSyms;
+                        badge.textContent = `${prov}: ${connected ? 'ONLINE' : 'OFFLINE'} (${cov.reporting_count}/${cov.configured_count})`;
+                        feedsContainer.appendChild(badge);
+                    });
+                }
+            }
 
             // 2. Regime counts based on unique symbols
             let bull = 0, bear = 0, neutral = 0;
@@ -6455,19 +9046,55 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             applyFilters();
         }
 
+        async function toggleChartCapture() {
+            const btn = document.getElementById('btnChartCaptureToggle');
+            const action = chartCaptureEnabledState ? 'stop' : 'start';
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch('/cli/chart-capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    const cc = data.chart_capture || {};
+                    chartCaptureEnabledState = Boolean(cc.enabled);
+                    showToast(`Chart capture thread ${cc.enabled ? 'started' : 'stopped'} & updated lib/parms.ini`);
+                    await fetchAllData();
+                } else {
+                    showToast(`Chart capture toggle failed: ${data.message || 'error'}`, 'error');
+                }
+            } catch (err) {
+                showToast(`Network error: ${err.message}`, 'error');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
         function updateBottomSymbolDropdown(symbolsList) {
             const sel = document.getElementById('bottomSymbolSelect');
             if (!sel || symbolsList.length === 0) return;
-            const current = sel.value;
-            sel.innerHTML = symbolsList.map(s => `
-                <option value="${s.symbol}" ${s.symbol === (selectedSymbol || current) ? 'selected' : ''}>
-                    ${s.symbol} (${s.providers_count} feeds &bull; ${s.regime.replace('_', ' ')})
-                </option>
-            `).join('');
 
-            if (!selectedSymbol && symbolsList.length > 0) {
-                selectedSymbol = symbolsList[0].symbol;
+            const withTv = symbolsList.find(s => Array.isArray(s.providers) && s.providers.includes('TRADINGVIEW'));
+            const currentObj = symbolsList.find(s => s.symbol === selectedSymbol);
+            const currentHasTv = Boolean(currentObj && Array.isArray(currentObj.providers) && currentObj.providers.includes('TRADINGVIEW'));
+            if (!selectedSymbol || (!userSelectedSymbol && withTv && !currentHasTv)) {
+                const bestFeeds = symbolsList.reduce((best, s) => (!best || s.providers_count > best.providers_count) ? s : best, null);
+                selectedSymbol = (withTv || bestFeeds || symbolsList[0]).symbol;
             }
+
+            const current = sel.value;
+            sel.innerHTML = symbolsList.map(s => {
+                const totalProvs = s.configured_providers_count || s.providers_count;
+                const hasTv = Array.isArray(s.providers) && s.providers.includes('TRADINGVIEW');
+                const tvTag = hasTv ? ' • TV ✓' : '';
+                return `
+                    <option value="${s.symbol}" ${s.symbol === (selectedSymbol || current) ? 'selected' : ''}>
+                        ${s.symbol} (${s.providers_count}/${totalProvs} feeds${tvTag} &bull; ${s.regime.replace('_', ' ')})
+                    </option>
+                `;
+            }).join('');
         }
 
         function renderQuadrantMatrix(instruments) {
@@ -6589,14 +9216,21 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const isExpanded = expandedSymbols.has(item.symbol);
                 const isSelected = selectedSymbol === item.symbol;
 
+                const totalProvs = item.configured_providers_count || item.providers_count;
+                const hasTv = Array.isArray(item.providers) && item.providers.includes('TRADINGVIEW');
+                const tvPill = hasTv
+                    ? `<span class="px-1 py-0.5 rounded text-[9px] mono font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30" title="TradingView feed active">TV</span>`
+                    : '';
+
                 let rowHtml = `
                     <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-indigo-950/20' : ''}" onclick="selectAndInspectSymbol('${item.symbol}')">
                         <td class="px-4 py-2.5">
                             <div class="flex items-center gap-2">
                                 <span class="font-bold text-white mono text-xs">${item.symbol}</span>
                                 <button onclick="event.stopPropagation(); toggleExpandSymbol('${item.symbol}')" class="px-1.5 py-0.5 rounded text-[10px] mono bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition" title="Toggle provider feed breakdown">
-                                    ${item.providers_count} feeds ${isExpanded ? '▲' : '▼'}
+                                    ${item.providers_count}/${totalProvs} feeds ${isExpanded ? '▲' : '▼'}
                                 </button>
+                                ${tvPill}
                             </div>
                         </td>
                         <td class="px-4 py-2.5 text-right mono font-semibold text-slate-200">${priceFormatted}</td>
@@ -6646,8 +9280,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         const sPv = safeNum(sub.price_velocity);
                         const sRv = safeNum(sub.rsi_velocity);
                         const sRa = safeNum(sub.rsi_acceleration);
+                        const isPlaceholder = sub.close === null && sub.rsi === null;
                         rowHtml += `
-                            <tr class="bg-slate-950/60 text-slate-400 text-[11px]">
+                            <tr class="bg-slate-950/60 text-slate-400 text-[11px] ${isPlaceholder ? 'opacity-65' : ''}">
                                 <td class="px-4 py-1.5 pl-8 mono text-cyan-300">&bull; ${sub.provider}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtPrice(sub.close)}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtPrice(sub.projected_price_next)}</td>
@@ -6655,8 +9290,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <td class="px-4 py-1.5 text-right mono">${fmtNum(sub.price_acceleration, 2, '+')}</td>
                                 <td class="px-4 py-1.5 mono">${fmtNum(sub.rsi, 1)}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtNum(sRv, 2, '+')} / ${fmtNum(sRa, 2, '+')}</td>
-                                <td class="px-4 py-1.5"><span class="text-[10px] px-1.5 py-0.5 rounded border ${sFConf.cls}">${sFConf.label}</span></td>
-                                <td class="px-4 py-1.5 text-center mono text-slate-500">feed</td>
+                                <td class="px-4 py-1.5"><span class="text-[10px] px-1.5 py-0.5 rounded border ${sFConf.cls}">${isPlaceholder ? (sub.trading_action || sFConf.label) : sFConf.label}</span></td>
+                                <td class="px-4 py-1.5 text-center mono text-[10px]">${formatFeedStatusBadge(sub.feed_status, true)}</td>
                             </tr>
                         `;
                     });
@@ -6885,9 +9520,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const consolidated = latestData.consolidated_symbols || [];
             if (consolidated.length === 0) return;
 
-            // If no symbol selected, default to the first or highest velocity symbol
+            // If no symbol selected, prefer first symbol reporting TradingView (or highest feed count)
             if (!selectedSymbol) {
-                selectedSymbol = consolidated[0].symbol;
+                const withTv = consolidated.find(s => Array.isArray(s.providers) && s.providers.includes('TRADINGVIEW'));
+                selectedSymbol = (withTv || consolidated[0]).symbol;
             }
 
             // Find data for selected symbol
@@ -6905,7 +9541,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             // Update Header Elements in Deep-Dive Panel
             document.getElementById('detailSymbolBadge').textContent = sym;
             document.getElementById('detailSymbolTitle').textContent = `${sym} Multi-Stream Kinematics Analysis`;
-            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count} reporting feeds • Close ${fmtPrice(symbolData.close)} • RSI ${fmtNum(symbolData.rsi, 1)}`;
+            const totalProvs = symbolData.configured_providers_count || symbolData.providers_count;
+            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count}/${totalProvs} reporting feeds (${(symbolData.providers || []).join(', ') || 'none'}) • Close ${fmtPrice(symbolData.close)} • RSI ${fmtNum(symbolData.rsi, 1)}`;
             
             const badgeEl = document.getElementById('detailRegimeBadge');
             badgeEl.className = `text-[10px] px-2 py-0.5 rounded-full font-semibold border ${rConf.badgeClass}`;
@@ -6960,9 +9597,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const pRsi = safeNum(e.rsi);
                 const pRv = safeNum(e.rsi_velocity);
                 const pRa = safeNum(e.rsi_acceleration);
+                const isPlaceholder = e.close === null && e.rsi === null;
+                const actionLabel = isPlaceholder ? (e.trading_action || pFConf.label) : pFConf.label;
 
                 return `
-                    <tr class="hover:bg-slate-900/60 transition">
+                    <tr class="hover:bg-slate-900/60 transition ${isPlaceholder ? 'opacity-65' : ''}">
                         <td class="px-3.5 py-2 font-bold text-white">${e.provider}</td>
                         <td class="px-3.5 py-2 text-right text-slate-200">${fmtPrice(e.close)}</td>
                         <td class="px-3.5 py-2 text-right text-cyan-300">${fmtPrice(e.projected_price_next)}</td>
@@ -6972,13 +9611,53 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td class="px-3.5 py-2 text-right">${fmtNum(pRv, 2, '+')} / ${fmtNum(pRa, 2, '+')}</td>
                         <td class="px-3.5 py-2">
                             <span class="text-[10px] px-2 py-0.5 rounded border ${pFConf.cls}">
-                                ${pFConf.label}
+                                ${actionLabel}
                             </span>
                         </td>
-                        <td class="px-3.5 py-2 text-center text-emerald-400 font-semibold">LIVE</td>
+                        <td class="px-3.5 py-2 text-center">${formatFeedStatusBadge(e.feed_status)}</td>
                     </tr>
                 `;
             }).join('');
+
+            const tvBanner = document.getElementById('detailTvDiagnosticBanner');
+            if (tvBanner) {
+                const tvEntry = entries.find(e => e.provider === 'TRADINGVIEW');
+                const tvCov = (latestData.provider_coverage || {}).TRADINGVIEW;
+                if (tvEntry && tvEntry.feed_status === 'AWAITING_WEBHOOK' && tvCov) {
+                    const repSyms = tvCov.reporting_symbols || [];
+                    const reqTotal = tvCov.requests_total ?? 0;
+                    const evQueued = tvCov.events_queued ?? 0;
+                    const skipped = tvCov.last_skipped_symbols || [];
+                    const lastErr = tvCov.last_error;
+
+                    document.getElementById('detailTvDiagTitle').textContent =
+                        repSyms.length > 0
+                            ? `TradingView Active for ${repSyms.length}/${tvCov.configured_count} Symbols — ${sym} Not Included in Webhooks`
+                            : `TradingView Webhook Listener Waiting (${reqTotal} POSTs / ${evQueued} events)`;
+
+                    let msg = '';
+                    if (repSyms.length > 0) {
+                        msg = `TradingView has delivered webhooks for ${repSyms.join(', ')} (${evQueued} events queued), but 0 webhooks for ${sym}. Verify ${sym} is enabled in your Pine Script slots, your Watchlist, and that RSI filter mode isn't skipping neutral bars.`;
+                    } else if (skipped.length > 0) {
+                        msg = `Incoming webhooks were skipped because tickers [${skipped.join(', ')}] do not match [symbols] target_symbols in parms.ini.`;
+                    } else if (lastErr) {
+                        msg = `Last webhook validation error: ${lastErr}`;
+                    } else {
+                        msg = `Webhook endpoint /webhook is listening, and no webhook has arrived for ${sym} yet.`;
+                    }
+                    document.getElementById('detailTvDiagBody').textContent = msg;
+
+                    const quickBox = document.getElementById('detailTvQuickSwitch');
+                    if (quickBox) {
+                        quickBox.innerHTML = repSyms.slice(0, 6).map(rs =>
+                            `<button onclick="selectAndInspectSymbol('${rs}')" class="px-1.5 py-0.5 rounded bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 font-mono text-[10px] transition">Inspect ${rs}</button>`
+                        ).join('');
+                    }
+                    tvBanner.classList.remove('hidden');
+                } else {
+                    tvBanner.classList.add('hidden');
+                }
+            }
         }
 
         async function fetchMinuteSummaries() {
@@ -7115,216 +9794,8 @@ class AdminCliProvider:
 
         @app.get("/api/kinematics")
         def get_kinematics():
-            latest = {}
-            records_flat = []
-            symbols_map = {}
-
-            for (provider, symbol), hist in self.coordinator.kinematics_history.items():
-                if hist:
-                    cur = hist[-1]
-                    regime = cur.get("regime")
-                    if not regime or regime == "neutral":
-                        regime = classify_kinematic_regime(
-                            cur.get("rsi_velocity"),
-                            cur.get("rsi_acceleration"),
-                            cur.get("price_velocity"),
-                            cur.get("price_acceleration"),
-                        )
-
-                    entry = {
-                        "provider": provider,
-                        "symbol": symbol,
-                        "close": cur.get("close"),
-                        "smoothed_close": cur.get("smoothed_close"),
-                        "rsi": cur.get("rsi"),
-                        "price_velocity": cur.get("price_velocity"),
-                        "price_velocity_pct": cur.get("price_velocity_pct"),
-                        "price_acceleration": cur.get("price_acceleration"),
-                        "smoothed_velocity": cur.get("smoothed_velocity"),
-                        "smoothed_acceleration": cur.get("smoothed_acceleration"),
-                        "rsi_velocity": cur.get("rsi_velocity"),
-                        "rsi_acceleration": cur.get("rsi_acceleration"),
-                        "momentum_3m_pct": cur.get("momentum_3m_pct"),
-                        "projected_price_next": cur.get("projected_price_next"),
-                        "projected_delta": cur.get("projected_delta"),
-                        "projected_delta_pct": cur.get("projected_delta_pct"),
-                        "rsi_zone": cur.get("rsi_zone"),
-                        "forecast_direction": cur.get("forecast_direction"),
-                        "trading_action": cur.get("trading_action"),
-                        "crossover_signal": cur.get("crossover_signal"),
-                        "ema_slope": cur.get("ema_slope"),
-                        "regime": regime,
-                        "timestamp": cur.get("timestamp"),
-                    }
-                    latest.setdefault(provider, {})[symbol] = entry
-                    records_flat.append(entry)
-
-                    # Group by unique ticker for consolidated view
-                    sym_group = symbols_map.setdefault(
-                        symbol,
-                        {
-                            "symbol": symbol,
-                            "providers": [],
-                            "entries": [],
-                            "closes": [],
-                            "rsis": [],
-                            "price_velocities": [],
-                            "price_velocity_pcts": [],
-                            "price_accelerations": [],
-                            "smoothed_velocities": [],
-                            "smoothed_accelerations": [],
-                            "rsi_velocities": [],
-                            "rsi_accelerations": [],
-                            "momentums": [],
-                            "regimes": [],
-                            "best_history": [],
-                        },
-                    )
-                    sym_group["providers"].append(provider)
-                    sym_group["entries"].append(entry)
-                    if len(hist) > len(sym_group["best_history"]):
-                        sym_group["best_history"] = [
-                            {
-                                "timestamp": h.get("timestamp"),
-                                "close": h.get("close"),
-                                "smoothed_close": h.get("smoothed_close"),
-                                "price_velocity": h.get("price_velocity"),
-                                "price_acceleration": h.get("price_acceleration"),
-                                "smoothed_velocity": h.get("smoothed_velocity"),
-                                "smoothed_acceleration": h.get("smoothed_acceleration"),
-                                "rsi": h.get("rsi"),
-                                "crossover_signal": h.get("crossover_signal"),
-                            }
-                            for h in hist[-20:]
-                        ]
-                    if entry["close"] is not None:
-                        sym_group["closes"].append(entry["close"])
-                    if entry["rsi"] is not None:
-                        sym_group["rsis"].append(entry["rsi"])
-                    if entry["price_velocity"] is not None:
-                        sym_group["price_velocities"].append(entry["price_velocity"])
-                    if entry["price_velocity_pct"] is not None:
-                        sym_group["price_velocity_pcts"].append(
-                            entry["price_velocity_pct"]
-                        )
-                    if entry["price_acceleration"] is not None:
-                        sym_group["price_accelerations"].append(
-                            entry["price_acceleration"]
-                        )
-                    if entry["smoothed_velocity"] is not None:
-                        sym_group["smoothed_velocities"].append(entry["smoothed_velocity"])
-                    if entry["smoothed_acceleration"] is not None:
-                        sym_group["smoothed_accelerations"].append(entry["smoothed_acceleration"])
-                    if entry["rsi_velocity"] is not None:
-                        sym_group["rsi_velocities"].append(entry["rsi_velocity"])
-                    if entry["rsi_acceleration"] is not None:
-                        sym_group["rsi_accelerations"].append(entry["rsi_acceleration"])
-                    if entry["momentum_3m_pct"] is not None:
-                        sym_group["momentums"].append(entry["momentum_3m_pct"])
-                    sym_group["regimes"].append(regime)
-
-            # Build consolidated unique symbols list
-            consolidated_symbols = []
-            regime_counts = {
-                "accelerating_bullish": 0,
-                "decelerating_bullish": 0,
-                "accelerating_bearish": 0,
-                "decelerating_bearish": 0,
-                "neutral": 0,
-            }
-
-            def median_or_none(vals):
-                if not vals:
-                    return None
-                s = sorted(vals)
-                mid = len(s) // 2
-                return s[mid] if len(s) % 2 != 0 else (s[mid - 1] + s[mid]) / 2
-
-            for sym, g in sorted(symbols_map.items()):
-                c_close = median_or_none(g["closes"])
-                c_rsi = median_or_none(g["rsis"])
-                c_pv = median_or_none(g["price_velocities"])
-                c_pv_pct = median_or_none(g["price_velocity_pcts"])
-                c_pa = median_or_none(g["price_accelerations"])
-                c_sv = median_or_none(g["smoothed_velocities"])
-                c_sa = median_or_none(g["smoothed_accelerations"])
-                c_rv = median_or_none(g["rsi_velocities"])
-                c_ra = median_or_none(g["rsi_accelerations"])
-                c_mom = median_or_none(g["momentums"])
-
-                active_pv = c_sv if c_sv is not None else c_pv
-                active_pa = c_sa if c_sa is not None else c_pa
-                c_forecast = compute_kinematic_forecast(c_close, active_pv, active_pa, c_rsi)
-                c_regime = classify_kinematic_regime(c_rv, c_ra, active_pv, active_pa)
-                if c_regime in regime_counts:
-                    regime_counts[c_regime] += 1
-
-                consolidated_symbols.append(
-                    {
-                        "symbol": sym,
-                        "providers_count": len(g["providers"]),
-                        "providers": g["providers"],
-                        "close": round(c_close, 2) if c_close is not None else None,
-                        "rsi": round(c_rsi, 2) if c_rsi is not None else None,
-                        "price_velocity": round(c_pv, 2) if c_pv is not None else None,
-                        "price_velocity_pct": (
-                            round(c_pv_pct, 4) if c_pv_pct is not None else None
-                        ),
-                        "price_acceleration": (
-                            round(c_pa, 2) if c_pa is not None else None
-                        ),
-                        "smoothed_velocity": round(c_sv, 2) if c_sv is not None else None,
-                        "smoothed_acceleration": round(c_sa, 2) if c_sa is not None else None,
-                        "rsi_velocity": round(c_rv, 2) if c_rv is not None else None,
-                        "rsi_acceleration": (
-                            round(c_ra, 2) if c_ra is not None else None
-                        ),
-                        "momentum_3m_pct": (
-                            round(c_mom, 2) if c_mom is not None else None
-                        ),
-                        "projected_price_next": c_forecast["projected_price_next"],
-                        "projected_delta": c_forecast["projected_delta"],
-                        "projected_delta_pct": c_forecast["projected_delta_pct"],
-                        "rsi_zone": c_forecast["rsi_zone"],
-                        "forecast_direction": c_forecast["forecast_direction"],
-                        "trading_action": c_forecast["trading_action"],
-                        "crossover_signal": c_forecast["crossover_signal"],
-                        "regime": c_regime,
-                        "history_window": g["best_history"],
-                        "buy_events": [
-                            e
-                            for e in self.coordinator.option_buy_events.get(sym, [])
-                            if not e.get("dry_run")
-                        ],
-                        "sell_events": [
-                            e
-                            for e in self.coordinator.option_sell_events.get(sym, [])
-                            if not e.get("dry_run")
-                        ],
-                        "provider_entries": g["entries"],
-                    }
-                )
-
-            return (
-                jsonify(
-                    status="ok",
-                    run_id=RUN_ID,
-                    total_unique_symbols=len(consolidated_symbols),
-                    total_provider_streams=len(records_flat),
-                    configured_symbols=list(self.coordinator.symbols),
-                    smooth_config={
-                        "method": KINEMATICS_SMOOTH_METHOD,
-                        "period": KINEMATICS_SMOOTH_PERIOD,
-                        "overbought": KINEMATICS_RSI_OVERBOUGHT,
-                        "oversold": KINEMATICS_RSI_OVERSOLD,
-                    },
-                    regime_counts=regime_counts,
-                    latest_by_provider=latest,
-                    consolidated_symbols=consolidated_symbols,
-                    instruments=records_flat,
-                ),
-                200,
-            )
+            snap = build_kinematics_snapshot_data(self.coordinator, history_limit=20)
+            return jsonify(status="ok", run_id=RUN_ID, **snap), 200
 
         @app.get("/api/minute-summaries")
         def get_minute_summaries():
@@ -7429,6 +9900,32 @@ class AdminCliProvider:
                         "timestamp": latest.get("timestamp"),
                     }
 
+            cc_entry = PROVIDER_REGISTRY.get("CHART_CAPTURE", {})
+            cc = cc_entry.get("router")
+            chart_capture_report = (
+                cc.get_status()
+                if cc is not None and hasattr(cc, "get_status")
+                else {
+                    "status": cc.last_status if cc else "not_loaded",
+                    "enabled": cc.enabled if cc else False,
+                    "thread_alive": False,
+                    "thread_name": None,
+                    "ini_enabled": _read_chart_capture_ini_enabled(),
+                    "output_dir": str(cc.output_dir) if cc else CHART_CAPTURE_DIR,
+                    "captures_total": cc.captures_total if cc else 0,
+                    "last_capture_utc": cc.last_capture_utc if cc else None,
+                    "last_capture_symbol_count": cc.last_capture_symbol_count if cc else 0,
+                }
+            )
+
+            tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {})
+            tv = tv_entry.get("router")
+            tv_report = (
+                tv.get_stats()
+                if tv is not None and hasattr(tv, "get_stats")
+                else None
+            )
+
             status_report = {
                 "run_id": RUN_ID,
                 "connected_providers": self.coordinator.connected,
@@ -7440,14 +9937,70 @@ class AdminCliProvider:
                 "loaded_providers": [
                     k
                     for k in PROVIDER_REGISTRY.keys()
-                    if k not in {"POSITIONS_MONITOR", "OPTION_BUYER", "OPTION_SELLER"}
+                    if k
+                    not in {
+                        "POSITIONS_MONITOR",
+                        "OPTION_BUYER",
+                        "OPTION_SELLER",
+                        "CHART_CAPTURE",
+                    }
                 ],
                 "position_monitor": position_monitor_report,
                 "option_buyer": option_buyer_report,
                 "option_seller": option_seller_report,
+                "chart_capture": chart_capture_report,
+                "tradingview_webhook": tv_report,
                 "latest_kinematics": latest_kinematics,
             }
             return jsonify(status="ok", metrics=status_report), 200
+
+        @app.route("/cli/chart-capture", methods=["GET", "POST"])
+        def control_chart_capture():
+            cc_entry = PROVIDER_REGISTRY.get("CHART_CAPTURE", {})
+            cc = cc_entry.get("router")
+            if cc is None:
+                return (
+                    jsonify(status="error", message="CHART_CAPTURE manager is not loaded"),
+                    503,
+                )
+
+            if request.method == "GET":
+                return jsonify(status="ok", chart_capture=cc.get_status()), 200
+
+            payload = request.get_json(force=True, silent=True) or {}
+            action = str(payload.get("action") or "status").strip().lower()
+            if action == "toggle":
+                action = "stop" if cc.enabled else "start"
+
+            if action == "status":
+                return jsonify(status="ok", chart_capture=cc.get_status()), 200
+            if action not in {"start", "stop"}:
+                return (
+                    jsonify(
+                        status="error",
+                        message="action must be 'start', 'stop', 'toggle', or 'status'",
+                    ),
+                    400,
+                )
+
+            def apply_action():
+                if action == "start":
+                    return cc.start_capture(persist_ini=True)
+                return cc.stop_capture(persist_ini=True)
+
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.to_thread(apply_action), self.loop
+            )
+            result = future.result(timeout=10.0)
+            return (
+                jsonify(
+                    status="ok",
+                    action=action,
+                    message=f"Chart capture thread {'started' if action == 'start' else 'stopped'} and lib/parms.ini updated.",
+                    chart_capture=result,
+                ),
+                200,
+            )
 
         @app.post("/cli/finalize")
         def force_finalize():
@@ -7571,9 +10124,10 @@ class AdminCliProvider:
             self.host,
             self.port,
             self.app,
-            threaded=False,
+            threaded=True,
             request_handler=BoundedRequestHandler,
         )
+        self.server.request_queue_size = 64
         self.server.timeout = 0.5
         self.thread = threading.Thread(
             target=self.serve, name="CLI-Admin-Server", daemon=True
@@ -7707,6 +10261,13 @@ async def main():
     )
     tasks.append(os_task)
 
+    chart_capture = ChartCaptureManager(coordinator)
+    cc_task = asyncio.create_task(
+        run_provider_isolated(chart_capture, coordinator),
+        name="CHART_CAPTURE",
+    )
+    tasks.append(cc_task)
+
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
             run_provider_isolated(entry["router"], coordinator), name=provider
@@ -7726,6 +10287,60 @@ async def main():
         "router": option_seller,
         "task": os_task,
     }
+    PROVIDER_REGISTRY["CHART_CAPTURE"] = {
+        "router": chart_capture,
+        "task": cc_task,
+    }
+
+    # 4b. Interactive TTY stdin CLI (strictly guarded by isatty so systemd/daemons never read EOF)
+    try:
+        is_tty = bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        is_tty = False
+    if is_tty:
+        def _tty_cli_reader():
+            logging.info("TTY_CLI_READY commands: 'chart-capture start|stop|status', 'status', 'help'")
+            while True:
+                try:
+                    line = sys.stdin.readline()
+                except Exception:
+                    break
+                if not line:
+                    break
+                cmd = line.strip().lower()
+                if not cmd:
+                    continue
+                if cmd in {"chart-capture start", "chart_capture start", "cc start"}:
+                    res = chart_capture.start_capture(persist_ini=True)
+                    print(f"[CLI] Chart capture STARTED: {json.dumps(res)}", flush=True)
+                elif cmd in {"chart-capture stop", "chart_capture stop", "cc stop"}:
+                    res = chart_capture.stop_capture(persist_ini=True)
+                    print(f"[CLI] Chart capture STOPPED: {json.dumps(res)}", flush=True)
+                elif cmd in {"chart-capture status", "chart_capture status", "cc status"}:
+                    print(f"[CLI] Chart capture STATUS: {json.dumps(chart_capture.get_status())}", flush=True)
+                elif cmd == "status":
+                    tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {})
+                    tv_r = tv_entry.get("router")
+                    print(
+                        json.dumps(
+                            {
+                                "connected": coordinator.connected,
+                                "chart_capture": chart_capture.get_status(),
+                                "tradingview": tv_r.get_stats() if tv_r and hasattr(tv_r, "get_stats") else None,
+                            },
+                            indent=2,
+                        ),
+                        flush=True,
+                    )
+                elif cmd in {"help", "?"}:
+                    print(
+                        "[CLI] Commands: chart-capture start | chart-capture stop | chart-capture status | status",
+                        flush=True,
+                    )
+                else:
+                    print(f"[CLI] Unknown command: {cmd!r} (type 'help')", flush=True)
+
+        threading.Thread(target=_tty_cli_reader, name="TTY-CLI", daemon=True).start()
 
     # 5. Execute engine orchestration
     try:
@@ -7743,6 +10358,107 @@ async def main():
     return 0
 
 
+def _call_running_chart_capture_cli(action, port=DASHBOARD_PORT, timeout=2.0):
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{int(port)}/cli/chart-capture"
+    try:
+        if action == "status":
+            req = urllib.request.Request(url, method="GET")
+        else:
+            body = json.dumps({"action": action}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError:
+        return None
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+def handle_cli_command(argv=None):
+    """Handle CLI commands like `chart-capture start|stop|status` or `--chart-capture ...`.
+
+    Returns an integer exit code if a one-shot CLI command was handled, or None to
+    proceed with starting the full async engine.
+    """
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if not raw_args:
+        return None
+
+    parser = argparse.ArgumentParser(
+        prog=Path(__file__).name,
+        description="Multi-Stream RSI & Price Kinematics Engine",
+    )
+    parser.add_argument(
+        "--chart-capture",
+        choices=["start", "stop", "status"],
+        help="Start, stop, or inspect the 1-minute PNG chart capture thread (updates lib/parms.ini).",
+    )
+    parser.add_argument(
+        "--ini",
+        default=None,
+        help="Optional path to parms.ini (defaults to lib/parms.ini next to the script).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DASHBOARD_PORT,
+        help="Running Admin/CLI HTTP port for live thread signaling (default 5001).",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cc_parser = subparsers.add_parser(
+        "chart-capture",
+        help="Manage the 1-minute PNG chart capture thread & lib/parms.ini setting.",
+    )
+    cc_parser.add_argument("action", choices=["start", "stop", "status"])
+    cc_parser.add_argument("--ini", dest="sub_ini", default=None, help="Optional path to parms.ini.")
+    cc_parser.add_argument("--port", dest="sub_port", type=int, default=DASHBOARD_PORT)
+
+    args = parser.parse_args(raw_args)
+    action = args.action if getattr(args, "subcommand", None) == "chart-capture" else args.chart_capture
+    if not action:
+        return None
+
+    ini_path = getattr(args, "sub_ini", None) or args.ini
+    port = getattr(args, "sub_port", None) or args.port
+
+    if action in {"start", "stop"}:
+        target_enabled = action == "start"
+        ini_updated = update_chart_capture_ini(target_enabled, ini_path=ini_path)
+        live_res = _call_running_chart_capture_cli(action, port=port)
+        out = {
+            "status": "ok",
+            "action": action,
+            "ini_path": str(Path(ini_path) if ini_path else get_default_parms_ini_path()),
+            "ini_updated": ini_updated,
+            "chart_capture_enabled": target_enabled,
+            "live_engine_updated": bool(live_res and live_res.get("status") == "ok"),
+            "live_response": live_res,
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    ini_enabled = _read_chart_capture_ini_enabled(ini_path=ini_path)
+    live_res = _call_running_chart_capture_cli("status", port=port)
+    out = {
+        "status": "ok",
+        "action": "status",
+        "ini_path": str(Path(ini_path) if ini_path else get_default_parms_ini_path()),
+        "ini_enabled": ini_enabled,
+        "live_engine_running": bool(live_res and live_res.get("status") == "ok"),
+        "live_chart_capture": (live_res or {}).get("chart_capture"),
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 logging.info(
     f"Reached entry point: "
     f"file={globals().get('__file__', '<interactive>')} "
@@ -7750,6 +10466,11 @@ logging.info(
 )
 
 if __name__ == "__main__":
+    cli_exit = handle_cli_command()
+    if cli_exit is not None:
+        logging.shutdown()
+        sys.exit(cli_exit)
+
     exit_code = 1
 
     try:
