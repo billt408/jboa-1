@@ -1,10 +1,9 @@
-// This Pine Script® code is subject to the terms of the
-// Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © billt408 / Consolidated 21-Symbol 1-Minute Batch Webhook Streamer
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © billt408 / Consolidated 27-Symbol 1-Minute Batch Webhook Streamer
 
 //@version=6
 indicator(
-     title = "RSI 1m Multi-Symbol Webhook Streamer",
+     title = "RSI 1m Multi-Symbol Webhook Streamer (27 Symbols)",
      shorttitle = "MultiRSI",
      overlay = false,
      format = format.price,
@@ -14,8 +13,7 @@ indicator(
 
 // ----------------------------- Inputs -----------------------------
 
-GRP_SYMBOLS = "Symbols"
-GRP_EXTRA = "Additional Symbols"
+GRP_SYMBOLS = "Symbols (1-27)"
 
 enable1 = input.bool(true, "Enable symbol 1", group = GRP_SYMBOLS)
 symbol1 = input.symbol("NASDAQ:NVDA", "Symbol 1", group = GRP_SYMBOLS)
@@ -26,59 +24,77 @@ symbol2 = input.symbol("NASDAQ:MU", "Symbol 2", group = GRP_SYMBOLS)
 enable3 = input.bool(true, "Enable symbol 3", group = GRP_SYMBOLS)
 symbol3 = input.symbol("NASDAQ:CRWV", "Symbol 3", group = GRP_SYMBOLS)
 
-enable4 = input.bool(true, "Enable symbol 4", group = GRP_EXTRA)
-symbol4 = input.symbol("NASDAQ:SNDK", "Symbol 4", group = GRP_EXTRA)
+enable4 = input.bool(true, "Enable symbol 4", group = GRP_SYMBOLS)
+symbol4 = input.symbol("NASDAQ:SNDK", "Symbol 4", group = GRP_SYMBOLS)
 
-enable5 = input.bool(true, "Enable symbol 5", group = GRP_EXTRA)
-symbol5 = input.symbol("NYSE:DELL", "Symbol 5", group = GRP_EXTRA)
+enable5 = input.bool(true, "Enable symbol 5", group = GRP_SYMBOLS)
+symbol5 = input.symbol("NYSE:DELL", "Symbol 5", group = GRP_SYMBOLS)
 
-enable6 = input.bool(true, "Enable symbol 6", group = GRP_EXTRA)
-symbol6 = input.symbol("NYSE:LLY", "Symbol 6", group = GRP_EXTRA)
+enable6 = input.bool(true, "Enable symbol 6", group = GRP_SYMBOLS)
+symbol6 = input.symbol("NYSE:LLY", "Symbol 6", group = GRP_SYMBOLS)
 
-enable7 = input.bool(true, "Enable symbol 7", group = GRP_EXTRA)
-symbol7 = input.symbol("NYSE:TMO", "Symbol 7", group = GRP_EXTRA)
+enable7 = input.bool(true, "Enable symbol 7", group = GRP_SYMBOLS)
+symbol7 = input.symbol("NYSE:TMO", "Symbol 7", group = GRP_SYMBOLS)
 
-enable8 = input.bool(true, "Enable symbol 8", group = GRP_EXTRA)
-symbol8 = input.symbol("NASDAQ:ISRG", "Symbol 8", group = GRP_EXTRA)
+enable8 = input.bool(true, "Enable symbol 8", group = GRP_SYMBOLS)
+symbol8 = input.symbol("NASDAQ:ISRG", "Symbol 8", group = GRP_SYMBOLS)
 
-enable9 = input.bool(true, "Enable symbol 9", group = GRP_EXTRA)
-symbol9 = input.symbol("NASDAQ:VRTX", "Symbol 9", group = GRP_EXTRA)
+enable9 = input.bool(true, "Enable symbol 9", group = GRP_SYMBOLS)
+symbol9 = input.symbol("NASDAQ:VRTX", "Symbol 9", group = GRP_SYMBOLS)
 
-enable10 = input.bool(true, "Enable symbol 10", group = GRP_EXTRA)
-symbol10 = input.symbol("NYSE:MCD", "Symbol 10", group = GRP_EXTRA)
+enable10 = input.bool(true, "Enable symbol 10", group = GRP_SYMBOLS)
+symbol10 = input.symbol("NYSE:MCD", "Symbol 10", group = GRP_SYMBOLS)
 
-enable11 = input.bool(true, "Enable symbol 11", group = GRP_EXTRA)
-symbol11 = input.symbol("NYSE:V", "Symbol 11", group = GRP_EXTRA)
+enable11 = input.bool(true, "Enable symbol 11", group = GRP_SYMBOLS)
+symbol11 = input.symbol("NYSE:V", "Symbol 11", group = GRP_SYMBOLS)
 
-enable12 = input.bool(true, "Enable symbol 12", group = GRP_EXTRA)
-symbol12 = input.symbol("NYSE:NOC", "Symbol 12", group = GRP_EXTRA)
+enable12 = input.bool(true, "Enable symbol 12", group = GRP_SYMBOLS)
+symbol12 = input.symbol("NYSE:NOC", "Symbol 12", group = GRP_SYMBOLS)
 
-enable13 = input.bool(true, "Enable symbol 13", group = GRP_EXTRA)
-symbol13 = input.symbol("NYSE:ROK", "Symbol 13", group = GRP_EXTRA)
+enable13 = input.bool(true, "Enable symbol 13", group = GRP_SYMBOLS)
+symbol13 = input.symbol("NYSE:ROK", "Symbol 13", group = GRP_SYMBOLS)
 
-enable14 = input.bool(true, "Enable symbol 14", group = GRP_EXTRA)
-symbol14 = input.symbol("NYSE:TSM", "Symbol 14", group = GRP_EXTRA)
+enable14 = input.bool(true, "Enable symbol 14", group = GRP_SYMBOLS)
+symbol14 = input.symbol("NYSE:TSM", "Symbol 14", group = GRP_SYMBOLS)
 
-enable15 = input.bool(true, "Enable symbol 15", group = GRP_EXTRA)
-symbol15 = input.symbol("NASDAQ:MSFT", "Symbol 15", group = GRP_EXTRA)
+enable15 = input.bool(true, "Enable symbol 15", group = GRP_SYMBOLS)
+symbol15 = input.symbol("NASDAQ:MSFT", "Symbol 15", group = GRP_SYMBOLS)
 
-enable16 = input.bool(true, "Enable symbol 16", group = GRP_EXTRA)
-symbol16 = input.symbol("NASDAQ:LITE", "Symbol 16", group = GRP_EXTRA)
+enable16 = input.bool(true, "Enable symbol 16", group = GRP_SYMBOLS)
+symbol16 = input.symbol("NASDAQ:LITE", "Symbol 16", group = GRP_SYMBOLS)
 
-enable17 = input.bool(true, "Enable symbol 17", group = GRP_EXTRA)
-symbol17 = input.symbol("NASDAQ:META", "Symbol 17", group = GRP_EXTRA)
+enable17 = input.bool(true, "Enable symbol 17", group = GRP_SYMBOLS)
+symbol17 = input.symbol("NASDAQ:META", "Symbol 17", group = GRP_SYMBOLS)
 
-enable18 = input.bool(true, "Enable symbol 18", group = GRP_EXTRA)
-symbol18 = input.symbol("NASDAQ:AMD", "Symbol 18", group = GRP_EXTRA)
+enable18 = input.bool(true, "Enable symbol 18", group = GRP_SYMBOLS)
+symbol18 = input.symbol("NASDAQ:AMD", "Symbol 18", group = GRP_SYMBOLS)
 
-enable19 = input.bool(true, "Enable symbol 19", group = GRP_EXTRA)
-symbol19 = input.symbol("NASDAQ:TSLA", "Symbol 19", group = GRP_EXTRA)
+enable19 = input.bool(true, "Enable symbol 19", group = GRP_SYMBOLS)
+symbol19 = input.symbol("NASDAQ:TSLA", "Symbol 19", group = GRP_SYMBOLS)
 
-enable20 = input.bool(true, "Enable symbol 20", group = GRP_EXTRA)
-symbol20 = input.symbol("NASDAQ:STX", "Symbol 20", group = GRP_EXTRA)
+enable20 = input.bool(true, "Enable symbol 20", group = GRP_SYMBOLS)
+symbol20 = input.symbol("NASDAQ:STX", "Symbol 20", group = GRP_SYMBOLS)
 
-enable21 = input.bool(true, "Enable symbol 21", group = GRP_EXTRA)
-symbol21 = input.symbol("AMEX:SURE", "Symbol 21", group = GRP_EXTRA, tooltip = "(21: AMEX:SURE is the AdvisorShares Insider Advantage ETF on NYSE Arca)")
+enable21 = input.bool(true, "Enable symbol 21", group = GRP_SYMBOLS)
+symbol21 = input.symbol("AMEX:SURE", "Symbol 21", group = GRP_SYMBOLS, tooltip = "(AMEX:SURE ETF on NYSE Arca)")
+
+enable22 = input.bool(true, "Enable symbol 22", group = GRP_SYMBOLS)
+symbol22 = input.symbol("NASDAQ:AMZN", "Symbol 22", group = GRP_SYMBOLS)
+
+enable23 = input.bool(true, "Enable symbol 23", group = GRP_SYMBOLS)
+symbol23 = input.symbol("NASDAQ:KLAC", "Symbol 23", group = GRP_SYMBOLS)
+
+enable24 = input.bool(true, "Enable symbol 24", group = GRP_SYMBOLS)
+symbol24 = input.symbol("NASDAQ:INTC", "Symbol 24", group = GRP_SYMBOLS)
+
+enable25 = input.bool(true, "Enable symbol 25", group = GRP_SYMBOLS)
+symbol25 = input.symbol("AMEX:SPCX", "Symbol 25", group = GRP_SYMBOLS)
+
+enable26 = input.bool(true, "Enable symbol 26", group = GRP_SYMBOLS)
+symbol26 = input.symbol("NASDAQ:AAPL", "Symbol 26", group = GRP_SYMBOLS)
+
+enable27 = input.bool(true, "Enable symbol 27", group = GRP_SYMBOLS)
+symbol27 = input.symbol("NASDAQ:GOOG", "Symbol 27", group = GRP_SYMBOLS)
 
 GRP_RSI = "RSI Configuration & Alert Filtering"
 
@@ -108,7 +124,7 @@ alertOnlyExtremes = input.bool(
      false,
      "Include ONLY extreme symbols (RSI <= 35 or >= 65)",
      group = GRP_RSI,
-     tooltip = "Disabled by default: sends ALL enabled symbols' 1m RSI & price in one consolidated payload every minute. Enable to only include symbols in extreme zones."
+     tooltip = "Disabled by default: sends ALL 27 enabled symbols' 1m RSI & price in one consolidated payload every minute. Enable to only include symbols in extreme zones."
 )
 
 includeExtended = input.bool(
@@ -159,8 +175,8 @@ if not chart.is_standard
 if maxAgeSeconds <= settleSeconds
     runtime.error("Maximum age must be greater than the wait after minute end.")
 
-allSymbols = array.from(symbol1, symbol2, symbol3, symbol4, symbol5, symbol6, symbol7, symbol8, symbol9, symbol10, symbol11, symbol12, symbol13, symbol14, symbol15, symbol16, symbol17, symbol18, symbol19, symbol20, symbol21)
-allEnabled = array.from(enable1, enable2, enable3, enable4, enable5, enable6, enable7, enable8, enable9, enable10, enable11, enable12, enable13, enable14, enable15, enable16, enable17, enable18, enable19, enable20, enable21)
+allSymbols = array.from(symbol1, symbol2, symbol3, symbol4, symbol5, symbol6, symbol7, symbol8, symbol9, symbol10, symbol11, symbol12, symbol13, symbol14, symbol15, symbol16, symbol17, symbol18, symbol19, symbol20, symbol21, symbol22, symbol23, symbol24, symbol25, symbol26, symbol27)
+allEnabled = array.from(enable1, enable2, enable3, enable4, enable5, enable6, enable7, enable8, enable9, enable10, enable11, enable12, enable13, enable14, enable15, enable16, enable17, enable18, enable19, enable20, enable21, enable22, enable23, enable24, enable25, enable26, enable27)
 
 bool duplicateFound = false
 for i = 0 to array.size(allSymbols) - 2
@@ -174,7 +190,7 @@ if duplicateFound
 // ----------------------------- Persistent state -----------------------------
 
 varip int lastBatchSent = na
-varip array<int> lastSent = array.new_int(21, na)
+varip array<int> lastSent = array.new_int(27, na)
 
 // ----------------------------- Functions -----------------------------
 
@@ -230,7 +246,7 @@ f_jsonEscape(string value) =>
     escaped := str.replace_all(escaped, "\t", "\\t")
     escaped
 
-// ----------------------------- Source data (21 Symbols) -----------------------------
+// ----------------------------- Source data (27 Symbols <= 40 security limit) -----------------------------
 
 [t1, e1, p1, r1, g1] = f_completedSample(symbol1)
 [t2, e2, p2, r2, g2] = f_completedSample(symbol2)
@@ -253,23 +269,28 @@ f_jsonEscape(string value) =>
 [t19, e19, p19, r19, g19] = f_completedSample(symbol19)
 [t20, e20, p20, r20, g20] = f_completedSample(symbol20)
 [t21, e21, p21, r21, g21] = f_completedSample(symbol21)
+[t22, e22, p22, r22, g22] = f_completedSample(symbol22)
+[t23, e23, p23, r23, g23] = f_completedSample(symbol23)
+[t24, e24, p24, r24, g24] = f_completedSample(symbol24)
+[t25, e25, p25, r25, g25] = f_completedSample(symbol25)
+[t26, e26, p26, r26, g26] = f_completedSample(symbol26)
+[t27, e27, p27, r27, g27] = f_completedSample(symbol27)
 
-allT = array.from(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21)
-allE = array.from(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21)
-allP = array.from(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21)
-allR = array.from(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21)
-allG = array.from(g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21)
+allT = array.from(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27)
+allE = array.from(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27)
+allP = array.from(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27)
+allR = array.from(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27)
+allG = array.from(g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21, g22, g23, g24, g25, g26, g27)
 
 // ----------------------------- Single Batch Webhook Dispatch (1 Payload / Minute) -----------------------------
 
-eligible = array.new_bool(21, false)
-sentFlags = array.new_bool(21, false)
+eligible = array.new_bool(27, false)
 int batchBarStart = na
 bool batchDispatched = false
 
 if sendWebhooks and barstate.isrealtime
     // Pass 1: find all valid symbols settled inside the 1-minute dispatch window
-    for i = 0 to 20
+    for i = 0 to 26
         bool isEnabled = array.get(allEnabled, i)
         int barStart = array.get(allT, i)
         int barEnd = array.get(allE, i)
@@ -304,7 +325,7 @@ if sendWebhooks and barstate.isrealtime
         batchItems = array.new_string()
         string batchTimestamp = str.format_time(batchBarStart, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC+0")
 
-        for i = 0 to 20
+        for i = 0 to 26
             if array.get(eligible, i)
                 string sym = array.get(allSymbols, i)
                 int barStart = array.get(allT, i)
@@ -334,7 +355,6 @@ if sendWebhooks and barstate.isrealtime
 
                 array.push(batchItems, itemJson)
                 array.set(lastSent, i, barStart)
-                array.set(sentFlags, i, true)
 
         if array.size(batchItems) > 0
             string batchMessage = (
@@ -355,28 +375,6 @@ if sendWebhooks and barstate.isrealtime
             lastBatchSent := batchBarStart
             batchDispatched := true
 
-sent1 = array.get(sentFlags, 0)
-sent2 = array.get(sentFlags, 1)
-sent3 = array.get(sentFlags, 2)
-sent4 = array.get(sentFlags, 3)
-sent5 = array.get(sentFlags, 4)
-sent6 = array.get(sentFlags, 5)
-sent7 = array.get(sentFlags, 6)
-sent8 = array.get(sentFlags, 7)
-sent9 = array.get(sentFlags, 8)
-sent10 = array.get(sentFlags, 9)
-sent11 = array.get(sentFlags, 10)
-sent12 = array.get(sentFlags, 11)
-sent13 = array.get(sentFlags, 12)
-sent14 = array.get(sentFlags, 13)
-sent15 = array.get(sentFlags, 14)
-sent16 = array.get(sentFlags, 15)
-sent17 = array.get(sentFlags, 16)
-sent18 = array.get(sentFlags, 17)
-sent19 = array.get(sentFlags, 18)
-sent20 = array.get(sentFlags, 19)
-sent21 = array.get(sentFlags, 20)
-
 // ----------------------------- Display & Guidelines -----------------------------
 
 plot(enable1 ? r1 : na, "Symbol 1 RSI", color = color.purple, linewidth = 2)
@@ -392,25 +390,4 @@ hBot = hline(0, "Bottom 0", color = color.new(color.gray, 100))
 fill(hHigh, hTop, color = color.new(color.red, 90), title = "Overbought Zone")
 fill(hBot, hLow, color = color.new(color.green, 90), title = "Oversold Zone")
 
-// Webhook dispatch markers
-plotshape(sent1, title = "Symbol 1 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
-plotshape(sent2, title = "Symbol 2 webhook", style = shape.circle, location = location.bottom, color = color.blue, size = size.tiny)
-plotshape(sent3, title = "Symbol 3 webhook", style = shape.circle, location = location.bottom, color = color.orange, size = size.tiny)
-plotshape(sent4, title = "Symbol 4 webhook", style = shape.circle, location = location.bottom, color = color.teal, size = size.tiny)
-plotshape(sent5, title = "Symbol 5 webhook", style = shape.circle, location = location.bottom, color = color.fuchsia, size = size.tiny)
-plotshape(sent6, title = "Symbol 6 webhook", style = shape.circle, location = location.bottom, color = color.olive, size = size.tiny)
-plotshape(sent7, title = "Symbol 7 webhook", style = shape.circle, location = location.bottom, color = color.aqua, size = size.tiny)
-plotshape(sent8, title = "Symbol 8 webhook", style = shape.circle, location = location.bottom, color = color.lime, size = size.tiny)
-plotshape(sent9, title = "Symbol 9 webhook", style = shape.circle, location = location.bottom, color = color.yellow, size = size.tiny)
-plotshape(sent10, title = "Symbol 10 webhook", style = shape.circle, location = location.bottom, color = color.maroon, size = size.tiny)
-plotshape(sent11, title = "Symbol 11 webhook", style = shape.circle, location = location.bottom, color = color.navy, size = size.tiny)
-plotshape(sent12, title = "Symbol 12 webhook", style = shape.circle, location = location.bottom, color = color.red, size = size.tiny)
-plotshape(sent13, title = "Symbol 13 webhook", style = shape.circle, location = location.bottom, color = color.green, size = size.tiny)
-plotshape(sent14, title = "Symbol 14 webhook", style = shape.circle, location = location.bottom, color = color.gray, size = size.tiny)
-plotshape(sent15, title = "Symbol 15 webhook", style = shape.circle, location = location.bottom, color = color.black, size = size.tiny)
-plotshape(sent16, title = "Symbol 16 webhook", style = shape.circle, location = location.bottom, color = color.white, size = size.tiny)
-plotshape(sent17, title = "Symbol 17 webhook", style = shape.circle, location = location.bottom, color = color.rgb(160, 82, 45), size = size.tiny)
-plotshape(sent18, title = "Symbol 18 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
-plotshape(sent19, title = "Symbol 19 webhook", style = shape.circle, location = location.bottom, color = color.blue, size = size.tiny)
-plotshape(sent20, title = "Symbol 20 webhook", style = shape.circle, location = location.bottom, color = color.orange, size = size.tiny)
-plotshape(sent21, title = "Symbol 21 webhook", style = shape.circle, location = location.bottom, color = color.purple, size = size.tiny)
+plotshape(batchDispatched, title = "Batch webhook dispatched", style = shape.circle, location = location.bottom, color = color.lime, size = size.tiny)
