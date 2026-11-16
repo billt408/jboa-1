@@ -4260,6 +4260,17 @@ def _fmt_log_total(val):
         return "n/a"
 
 
+def _is_no_quote_market_rejection(exc):
+    """Return True when Alpaca rejects a Market order because no quote is available (code 40310000)."""
+    msg = str(exc or "").lower()
+    return (
+        "40310000" in msg
+        or "no available quote" in msg
+        or "reenter with a limit" in msg
+        or "market orders are not available" in msg
+    )
+
+
 class AlpacaOptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
@@ -4292,6 +4303,7 @@ class AlpacaOptionBuyer:
         self.last_order_contract = None
         self.last_order_symbol = None
         self.last_order_reason = None
+        self.last_error_detail = None
         self.orders_submitted = 0
         self.dry_run_orders = 0
         self.last_buy_by_symbol = {}
@@ -4598,18 +4610,21 @@ class AlpacaOptionBuyer:
                 best_ts = ts
         return best_provider, best_entry
 
-    def _submit_option_order(self, contract_symbol, qty, limit_price=None):
+    def _submit_option_order(self, contract_symbol, qty, limit_price=None, force_limit=False):
         """Place the option BUY order on Alpaca TradingClient (blocking)."""
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
-        if OPTION_BUY_ORDER_TYPE == "limit" and limit_price is not None and limit_price > 0:
+        use_limit = (OPTION_BUY_ORDER_TYPE == "limit" or force_limit) and (
+            limit_price is not None and limit_price > 0
+        )
+        if use_limit:
             req = LimitOrderRequest(
                 symbol=contract_symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                limit_price=limit_price,
+                limit_price=round(max(0.01, float(limit_price)), 2),
             )
         else:
             req = MarketOrderRequest(
@@ -4895,13 +4910,54 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
+            eff_buy_order_type = OPTION_BUY_ORDER_TYPE
+            eff_buy_limit = limit_price
             try:
-                order = await asyncio.to_thread(
-                    self._submit_option_order,
-                    contract_symbol,
-                    OPTION_BUY_QTY,
-                    limit_price,
-                )
+                try:
+                    order = await asyncio.to_thread(
+                        self._submit_option_order,
+                        contract_symbol,
+                        OPTION_BUY_QTY,
+                        eff_buy_limit,
+                        False,
+                    )
+                except Exception as submit_exc:
+                    if eff_buy_order_type != "limit" and _is_no_quote_market_rejection(submit_exc):
+                        fallback_candidates = [
+                            eff_buy_limit,
+                            contract_ask,
+                            contract_bid,
+                            self._first_pos_float(contract, ("close_price", "mark_price", "last_price")),
+                        ]
+                        fallback_lp = next(
+                            (round(max(0.01, float(p)), 2) for p in fallback_candidates if p is not None and math.isfinite(float(p)) and float(p) > 0),
+                            None,
+                        )
+                        if fallback_lp is None:
+                            raise
+                        eff_buy_order_type = "limit"
+                        eff_buy_limit = fallback_lp
+                        est_unit_price = fallback_lp
+                        total_purchase = _compute_order_total(
+                            est_unit_price, OPTION_BUY_QTY, is_option=True
+                        )
+                        self.logger.warning(
+                            "OPTION_BUY_MARKET_FALLBACK_TO_LIMIT symbol=%s contract=%s "
+                            "limit_price=%.2f reason=no_available_quote",
+                            symbol,
+                            contract_symbol,
+                            fallback_lp,
+                        )
+                        order = await asyncio.to_thread(
+                            self._submit_option_order,
+                            contract_symbol,
+                            OPTION_BUY_QTY,
+                            fallback_lp,
+                            True,
+                        )
+                    else:
+                        raise
+
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
                 filled_avg = self._first_pos_float(order, ("filled_avg_price",))
@@ -4926,6 +4982,7 @@ class AlpacaOptionBuyer:
                         pass
 
                 self.orders_submitted += 1
+                self.last_error_detail = None
                 open_option_count += 1
                 open_contracts.add(contract_symbol)
                 open_underlyings.add(symbol)
@@ -4955,10 +5012,10 @@ class AlpacaOptionBuyer:
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
-                    OPTION_BUY_ORDER_TYPE,
+                    eff_buy_order_type,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
-                    _fmt_log_price(limit_price) if OPTION_BUY_ORDER_TYPE == "limit" else "n/a",
+                    _fmt_log_price(eff_buy_limit) if eff_buy_order_type == "limit" else "n/a",
                     _fmt_log_total(actual_total_purchase),
                     inferred_right or desired_right,
                     contract_source,
@@ -4973,7 +5030,7 @@ class AlpacaOptionBuyer:
                     symbol,
                     contract_symbol,
                     OPTION_BUY_QTY,
-                    OPTION_BUY_ORDER_TYPE,
+                    eff_buy_order_type,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
                     _fmt_log_total(actual_total_purchase),
@@ -4981,6 +5038,7 @@ class AlpacaOptionBuyer:
                 )
             except Exception as exc:
                 self.last_status = f"order_error: {type(exc).__name__}"
+                self.last_error_detail = f"{symbol} ({contract_symbol}): {str(exc)[:140]}"
                 self.logger.error(
                     "OPTION_BUY_FAILED symbol=%s contract=%s error_type=%s detail=%s",
                     symbol,
@@ -5091,6 +5149,7 @@ class AlpacaOptionSeller:
         self.last_order_contract = None
         self.last_order_symbol = None
         self.last_order_reason = None
+        self.last_error_detail = None
         self.last_positions_checked = 0
         self.orders_submitted = 0
         self.dry_run_orders = 0
@@ -5466,6 +5525,53 @@ class AlpacaOptionSeller:
         bid, _ = self._fetch_live_quote(pos_sym, is_option)
         return bid
 
+    @staticmethod
+    def _extract_position_fallback_price(pos, raw_qty, is_option, live_bid, cur_price):
+        """Return best available positive per-unit price from quote or Alpaca position fields."""
+        candidates = [
+            live_bid,
+            cur_price,
+            AlpacaPositionMonitor._num(pos, "lastday_price", None),
+            AlpacaPositionMonitor._num(pos, "avg_entry_price", None),
+        ]
+        try:
+            q = float(raw_qty or 0.0)
+        except (TypeError, ValueError):
+            q = 0.0
+        if q > 0:
+            mult = 100.0 if is_option else 1.0
+            mkt_val = AlpacaPositionMonitor._num(pos, "market_value", None)
+            cost_basis = AlpacaPositionMonitor._num(pos, "cost_basis", None)
+            if mkt_val is not None and mkt_val > 0:
+                candidates.append(mkt_val / (q * mult))
+            if cost_basis is not None and cost_basis > 0:
+                candidates.append(cost_basis / (q * mult))
+
+        for cand in candidates:
+            if cand is None or isinstance(cand, bool):
+                continue
+            try:
+                val = float(cand)
+                if math.isfinite(val) and val > 0:
+                    return val
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _compute_discounted_limit_price(ref_price, trigger_kind):
+        """Compute a marketable SELL limit price slightly below ref_price."""
+        discount_pct = (
+            OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT
+            if trigger_kind == "stop_loss"
+            else OPTION_SELL_LIMIT_DISCOUNT_PCT
+        )
+        discounted = ref_price * (1.0 - (discount_pct / 100.0))
+        limit_price = round(max(0.01, discounted), 2)
+        if discount_pct > 0 and limit_price >= round(ref_price, 2) and ref_price > 0.01:
+            limit_price = round(max(0.01, ref_price - 0.01), 2)
+        return limit_price
+
     async def _resolve_sell_order_params(self, pos_sym, cur_price, is_option, trigger_kind):
         """Compute (order_type, live_bid, live_ask, limit_price) with marketable discount
         below min(live_bid, current_price), and deeper discount / optional market override
@@ -5484,15 +5590,7 @@ class AlpacaOptionSeller:
             return "market", live_bid, live_ask, None
 
         ref_price = min(candidates)
-        discount_pct = (
-            OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT
-            if trigger_kind == "stop_loss"
-            else OPTION_SELL_LIMIT_DISCOUNT_PCT
-        )
-        discounted = ref_price * (1.0 - (discount_pct / 100.0))
-        limit_price = round(max(0.01, discounted), 2)
-        if discount_pct > 0 and limit_price >= round(ref_price, 2) and ref_price > 0.01:
-            limit_price = round(max(0.01, ref_price - 0.01), 2)
+        limit_price = self._compute_discounted_limit_price(ref_price, trigger_kind)
         return "limit", live_bid, live_ask, limit_price
 
     def _submit_sell_order(self, contract_or_symbol, qty, limit_price=None, order_type=None):
@@ -5832,13 +5930,48 @@ class AlpacaOptionSeller:
                 continue
 
             try:
-                order = await asyncio.to_thread(
-                    self._submit_sell_order,
-                    pos_sym,
-                    order_qty,
-                    limit_price,
-                    eff_order_type,
-                )
+                try:
+                    order = await asyncio.to_thread(
+                        self._submit_sell_order,
+                        pos_sym,
+                        order_qty,
+                        limit_price,
+                        eff_order_type,
+                    )
+                except Exception as submit_exc:
+                    if eff_order_type != "limit" and _is_no_quote_market_rejection(submit_exc):
+                        fallback_ref = self._extract_position_fallback_price(
+                            pos, raw_qty, is_option, live_bid, cur_price
+                        )
+                        if fallback_ref is None:
+                            raise
+                        fallback_limit = self._compute_discounted_limit_price(
+                            fallback_ref, trigger_kind
+                        )
+                        eff_order_type = "limit"
+                        limit_price = fallback_limit
+                        est_sell_unit = fallback_limit
+                        est_total_sale = _compute_order_total(
+                            est_sell_unit, order_qty, is_option=is_option
+                        )
+                        self.logger.warning(
+                            "OPTION_SELL_MARKET_FALLBACK_TO_LIMIT underlying=%s symbol=%s "
+                            "ref_price=%.4f limit_price=%.2f reason=no_available_quote",
+                            underlying,
+                            pos_sym,
+                            fallback_ref,
+                            fallback_limit,
+                        )
+                        order = await asyncio.to_thread(
+                            self._submit_sell_order,
+                            pos_sym,
+                            order_qty,
+                            fallback_limit,
+                            "limit",
+                        )
+                    else:
+                        raise
+
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
                 filled_avg = AlpacaPositionMonitor._num(order, "filled_avg_price", None)
@@ -5867,6 +6000,7 @@ class AlpacaOptionSeller:
                         pass
 
                 self.orders_submitted += 1
+                self.last_error_detail = None
                 if trigger_kind == "profit_target":
                     self.profit_target_orders += 1
                 elif trigger_kind == "trailing_stop":
@@ -5930,6 +6064,7 @@ class AlpacaOptionSeller:
                 )
             except Exception as exc:
                 self.last_status = f"order_error: {type(exc).__name__}"
+                self.last_error_detail = f"{underlying} ({pos_sym}): {str(exc)[:140]}"
                 self.logger.error(
                     "OPTION_SELL_FAILED underlying=%s symbol=%s error_type=%s detail=%s",
                     underlying,
@@ -8443,24 +8578,28 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
                         </div>
 
-                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400">Option Buyer (1m Sync)</span>
-                            <span id="optionBuyerStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400 shrink-0">Option Buyer (1m Sync)</span>
+                            <span id="optionBuyerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
                         </div>
 
-                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400">Last Option Order</span>
-                            <span id="optionBuyerLast" class="mono text-[11px] text-cyan-300 truncate max-w-[160px]">--</span>
+                        <div id="optionBuyerErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
+
+                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400 shrink-0">Last Option Order</span>
+                            <span id="optionBuyerLast" class="mono text-[11px] text-cyan-300 truncate max-w-[160px] text-right">--</span>
                         </div>
 
-                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400">Option Seller (1m Sync)</span>
-                            <span id="optionSellerStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400 shrink-0">Option Seller (1m Sync)</span>
+                            <span id="optionSellerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
                         </div>
 
-                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400">Last Sell Order</span>
-                            <span id="optionSellerLast" class="mono text-[11px] text-amber-300 truncate max-w-[160px]">--</span>
+                        <div id="optionSellerErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
+
+                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400 shrink-0">Last Sell Order</span>
+                            <span id="optionSellerLast" class="mono text-[11px] text-amber-300 truncate max-w-[160px] text-right">--</span>
                         </div>
 
                         <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
@@ -8853,12 +8992,48 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
             if (m.option_buyer) {
                 const ob = m.option_buyer;
-                document.getElementById('optionBuyerStatus').textContent = `${ob.status || 'not_loaded'} (${ob.orders_submitted ?? 0}/${ob.dry_run_orders ?? 0})`;
+                const obEl = document.getElementById('optionBuyerStatus');
+                const obStatusText = `${ob.status || 'not_loaded'} (${ob.orders_submitted ?? 0}/${ob.dry_run_orders ?? 0})`;
+                obEl.textContent = obStatusText;
+                obEl.title = ob.last_error_detail ? `${obStatusText} — ${ob.last_error_detail}` : obStatusText;
+                obEl.className = `mono font-semibold truncate text-right min-w-0 ${
+                    String(ob.status || '').includes('error')
+                        ? 'text-rose-400'
+                        : (ob.status === 'watching_live' ? 'text-emerald-300' : 'text-slate-200')
+                }`;
+                const obErrEl = document.getElementById('optionBuyerErrorRow');
+                if (obErrEl) {
+                    if (ob.last_error_detail && String(ob.status || '').includes('error')) {
+                        obErrEl.textContent = ob.last_error_detail;
+                        obErrEl.classList.remove('hidden');
+                    } else {
+                        obErrEl.textContent = '';
+                        obErrEl.classList.add('hidden');
+                    }
+                }
                 document.getElementById('optionBuyerLast').textContent = ob.last_order_contract || '--';
             }
             if (m.option_seller) {
                 const os = m.option_seller;
-                document.getElementById('optionSellerStatus').textContent = `${os.status || 'not_loaded'} (${os.orders_submitted ?? 0}/${os.dry_run_orders ?? 0})`;
+                const osEl = document.getElementById('optionSellerStatus');
+                const osStatusText = `${os.status || 'not_loaded'} (${os.orders_submitted ?? 0}/${os.dry_run_orders ?? 0})`;
+                osEl.textContent = osStatusText;
+                osEl.title = os.last_error_detail ? `${osStatusText} — ${os.last_error_detail}` : osStatusText;
+                osEl.className = `mono font-semibold truncate text-right min-w-0 ${
+                    String(os.status || '').includes('error')
+                        ? 'text-rose-400'
+                        : (os.status === 'watching_live' ? 'text-emerald-300' : 'text-slate-200')
+                }`;
+                const osErrEl = document.getElementById('optionSellerErrorRow');
+                if (osErrEl) {
+                    if (os.last_error_detail && String(os.status || '').includes('error')) {
+                        osErrEl.textContent = os.last_error_detail;
+                        osErrEl.classList.remove('hidden');
+                    } else {
+                        osErrEl.textContent = '';
+                        osErrEl.classList.add('hidden');
+                    }
+                }
                 document.getElementById('optionSellerLast').textContent = os.last_order_contract || '--';
                 const slEl = document.getElementById('optionSellerStopLoss');
                 if (slEl) {
@@ -9839,6 +10014,7 @@ class AdminCliProvider:
                 "last_order_utc": ob.last_order_utc if ob else None,
                 "last_order_contract": ob.last_order_contract if ob else None,
                 "last_order_reason": ob.last_order_reason if ob else None,
+                "last_error_detail": getattr(ob, "last_error_detail", None) if ob else None,
                 "cached_contracts": len(self.coordinator.option_chain_cache),
             }
             option_seller_report = {
@@ -9872,6 +10048,7 @@ class AdminCliProvider:
                 "last_order_utc": osel.last_order_utc if osel else None,
                 "last_order_contract": osel.last_order_contract if osel else None,
                 "last_order_reason": osel.last_order_reason if osel else None,
+                "last_error_detail": getattr(osel, "last_error_detail", None) if osel else None,
                 "positions_checked": osel.last_positions_checked if osel else 0,
             }
             latest_kinematics = {}
