@@ -2832,14 +2832,18 @@ def load_settings():
         )
         return [], {}
 
-    # Feed a sanitized copy to JsonIniParser so non-JSON INI feature sections
-    # and inline comments cannot trigger JSONDecodeError in lib.utils.
+    # Feed a sanitized copy to JsonIniParser inside config_path.parent so
+    # non-JSON INI feature sections and inline comments cannot trigger
+    # JSONDecodeError while relative paths (e.g., jboa.log) resolve inside the
+    # project directory rather than '/'.
     sanitized_ini = _sanitize_parms_for_json_ini(raw_ini_text)
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
+            prefix=".parms_sanitized_",
             suffix=".ini",
+            dir=str(config_path.parent),
             encoding="utf-8",
             delete=False,
         ) as tmp_file:
@@ -3076,24 +3080,39 @@ def rsi_signal(rsi):
     return None
 
 
+def _normalize_tv_timeframe(raw_tf):
+    if raw_tf is None:
+        return "1m"
+    tf = str(raw_tf).strip().lower()
+    if tf in {"1m", "1", "1min", "1t"}:
+        return "1m"
+    return None
+
+
 def _parse_tv_bar_start(raw_time, now):
-    if not isinstance(raw_time, str) or not raw_time.strip() or len(raw_time) > 100:
+    timestamp = None
+    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+        if math.isfinite(raw_time) and raw_time > 0:
+            epoch_sec = float(raw_time) / (1000.0 if raw_time > 1e11 else 1.0)
+            timestamp = minute_utc(datetime.fromtimestamp(epoch_sec, UTC))
+    elif isinstance(raw_time, str) and raw_time.strip() and len(raw_time) <= 100:
+        try:
+            parsed = as_utc(
+                datetime.fromisoformat(raw_time.strip().replace("Z", "+00:00"))
+            )
+            timestamp = minute_utc(parsed)
+        except (TypeError, ValueError, OverflowError):
+            timestamp = None
+
+    if timestamp is None:
         raise ValueError(
-            "bar_start must be a timezone-aware ISO-8601 minute-start string"
+            "bar_start must be a timezone-aware ISO-8601 minute-start string or Unix timestamp"
         )
-    try:
-        timestamp = as_utc(datetime.fromisoformat(raw_time.strip().replace("Z", "+00:00")))
-        if timestamp != minute_utc(timestamp):
-            raise ValueError()
-        if now < timestamp:
-            raise ValueError()
-        if not regular_session(timestamp):
-            raise ValueError()
-        return timestamp
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(
-            "bar_start must identify a completed regular-session minute"
-        ) from None
+    if (now + timedelta(seconds=5)) < timestamp:
+        raise ValueError("bar_start cannot be in the future")
+    if not regular_session(timestamp):
+        raise ValueError("bar_start must identify a completed regular-session minute")
+    return timestamp
 
 
 def _validate_tradingview_item(
@@ -3108,7 +3127,11 @@ def _validate_tradingview_item(
     if not isinstance(item, dict):
         raise ValueError("Each symbol item must be a JSON object")
 
-    raw_ticker = item.get("ticker") if "ticker" in item else item.get("symbol")
+    raw_ticker = (
+        item.get("ticker")
+        if "ticker" in item
+        else (item.get("symbol") if "symbol" in item else item.get("sym"))
+    )
     if not isinstance(raw_ticker, str) or not raw_ticker.strip() or len(raw_ticker) > 100:
         raise ValueError("ticker must be a nonempty string of at most 100 characters")
     ticker = raw_ticker.strip().upper()
@@ -3137,21 +3160,29 @@ def _validate_tradingview_item(
                 f"{symbol}: rsi_value must be between 0 and 100, or omitted"
             ) from None
 
-    timeframe = item.get("timeframe", default_timeframe)
-    if timeframe != "1m":
-        raise ValueError(f'{symbol}: timeframe must be "1m"')
+    norm_tf = _normalize_tv_timeframe(item.get("timeframe", default_timeframe))
+    if norm_tf != "1m":
+        raise ValueError(f'{symbol}: timeframe must be "1m" or "1"')
 
     bar_closed = item.get("bar_closed", default_bar_closed)
+    if isinstance(bar_closed, str):
+        bar_closed = bar_closed.strip().lower() == "true"
     if bar_closed is not True:
         raise ValueError(f"{symbol}: bar_closed must be JSON true")
 
-    raw_time = item.get("bar_start")
+    raw_time = (
+        item.get("bar_start")
+        if item.get("bar_start") is not None
+        else (item.get("timestamp") if item.get("timestamp") is not None else item.get("time"))
+    )
     if raw_time is not None:
         timestamp = _parse_tv_bar_start(raw_time, now)
     elif default_timestamp is not None:
         timestamp = default_timestamp
     else:
-        raise ValueError(f"{symbol}: missing bar_start timestamp")
+        timestamp = minute_utc(now) - MINUTE
+        if not regular_session(timestamp):
+            raise ValueError(f"{symbol}: missing bar_start timestamp outside regular session")
 
     return (
         {
@@ -3170,9 +3201,9 @@ def _validate_tradingview_item(
 
 
 def validate_tradingview_payload(payload, allowed_symbols):
-    """Parse and validate a consolidated 1-minute TradingView batch webhook payload.
+    """Parse and validate TradingView 1-minute webhook payloads (batch or single-symbol).
 
-    Expected batch structure:
+    Accepts consolidated batch payloads:
       {
         "event": "rsi_batch",
         "timeframe": "1m",
@@ -3184,9 +3215,21 @@ def validate_tradingview_payload(payload, allowed_symbols):
           ...
         ]
       }
-    Also accepts top-level "symbols" or "items" lists.
+    Also accepts single-symbol Watchlist/Chart Alert JSON objects
+    ({"ticker": "NASDAQ:NVDA", "rsi_value": ..., "price": ..., ...}), top-level
+    arrays, or "symbols" / "items" / "records" / "bars" lists or symbol-keyed dicts.
     """
     now = datetime.now(UTC)
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            raise ValueError("JSON payload must be a batch or symbol object") from None
+
+    if isinstance(payload, dict) and isinstance(payload.get("payload"), dict):
+        if not any(k in payload for k in ("data", "symbols", "items", "ticker", "symbol")):
+            payload = payload["payload"]
 
     if isinstance(payload, list):
         raw_items = payload
@@ -3194,31 +3237,54 @@ def validate_tradingview_payload(payload, allowed_symbols):
     elif isinstance(payload, dict):
         envelope = payload
         raw_items = None
-        for key in ("data", "symbols", "items"):
+        for key in ("data", "symbols", "items", "records", "bars"):
             if key in payload:
-                raw_items = payload[key]
+                candidate = payload[key]
+                if isinstance(candidate, dict):
+                    raw_items = [
+                        {"ticker": k, **v} if isinstance(v, dict) else v
+                        for k, v in candidate.items()
+                    ]
+                else:
+                    raw_items = candidate
                 break
+        if raw_items is None and (
+            "ticker" in payload or "symbol" in payload or "sym" in payload
+        ):
+            raw_items = [payload]
         if raw_items is None:
             raise ValueError(
-                'Batch payload must be an object containing a "data" (or "symbols") array of 1m symbol records'
+                'Payload must be a single symbol object (with "ticker"/"symbol") '
+                'or a batch object containing a "data" (or "symbols") array'
             )
     else:
-        raise ValueError("JSON payload must be a batch object")
+        raise ValueError("JSON payload must be a batch or symbol object")
 
     if not isinstance(raw_items, list) or len(raw_items) == 0:
         raise ValueError("Batch payload symbol list must be a non-empty JSON array")
 
-    default_timeframe = envelope.get("timeframe", "1m")
+    default_timeframe = _normalize_tv_timeframe(envelope.get("timeframe", "1m"))
     if default_timeframe != "1m":
-        raise ValueError('Batch timeframe must be "1m"')
+        raise ValueError('Batch timeframe must be "1m" or "1"')
 
     default_bar_closed = envelope.get("bar_closed", True)
+    if isinstance(default_bar_closed, str):
+        default_bar_closed = default_bar_closed.strip().lower() == "true"
     if default_bar_closed is not True:
         raise ValueError("Batch bar_closed must be JSON true")
 
     default_timestamp = None
-    if envelope.get("bar_start") is not None:
-        default_timestamp = _parse_tv_bar_start(envelope.get("bar_start"), now)
+    raw_env_time = (
+        envelope.get("bar_start")
+        if envelope.get("bar_start") is not None
+        else (
+            envelope.get("timestamp")
+            if envelope.get("timestamp") is not None
+            else envelope.get("time")
+        )
+    )
+    if raw_env_time is not None:
+        default_timestamp = _parse_tv_bar_start(raw_env_time, now)
 
     events = []
     skipped = []
@@ -3260,14 +3326,27 @@ def validate_tradingview_payload(payload, allowed_symbols):
     }
 
 
-def build_option_chain_client(keys):
-    """Create the Alpaca client handed to get_pruned_option_chain.
+def build_trading_client(keys, paper=None):
+    """Create an Alpaca TradingClient for account, position, and order operations."""
+    if not keys.get("alpaca_key") or not keys.get("alpaca_secret"):
+        logging.warning(
+            "TRADING_CLIENT_DISABLED reason=missing_alpaca_credentials "
+            "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
+            "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
+        )
+        return None
+    from alpaca.trading.client import TradingClient
 
-    The option-chain call receives the key/secret alongside this client. If
-    your lib.getOptionsContracts implementation expects a different client
-    type, adjust only this factory ? the rest of the plumbing is unchanged.
-    Returns None when credentials are missing; the trigger then skips with a
-    logged warning instead of failing the webhook loop.
+    use_paper = ALPACA_PAPER if paper is None else bool(paper)
+    return TradingClient(keys["alpaca_key"], keys["alpaca_secret"], paper=use_paper)
+
+
+def build_option_chain_client(keys):
+    """Create the Alpaca StockHistoricalDataClient handed to get_pruned_option_chain.
+
+    lib.getOptionsContracts.get_pruned_option_chain expects a market-data
+    client exposing get_stock_snapshot() alongside the api_key/secret_key.
+    Returns None when credentials are missing.
     """
     if not keys.get("alpaca_key") or not keys.get("alpaca_secret"):
         logging.warning(
@@ -3276,9 +3355,8 @@ def build_option_chain_client(keys):
             "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
         )
         return None
-    from alpaca.trading.client import TradingClient
 
-    return TradingClient(keys["alpaca_key"], keys["alpaca_secret"], paper=ALPACA_PAPER)
+    return StockHistoricalDataClient(keys["alpaca_key"], keys["alpaca_secret"])
 
 
 class TradingviewProvider:
@@ -3448,7 +3526,17 @@ class TradingviewProvider:
                 )
 
             except ValueError as exc:
-                print(f"[VALIDATION FAILED]: {exc}")
+                payload_keys = (
+                    list(payload.keys())[:12]
+                    if isinstance(payload, dict)
+                    else f"len={len(payload)}"
+                )
+                self.logger.warning(
+                    "WEBHOOK_VALIDATION_FAILED reason=%s payload_keys=%s",
+                    exc,
+                    payload_keys,
+                )
+                print(f"[VALIDATION FAILED]: {exc} (keys={payload_keys})")
                 return jsonify(status="error", message=str(exc)), 400
 
             except queue.Full:
@@ -3718,7 +3806,7 @@ class AlpacaPositionMonitor:
         self.provider = "POSITIONS"
         self.credentials = dict(keys or {})
         self.logger = make_logger("POSITIONS", "ALPACA")
-        self.client = build_option_chain_client(self.credentials)
+        self.client = build_trading_client(self.credentials)
         # --- NEW: Status Tracking State Variables ---
         self.last_poll_utc = None
         self.last_status = "uninitialized"
@@ -3882,14 +3970,19 @@ class AlpacaOptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
 
-    def __init__(self, keys, coordinator, client=None):
+    def __init__(self, keys, coordinator, client=None, option_chain_client=None):
         self.provider = "OPTION_BUYER"
         self.credentials = dict(keys or {})
         self.coordinator = coordinator
         self.logger = make_logger("OPTION_BUYER", "ALPACA")
         self.client = (
-            client if client is not None else build_option_chain_client(self.credentials)
+            client if client is not None else build_trading_client(self.credentials)
         )
+        if option_chain_client is not None:
+            self.option_chain_client = option_chain_client
+        else:
+            data_client = build_option_chain_client(self.credentials)
+            self.option_chain_client = data_client if data_client is not None else self.client
         self.last_status = "uninitialized"
         self.mode = "dry_run" if OPTION_BUY_DRY_RUN else ("paper" if ALPACA_PAPER else "live")
         self.last_eval_minute_utc = None
@@ -4210,7 +4303,7 @@ class AlpacaOptionBuyer:
                         symbol,
                         self.credentials["alpaca_key"],
                         self.credentials["alpaca_secret"],
-                        self.client,
+                        self.option_chain_client,
                     )
                     signal_label = "buy" if desired_right == "CALL" else "sell"
                     self.coordinator.record_option_contract(
