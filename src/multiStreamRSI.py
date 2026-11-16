@@ -742,8 +742,11 @@ class MinuteCoordinator:
         self.late_counts = {provider: 0 for provider in self.providers}
         self.kinematics_history = {}
         self.option_chain_cache = {}
+        self.option_buy_events = {}
+        self.option_sell_events = {}
         self.event_loop = None
         self.minute_finalized_event = None
+        self.minute_finalized_listeners = []
         logger = None if emit is not None else make_summary_logger()
         self.emit = emit or (
             lambda record: logger.info(
@@ -756,18 +759,30 @@ class MinuteCoordinator:
         if self.minute_finalized_event is None:
             self.minute_finalized_event = asyncio.Event()
 
+    def subscribe_minute_finalized(self):
+        """Return a dedicated asyncio.Event signaled on each minute finalization."""
+        evt = asyncio.Event()
+        self.minute_finalized_listeners.append(evt)
+        return evt
+
     def notify_minute_finalized(self):
-        if self.minute_finalized_event is None:
+        def _set_all():
+            if self.minute_finalized_event is not None:
+                self.minute_finalized_event.set()
+            for evt in list(self.minute_finalized_listeners):
+                evt.set()
+
+        if self.minute_finalized_event is None and not self.minute_finalized_listeners:
             return
         try:
             running = asyncio.get_running_loop()
             if running is self.event_loop:
-                self.minute_finalized_event.set()
+                _set_all()
                 return
         except RuntimeError:
             pass
         if self.event_loop is not None and not self.event_loop.is_closed():
-            self.event_loop.call_soon_threadsafe(self.minute_finalized_event.set)
+            self.event_loop.call_soon_threadsafe(_set_all)
 
     def record_option_contract(
         self,
@@ -789,6 +804,123 @@ class MinuteCoordinator:
             "source": source,
             "collected_at_utc": datetime.now(UTC).isoformat(),
         }
+
+    def record_option_buy_event(
+        self,
+        symbol,
+        executed_at,
+        contract,
+        qty=1,
+        order_id=None,
+        trigger_minute=None,
+        reason=None,
+        rsi=None,
+        dry_run=False,
+    ):
+        """Record an executed option buy order aligned to its exact UTC minute."""
+        sym = str(symbol).strip().upper()
+        if isinstance(executed_at, str):
+            exec_dt = as_utc(
+                datetime.fromisoformat(executed_at.strip().replace("Z", "+00:00"))
+            )
+        else:
+            exec_dt = as_utc(executed_at or datetime.now(UTC))
+        min_dt = minute_utc(exec_dt)
+
+        trig_iso = None
+        if isinstance(trigger_minute, datetime):
+            trig_iso = minute_utc(trigger_minute).isoformat()
+        elif isinstance(trigger_minute, str) and trigger_minute.strip():
+            try:
+                trig_dt = datetime.fromisoformat(
+                    trigger_minute.strip().replace("Z", "+00:00")
+                )
+                trig_iso = (
+                    minute_utc(trig_dt).isoformat()
+                    if trig_dt.tzinfo is not None
+                    else trigger_minute.strip()
+                )
+            except ValueError:
+                trig_iso = trigger_minute.strip()
+
+        event = {
+            "symbol": sym,
+            "minute_utc": min_dt.isoformat(),
+            "executed_at_utc": exec_dt.isoformat(),
+            "trigger_minute_utc": trig_iso,
+            "contract": str(contract) if contract is not None else None,
+            "qty": int(qty or 1),
+            "order_id": str(order_id) if order_id is not None else None,
+            "reason": reason,
+            "rsi": round(float(rsi), 2) if rsi is not None else None,
+            "dry_run": bool(dry_run),
+        }
+        events = self.option_buy_events.setdefault(sym, [])
+        events.append(event)
+        if len(events) > 100:
+            del events[:-100]
+        return event
+
+    def record_option_sell_event(
+        self,
+        symbol,
+        executed_at,
+        contract,
+        qty=1,
+        order_id=None,
+        trigger_minute=None,
+        reason=None,
+        rsi=None,
+        dry_run=False,
+    ):
+        """Record an executed sell order aligned to its exact UTC minute."""
+        sym = str(symbol).strip().upper()
+        if isinstance(executed_at, str):
+            exec_dt = as_utc(
+                datetime.fromisoformat(executed_at.strip().replace("Z", "+00:00"))
+            )
+        else:
+            exec_dt = as_utc(executed_at or datetime.now(UTC))
+        min_dt = minute_utc(exec_dt)
+
+        trig_iso = None
+        if isinstance(trigger_minute, datetime):
+            trig_iso = minute_utc(trigger_minute).isoformat()
+        elif isinstance(trigger_minute, str) and trigger_minute.strip():
+            try:
+                trig_dt = datetime.fromisoformat(
+                    trigger_minute.strip().replace("Z", "+00:00")
+                )
+                trig_iso = (
+                    minute_utc(trig_dt).isoformat()
+                    if trig_dt.tzinfo is not None
+                    else trigger_minute.strip()
+                )
+            except ValueError:
+                trig_iso = trigger_minute.strip()
+
+        clean_qty = (
+            int(round(qty))
+            if isinstance(qty, (int, float)) and abs(qty - round(qty)) < 1e-9
+            else qty
+        )
+        event = {
+            "symbol": sym,
+            "minute_utc": min_dt.isoformat(),
+            "executed_at_utc": exec_dt.isoformat(),
+            "trigger_minute_utc": trig_iso,
+            "contract": str(contract) if contract is not None else None,
+            "qty": clean_qty,
+            "order_id": str(order_id) if order_id is not None else None,
+            "reason": reason,
+            "rsi": round(float(rsi), 2) if rsi is not None else None,
+            "dry_run": bool(dry_run),
+        }
+        events = self.option_sell_events.setdefault(sym, [])
+        events.append(event)
+        if len(events) > 100:
+            del events[:-100]
+        return event
 
     def latest_option_contract(self, symbol, max_age_seconds=None):
         """Return cached collect_option_chain entry for symbol if fresh enough."""
@@ -1846,7 +1978,47 @@ class ProviderRouter:
         async def bootstrap():
             for symbol in self.symbols:
                 self.enqueue(symbol, "recover", datetime.now(UTC))
-            await self.stream._run_forever()
+
+            orig_subscribe_all = getattr(self.stream, "_subscribe_all", None)
+            if callable(orig_subscribe_all):
+                async def _wrapped_subscribe_all(*args, **kwargs):
+                    res = await orig_subscribe_all(*args, **kwargs)
+                    self.coordinator.set_connected(self.provider, True)
+                    return res
+
+                self.stream._subscribe_all = _wrapped_subscribe_all
+
+            async def watch_connection():
+                # StockDataStream._run_forever() keeps the WebSocket open internally,
+                # whereas callback(bar) only fires when a live 1m bar trades. Track
+                # underlying WebSocket state so ALPACA reports ONLINE outside market
+                # hours / before the first bar as well as OFFLINE on disconnects.
+                while True:
+                    ws = getattr(self.stream, "_ws", None)
+                    state = getattr(ws, "state", None) if ws is not None else None
+                    state_name = (
+                        getattr(state, "name", str(state or "")).upper()
+                        if state is not None
+                        else ""
+                    )
+                    ws_closed = (
+                        ws is None
+                        or bool(getattr(ws, "closed", False))
+                        or state_name in {"CLOSED", "CLOSING"}
+                    )
+                    if not ws_closed and getattr(self.stream, "_running", True):
+                        self.coordinator.set_connected(self.provider, True)
+                    elif self.coordinator.connected.get(self.provider):
+                        self.coordinator.set_connected(self.provider, False)
+                    await asyncio.sleep(1.0)
+
+            watcher = asyncio.create_task(watch_connection())
+            try:
+                await self.stream._run_forever()
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+                self.coordinator.set_connected(self.provider, False)
 
         self.stream.subscribe_bars(callback, *self.symbols)
         # Corrections received before the common deadline replace the candidate.
@@ -2160,7 +2332,7 @@ def _ini_float(cfg, section, option, env_name, default):
 
 
 def _apply_ini_feature_settings(cfg):
-    """Load [kinematics] and [option_buyer] overrides from lib/parms.ini."""
+    """Load [kinematics], [option_buyer], and [option_seller] overrides from lib/parms.ini."""
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
@@ -2170,6 +2342,11 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_BUY_FETCH_IF_MISSING, OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING
     global OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT, OPTION_BUY_REQUIRE_RIGHT_MATCH
     global OPTION_BUY_ALLOWED_FORECASTS
+    global OPTION_SELL_ENABLED, OPTION_SELL_DRY_RUN, OPTION_SELL_PAPER
+    global OPTION_SELL_QTY, OPTION_SELL_CLOSE_FULL_POSITION
+    global OPTION_SELL_ORDER_TYPE, OPTION_SELL_COOLDOWN_MINUTES
+    global OPTION_SELL_OPTIONS_ONLY, OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT
+    global OPTION_SELL_ALLOWED_FORECASTS
 
     smooth_method = (
         _ini_str(cfg, "kinematics", "smooth_method", "KINEMATICS_SMOOTH_METHOD", "hma")
@@ -2197,6 +2374,10 @@ def _apply_ini_feature_settings(cfg):
     OPTION_CHAIN_RSI_HIGH = _ini_float(
         cfg, "option_buyer", "rsi_high", "OPTION_CHAIN_RSI_HIGH", 65.0
     )
+    if cfg.has_section("option_seller") and cfg.has_option("option_seller", "rsi_high"):
+        OPTION_CHAIN_RSI_HIGH = _ini_float(
+            cfg, "option_seller", "rsi_high", "OPTION_CHAIN_RSI_HIGH", OPTION_CHAIN_RSI_HIGH
+        )
     ALPACA_PAPER = _ini_bool(cfg, "option_buyer", "paper", "ALPACA_PAPER", True)
     OPTION_BUY_ENABLED = _ini_bool(
         cfg, "option_buyer", "enabled", "OPTION_BUY_ENABLED", True
@@ -2270,19 +2451,77 @@ def _apply_ini_feature_settings(cfg):
     OPTION_BUY_ALLOWED_FORECASTS = {
         s.strip().lower() for s in raw_forecasts.split(",") if s.strip()
     }
+
+    OPTION_SELL_PAPER = _ini_bool(
+        cfg, "option_seller", "paper", "OPTION_SELL_PAPER", ALPACA_PAPER
+    )
+    OPTION_SELL_ENABLED = _ini_bool(
+        cfg, "option_seller", "enabled", "OPTION_SELL_ENABLED", True
+    )
+    OPTION_SELL_DRY_RUN = _ini_bool(
+        cfg, "option_seller", "dry_run", "OPTION_SELL_DRY_RUN", True
+    )
+    OPTION_SELL_QTY = _ini_int(
+        cfg, "option_seller", "qty", "OPTION_SELL_QTY", 1, minimum=1
+    )
+    OPTION_SELL_CLOSE_FULL_POSITION = _ini_bool(
+        cfg,
+        "option_seller",
+        "close_full_position",
+        "OPTION_SELL_CLOSE_FULL_POSITION",
+        True,
+    )
+    OPTION_SELL_ORDER_TYPE = (
+        _ini_str(cfg, "option_seller", "order_type", "OPTION_SELL_ORDER_TYPE", "market")
+        .strip()
+        .lower()
+    )
+    OPTION_SELL_COOLDOWN_MINUTES = _ini_int(
+        cfg,
+        "option_seller",
+        "cooldown_minutes",
+        "OPTION_SELL_COOLDOWN_MINUTES",
+        15,
+        minimum=0,
+    )
+    OPTION_SELL_OPTIONS_ONLY = _ini_bool(
+        cfg, "option_seller", "options_only", "OPTION_SELL_OPTIONS_ONLY", False
+    )
+    OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT = _ini_bool(
+        cfg,
+        "option_seller",
+        "require_projection_alignment",
+        "OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT",
+        True,
+    )
+    raw_sell_forecasts = _ini_str(
+        cfg,
+        "option_seller",
+        "allowed_forecasts",
+        "OPTION_SELL_ALLOWED_FORECASTS",
+        "bearish_reversal,bearish_continuation,bearish_momentum",
+    )
+    OPTION_SELL_ALLOWED_FORECASTS = {
+        s.strip().lower() for s in raw_sell_forecasts.split(",") if s.strip()
+    }
     logging.info(
         "FEATURE_CONFIG smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f "
-        "buy_enabled=%s dry_run=%s paper=%s rsi_low=%.1f rsi_high=%.1f qty=%d",
+        "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
+        "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s",
         KINEMATICS_SMOOTH_METHOD,
         KINEMATICS_SMOOTH_PERIOD,
         KINEMATICS_RSI_OVERBOUGHT,
         KINEMATICS_RSI_OVERSOLD,
         OPTION_BUY_ENABLED,
         OPTION_BUY_DRY_RUN,
+        OPTION_SELL_ENABLED,
+        OPTION_SELL_DRY_RUN,
         ALPACA_PAPER,
+        OPTION_SELL_PAPER,
         OPTION_CHAIN_RSI_LOW,
         OPTION_CHAIN_RSI_HIGH,
         OPTION_BUY_QTY,
+        OPTION_SELL_CLOSE_FULL_POSITION,
     )
 
 
@@ -2463,6 +2702,41 @@ OPTION_BUY_ALLOWED_FORECASTS = {
     for s in os.getenv(
         "OPTION_BUY_ALLOWED_FORECASTS",
         "bullish_reversal,bullish_continuation,bullish_momentum",
+    ).split(",")
+    if s.strip()
+}
+OPTION_SELL_PAPER = os.getenv(
+    "OPTION_SELL_PAPER", "true" if ALPACA_PAPER else "false"
+).strip().lower() not in {"0", "false", "no"}
+OPTION_SELL_ENABLED = os.getenv("OPTION_SELL_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OPTION_SELL_DRY_RUN = os.getenv("OPTION_SELL_DRY_RUN", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+OPTION_SELL_QTY = max(1, int(os.getenv("OPTION_SELL_QTY", "1")))
+OPTION_SELL_CLOSE_FULL_POSITION = os.getenv(
+    "OPTION_SELL_CLOSE_FULL_POSITION", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_SELL_ORDER_TYPE = os.getenv("OPTION_SELL_ORDER_TYPE", "market").strip().lower()
+OPTION_SELL_COOLDOWN_MINUTES = max(
+    0, int(os.getenv("OPTION_SELL_COOLDOWN_MINUTES", "15"))
+)
+OPTION_SELL_OPTIONS_ONLY = os.getenv(
+    "OPTION_SELL_OPTIONS_ONLY", "false"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT = os.getenv(
+    "OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_SELL_ALLOWED_FORECASTS = {
+    s.strip().lower()
+    for s in os.getenv(
+        "OPTION_SELL_ALLOWED_FORECASTS",
+        "bearish_reversal,bearish_continuation,bearish_momentum",
     ).split(",")
     if s.strip()
 }
@@ -3754,15 +4028,42 @@ class AlpacaOptionBuyer:
                 )
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
+                exec_at = datetime.now(UTC)
+                raw_submitted = getattr(order, "submitted_at", None) or getattr(
+                    order, "created_at", None
+                )
+                if isinstance(raw_submitted, datetime) and raw_submitted.tzinfo is not None:
+                    exec_at = as_utc(raw_submitted)
+                elif isinstance(raw_submitted, str) and raw_submitted.strip():
+                    try:
+                        parsed_sub = datetime.fromisoformat(
+                            raw_submitted.strip().replace("Z", "+00:00")
+                        )
+                        if parsed_sub.tzinfo is not None:
+                            exec_at = as_utc(parsed_sub)
+                    except ValueError:
+                        pass
+
                 self.orders_submitted += 1
                 open_option_count += 1
                 open_contracts.add(contract_symbol)
                 open_underlyings.add(symbol)
-                self.last_buy_by_symbol[symbol] = now
-                self.last_order_utc = now.isoformat()
+                self.last_buy_by_symbol[symbol] = exec_at
+                self.last_order_utc = exec_at.isoformat()
                 self.last_order_contract = contract_symbol
                 self.last_order_symbol = symbol
                 self.last_order_reason = reason
+                self.coordinator.record_option_buy_event(
+                    symbol=symbol,
+                    executed_at=exec_at,
+                    contract=contract_symbol,
+                    qty=OPTION_BUY_QTY,
+                    order_id=order_id,
+                    trigger_minute=minute_key,
+                    reason=reason,
+                    rsi=entry.get("rsi"),
+                    dry_run=False,
+                )
                 self.logger.info(
                     "OPTION_BUY_SUBMITTED order_id=%s status=%s provider=%s symbol=%s "
                     "contract=%s qty=%d right=%s contract_source=%s trigger=%s p_hat=%s rsi=%s",
@@ -3824,6 +4125,7 @@ class AlpacaOptionBuyer:
             OPTION_BUY_MAX_OPEN_CONTRACTS,
             sorted(OPTION_BUY_ALLOWED_FORECASTS),
         )
+        wake_event = self.coordinator.subscribe_minute_finalized()
         last_processed_minute = self.coordinator.last_finalized
         while True:
             try:
@@ -3835,17 +4137,11 @@ class AlpacaOptionBuyer:
                     + timedelta(seconds=1)
                 )
                 wait_sec = max(1.0, (next_wake - now).total_seconds())
-                if self.coordinator.minute_finalized_event is not None:
-                    try:
-                        await asyncio.wait_for(
-                            self.coordinator.minute_finalized_event.wait(),
-                            timeout=wait_sec,
-                        )
-                        self.coordinator.minute_finalized_event.clear()
-                    except asyncio.TimeoutError:
-                        pass
-                else:
-                    await asyncio.sleep(wait_sec)
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=wait_sec)
+                    wake_event.clear()
+                except asyncio.TimeoutError:
+                    pass
 
                 cur_finalized = self.coordinator.last_finalized
                 if cur_finalized is not None and cur_finalized != last_processed_minute:
@@ -3857,6 +4153,448 @@ class AlpacaOptionBuyer:
                 self.last_status = f"error: {type(exc).__name__}"
                 self.logger.warning(
                     "OPTION_BUYER_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(2.0)
+
+
+class AlpacaOptionSeller:
+    """Async task synced to 1-minute finalization that inspects all held positions
+    in the Alpaca account and submits SELL orders when underlying RSI >= OPTION_CHAIN_RSI_HIGH
+    and kinematic metrics are favorable for selling."""
+
+    def __init__(self, keys, coordinator, client=None):
+        self.provider = "OPTION_SELLER"
+        self.credentials = dict(keys or {})
+        self.coordinator = coordinator
+        self.logger = make_logger("OPTION_SELLER", "ALPACA")
+        if client is not None:
+            self.client = client
+        elif self.credentials.get("alpaca_key") and self.credentials.get("alpaca_secret"):
+            from alpaca.trading.client import TradingClient
+
+            self.client = TradingClient(
+                self.credentials["alpaca_key"],
+                self.credentials["alpaca_secret"],
+                paper=OPTION_SELL_PAPER,
+            )
+        else:
+            self.client = None
+        self.last_status = "uninitialized"
+        self.mode = (
+            "dry_run" if OPTION_SELL_DRY_RUN else ("paper" if OPTION_SELL_PAPER else "live")
+        )
+        self.last_eval_minute_utc = None
+        self.last_order_utc = None
+        self.last_order_contract = None
+        self.last_order_symbol = None
+        self.last_order_reason = None
+        self.last_positions_checked = 0
+        self.orders_submitted = 0
+        self.dry_run_orders = 0
+        self.last_sell_by_symbol = {}
+        self.attempted_minutes = set()
+
+    @staticmethod
+    def _extract_underlying(pos, pos_sym, is_option):
+        raw_und = (
+            pos.get("underlying_symbol")
+            if isinstance(pos, dict)
+            else getattr(pos, "underlying_symbol", None)
+        )
+        if isinstance(raw_und, str) and raw_und.strip():
+            return raw_und.strip().upper()
+        if is_option:
+            inferred = AlpacaOptionBuyer._infer_occ_underlying(pos_sym)
+            if inferred:
+                return inferred
+        return pos_sym
+
+    @staticmethod
+    def _evaluate_sell_kinematics(entry):
+        """Determine whether a finalized 1m snapshot triggers a SELL decision.
+
+        Mandatory rule:
+        1. RSI must be present and strictly >= OPTION_CHAIN_RSI_HIGH.
+        2. Kinematic metrics must be favorable for selling (downward acceleration
+           a < 0 with either an overbought decelerating top v > 0 or bearish thrust
+           v < 0, or a bearish zero-line crossover), and projected P_hat_{t+1} must
+           align < 0 when enabled.
+
+        Returns (qualifies: bool, reason: str).
+        """
+        if not entry:
+            return False, "no_entry"
+
+        raw_rsi = entry.get("rsi")
+        if raw_rsi is None or isinstance(raw_rsi, bool):
+            return False, "rsi_unavailable"
+        try:
+            rsi = float(raw_rsi)
+        except (TypeError, ValueError):
+            return False, "rsi_invalid"
+        if not math.isfinite(rsi):
+            return False, "rsi_nonfinite"
+
+        if rsi < OPTION_CHAIN_RSI_HIGH:
+            return (
+                False,
+                f"rsi_below_sell_threshold(rsi={rsi:.2f}<{OPTION_CHAIN_RSI_HIGH:.2f})",
+            )
+
+        raw_vel = (
+            entry.get("smoothed_velocity")
+            if entry.get("smoothed_velocity") is not None
+            else entry.get("price_velocity")
+        )
+        raw_acc = (
+            entry.get("smoothed_acceleration")
+            if entry.get("smoothed_acceleration") is not None
+            else entry.get("price_acceleration")
+        )
+        if raw_vel is None or raw_acc is None:
+            return False, "kinematics_unavailable"
+        try:
+            vel = float(raw_vel)
+            acc = float(raw_acc)
+        except (TypeError, ValueError):
+            return False, "kinematics_invalid"
+        if not (math.isfinite(vel) and math.isfinite(acc)):
+            return False, "kinematics_nonfinite"
+
+        forecast = str(entry.get("forecast_direction") or "").lower()
+        crossover = str(entry.get("crossover_signal") or "none").lower()
+        proj_delta = entry.get("projected_delta")
+
+        reason = None
+        if vel < 0 and acc < 0:
+            reason = f"rsi={rsi:.2f}>=high&bearish_thrust(v={vel:+.4f},a={acc:+.4f})"
+        elif vel > 0 and acc < 0:
+            tag = (
+                forecast
+                if forecast in OPTION_SELL_ALLOWED_FORECASTS
+                else "overbought_decel_top"
+            )
+            reason = f"rsi={rsi:.2f}>=high&{tag}(v={vel:+.4f},a={acc:+.4f})"
+        elif crossover in {"leading_bearish", "confirmed_bearish"} and acc <= 0:
+            reason = f"rsi={rsi:.2f}>=high&crossover={crossover}"
+        elif forecast in OPTION_SELL_ALLOWED_FORECASTS and acc < 0:
+            reason = f"rsi={rsi:.2f}>=high&forecast={forecast}"
+
+        if reason is None:
+            return (
+                False,
+                f"kinematics_unfavorable(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f},cross={crossover})",
+            )
+
+        if OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT and proj_delta is not None:
+            try:
+                pdelta = float(proj_delta)
+                if pdelta >= 0:
+                    return (
+                        False,
+                        f"projection_misaligned(SELL,delta={pdelta:+.4f})",
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        return True, reason
+
+    def _select_kinematics_entry(self, symbol):
+        """Return (provider, latest_entry) for symbol, preferring TRADINGVIEW if present."""
+        tv_hist = self.coordinator.kinematics_history.get(("TRADINGVIEW", symbol))
+        if tv_hist:
+            return "TRADINGVIEW", tv_hist[-1]
+        best_provider = None
+        best_entry = None
+        best_ts = ""
+        for (provider, sym), hist in self.coordinator.kinematics_history.items():
+            if sym != symbol or not hist:
+                continue
+            cand = hist[-1]
+            ts = str(cand.get("timestamp") or "")
+            if best_entry is None or ts >= best_ts:
+                best_provider = provider
+                best_entry = cand
+                best_ts = ts
+        return best_provider, best_entry
+
+    def _submit_sell_order(self, contract_or_symbol, qty, limit_price=None):
+        """Place a SELL order on Alpaca TradingClient (blocking)."""
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+
+        if OPTION_SELL_ORDER_TYPE == "limit" and limit_price is not None and limit_price > 0:
+            req = LimitOrderRequest(
+                symbol=contract_or_symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+            )
+        else:
+            req = MarketOrderRequest(
+                symbol=contract_or_symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+        return self.client.submit_order(order_data=req)
+
+    async def evaluate_and_sell(self, target_minute=None):
+        """Inspect all positions in the Alpaca account and submit SELL orders when
+        underlying RSI >= OPTION_CHAIN_RSI_HIGH and kinematic metrics are favorable."""
+        now = datetime.now(UTC)
+        minute_key = (
+            target_minute.isoformat()
+            if hasattr(target_minute, "isoformat")
+            else str(target_minute or now.replace(second=0, microsecond=0).isoformat())
+        )
+        self.last_eval_minute_utc = now.isoformat()
+        self.last_status = "evaluating"
+
+        if len(self.attempted_minutes) > 1000:
+            self.attempted_minutes.clear()
+
+        try:
+            positions = list(await asyncio.to_thread(self.client.get_all_positions) or [])
+        except Exception as exc:
+            self.last_status = f"positions_error: {type(exc).__name__}"
+            self.logger.warning(
+                "OPTION_SELL_POSITIONS_FAILED error_type=%s detail=%s",
+                type(exc).__name__,
+                exc,
+            )
+            return
+
+        self.last_positions_checked = len(positions)
+        if not positions:
+            self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+            return
+
+        for pos in positions:
+            pos_sym = str(
+                (pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", ""))
+                or ""
+            ).strip().upper()
+            if not pos_sym:
+                continue
+
+            dedup_key = (pos_sym, minute_key)
+            if dedup_key in self.attempted_minutes:
+                continue
+
+            raw_qty = AlpacaPositionMonitor._num(pos, "qty", 0.0)
+            raw_side = (
+                pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+            )
+            side = str(getattr(raw_side, "value", raw_side) or "long").lower()
+            if raw_qty <= 0 or side == "short":
+                continue
+
+            is_option = AlpacaPositionMonitor._is_option(pos)
+            if OPTION_SELL_OPTIONS_ONLY and not is_option:
+                continue
+
+            underlying = self._extract_underlying(pos, pos_sym, is_option)
+            provider, entry = self._select_kinematics_entry(underlying)
+            if not entry:
+                continue
+
+            qualifies, reason = self._evaluate_sell_kinematics(entry)
+            if not qualifies:
+                continue
+
+            self.attempted_minutes.add(dedup_key)
+
+            last_sell = self.last_sell_by_symbol.get(pos_sym)
+            if (
+                last_sell is not None
+                and OPTION_SELL_COOLDOWN_MINUTES > 0
+                and (now - last_sell).total_seconds() < OPTION_SELL_COOLDOWN_MINUTES * 60
+            ):
+                self.logger.info(
+                    "OPTION_SELL_SKIPPED symbol=%s underlying=%s reason=cooldown_active minute=%s",
+                    pos_sym,
+                    underlying,
+                    minute_key,
+                )
+                continue
+
+            target_qty = raw_qty if OPTION_SELL_CLOSE_FULL_POSITION else min(
+                float(OPTION_SELL_QTY), raw_qty
+            )
+            if target_qty <= 0:
+                continue
+            if is_option or abs(target_qty - round(target_qty)) < 1e-9:
+                order_qty = max(1, int(round(target_qty)))
+            else:
+                order_qty = round(target_qty, 6)
+
+            cur_price = AlpacaPositionMonitor._num(pos, "current_price", 0.0)
+            limit_price = round(cur_price, 2) if cur_price > 0 else None
+
+            if OPTION_SELL_DRY_RUN:
+                self.dry_run_orders += 1
+                self.last_sell_by_symbol[pos_sym] = now
+                self.last_order_utc = now.isoformat()
+                self.last_order_contract = pos_sym
+                self.last_order_symbol = underlying
+                self.last_order_reason = reason
+                self.logger.info(
+                    "OPTION_SELL_DRY_RUN provider=%s underlying=%s symbol=%s is_option=%s "
+                    "qty=%s trigger=%s p_hat=%s rsi=%s",
+                    provider,
+                    underlying,
+                    pos_sym,
+                    is_option,
+                    order_qty,
+                    reason,
+                    entry.get("projected_price_next"),
+                    entry.get("rsi"),
+                )
+                logging.info(
+                    "OPTION_SELL_DRY_RUN underlying=%s symbol=%s qty=%s trigger=%s",
+                    underlying,
+                    pos_sym,
+                    order_qty,
+                    reason,
+                )
+                continue
+
+            try:
+                order = await asyncio.to_thread(
+                    self._submit_sell_order,
+                    pos_sym,
+                    order_qty,
+                    limit_price,
+                )
+                order_id = getattr(order, "id", None)
+                order_status = getattr(order, "status", "submitted")
+                exec_at = datetime.now(UTC)
+                raw_submitted = getattr(order, "submitted_at", None) or getattr(
+                    order, "created_at", None
+                )
+                if isinstance(raw_submitted, datetime) and raw_submitted.tzinfo is not None:
+                    exec_at = as_utc(raw_submitted)
+                elif isinstance(raw_submitted, str) and raw_submitted.strip():
+                    try:
+                        parsed_sub = datetime.fromisoformat(
+                            raw_submitted.strip().replace("Z", "+00:00")
+                        )
+                        if parsed_sub.tzinfo is not None:
+                            exec_at = as_utc(parsed_sub)
+                    except ValueError:
+                        pass
+
+                self.orders_submitted += 1
+                self.last_sell_by_symbol[pos_sym] = exec_at
+                self.last_order_utc = exec_at.isoformat()
+                self.last_order_contract = pos_sym
+                self.last_order_symbol = underlying
+                self.last_order_reason = reason
+                self.coordinator.record_option_sell_event(
+                    symbol=underlying,
+                    executed_at=exec_at,
+                    contract=pos_sym,
+                    qty=order_qty,
+                    order_id=order_id,
+                    trigger_minute=minute_key,
+                    reason=reason,
+                    rsi=entry.get("rsi"),
+                    dry_run=False,
+                )
+                self.logger.info(
+                    "OPTION_SELL_SUBMITTED order_id=%s status=%s provider=%s underlying=%s "
+                    "symbol=%s is_option=%s qty=%s trigger=%s p_hat=%s rsi=%s",
+                    order_id,
+                    order_status,
+                    provider,
+                    underlying,
+                    pos_sym,
+                    is_option,
+                    order_qty,
+                    reason,
+                    entry.get("projected_price_next"),
+                    entry.get("rsi"),
+                )
+                logging.info(
+                    "OPTION_SELL_SUBMITTED order_id=%s underlying=%s symbol=%s qty=%s trigger=%s",
+                    order_id,
+                    underlying,
+                    pos_sym,
+                    order_qty,
+                    reason,
+                )
+            except Exception as exc:
+                self.last_status = f"order_error: {type(exc).__name__}"
+                self.logger.error(
+                    "OPTION_SELL_FAILED underlying=%s symbol=%s error_type=%s detail=%s",
+                    underlying,
+                    pos_sym,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        if not str(self.last_status).startswith(("order_error", "positions_error")):
+            self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+
+    async def run(self):
+        self.coordinator.attach_event_loop(asyncio.get_running_loop())
+        if not OPTION_SELL_ENABLED:
+            self.last_status = "disabled"
+            self.logger.info("OPTION_SELLER_DISABLED reason=OPTION_SELL_ENABLED=false")
+            return
+        if self.client is None:
+            self.last_status = "disabled"
+            self.logger.warning(
+                "OPTION_SELLER_DISABLED reason=missing_alpaca_credentials "
+                "hint=provide api_key/secret_key in parms.ini CREDENTIALS or "
+                "ALPACA_API_KEY/ALPACA_SECRET_KEY environment variables"
+            )
+            return
+
+        self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+        self.logger.info(
+            "OPTION_SELLER_START mode=%s rsi_high>=%.2f qty=%d close_full=%s "
+            "options_only=%s cooldown_min=%d allowed=%s",
+            self.mode,
+            OPTION_CHAIN_RSI_HIGH,
+            OPTION_SELL_QTY,
+            OPTION_SELL_CLOSE_FULL_POSITION,
+            OPTION_SELL_OPTIONS_ONLY,
+            OPTION_SELL_COOLDOWN_MINUTES,
+            sorted(OPTION_SELL_ALLOWED_FORECASTS),
+        )
+        wake_event = self.coordinator.subscribe_minute_finalized()
+        last_processed_minute = self.coordinator.last_finalized
+        while True:
+            try:
+                now = datetime.now(UTC)
+                next_wake = (
+                    now.replace(second=0, microsecond=0)
+                    + MINUTE
+                    + self.coordinator.delay
+                    + timedelta(seconds=1)
+                )
+                wait_sec = max(1.0, (next_wake - now).total_seconds())
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=wait_sec)
+                    wake_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                cur_finalized = self.coordinator.last_finalized
+                if cur_finalized is not None and cur_finalized != last_processed_minute:
+                    await self.evaluate_and_sell(cur_finalized)
+                    last_processed_minute = cur_finalized
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_status = f"error: {type(exc).__name__}"
+                self.logger.warning(
+                    "OPTION_SELLER_ERROR error_type=%s detail=%s",
                     type(exc).__name__,
                     exc,
                 )
@@ -4206,7 +4944,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div class="lg:col-span-2 bg-slate-950/70 border border-slate-800/80 rounded-xl p-4">
                             <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
                                 <span class="text-[11px] font-bold uppercase tracking-wider text-slate-300">3-Panel Synchronized Kinematic Crossover (Price · v/a · RSI)</span>
-                                <span class="text-[10px] text-slate-400 mono">a crosses 0 = Leading · v crosses 0 = Confirmed</span>
+                                <span class="flex flex-wrap items-center gap-3 text-[10px] text-slate-400 mono">
+                                    <span>a crosses 0 = Leading · v crosses 0 = Confirmed</span>
+                                    <span class="inline-flex items-center gap-1 text-red-400">
+                                        <svg viewBox="0 0 16 16" class="w-3 h-3 inline-block"><polygon points="8,1 10.1,5.6 15,6.2 11.4,9.6 12.3,14.5 8,12.1 3.7,14.5 4.6,9.6 1,6.2 5.9,5.6" fill="#ef4444" stroke="#020617" stroke-width="0.8"/></svg>
+                                        Executed Buy
+                                    </span>
+                                </span>
                             </div>
                             <div id="detailCrossoverChart" class="w-full min-h-[210px] flex items-center justify-center text-xs text-slate-500">
                                 Collecting multi-bar history...
@@ -4312,6 +5056,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
                             <span class="text-slate-400">Last Option Order</span>
                             <span id="optionBuyerLast" class="mono text-[11px] text-cyan-300 truncate max-w-[160px]">--</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Option Seller (1m Sync)</span>
+                            <span id="optionSellerStatus" class="mono font-semibold text-slate-200">not_loaded</span>
+                        </div>
+
+                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400">Last Sell Order</span>
+                            <span id="optionSellerLast" class="mono text-[11px] text-amber-300 truncate max-w-[160px]">--</span>
                         </div>
                     </div>
 
@@ -4682,6 +5436,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById('optionBuyerStatus').textContent = `${ob.status || 'not_loaded'} (${ob.orders_submitted ?? 0}/${ob.dry_run_orders ?? 0})`;
                 document.getElementById('optionBuyerLast').textContent = ob.last_order_contract || '--';
             }
+            if (m.option_seller) {
+                const os = m.option_seller;
+                document.getElementById('optionSellerStatus').textContent = `${os.status || 'not_loaded'} (${os.orders_submitted ?? 0}/${os.dry_run_orders ?? 0})`;
+                document.getElementById('optionSellerLast').textContent = os.last_order_contract || '--';
+            }
 
             // Connected Feeds
             const feedsContainer = document.getElementById('connectedFeedsList');
@@ -5030,7 +5789,25 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return m ? m[1] : `t${idx}`;
         }
 
-        function renderCrossoverChart(container, points, projectedNext) {
+        function escSvg(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function svgStarPoints(cx, cy, outerR = 6.5, innerR = 2.8) {
+            const pts = [];
+            for (let i = 0; i < 10; i++) {
+                const r = i % 2 === 0 ? outerR : innerR;
+                const angle = (-Math.PI / 2) + (i * Math.PI / 5);
+                pts.push(`${(cx + r * Math.cos(angle)).toFixed(1)},${(cy + r * Math.sin(angle)).toFixed(1)}`);
+            }
+            return pts.join(' ');
+        }
+
+        function renderCrossoverChart(container, points, projectedNext, buyEvents = []) {
             if (!container) return;
             if (!points || points.length < 2) {
                 container.innerHTML = '<div class="text-xs text-slate-500 py-8">Need at least 2 closed minute bars to draw synchronized Price / Velocity / Acceleration / RSI panels.</div>';
@@ -5111,6 +5888,42 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return '';
             }).join('');
 
+            // Executed option buy markers: red 5-point star pinned to exact UTC minute column
+            const toMinIdx = (raw) => {
+                if (!raw) return null;
+                const ms = Date.parse(raw);
+                return Number.isNaN(ms) ? null : Math.floor(ms / 60000);
+            };
+            const barMinIndices = points.map(p => toMinIdx(p.timestamp || p.minute));
+            const lastBarMinIdx = barMinIndices[n - 1];
+            const buyMarkers = (Array.isArray(buyEvents) ? buyEvents : [])
+                .filter(ev => ev && !ev.dry_run)
+                .map(ev => {
+                    const evMin = toMinIdx(ev.minute_utc || ev.executed_at_utc);
+                    if (evMin === null) return '';
+                    let bx = null;
+                    let by = null;
+                    const barIdx = barMinIndices.indexOf(evMin);
+                    if (barIdx >= 0) {
+                        bx = xAt(barIdx);
+                        const bp = safeNum(points[barIdx].close);
+                        by = bp !== null ? yP(bp) : lastY;
+                    } else if (lastBarMinIdx !== null && evMin === lastBarMinIdx + 1) {
+                        bx = nextX;
+                        by = nextY;
+                    } else {
+                        return '';
+                    }
+                    const execDate = ev.executed_at_utc ? new Date(ev.executed_at_utc) : null;
+                    const execLabel = (execDate && !Number.isNaN(execDate.getTime()))
+                        ? execDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+                        : (ev.minute_utc || '');
+                    const tip = `BUY EXECUTED: ${ev.contract || ev.symbol || ''} x${ev.qty || 1} @ ${execLabel}${ev.order_id ? ' · Order ' + ev.order_id : ''}`;
+                    const starPts = svgStarPoints(bx, by, 6.5, 2.8);
+                    return `<g><line x1="${bx.toFixed(1)}" y1="10" x2="${bx.toFixed(1)}" y2="212" stroke="#ef4444" stroke-opacity="0.40" stroke-dasharray="2,2" stroke-width="1.2" /><polygon points="${starPts}" fill="#ef4444" stroke="#020617" stroke-width="1"><title>${escSvg(tip)}</title></polygon></g>`;
+                })
+                .join('');
+
             container.innerHTML = `
                 <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto overflow-visible">
                     ${minuteGrid}
@@ -5137,6 +5950,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     ${crossMarkers}
 
                     ${rsiPts ? `<polyline fill="none" stroke="#c084fc" stroke-width="1.6" points="${rsiPts}" />` : ''}
+                    ${buyMarkers}
                 </svg>
             `;
         }
@@ -5191,7 +6005,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             renderCrossoverChart(
                 document.getElementById('detailCrossoverChart'),
                 symbolData.history_window || [],
-                safeNum(symbolData.projected_price_next)
+                safeNum(symbolData.projected_price_next),
+                symbolData.buy_events || []
             );
 
             // Diagnosis sentence
@@ -5554,6 +6369,16 @@ class AdminCliProvider:
                         "crossover_signal": c_forecast["crossover_signal"],
                         "regime": c_regime,
                         "history_window": g["best_history"],
+                        "buy_events": [
+                            e
+                            for e in self.coordinator.option_buy_events.get(sym, [])
+                            if not e.get("dry_run")
+                        ],
+                        "sell_events": [
+                            e
+                            for e in self.coordinator.option_sell_events.get(sym, [])
+                            if not e.get("dry_run")
+                        ],
                         "provider_entries": g["entries"],
                     }
                 )
@@ -5603,6 +6428,8 @@ class AdminCliProvider:
             pm = pm_entry.get("router")
             ob_entry = PROVIDER_REGISTRY.get("OPTION_BUYER", {})
             ob = ob_entry.get("router")
+            os_entry = PROVIDER_REGISTRY.get("OPTION_SELLER", {})
+            osel = os_entry.get("router")
 
             position_monitor_report = {
                 "status": pm.last_status if pm else "not_loaded",
@@ -5620,6 +6447,16 @@ class AdminCliProvider:
                 "last_order_contract": ob.last_order_contract if ob else None,
                 "last_order_reason": ob.last_order_reason if ob else None,
                 "cached_contracts": len(self.coordinator.option_chain_cache),
+            }
+            option_seller_report = {
+                "status": osel.last_status if osel else "not_loaded",
+                "mode": osel.mode if osel else "disabled",
+                "orders_submitted": osel.orders_submitted if osel else 0,
+                "dry_run_orders": osel.dry_run_orders if osel else 0,
+                "last_order_utc": osel.last_order_utc if osel else None,
+                "last_order_contract": osel.last_order_contract if osel else None,
+                "last_order_reason": osel.last_order_reason if osel else None,
+                "positions_checked": osel.last_positions_checked if osel else 0,
             }
             latest_kinematics = {}
             for (provider, symbol), hist in self.coordinator.kinematics_history.items():
@@ -5658,10 +6495,11 @@ class AdminCliProvider:
                 "loaded_providers": [
                     k
                     for k in PROVIDER_REGISTRY.keys()
-                    if k not in {"POSITIONS_MONITOR", "OPTION_BUYER"}
+                    if k not in {"POSITIONS_MONITOR", "OPTION_BUYER", "OPTION_SELLER"}
                 ],
                 "position_monitor": position_monitor_report,
                 "option_buyer": option_buyer_report,
+                "option_seller": option_seller_report,
                 "latest_kinematics": latest_kinematics,
             }
             return jsonify(status="ok", metrics=status_report), 200
@@ -5917,6 +6755,13 @@ async def main():
     )
     tasks.append(ob_task)
 
+    option_seller = AlpacaOptionSeller(keys, coordinator)
+    os_task = asyncio.create_task(
+        run_provider_isolated(option_seller, coordinator),
+        name="ALPACA_OPTION_SELLER",
+    )
+    tasks.append(os_task)
+
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
             run_provider_isolated(entry["router"], coordinator), name=provider
@@ -5931,6 +6776,10 @@ async def main():
     PROVIDER_REGISTRY["OPTION_BUYER"] = {
         "router": option_buyer,
         "task": ob_task,
+    }
+    PROVIDER_REGISTRY["OPTION_SELLER"] = {
+        "router": option_seller,
+        "task": os_task,
     }
 
     # 5. Execute engine orchestration
