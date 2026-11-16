@@ -38,7 +38,9 @@ import json
 import logging
 import math
 import os
+import re
 import sys
+import tempfile
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as clock_time, timezone
@@ -2262,6 +2264,94 @@ def load_tradier_token(config, credentials):
     return token
 
 
+_INI_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[;#].*)?$")
+_INI_FEATURE_SECTIONS = frozenset(
+    {"providers", "kinematics", "option_buyer", "option_seller"}
+)
+
+
+def _strip_inline_ini_comment(value):
+    """Strip inline ';' or '#' comments outside single/double quotes."""
+    if not isinstance(value, str):
+        return value
+    in_quote = None
+    escaped = False
+    for idx, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_quote == '"':
+            escaped = True
+            continue
+        if ch in {"'", '"'}:
+            if in_quote is None:
+                in_quote = ch
+            elif in_quote == ch:
+                in_quote = None
+            continue
+        if in_quote is None and ch in {";", "#"}:
+            return value[:idx].strip()
+    return value.strip()
+
+
+def _strip_trailing_json_comment(raw_val):
+    """Strip inline INI comments following a complete single-line JSON literal."""
+    stripped = raw_val.strip()
+    if not stripped:
+        return raw_val
+    try:
+        _, end_idx = json.JSONDecoder().raw_decode(stripped)
+    except Exception:
+        return raw_val
+    trailing = stripped[end_idx:].lstrip()
+    if not trailing:
+        return stripped
+    if trailing[0] in {";", "#"}:
+        return stripped[:end_idx]
+    return raw_val
+
+
+def _sanitize_parms_for_json_ini(raw_text):
+    """Prepare parms.ini text for JsonIniParser without altering line numbers.
+
+    Sections read directly via configparser ([providers], [kinematics],
+    [option_buyer], [option_seller]) support standard INI inline comments and
+    unquoted strings, which would otherwise raise JSONDecodeError inside
+    lib.utils.JsonIniParser. Replacing option lines in those sections with
+    comment lines and stripping trailing INI comments after JSON literals lets
+    JsonIniParser load [symbols], CREDENTIALS, [tradier], and [twelvedata_api]
+    while preserving 1:1 line numbering.
+    """
+    out_lines = []
+    in_feature_section = False
+    for line in raw_text.splitlines(keepends=True):
+        newline = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if newline else line
+        if body.endswith("\r"):
+            body = body[:-1]
+            newline = "\r\n" if newline else "\r"
+        stripped = body.strip()
+        sec_match = _INI_SECTION_RE.match(body)
+        if sec_match:
+            sec_name = sec_match.group(1).strip().lower()
+            in_feature_section = sec_name in _INI_FEATURE_SECTIONS
+            out_lines.append(f"[{sec_match.group(1).strip()}]{newline}")
+            continue
+        if not stripped or stripped[0] in {";", "#"}:
+            out_lines.append(line)
+            continue
+        if in_feature_section:
+            out_lines.append(f"; ini-feature-option{newline}")
+            continue
+        if "=" in body:
+            key_part, val_part = body.split("=", 1)
+            cleaned_val = _strip_trailing_json_comment(val_part)
+            out_lines.append(f"{key_part.rstrip()} = {cleaned_val}{newline}")
+            continue
+        out_lines.append(line)
+    return "".join(out_lines)
+
+
 def parse_provider_enabled(value, provider):
     """Only explicit true enables a provider; quoted true/false are supported."""
     if value is None:
@@ -2270,7 +2360,7 @@ def parse_provider_enabled(value, provider):
         return value
     if not isinstance(value, str):
         raise ValueError(f"[providers] {provider}.enabled must be True or False")
-    flag = value.strip()
+    flag = _strip_inline_ini_comment(value)
     if len(flag) >= 2 and flag[0] == flag[-1] and flag[0] in {"'", '"'}:
         flag = flag[1:-1].strip()
     flag = flag.casefold()
@@ -2286,7 +2376,7 @@ def parse_provider_enabled(value, provider):
 def _strip_ini_value(value):
     if not isinstance(value, str):
         return value
-    cleaned = value.split(";", 1)[0].strip()
+    cleaned = _strip_inline_ini_comment(value)
     if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
         cleaned = cleaned[1:-1].strip()
     return cleaned
@@ -2712,10 +2802,11 @@ def load_settings():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     # Read provider and feature flags with standard INI semantics, independent of
-    # how the project's JsonIniParser interprets dotted names or quoted values.
+    # how the project's JsonIniParser interprets dotted names, unquoted strings,
+    # or inline ';'/'#' comments.
+    raw_ini_text = config_path.read_text(encoding="utf-8-sig")
     provider_config = configparser.ConfigParser(interpolation=None)
-    with config_path.open("r", encoding="utf-8-sig") as handle:
-        provider_config.read_file(handle)
+    provider_config.read_string(raw_ini_text)
 
     _apply_ini_feature_settings(provider_config)
 
@@ -2741,59 +2832,78 @@ def load_settings():
         )
         return [], {}
 
-    # Keep the existing project-specific parsing for symbols and API credentials.
-    config = JsonIniParser(str(config_path))
-    config.load_globals()
-    raw = config.get("symbols", "target_symbols")
+    # Feed a sanitized copy to JsonIniParser so non-JSON INI feature sections
+    # and inline comments cannot trigger JSONDecodeError in lib.utils.
+    sanitized_ini = _sanitize_parms_for_json_ini(raw_ini_text)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".ini",
+            encoding="utf-8",
+            delete=False,
+        ) as tmp_file:
+            tmp_file.write(sanitized_ini)
+            tmp_path = tmp_file.name
 
-    if isinstance(raw, str):
-        symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    elif isinstance(raw, (list, tuple)):
-        if any(not isinstance(s, str) or not s.strip() for s in raw):
-            raise ValueError("Symbols must be nonempty strings")
-        symbols = [s.strip().upper() for s in raw]
-    else:
-        raise ValueError("target_symbols must be a string, list, or tuple")
+        config = JsonIniParser(tmp_path)
+        config.load_globals()
+        raw = config.get("symbols", "target_symbols")
 
-    symbols = list(dict.fromkeys(symbols))
-    if not symbols:
-        raise ValueError("No symbols configured")
+        if isinstance(raw, str):
+            symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+        elif isinstance(raw, (list, tuple)):
+            if any(not isinstance(s, str) or not s.strip() for s in raw):
+                raise ValueError("Symbols must be nonempty strings")
+            symbols = [s.strip().upper() for s in raw]
+        else:
+            raise ValueError("target_symbols must be a string, list, or tuple")
 
-    credentials = {}
-    # TRADINGVIEW and the position monitor both need the Alpaca credentials
-    # even without the ALPACA stream, so always load CREDENTIALS when any
-    # provider is enabled.
-    if selected:
-        credentials = getattr(config, "CREDENTIALS", {}) or {}
-        if not isinstance(credentials, dict):
-            raise ValueError("CREDENTIALS must be a dictionary")
+        symbols = list(dict.fromkeys(symbols))
+        if not symbols:
+            raise ValueError("No symbols configured")
 
-    keys = {
-        "alpaca_key": "",
-        "alpaca_secret": "",
-        "tradier_token": "",
-        "twelvedata_key": "",
-    }
+        credentials = {}
+        # TRADINGVIEW and the position monitor both need the Alpaca credentials
+        # even without the ALPACA stream, so always load CREDENTIALS when any
+        # provider is enabled.
+        if selected:
+            credentials = getattr(config, "CREDENTIALS", {}) or {}
+            if not isinstance(credentials, dict):
+                raise ValueError("CREDENTIALS must be a dictionary")
 
-    if selected:
-        keys["alpaca_key"] = credentials.get("api_key") or os.getenv(
-            "ALPACA_API_KEY", ""
-        )
-        keys["alpaca_secret"] = credentials.get("secret_key") or os.getenv(
-            "ALPACA_SECRET_KEY", ""
-        )
+        keys = {
+            "alpaca_key": "",
+            "alpaca_secret": "",
+            "tradier_token": "",
+            "twelvedata_key": "",
+        }
 
-    if "TRADIER" in selected:
-        keys["tradier_token"] = load_tradier_token(config, credentials)
+        if selected:
+            keys["alpaca_key"] = credentials.get("api_key") or os.getenv(
+                "ALPACA_API_KEY", ""
+            )
+            keys["alpaca_secret"] = credentials.get("secret_key") or os.getenv(
+                "ALPACA_SECRET_KEY", ""
+            )
 
-    if "TWELVEDATA" in selected:
-        td_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
-        if not td_key:
+        if "TRADIER" in selected:
+            keys["tradier_token"] = load_tradier_token(config, credentials)
+
+        if "TWELVEDATA" in selected:
+            td_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+            if not td_key:
+                try:
+                    td_key = config.get("twelvedata_api", "twelvedata_api_key")
+                except Exception:
+                    td_key = ""
+            keys["twelvedata_key"] = td_key
+    finally:
+        if tmp_path:
             try:
-                td_key = config.get("twelvedata_api", "twelvedata_api_key")
-            except Exception:
-                td_key = ""
-        keys["twelvedata_key"] = td_key
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     keys = {
         key: value.strip() if isinstance(value, str) else ""
