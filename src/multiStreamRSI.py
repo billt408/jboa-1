@@ -12173,19 +12173,55 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
             const q = optionLogSearchFilter.trim().toUpperCase();
 
-            const filtered = allEntries.filter(e => {
-                if (optionLogStreamFilter !== 'all' && e.stream !== optionLogStreamFilter) return false;
+            const isEntryQualified = (e) => {
                 const dec = String(e.decision || '').toUpperCase();
                 const ev = String(e.event || '').toUpperCase();
-                if (optionLogDecisionFilter === 'QUALIFIED') {
-                    if (!dec.includes('QUALIFIED') && !ev.includes('SUBMITTED') && !ev.includes('DRY_RUN')) return false;
-                } else if (optionLogDecisionFilter === 'REJECTED') {
-                    if (!dec.includes('REJECTED') && !ev.includes('SKIPPED') && !ev.includes('HOLD') && !ev.includes('FAILED')) return false;
-                }
-                if (q) {
-                    const hay = `${e.symbol || ''} ${e.contract || ''} ${e.provider || ''} ${e.reason || ''} ${e.event || ''}`.toUpperCase();
-                    if (!hay.includes(q)) return false;
-                }
+                if (dec.includes('FAILED') || ev.includes('FAILED')) return false;
+                return dec.includes('QUALIFIED') || ev.includes('SUBMITTED') || ev.includes('DRY_RUN');
+            };
+            const isEntryRejected = (e) => {
+                const dec = String(e.decision || '').toUpperCase();
+                const ev = String(e.event || '').toUpperCase();
+                return (
+                    dec.includes('REJECTED') ||
+                    dec.includes('SKIPPED') ||
+                    dec.includes('HOLD') ||
+                    dec.includes('WATCH') ||
+                    dec.includes('FAILED') ||
+                    ev.includes('SKIPPED') ||
+                    ev.includes('HOLD') ||
+                    ev.includes('FAILED')
+                );
+            };
+            const matchesDecisionFilter = (e, filterVal) => {
+                if (filterVal === 'QUALIFIED') return isEntryQualified(e);
+                if (filterVal === 'REJECTED') return isEntryRejected(e);
+                return true;
+            };
+
+            const searchMatched = q
+                ? allEntries.filter(e => {
+                      const hay = `${e.symbol || ''} ${e.contract || ''} ${e.provider || ''} ${e.reason || ''} ${e.event || ''}`.toUpperCase();
+                      return hay.includes(q);
+                  })
+                : allEntries;
+
+            const sidePool = optionLogDecisionFilter === 'all'
+                ? searchMatched
+                : searchMatched.filter(e => matchesDecisionFilter(e, optionLogDecisionFilter));
+            const countAllSide = sidePool.length;
+            const countBuySide = sidePool.filter(e => e.stream === 'BUY').length;
+            const countSellSide = sidePool.filter(e => e.stream === 'SELL').length;
+
+            const decPool = optionLogStreamFilter === 'all'
+                ? searchMatched
+                : searchMatched.filter(e => e.stream === optionLogStreamFilter);
+            const countQualified = decPool.filter(isEntryQualified).length;
+            const countRejected = decPool.filter(isEntryRejected).length;
+
+            const filtered = searchMatched.filter(e => {
+                if (optionLogStreamFilter !== 'all' && e.stream !== optionLogStreamFilter) return false;
+                if (!matchesDecisionFilter(e, optionLogDecisionFilter)) return false;
                 return true;
             });
 
@@ -12250,7 +12286,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (payload.seller_log_file) fileInfoParts.push(`Seller: ${payload.seller_log_file}`);
 
             const rowBadge = document.getElementById('optLogsRowBadge');
-            if (rowBadge) rowBadge.textContent = `${filtered.length} / ${allEntries.length} rows`;
+            if (rowBadge) {
+                rowBadge.textContent = filtered.length === searchMatched.length
+                    ? `${filtered.length} ${filtered.length === 1 ? 'row' : 'rows'}`
+                    : `${filtered.length} / ${searchMatched.length} rows`;
+            }
             const fileSubtitle = document.getElementById('optLogsFileSubtitle');
             if (fileSubtitle) {
                 const subTxt = fileInfoParts.join(' · ') || 'No option_buyer / option_seller log files found yet';
@@ -12263,14 +12303,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
                     <div class="flex flex-wrap items-center gap-2">
                         <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
-                            <button type="button" onclick="setOptionLogStreamFilter('all')" class="${streamBtnCls('all')}">All (${allEntries.length})</button>
-                            <button type="button" onclick="setOptionLogStreamFilter('BUY')" class="${streamBtnCls('BUY')}">Buy (${payload.counts?.buy ?? 0})</button>
-                            <button type="button" onclick="setOptionLogStreamFilter('SELL')" class="${streamBtnCls('SELL')}">Sell (${payload.counts?.sell ?? 0})</button>
+                            <button type="button" onclick="setOptionLogStreamFilter('all')" class="${streamBtnCls('all')}">All (${countAllSide})</button>
+                            <button type="button" onclick="setOptionLogStreamFilter('BUY')" class="${streamBtnCls('BUY')}">Buy (${countBuySide})</button>
+                            <button type="button" onclick="setOptionLogStreamFilter('SELL')" class="${streamBtnCls('SELL')}">Sell (${countSellSide})</button>
                         </div>
                         <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
                             <button type="button" onclick="setOptionLogDecisionFilter('all')" class="${decBtnCls('all')}">All Decisions</button>
-                            <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${payload.counts?.qualified ?? 0})</button>
-                            <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${payload.counts?.rejected ?? 0})</button>
+                            <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${countQualified})</button>
+                            <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${countRejected})</button>
                         </div>
                     </div>
                     <div class="flex items-center gap-1.5">
@@ -12890,6 +12930,16 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     event = m.group(3)
     rest = (m.group(4) or "").strip()
 
+    # Ignore startup/config lifecycle banners so an empty log doesn't report phantom Buy/Sell counts
+    if event in {
+        "OPTION_BUYER_START",
+        "OPTION_SELLER_START",
+        "OPTION_BUYER_DISABLED",
+        "OPTION_SELLER_DISABLED",
+        "OPTION_BUY_CYCLE_CAP_REACHED",
+    }:
+        return None
+
     rec = {
         "timestamp": ts_full,
         "timestamp_short": ts_short,
@@ -13087,13 +13137,19 @@ def read_option_analysis_logs(limit_per_file: int = 500):
             sell_count += 1
         dec_u = str(r.get("decision") or "").upper()
         ev_u = str(r.get("event") or "").upper()
-        if "QUALIFIED" in dec_u or "SUBMITTED" in ev_u or "DRY_RUN" in ev_u:
+        is_failed = ("FAILED" in dec_u) or ("FAILED" in ev_u)
+        if (not is_failed) and (
+            "QUALIFIED" in dec_u or "SUBMITTED" in ev_u or "DRY_RUN" in ev_u
+        ):
             qualified_count += 1
         elif (
-            "REJECTED" in dec_u
+            is_failed
+            or "REJECTED" in dec_u
+            or "SKIPPED" in dec_u
+            or "HOLD" in dec_u
+            or "WATCH" in dec_u
             or "SKIPPED" in ev_u
             or "HOLD" in ev_u
-            or "FAILED" in ev_u
         ):
             rejected_count += 1
 
