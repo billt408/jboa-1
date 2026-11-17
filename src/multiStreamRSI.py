@@ -10646,9 +10646,6 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div class="flex items-center gap-2">
                     <span id="optBackfillBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">backfill: idle</span>
-                    <button id="btnOptViewLogs" onclick="toggleOptionLogsPanel()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[11px] font-semibold transition">
-                        Buy/Sell Logs
-                    </button>
                     <button id="btnOptSyncAlpaca" onclick="refreshOptionHistoryFromAlpaca()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
                         Sync Alpaca History
                     </button>
@@ -10692,13 +10689,35 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Right: Contract Chart & Minute-by-Minute Breakdown / Buy-Sell Logs -->
+                <!-- Right: Contract Chart & Minute-by-Minute Breakdown -->
                 <div id="optContractDetailPane" class="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5 space-y-4">
                     <div class="text-xs text-slate-500 text-center py-12">Select a contract on the left to inspect its minute-by-minute price &amp; P/L chart.</div>
                 </div>
-                <div id="optLogsPane" class="hidden flex-1 min-w-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
-                    <div class="text-xs text-slate-500 text-center py-12">Loading buy/sell logs...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Standalone Buy / Sell Decision & Execution Logs Modal -->
+    <div id="optionLogsModal" onclick="if(event.target===this) closeOptionLogsModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-7xl w-full h-[88vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</h3>
+                        <span id="optLogsRowBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 rows</span>
+                    </div>
+                    <p id="optLogsFileSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Minute-by-minute Option Buyer &amp; Option Seller evaluations</p>
                 </div>
+                <div class="flex items-center gap-2">
+                    <button type="button" onclick="fetchOptionLogs()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                        Refresh Logs
+                    </button>
+                    <button type="button" onclick="closeOptionLogsModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div id="optLogsPane" class="flex-1 min-h-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
+                <div class="text-xs text-slate-500 text-center py-12">Loading buy/sell logs...</div>
             </div>
         </div>
     </div>
@@ -10983,10 +11002,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     fetch('/cli/status').then(r => r.json()).catch(() => null),
                     fetch('/api/kinematics').then(r => r.json()).catch(() => null)
                 ];
-                const modal = document.getElementById('optionDrilldownModal');
-                const modalOpen = modal && !modal.classList.contains('hidden');
-                const logsOpen = modalOpen && optionDrilldownSubView === 'logs';
-                if (modalOpen) {
+                const contractsModal = document.getElementById('optionDrilldownModal');
+                const contractsOpen = contractsModal && !contractsModal.classList.contains('hidden');
+                const logsModal = document.getElementById('optionLogsModal');
+                const logsOpen = logsModal && !logsModal.classList.contains('hidden');
+                if (contractsOpen) {
                     jobs.push(fetch('/api/option-history').then(r => r.json()).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
@@ -11009,7 +11029,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     renderSymbolDeepDive();
                 }
 
-                if (modalOpen && optRes && optRes.status === 'ok') {
+                if (contractsOpen && optRes && optRes.status === 'ok') {
                     latestOptionHistory = optRes;
                     renderOptionDrilldown();
                 }
@@ -12020,7 +12040,6 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         // OPTION BUYER / SELLER CONTRACT DRILL-DOWN & MINUTE-BY-MINUTE P/L CHART
         // =========================================================================================
         let optionDrilldownMode = 'buyer'; // 'buyer' | 'seller'
-        let optionDrilldownSubView = 'chart'; // 'chart' | 'logs'
         let selectedBuyerContract = null;
         let selectedSellerTradeId = null;
         let latestOptionHistory = null;
@@ -12062,10 +12081,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         async function openOptionDrilldown(mode = 'buyer') {
             optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
-            optionDrilldownSubView = 'chart';
             const modal = document.getElementById('optionDrilldownModal');
             if (modal) modal.classList.remove('hidden');
-            syncOptionSubViewVisibility();
             await fetchOptionHistory();
         }
 
@@ -12076,8 +12093,6 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function switchOptionDrilldownMode(mode) {
             optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
-            optionDrilldownSubView = 'chart';
-            syncOptionSubViewVisibility();
             renderOptionDrilldown();
         }
 
@@ -12087,51 +12102,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             } else {
                 selectedSellerTradeId = key;
             }
-            optionDrilldownSubView = 'chart';
-            syncOptionSubViewVisibility();
             renderOptionDrilldown();
         }
 
-        function syncOptionSubViewVisibility() {
-            const detailEl = document.getElementById('optContractDetailPane');
-            const logsEl = document.getElementById('optLogsPane');
-            const logsBtn = document.getElementById('btnOptViewLogs');
-            const showLogs = optionDrilldownSubView === 'logs';
-            if (detailEl) detailEl.classList.toggle('hidden', showLogs);
-            if (logsEl) logsEl.classList.toggle('hidden', !showLogs);
-            if (logsBtn) {
-                logsBtn.textContent = showLogs ? 'Back to Chart' : 'Buy/Sell Logs';
-                logsBtn.className = showLogs
-                    ? 'px-2.5 py-1 rounded-lg bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-200 border border-cyan-500/50 text-[11px] font-semibold transition'
-                    : 'px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[11px] font-semibold transition';
-            }
-        }
-
         async function openOptionLogsPanel(symbolFilter = '') {
-            optionDrilldownSubView = 'logs';
             if (typeof symbolFilter === 'string') {
                 optionLogSearchFilter = symbolFilter.trim().toUpperCase();
             }
-            const modal = document.getElementById('optionDrilldownModal');
-            if (modal && modal.classList.contains('hidden')) {
+            const modal = document.getElementById('optionLogsModal');
+            if (modal) {
                 modal.classList.remove('hidden');
             }
-            syncOptionSubViewVisibility();
-            if (latestOptionHistory) {
-                await fetchOptionLogs();
-            } else {
-                await Promise.all([fetchOptionLogs(), fetchOptionHistory()]);
+            if (latestOptionLogs) {
+                renderOptionLogsPanel();
             }
+            await fetchOptionLogs();
         }
 
-        function toggleOptionLogsPanel() {
-            if (optionDrilldownSubView === 'logs') {
-                optionDrilldownSubView = 'chart';
-                syncOptionSubViewVisibility();
-                renderOptionDrilldown();
-            } else {
-                openOptionLogsPanel('');
-            }
+        function closeOptionLogsModal() {
+            const modal = document.getElementById('optionLogsModal');
+            if (modal) modal.classList.add('hidden');
         }
 
         async function fetchOptionLogs() {
@@ -12243,7 +12233,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td class="px-2 py-2 whitespace-nowrap">
                             <span class="inline-block px-1.5 py-0.5 rounded border text-[9.5px] font-semibold ${decCls}">${escSvg(dec)}</span>
                         </td>
-                        <td class="px-2.5 py-2 text-slate-300 break-words max-w-[320px]">${escSvg(reasonText)}</td>
+                        <td class="px-2.5 py-2 text-slate-300 break-words min-w-[240px]">${escSvg(reasonText)}</td>
                     </tr>
                 `;
             }).join('');
@@ -12259,26 +12249,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (payload.buyer_log_file) fileInfoParts.push(`Buyer: ${payload.buyer_log_file}`);
             if (payload.seller_log_file) fileInfoParts.push(`Seller: ${payload.seller_log_file}`);
 
+            const rowBadge = document.getElementById('optLogsRowBadge');
+            if (rowBadge) rowBadge.textContent = `${filtered.length} / ${allEntries.length} rows`;
+            const fileSubtitle = document.getElementById('optLogsFileSubtitle');
+            if (fileSubtitle) {
+                const subTxt = fileInfoParts.join(' · ') || 'No option_buyer / option_seller log files found yet';
+                fileSubtitle.textContent = subTxt;
+                fileSubtitle.title = subTxt;
+            }
+
             logsEl.innerHTML = `
-                <div class="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800/80 shrink-0">
-                    <div>
-                        <div class="flex items-center gap-2">
-                            <span class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</span>
-                            <span class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">${filtered.length} / ${allEntries.length} rows</span>
-                        </div>
-                        <div class="text-[10px] text-slate-400 mono mt-0.5 truncate max-w-2xl" title="${escSvg(fileInfoParts.join(' · '))}">
-                            ${escSvg(fileInfoParts.join(' · ') || 'No option_buyer / option_seller log files found yet')}
-                        </div>
-                    </div>
-                    <div class="flex items-center gap-2">
-                        <button type="button" onclick="fetchOptionLogs()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
-                            Refresh Logs
-                        </button>
-                        <button type="button" onclick="toggleOptionLogsPanel()" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] font-semibold transition">
-                            &larr; Back to Chart
-                        </button>
-                    </div>
-                </div>
 
                 <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
                     <div class="flex flex-wrap items-center gap-2">
@@ -12634,14 +12614,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             if (items.length === 0) {
                 listEl.innerHTML = `
-                    <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-2">
+                    <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-1.5">
                         <div class="text-xs font-semibold text-slate-300">No ${isBuyer ? 'Open' : 'Closed'} Contracts Found</div>
                         <p class="text-[11px] text-slate-500">${isBuyer ? 'Open option positions or newly placed Option Buyer orders will appear here and track minute by minute.' : 'Completed Option Seller exits or historical closed orders will appear here.'}</p>
-                        <button type="button" onclick="openOptionLogsPanel('')" class="px-2.5 py-1 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[10.5px] font-semibold transition">
-                            View Buy/Sell Log
-                        </button>
                     </div>`;
-                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session, or click "Buy/Sell Logs" above to inspect per-minute decisions.</div>`;
+                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session.</div>`;
                 activeOptionHistoryPoints = [];
                 return;
             }
@@ -12814,6 +12791,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
+                const logsModal = document.getElementById('optionLogsModal');
+                if (logsModal && !logsModal.classList.contains('hidden')) {
+                    closeOptionLogsModal();
+                }
                 const modal = document.getElementById('optionDrilldownModal');
                 if (modal && !modal.classList.contains('hidden')) {
                     closeOptionDrilldown();
