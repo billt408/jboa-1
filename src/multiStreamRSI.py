@@ -712,6 +712,1277 @@ def make_summary_logger():
     return logger
 
 
+OPTION_CONTRACT_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+
+
+def _opt_safe_float(val, default=None):
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _opt_parse_utc(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return as_utc(raw) if raw.tzinfo is not None else raw.replace(tzinfo=UTC)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            return as_utc(dt) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_occ_contract(symbol):
+    sym = str(symbol or "").strip().upper()
+    m = OPTION_CONTRACT_SYMBOL_RE.match(sym)
+    if not m:
+        return False, sym, "EQUITY", None, None
+    underlying, yy, mm, dd, cp, strike_raw = m.groups()
+    right = "CALL" if cp == "C" else "PUT"
+    strike = round(int(strike_raw) / 1000.0, 4)
+    expiry = f"20{yy}-{mm}-{dd}"
+    return True, underlying, right, strike, expiry
+
+
+def _is_option_contract_symbol(symbol, asset_class=None):
+    if asset_class is not None:
+        ac_val = getattr(asset_class, "value", asset_class)
+        if "option" in str(ac_val).lower():
+            return True
+    return bool(OPTION_CONTRACT_SYMBOL_RE.match(str(symbol or "").strip().upper()))
+
+
+class OptionContractHistoryTracker:
+    """Thread-safe tracker & Alpaca backfill engine for open & closed option contracts.
+
+    Tracks minute-by-minute contract price, position value, and P/L ($ and %)
+    for open contracts (Option Buyer 1m Sync) and completed trades (Option Seller
+    1m Sync), including startup historical reconstruction from Alpaca orders + 1m bars.
+    """
+
+    MAX_HISTORY_POINTS = 2400
+    MAX_CLOSED_TRADES = 60
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.open_contracts = {}
+        self.closed_contracts = []
+        self._closed_ids = set()
+        self.backfill_status = "idle"
+        self.backfill_last_utc = None
+        self.backfill_error = None
+        self._credentials = {}
+        self._trading_client = None
+        self._option_data_client = None
+        self._stock_data_client = None
+
+    def attach_clients(
+        self,
+        credentials=None,
+        trading_client=None,
+        option_data_client=None,
+        stock_data_client=None,
+    ):
+        with self._lock:
+            if credentials:
+                self._credentials = dict(credentials)
+            if trading_client is not None:
+                self._trading_client = trading_client
+            if option_data_client is not None:
+                self._option_data_client = option_data_client
+            if stock_data_client is not None:
+                self._stock_data_client = stock_data_client
+
+    @staticmethod
+    def _build_point(ts_dt, price, entry_price, qty, multiplier, source="live_poll", minute_key_override=None):
+        ts_utc = as_utc(ts_dt)
+        min_dt = minute_utc(ts_utc)
+        p = max(0.0, float(price))
+        ep = max(0.0, float(entry_price))
+        q = max(0.0, float(qty))
+        mult = float(multiplier)
+        cost_basis = round(ep * q * mult, 2)
+        market_value = round(p * q * mult, 2)
+        pnl_dollars = round(market_value - cost_basis, 2)
+        pnl_pct = round(((p - ep) / ep) * 100.0, 2) if ep > 0 else 0.0
+        return {
+            "minute_utc": minute_key_override or min_dt.isoformat(),
+            "timestamp": ts_utc.isoformat(),
+            "price": round(p, 4),
+            "price_change_dollars": round(p - ep, 4),
+            "market_value": market_value,
+            "cost_basis": cost_basis,
+            "pnl_dollars": pnl_dollars,
+            "pnl_pct": pnl_pct,
+            "source": source,
+        }
+
+    @classmethod
+    def _upsert_point(cls, history, point):
+        if not point:
+            return
+        key = point["minute_utc"]
+        priority = {
+            "order_fill": 4,
+            "live_poll": 3,
+            "option_bar": 2,
+            "stock_bar": 2,
+            "carry_forward": 1,
+        }
+        new_prio = priority.get(point.get("source"), 1)
+        for idx, existing in enumerate(history):
+            if existing.get("minute_utc") == key:
+                old_prio = priority.get(existing.get("source"), 1)
+                if new_prio >= old_prio:
+                    history[idx] = point
+                return
+        history.append(point)
+        history.sort(key=lambda pt: str(pt.get("timestamp") or pt.get("minute_utc") or ""))
+        if len(history) > cls.MAX_HISTORY_POINTS:
+            del history[:-cls.MAX_HISTORY_POINTS]
+
+    @classmethod
+    def _fill_minute_gaps(
+        cls,
+        existing_history,
+        start_dt,
+        end_dt,
+        entry_price,
+        end_price,
+        qty,
+        multiplier,
+        bar_prices_by_min=None,
+        is_closed=False,
+    ):
+        start_utc = as_utc(start_dt)
+        end_utc = max(start_utc, as_utc(end_dt))
+        start_min = minute_utc(start_utc)
+        end_min = minute_utc(end_utc)
+        bar_map = dict(bar_prices_by_min or {})
+
+        preserved_by_min = {}
+        for pt in existing_history or []:
+            mk = pt.get("minute_utc")
+            if mk and pt.get("source") in {"live_poll", "order_fill"}:
+                preserved_by_min[mk] = pt
+
+        total_span_mins = int((end_min - start_min).total_seconds() // 60)
+        candidate_mins = []
+        if total_span_mins <= 420:
+            cur = start_min
+            while cur <= end_min:
+                if (
+                    cur == start_min
+                    or cur == end_min
+                    or regular_session(cur)
+                    or cur in bar_map
+                    or cur.isoformat() in preserved_by_min
+                ):
+                    candidate_mins.append(cur)
+                cur += MINUTE
+        else:
+            day = start_min.astimezone(MARKET_TZ).date()
+            end_day = end_min.astimezone(MARKET_TZ).date()
+            while day <= end_day:
+                bounds = session_bounds(day)
+                if bounds is not None:
+                    open_dt, close_dt = bounds
+                    cur = max(start_min, minute_utc(open_dt))
+                    stop = min(end_min, minute_utc(close_dt - MINUTE))
+                    while cur <= stop:
+                        candidate_mins.append(cur)
+                        cur += MINUTE
+                day += timedelta(days=1)
+            for bm in bar_map.keys():
+                if start_min <= bm <= end_min:
+                    candidate_mins.append(bm)
+            candidate_mins.extend([start_min, end_min])
+            candidate_mins = sorted(set(candidate_mins))
+
+        if len(candidate_mins) > cls.MAX_HISTORY_POINTS:
+            candidate_mins = [candidate_mins[0]] + candidate_mins[-(cls.MAX_HISTORY_POINTS - 1):]
+
+        out = []
+        last_known_price = float(entry_price)
+        for m_dt in candidate_mins:
+            m_iso = m_dt.isoformat()
+            if m_iso in preserved_by_min:
+                pt = dict(preserved_by_min[m_iso])
+                pt_price = _opt_safe_float(pt.get("price"), last_known_price)
+                pt = cls._build_point(
+                    _opt_parse_utc(pt.get("timestamp")) or m_dt,
+                    pt_price,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source=pt.get("source") or "live_poll",
+                    minute_key_override=m_iso,
+                )
+                last_known_price = pt["price"]
+                out.append(pt)
+                continue
+
+            if m_dt == start_min and m_dt not in bar_map:
+                pt = cls._build_point(
+                    start_utc,
+                    entry_price,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source="order_fill",
+                    minute_key_override=m_iso,
+                )
+                last_known_price = entry_price
+                out.append(pt)
+                continue
+
+            if m_dt in bar_map and bar_map[m_dt] is not None and bar_map[m_dt] > 0:
+                p = float(bar_map[m_dt])
+                last_known_price = p
+                src = "option_bar"
+            elif m_dt == end_min and end_price is not None and end_price > 0:
+                p = float(end_price)
+                last_known_price = p
+                src = "order_fill" if is_closed else "live_poll"
+            else:
+                p = last_known_price
+                src = "carry_forward"
+
+            out.append(
+                cls._build_point(
+                    m_dt,
+                    p,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source=src,
+                    minute_key_override=m_iso,
+                )
+            )
+
+        if end_price is not None and end_price > 0:
+            final_src = "order_fill" if is_closed else "live_poll"
+            if start_min == end_min and is_closed:
+                buy_pt = cls._build_point(
+                    start_utc,
+                    entry_price,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source="order_fill",
+                    minute_key_override=start_utc.isoformat(),
+                )
+                sell_pt = cls._build_point(
+                    end_utc,
+                    end_price,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source="order_fill",
+                    minute_key_override=end_utc.isoformat(),
+                )
+                return [buy_pt, sell_pt]
+            final_pt = cls._build_point(
+                end_utc,
+                end_price,
+                entry_price,
+                qty,
+                multiplier,
+                source=final_src,
+                minute_key_override=end_min.isoformat(),
+            )
+            cls._upsert_point(out, final_pt)
+        return out
+
+    def record_buy(
+        self,
+        contract,
+        underlying=None,
+        qty=1,
+        entry_price=None,
+        executed_at=None,
+        order_id=None,
+        reason=None,
+        dry_run=False,
+        is_option=None,
+    ):
+        if dry_run:
+            return None
+        sym = str(contract or "").strip().upper()
+        if not sym:
+            return None
+        parsed_opt, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
+        eff_opt = parsed_opt if is_option is None else bool(is_option)
+        if not eff_opt:
+            return None
+        eff_und = str(underlying or parsed_und or sym).strip().upper()
+        eff_qty = max(1.0, float(_opt_safe_float(qty, 1.0) or 1.0))
+        eff_price = _opt_safe_float(entry_price, 0.0) or 0.0
+        exec_dt = _opt_parse_utc(executed_at) or datetime.now(UTC)
+        mult = 100.0 if eff_opt else 1.0
+        cost_basis = round(eff_price * eff_qty * mult, 2)
+
+        with self._lock:
+            existing = self.open_contracts.get(sym)
+            if existing:
+                old_qty = _opt_safe_float(existing.get("qty"), 0.0) or 0.0
+                old_cost = _opt_safe_float(existing.get("cost_basis"), 0.0) or 0.0
+                new_qty = old_qty + eff_qty
+                new_cost = round(old_cost + cost_basis, 2)
+                new_entry = round(new_cost / (new_qty * mult), 4) if new_qty > 0 else eff_price
+                existing["qty"] = int(round(new_qty)) if abs(new_qty - round(new_qty)) < 1e-6 else round(new_qty, 4)
+                existing["entry_price"] = new_entry
+                existing["cost_basis"] = new_cost
+                existing["order_id"] = str(order_id) if order_id else existing.get("order_id")
+                existing["buy_reason"] = reason or existing.get("buy_reason")
+                existing["last_updated_utc"] = exec_dt.isoformat()
+                if eff_price > 0:
+                    existing["current_price"] = round(eff_price, 4)
+                    existing["market_value"] = round(eff_price * new_qty * mult, 2)
+                    existing["pnl_dollars"] = round(existing["market_value"] - new_cost, 2)
+                    existing["pnl_pct"] = round(
+                        ((existing["pnl_dollars"] / new_cost) * 100.0) if new_cost > 0 else 0.0,
+                        2,
+                    )
+                    pt = self._build_point(exec_dt, eff_price, new_entry, new_qty, mult, source="order_fill")
+                    self._upsert_point(existing["history"], pt)
+                return existing
+
+            history = []
+            if eff_price > 0:
+                history.append(
+                    self._build_point(exec_dt, eff_price, eff_price, eff_qty, mult, source="order_fill")
+                )
+            entry = {
+                "contract": sym,
+                "underlying": eff_und,
+                "is_option": eff_opt,
+                "right": right,
+                "strike": strike,
+                "expiry": expiry,
+                "qty": int(round(eff_qty)) if abs(eff_qty - round(eff_qty)) < 1e-6 else round(eff_qty, 4),
+                "multiplier": mult,
+                "entry_price": round(eff_price, 4),
+                "cost_basis": cost_basis,
+                "purchased_at_utc": exec_dt.isoformat(),
+                "purchased_minute_utc": minute_utc(exec_dt).isoformat(),
+                "order_id": str(order_id) if order_id else None,
+                "buy_reason": reason,
+                "dry_run": False,
+                "current_price": round(eff_price, 4),
+                "market_value": cost_basis,
+                "pnl_dollars": 0.0,
+                "pnl_pct": 0.0,
+                "last_updated_utc": exec_dt.isoformat(),
+                "history_source": "live",
+                "history": history,
+            }
+            self.open_contracts[sym] = entry
+            return entry
+
+    def update_buy_fill(self, contract, order_id, filled_price, filled_at=None, filled_qty=None):
+        sym = str(contract or "").strip().upper()
+        fp = _opt_safe_float(filled_price, None)
+        if not sym or fp is None or fp <= 0:
+            return False
+        fdt = _opt_parse_utc(filled_at)
+        with self._lock:
+            entry = self.open_contracts.get(sym)
+            if not entry:
+                return False
+            mult = float(entry.get("multiplier") or 100.0)
+            q = float(_opt_safe_float(filled_qty, entry.get("qty")) or entry.get("qty") or 1.0)
+            entry["entry_price"] = round(fp, 4)
+            entry["cost_basis"] = round(fp * q * mult, 2)
+            if fdt is not None:
+                entry["purchased_at_utc"] = fdt.isoformat()
+                entry["purchased_minute_utc"] = minute_utc(fdt).isoformat()
+            if order_id:
+                entry["order_id"] = str(order_id)
+            cur_p = _opt_safe_float(entry.get("current_price"), fp) or fp
+            entry["market_value"] = round(cur_p * q * mult, 2)
+            entry["pnl_dollars"] = round(entry["market_value"] - entry["cost_basis"], 2)
+            entry["pnl_pct"] = round(
+                (entry["pnl_dollars"] / entry["cost_basis"]) * 100.0 if entry["cost_basis"] > 0 else 0.0,
+                2,
+            )
+            rebuilt = []
+            for pt in entry.get("history") or []:
+                pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc")) or (fdt or datetime.now(UTC))
+                pt_p = fp if pt.get("source") == "order_fill" else (_opt_safe_float(pt.get("price"), cur_p) or cur_p)
+                rebuilt.append(
+                    self._build_point(
+                        pt_dt,
+                        pt_p,
+                        fp,
+                        q,
+                        mult,
+                        source=pt.get("source") or "live_poll",
+                        minute_key_override=pt.get("minute_utc"),
+                    )
+                )
+            entry["history"] = rebuilt
+            return True
+
+    def record_positions_snapshot(self, positions, timestamp=None):
+        now_dt = _opt_parse_utc(timestamp) or datetime.now(UTC)
+        seen_symbols = set()
+        missing_symbols = []
+
+        with self._lock:
+            for pos in positions or []:
+                sym = str(
+                    (pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", ""))
+                    or ""
+                ).strip().upper()
+                if not sym:
+                    continue
+                raw_ac = pos.get("asset_class") if isinstance(pos, dict) else getattr(pos, "asset_class", None)
+                if not _is_option_contract_symbol(sym, raw_ac):
+                    continue
+                raw_qty = _opt_safe_float(
+                    pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 0.0
+                ) or 0.0
+                raw_side = pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+                side = str(getattr(raw_side, "value", raw_side) or "long").lower()
+                if raw_qty <= 0 or side == "short":
+                    continue
+
+                seen_symbols.add(sym)
+                _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
+                raw_und = pos.get("underlying_symbol") if isinstance(pos, dict) else getattr(pos, "underlying_symbol", None)
+                und = str(raw_und or parsed_und or sym).strip().upper()
+                mult = 100.0
+                avg_entry = _opt_safe_float(
+                    pos.get("avg_entry_price") if isinstance(pos, dict) else getattr(pos, "avg_entry_price", None),
+                    None,
+                )
+                cur_price = _opt_safe_float(
+                    pos.get("current_price") if isinstance(pos, dict) else getattr(pos, "current_price", None),
+                    None,
+                )
+                mkt_val = _opt_safe_float(
+                    pos.get("market_value") if isinstance(pos, dict) else getattr(pos, "market_value", None),
+                    None,
+                )
+                cost_b = _opt_safe_float(
+                    pos.get("cost_basis") if isinstance(pos, dict) else getattr(pos, "cost_basis", None),
+                    None,
+                )
+                upl = _opt_safe_float(
+                    pos.get("unrealized_pl") if isinstance(pos, dict) else getattr(pos, "unrealized_pl", None),
+                    None,
+                )
+                uplpc = _opt_safe_float(
+                    pos.get("unrealized_plpc") if isinstance(pos, dict) else getattr(pos, "unrealized_plpc", None),
+                    None,
+                )
+
+                if (avg_entry is None or avg_entry <= 0) and cost_b is not None and cost_b > 0:
+                    avg_entry = cost_b / (raw_qty * mult)
+                if (cur_price is None or cur_price <= 0) and mkt_val is not None and mkt_val > 0:
+                    cur_price = mkt_val / (raw_qty * mult)
+                if avg_entry is None or avg_entry <= 0:
+                    avg_entry = cur_price or 0.0
+                if cur_price is None or cur_price <= 0:
+                    cur_price = avg_entry
+                if cost_b is None or cost_b <= 0:
+                    cost_b = round(avg_entry * raw_qty * mult, 2)
+                if mkt_val is None or mkt_val <= 0:
+                    mkt_val = round(cur_price * raw_qty * mult, 2)
+                if upl is None:
+                    upl = round(mkt_val - cost_b, 2)
+                if uplpc is not None:
+                    pnl_pct = round(uplpc * 100.0, 2)
+                elif cost_b > 0:
+                    pnl_pct = round((upl / cost_b) * 100.0, 2)
+                else:
+                    pnl_pct = 0.0
+
+                clean_qty = int(round(raw_qty)) if abs(raw_qty - round(raw_qty)) < 1e-6 else round(raw_qty, 4)
+                existing = self.open_contracts.get(sym)
+                if existing is None:
+                    existing = {
+                        "contract": sym,
+                        "underlying": und,
+                        "is_option": True,
+                        "right": right,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "qty": clean_qty,
+                        "multiplier": mult,
+                        "entry_price": round(avg_entry, 4),
+                        "cost_basis": round(cost_b, 2),
+                        "purchased_at_utc": now_dt.isoformat(),
+                        "purchased_minute_utc": minute_utc(now_dt).isoformat(),
+                        "order_id": None,
+                        "buy_reason": "detected_open_position",
+                        "dry_run": False,
+                        "current_price": round(cur_price, 4),
+                        "market_value": round(mkt_val, 2),
+                        "pnl_dollars": round(upl, 2),
+                        "pnl_pct": pnl_pct,
+                        "last_updated_utc": now_dt.isoformat(),
+                        "history_source": "live",
+                        "history": [],
+                    }
+                    if avg_entry > 0:
+                        existing["history"].append(
+                            self._build_point(now_dt, avg_entry, avg_entry, raw_qty, mult, source="order_fill")
+                        )
+                    self.open_contracts[sym] = existing
+                else:
+                    existing["qty"] = clean_qty
+                    if avg_entry > 0:
+                        existing["entry_price"] = round(avg_entry, 4)
+                    if cost_b > 0:
+                        existing["cost_basis"] = round(cost_b, 2)
+                    existing["current_price"] = round(cur_price, 4)
+                    existing["market_value"] = round(mkt_val, 2)
+                    existing["pnl_dollars"] = round(upl, 2)
+                    existing["pnl_pct"] = pnl_pct
+                    existing["last_updated_utc"] = now_dt.isoformat()
+                    if "live" not in str(existing.get("history_source") or ""):
+                        existing["history_source"] = "backfilled+live"
+
+                if cur_price > 0 and avg_entry > 0:
+                    pt = self._build_point(now_dt, cur_price, avg_entry, raw_qty, mult, source="live_poll")
+                    pt["market_value"] = round(mkt_val, 2)
+                    pt["cost_basis"] = round(cost_b, 2)
+                    pt["pnl_dollars"] = round(upl, 2)
+                    pt["pnl_pct"] = pnl_pct
+                    self._upsert_point(existing["history"], pt)
+
+            for sym, entry in list(self.open_contracts.items()):
+                if sym not in seen_symbols:
+                    opened_dt = _opt_parse_utc(entry.get("purchased_at_utc"))
+                    if opened_dt is None or (now_dt - opened_dt).total_seconds() > 20.0:
+                        missing_symbols.append(sym)
+
+        if missing_symbols and self._trading_client is not None:
+            for sym in missing_symbols:
+                self._reconcile_missing_open_contract(sym)
+
+    def _reconcile_missing_open_contract(self, sym):
+        if self._trading_client is None:
+            return
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[sym], limit=20)
+            orders = list(self._trading_client.get_orders(filter=req) or [])
+        except Exception:
+            return
+
+        sell_order = None
+        for ord_obj in orders:
+            side_val = str(getattr(getattr(ord_obj, "side", None), "value", getattr(ord_obj, "side", "")) or "").lower()
+            st_val = str(getattr(getattr(ord_obj, "status", None), "value", getattr(ord_obj, "status", "")) or "").lower()
+            f_qty = _opt_safe_float(getattr(ord_obj, "filled_qty", None), 0.0) or 0.0
+            f_price = _opt_safe_float(getattr(ord_obj, "filled_avg_price", None), 0.0) or 0.0
+            if side_val == "sell" and ("fill" in st_val or f_qty > 0) and f_price > 0:
+                sell_order = ord_obj
+                break
+
+        if sell_order is None:
+            return
+
+        f_qty = _opt_safe_float(getattr(sell_order, "filled_qty", None), None)
+        f_price = _opt_safe_float(getattr(sell_order, "filled_avg_price", None), None)
+        f_at = _opt_parse_utc(
+            getattr(sell_order, "filled_at", None)
+            or getattr(sell_order, "updated_at", None)
+            or getattr(sell_order, "submitted_at", None)
+        ) or datetime.now(UTC)
+        oid = getattr(sell_order, "id", None)
+        self.record_sell(
+            contract=sym,
+            underlying=None,
+            is_option=_is_option_contract_symbol(sym),
+            qty=f_qty,
+            exit_price=f_price,
+            sold_at=f_at,
+            order_id=oid,
+            reason="alpaca_order_reconciled",
+            dry_run=False,
+        )
+
+    def record_sell(
+        self,
+        contract,
+        underlying=None,
+        is_option=None,
+        qty=None,
+        exit_price=None,
+        sold_at=None,
+        order_id=None,
+        reason=None,
+        entry_price=None,
+        cost_basis=None,
+        purchased_at=None,
+        buy_order_id=None,
+        dry_run=False,
+    ):
+        if dry_run:
+            return None
+        sym = str(contract or "").strip().upper()
+        if not sym:
+            return None
+        parsed_opt, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
+        eff_opt = parsed_opt if is_option is None else bool(is_option)
+        eff_und = str(underlying or parsed_und or sym).strip().upper()
+        sold_dt = _opt_parse_utc(sold_at) or datetime.now(UTC)
+        mult = 100.0 if eff_opt else 1.0
+
+        with self._lock:
+            open_entry = self.open_contracts.get(sym)
+            eff_qty = _opt_safe_float(
+                qty,
+                open_entry.get("qty") if open_entry else 1.0,
+            ) or 1.0
+            eff_entry = _opt_safe_float(
+                entry_price,
+                open_entry.get("entry_price") if open_entry else None,
+            )
+            if (eff_entry is None or eff_entry <= 0) and cost_basis is not None and eff_qty > 0:
+                eff_entry = float(cost_basis) / (eff_qty * mult)
+            eff_exit = _opt_safe_float(
+                exit_price,
+                open_entry.get("current_price") if open_entry else eff_entry,
+            ) or (eff_entry or 0.0)
+            if eff_entry is None or eff_entry <= 0:
+                eff_entry = eff_exit
+
+            eff_purchased_dt = (
+                _opt_parse_utc(purchased_at)
+                or (_opt_parse_utc(open_entry.get("purchased_at_utc")) if open_entry else None)
+                or sold_dt
+            )
+            eff_buy_order_id = buy_order_id or (open_entry.get("order_id") if open_entry else None)
+            eff_cost_basis = round(eff_entry * eff_qty * mult, 2)
+            proceeds = round(eff_exit * eff_qty * mult, 2)
+            total_pnl_dollars = round(proceeds - eff_cost_basis, 2)
+            total_pnl_pct = round((total_pnl_dollars / eff_cost_basis) * 100.0, 2) if eff_cost_basis > 0 else 0.0
+            hold_minutes = round(max(0.0, (sold_dt - eff_purchased_dt).total_seconds() / 60.0), 2)
+
+            trade_id = str(order_id) if order_id else f"{sym}@{sold_dt.isoformat()}"
+            base_history = list(open_entry.get("history") or []) if open_entry else []
+            rebuilt_hist = self._fill_minute_gaps(
+                base_history,
+                eff_purchased_dt,
+                sold_dt,
+                eff_entry,
+                eff_exit,
+                eff_qty,
+                mult,
+                bar_prices_by_min={},
+                is_closed=True,
+            )
+
+            closed_record = {
+                "trade_id": trade_id,
+                "contract": sym,
+                "underlying": eff_und,
+                "is_option": eff_opt,
+                "right": right if eff_opt else "EQUITY",
+                "strike": strike,
+                "expiry": expiry,
+                "qty": int(round(eff_qty)) if abs(eff_qty - round(eff_qty)) < 1e-6 else round(eff_qty, 4),
+                "multiplier": mult,
+                "entry_price": round(eff_entry, 4),
+                "exit_price": round(eff_exit, 4),
+                "cost_basis": eff_cost_basis,
+                "proceeds": proceeds,
+                "total_pnl_dollars": total_pnl_dollars,
+                "total_pnl_pct": total_pnl_pct,
+                "purchased_at_utc": eff_purchased_dt.isoformat(),
+                "sold_at_utc": sold_dt.isoformat(),
+                "hold_minutes": hold_minutes,
+                "buy_order_id": str(eff_buy_order_id) if eff_buy_order_id else None,
+                "sell_order_id": str(order_id) if order_id else None,
+                "reason": reason,
+                "dry_run": False,
+                "history_source": (
+                    f"{open_entry.get('history_source')}+sell"
+                    if open_entry and open_entry.get("history_source")
+                    else "live+sell"
+                ),
+                "history": rebuilt_hist,
+            }
+
+            if trade_id in self._closed_ids:
+                for idx, item in enumerate(self.closed_contracts):
+                    if item.get("trade_id") == trade_id:
+                        self.closed_contracts[idx] = closed_record
+                        break
+            else:
+                self._closed_ids.add(trade_id)
+                self.closed_contracts.insert(0, closed_record)
+                if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
+                    removed = self.closed_contracts.pop()
+                    self._closed_ids.discard(removed.get("trade_id"))
+
+            if open_entry is not None:
+                open_qty = _opt_safe_float(open_entry.get("qty"), 0.0) or 0.0
+                rem_qty = open_qty - eff_qty
+                if rem_qty <= 1e-6:
+                    self.open_contracts.pop(sym, None)
+                else:
+                    open_entry["qty"] = int(round(rem_qty)) if abs(rem_qty - round(rem_qty)) < 1e-6 else round(rem_qty, 4)
+                    open_entry["cost_basis"] = round(eff_entry * rem_qty * mult, 2)
+                    open_entry["market_value"] = round((open_entry.get("current_price") or eff_exit) * rem_qty * mult, 2)
+                    open_entry["pnl_dollars"] = round(open_entry["market_value"] - open_entry["cost_basis"], 2)
+            return closed_record
+
+    def update_sell_fill(self, order_id, filled_price, filled_at=None):
+        fp = _opt_safe_float(filled_price, None)
+        if not order_id or fp is None or fp <= 0:
+            return False
+        oid_str = str(order_id)
+        fdt = _opt_parse_utc(filled_at)
+        with self._lock:
+            for item in self.closed_contracts:
+                if item.get("sell_order_id") == oid_str or item.get("trade_id") == oid_str:
+                    mult = float(item.get("multiplier") or 100.0)
+                    q = float(_opt_safe_float(item.get("qty"), 1.0) or 1.0)
+                    ep = float(_opt_safe_float(item.get("entry_price"), fp) or fp)
+                    item["exit_price"] = round(fp, 4)
+                    item["proceeds"] = round(fp * q * mult, 2)
+                    item["cost_basis"] = round(ep * q * mult, 2)
+                    item["total_pnl_dollars"] = round(item["proceeds"] - item["cost_basis"], 2)
+                    item["total_pnl_pct"] = round(
+                        (item["total_pnl_dollars"] / item["cost_basis"]) * 100.0 if item["cost_basis"] > 0 else 0.0,
+                        2,
+                    )
+                    if fdt is not None:
+                        item["sold_at_utc"] = fdt.isoformat()
+                        p_dt = _opt_parse_utc(item.get("purchased_at_utc"))
+                        if p_dt is not None:
+                            item["hold_minutes"] = round(max(0.0, (fdt - p_dt).total_seconds() / 60.0), 2)
+                    hist = item.get("history") or []
+                    if hist:
+                        last_dt = fdt or _opt_parse_utc(item.get("sold_at_utc")) or datetime.now(UTC)
+                        last_mk = hist[-1].get("minute_utc") or minute_utc(last_dt).isoformat()
+                        hist[-1] = self._build_point(
+                            last_dt, fp, ep, q, mult, source="order_fill", minute_key_override=last_mk
+                        )
+                    return True
+        return False
+
+    def schedule_order_fill_refresh(self, trading_client, order_id, contract, side="buy"):
+        if trading_client is None or not order_id:
+            return
+        oid_str = str(order_id)
+        sym = str(contract or "").strip().upper()
+
+        def _poll_fill():
+            import time
+
+            for delay in (1.5, 4.0, 10.0):
+                time.sleep(delay)
+                try:
+                    ord_obj = trading_client.get_order_by_id(oid_str)
+                except Exception:
+                    return
+                fp = _opt_safe_float(getattr(ord_obj, "filled_avg_price", None), None)
+                fq = _opt_safe_float(getattr(ord_obj, "filled_qty", None), None)
+                fat = getattr(ord_obj, "filled_at", None) or getattr(ord_obj, "updated_at", None)
+                st = str(getattr(getattr(ord_obj, "status", None), "value", getattr(ord_obj, "status", "")) or "").lower()
+                if fp is not None and fp > 0:
+                    if side == "buy":
+                        self.update_buy_fill(sym, oid_str, fp, filled_at=fat, filled_qty=fq)
+                    else:
+                        self.update_sell_fill(oid_str, fp, filled_at=fat)
+                    if "fill" in st and "partially" not in st:
+                        return
+                if st in {"canceled", "cancelled", "expired", "rejected"}:
+                    return
+
+        threading.Thread(target=_poll_fill, name=f"OPT-FILL-{oid_str[:8]}", daemon=True).start()
+
+    def _fetch_option_bars_map(self, symbol_ranges):
+        """Fetch 1-minute option bars for {sym: (start_dt, end_dt)} -> {sym: {min_dt: close}}."""
+        result = {}
+        if not symbol_ranges:
+            return result
+        if self._option_data_client is None:
+            key = self._credentials.get("alpaca_key")
+            secret = self._credentials.get("alpaca_secret")
+            if not key or not secret:
+                return result
+            try:
+                try:
+                    from alpaca.data.historical.option import OptionHistoricalDataClient
+                except ImportError:
+                    from alpaca.data.historical import OptionHistoricalDataClient
+                self._option_data_client = OptionHistoricalDataClient(key, secret)
+            except Exception as exc:
+                logging.warning("OPTION_HISTORY_CLIENT_INIT_FAILED detail=%s", exc)
+                return result
+
+        try:
+            from alpaca.data.requests import OptionBarsRequest
+        except Exception as exc:
+            logging.warning("OPTION_BARS_IMPORT_FAILED detail=%s", exc)
+            return result
+
+        def _extract_bars_from_resp(resp_obj):
+            raw = getattr(resp_obj, "data", resp_obj)
+            if isinstance(raw, dict):
+                return raw
+            return {}
+
+        items = list(symbol_ranges.items())
+        chunk_size = 10
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i : i + chunk_size]
+            chunk_syms = [s for s, _ in chunk]
+            min_start = min(minute_utc(as_utc(r[0])) for _, r in chunk)
+            max_end = max(as_utc(r[1]) + MINUTE for _, r in chunk)
+            try:
+                req = OptionBarsRequest(
+                    symbol_or_symbols=chunk_syms,
+                    timeframe=TimeFrame.Minute,
+                    start=min_start,
+                    end=max_end,
+                )
+                resp = self._option_data_client.get_option_bars(req)
+                bar_dict = _extract_bars_from_resp(resp)
+                for sym, bars in bar_dict.items():
+                    s_upper = str(sym).strip().upper()
+                    per_min = result.setdefault(s_upper, {})
+                    for b in bars or []:
+                        ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
+                        close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
+                        if ts is not None and close_p is not None and close_p > 0:
+                            per_min[minute_utc(ts)] = close_p
+            except Exception:
+                for sym, (s_dt, e_dt) in chunk:
+                    try:
+                        req = OptionBarsRequest(
+                            symbol_or_symbols=sym,
+                            timeframe=TimeFrame.Minute,
+                            start=minute_utc(as_utc(s_dt)),
+                            end=as_utc(e_dt) + MINUTE,
+                        )
+                        resp = self._option_data_client.get_option_bars(req)
+                        bar_dict = _extract_bars_from_resp(resp)
+                        bars = bar_dict.get(sym) or (next(iter(bar_dict.values()), []) if bar_dict else [])
+                        per_min = result.setdefault(sym, {})
+                        for b in bars or []:
+                            ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
+                            close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
+                            if ts is not None and close_p is not None and close_p > 0:
+                                per_min[minute_utc(ts)] = close_p
+                    except Exception:
+                        continue
+        return result
+
+    def startup_backfill(self, trading_client=None, option_data_client=None, stock_data_client=None):
+        """Scan open positions & closed/filled orders in Alpaca and backfill 1m option history."""
+        client = trading_client or self._trading_client
+        if client is None:
+            with self._lock:
+                self.backfill_status = "disabled"
+                self.backfill_error = "missing_trading_client"
+            return {"open": 0, "closed": 0}
+
+        self.attach_clients(
+            trading_client=client,
+            option_data_client=option_data_client,
+            stock_data_client=stock_data_client,
+        )
+        with self._lock:
+            self.backfill_status = "running"
+            self.backfill_error = None
+
+        now_dt = datetime.now(UTC)
+        try:
+            positions = list(client.get_all_positions() or [])
+            open_pos_by_sym = {}
+            for pos in positions:
+                sym = str((pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", "")) or "").strip().upper()
+                if not sym:
+                    continue
+                raw_ac = pos.get("asset_class") if isinstance(pos, dict) else getattr(pos, "asset_class", None)
+                if not _is_option_contract_symbol(sym, raw_ac):
+                    continue
+                qty = _opt_safe_float(pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 0.0) or 0.0
+                raw_side = pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+                side = str(getattr(raw_side, "value", raw_side) or "long").lower()
+                if qty > 0 and side != "short":
+                    open_pos_by_sym[sym] = pos
+
+            orders = []
+            try:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+
+                try:
+                    req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500, direction=Sort.DESC)
+                except Exception:
+                    req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
+                orders = list(client.get_orders(filter=req) or [])
+            except Exception as exc:
+                logging.warning("OPTION_HISTORY_GET_ORDERS_FAILED detail=%s", exc)
+
+            seen_order_syms = {
+                str(getattr(o, "symbol", "") or "").strip().upper()
+                for o in orders
+            }
+            missing_open_syms = [s for s in open_pos_by_sym.keys() if s not in seen_order_syms]
+            if missing_open_syms:
+                try:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus
+
+                    for osym in missing_open_syms:
+                        try:
+                            treq = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[osym], limit=50)
+                            orders.extend(list(client.get_orders(filter=treq) or []))
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            filled_orders = []
+            dedup_oids = set()
+            for o in orders:
+                oid = str(getattr(o, "id", "") or "")
+                if oid and oid in dedup_oids:
+                    continue
+                if oid:
+                    dedup_oids.add(oid)
+                sym = str(getattr(o, "symbol", "") or "").strip().upper()
+                raw_ac = getattr(o, "asset_class", None)
+                if not sym or not _is_option_contract_symbol(sym, raw_ac):
+                    continue
+                f_qty = _opt_safe_float(getattr(o, "filled_qty", None), 0.0) or 0.0
+                f_price = _opt_safe_float(getattr(o, "filled_avg_price", None), 0.0) or 0.0
+                if f_qty <= 0 or f_price <= 0:
+                    continue
+                f_at = (
+                    _opt_parse_utc(getattr(o, "filled_at", None))
+                    or _opt_parse_utc(getattr(o, "updated_at", None))
+                    or _opt_parse_utc(getattr(o, "submitted_at", None))
+                    or _opt_parse_utc(getattr(o, "created_at", None))
+                )
+                if f_at is None:
+                    continue
+                side_val = str(getattr(getattr(o, "side", None), "value", getattr(o, "side", "")) or "").lower()
+                if side_val not in {"buy", "sell"}:
+                    continue
+                filled_orders.append({
+                    "order_id": oid or None,
+                    "symbol": sym,
+                    "side": side_val,
+                    "qty": f_qty,
+                    "price": f_price,
+                    "filled_at": f_at,
+                })
+
+            filled_orders.sort(key=lambda item: item["filled_at"])
+
+            lots_by_sym = {}
+            latest_buy_by_sym = {}
+            closed_matches = []
+            for fo in filled_orders:
+                sym = fo["symbol"]
+                if fo["side"] == "buy":
+                    lots_by_sym.setdefault(sym, []).append({
+                        "qty": fo["qty"],
+                        "price": fo["price"],
+                        "filled_at": fo["filled_at"],
+                        "order_id": fo["order_id"],
+                    })
+                    latest_buy_by_sym[sym] = fo
+                elif fo["side"] == "sell":
+                    sym_lots = lots_by_sym.get(sym, [])
+                    rem = fo["qty"]
+                    matched_qty = 0.0
+                    matched_cost = 0.0
+                    earliest_buy_dt = None
+                    first_buy_oid = None
+                    while rem > 1e-6 and sym_lots:
+                        lot = sym_lots[0]
+                        take = min(rem, lot["qty"])
+                        matched_qty += take
+                        matched_cost += take * lot["price"]
+                        if earliest_buy_dt is None:
+                            earliest_buy_dt = lot["filled_at"]
+                            first_buy_oid = lot["order_id"]
+                        lot["qty"] -= take
+                        rem -= take
+                        if lot["qty"] <= 1e-6:
+                            sym_lots.pop(0)
+                    if matched_qty > 0 and earliest_buy_dt is not None:
+                        avg_entry = matched_cost / matched_qty
+                        closed_matches.append({
+                            "contract": sym,
+                            "qty": matched_qty,
+                            "entry_price": avg_entry,
+                            "exit_price": fo["price"],
+                            "purchased_at": earliest_buy_dt,
+                            "sold_at": fo["filled_at"],
+                            "buy_order_id": first_buy_oid,
+                            "sell_order_id": fo["order_id"],
+                        })
+
+            closed_matches.sort(key=lambda c: c["sold_at"], reverse=True)
+            closed_matches = closed_matches[: self.MAX_CLOSED_TRADES]
+
+            bar_ranges = {}
+            open_specs = {}
+            for sym, pos in open_pos_by_sym.items():
+                rem_lots = [l for l in lots_by_sym.get(sym, []) if l["qty"] > 1e-6]
+                if rem_lots:
+                    purchased_dt = rem_lots[0]["filled_at"]
+                    buy_oid = rem_lots[0]["order_id"]
+                elif sym in latest_buy_by_sym:
+                    purchased_dt = latest_buy_by_sym[sym]["filled_at"]
+                    buy_oid = latest_buy_by_sym[sym]["order_id"]
+                else:
+                    purchased_dt = now_dt
+                    buy_oid = None
+                open_specs[sym] = (pos, purchased_dt, buy_oid)
+                s_min = bar_ranges[sym][0] if sym in bar_ranges else purchased_dt
+                e_max = bar_ranges[sym][1] if sym in bar_ranges else now_dt
+                bar_ranges[sym] = (min(s_min, purchased_dt), max(e_max, now_dt))
+
+            for cm in closed_matches[:25]:
+                sym = cm["contract"]
+                if sym in bar_ranges:
+                    s_min, e_max = bar_ranges[sym]
+                    bar_ranges[sym] = (min(s_min, cm["purchased_at"]), max(e_max, cm["sold_at"]))
+                else:
+                    bar_ranges[sym] = (cm["purchased_at"], cm["sold_at"])
+
+            bars_by_sym = self._fetch_option_bars_map(bar_ranges)
+
+            with self._lock:
+                for cm in closed_matches:
+                    sym = cm["contract"]
+                    _, und, right, strike, expiry = _parse_occ_contract(sym)
+                    mult = 100.0
+                    q = cm["qty"]
+                    ep = cm["entry_price"]
+                    xp = cm["exit_price"]
+                    p_dt = cm["purchased_at"]
+                    s_dt = cm["sold_at"]
+                    trade_id = str(cm["sell_order_id"]) if cm["sell_order_id"] else f"{sym}@{s_dt.isoformat()}"
+                    existing_closed = next((x for x in self.closed_contracts if x.get("trade_id") == trade_id), None)
+                    existing_hist = existing_closed.get("history") if existing_closed else []
+                    hist = self._fill_minute_gaps(
+                        existing_hist,
+                        p_dt,
+                        s_dt,
+                        ep,
+                        xp,
+                        q,
+                        mult,
+                        bar_prices_by_min=bars_by_sym.get(sym, {}),
+                        is_closed=True,
+                    )
+                    cost_b = round(ep * q * mult, 2)
+                    proceeds = round(xp * q * mult, 2)
+                    pnl_d = round(proceeds - cost_b, 2)
+                    pnl_p = round((pnl_d / cost_b) * 100.0, 2) if cost_b > 0 else 0.0
+                    rec = {
+                        "trade_id": trade_id,
+                        "contract": sym,
+                        "underlying": und,
+                        "is_option": True,
+                        "right": right,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "qty": int(round(q)) if abs(q - round(q)) < 1e-6 else round(q, 4),
+                        "multiplier": mult,
+                        "entry_price": round(ep, 4),
+                        "exit_price": round(xp, 4),
+                        "cost_basis": cost_b,
+                        "proceeds": proceeds,
+                        "total_pnl_dollars": pnl_d,
+                        "total_pnl_pct": pnl_p,
+                        "purchased_at_utc": p_dt.isoformat(),
+                        "sold_at_utc": s_dt.isoformat(),
+                        "hold_minutes": round(max(0.0, (s_dt - p_dt).total_seconds() / 60.0), 2),
+                        "buy_order_id": str(cm["buy_order_id"]) if cm["buy_order_id"] else None,
+                        "sell_order_id": str(cm["sell_order_id"]) if cm["sell_order_id"] else None,
+                        "reason": (existing_closed.get("reason") if existing_closed else None) or "alpaca_closed_order",
+                        "dry_run": False,
+                        "history_source": "backfilled" if bars_by_sym.get(sym) else "order_fills",
+                        "history": hist,
+                    }
+                    if existing_closed is not None:
+                        idx = self.closed_contracts.index(existing_closed)
+                        self.closed_contracts[idx] = rec
+                    elif trade_id not in self._closed_ids:
+                        self._closed_ids.add(trade_id)
+                        self.closed_contracts.append(rec)
+
+                self.closed_contracts.sort(key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True)
+                if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
+                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES:]:
+                        self._closed_ids.discard(dropped.get("trade_id"))
+                    del self.closed_contracts[self.MAX_CLOSED_TRADES:]
+
+                for sym, (pos, purchased_dt, buy_oid) in open_specs.items():
+                    _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
+                    raw_und = pos.get("underlying_symbol") if isinstance(pos, dict) else getattr(pos, "underlying_symbol", None)
+                    und = str(raw_und or parsed_und or sym).strip().upper()
+                    mult = 100.0
+                    raw_qty = _opt_safe_float(pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 1.0) or 1.0
+                    clean_qty = int(round(raw_qty)) if abs(raw_qty - round(raw_qty)) < 1e-6 else round(raw_qty, 4)
+                    avg_entry = _opt_safe_float(pos.get("avg_entry_price") if isinstance(pos, dict) else getattr(pos, "avg_entry_price", None), None)
+                    cur_price = _opt_safe_float(pos.get("current_price") if isinstance(pos, dict) else getattr(pos, "current_price", None), None)
+                    mkt_val = _opt_safe_float(pos.get("market_value") if isinstance(pos, dict) else getattr(pos, "market_value", None), None)
+                    cost_b = _opt_safe_float(pos.get("cost_basis") if isinstance(pos, dict) else getattr(pos, "cost_basis", None), None)
+                    upl = _opt_safe_float(pos.get("unrealized_pl") if isinstance(pos, dict) else getattr(pos, "unrealized_pl", None), None)
+                    uplpc = _opt_safe_float(pos.get("unrealized_plpc") if isinstance(pos, dict) else getattr(pos, "unrealized_plpc", None), None)
+
+                    if (avg_entry is None or avg_entry <= 0) and cost_b and raw_qty > 0:
+                        avg_entry = cost_b / (raw_qty * mult)
+                    if (cur_price is None or cur_price <= 0) and mkt_val and raw_qty > 0:
+                        cur_price = mkt_val / (raw_qty * mult)
+                    avg_entry = avg_entry or cur_price or 0.0
+                    cur_price = cur_price or avg_entry
+                    cost_b = cost_b if (cost_b is not None and cost_b > 0) else round(avg_entry * raw_qty * mult, 2)
+                    mkt_val = mkt_val if (mkt_val is not None and mkt_val > 0) else round(cur_price * raw_qty * mult, 2)
+                    upl = upl if upl is not None else round(mkt_val - cost_b, 2)
+                    pnl_pct = round(uplpc * 100.0, 2) if uplpc is not None else (round((upl / cost_b) * 100.0, 2) if cost_b > 0 else 0.0)
+
+                    prev_entry = self.open_contracts.get(sym)
+                    existing_hist = list(prev_entry.get("history") or []) if prev_entry else []
+                    hist = self._fill_minute_gaps(
+                        existing_hist,
+                        purchased_dt,
+                        now_dt,
+                        avg_entry,
+                        cur_price,
+                        raw_qty,
+                        mult,
+                        bar_prices_by_min=bars_by_sym.get(sym, {}),
+                        is_closed=False,
+                    )
+                    self.open_contracts[sym] = {
+                        "contract": sym,
+                        "underlying": und,
+                        "is_option": True,
+                        "right": right,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "qty": clean_qty,
+                        "multiplier": mult,
+                        "entry_price": round(avg_entry, 4),
+                        "cost_basis": round(cost_b, 2),
+                        "purchased_at_utc": purchased_dt.isoformat(),
+                        "purchased_minute_utc": minute_utc(purchased_dt).isoformat(),
+                        "order_id": str(buy_oid) if buy_oid else (prev_entry.get("order_id") if prev_entry else None),
+                        "buy_reason": (prev_entry.get("buy_reason") if prev_entry else None) or "alpaca_open_position",
+                        "dry_run": False,
+                        "current_price": round(cur_price, 4),
+                        "market_value": round(mkt_val, 2),
+                        "pnl_dollars": round(upl, 2),
+                        "pnl_pct": pnl_pct,
+                        "last_updated_utc": now_dt.isoformat(),
+                        "history_source": "backfilled+live" if bars_by_sym.get(sym) else "live",
+                        "history": hist,
+                    }
+
+                for sym in list(self.open_contracts.keys()):
+                    if sym not in open_pos_by_sym:
+                        self.open_contracts.pop(sym, None)
+
+                self.backfill_status = "completed"
+                self.backfill_last_utc = datetime.now(UTC).isoformat()
+                open_cnt = len(self.open_contracts)
+                closed_cnt = len(self.closed_contracts)
+
+            logging.info(
+                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d",
+                open_cnt,
+                closed_cnt,
+                len(bars_by_sym),
+            )
+            return {"open": open_cnt, "closed": closed_cnt}
+        except Exception as exc:
+            with self._lock:
+                self.backfill_status = "error"
+                self.backfill_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            logging.warning("OPTION_HISTORY_BACKFILL_FAILED error_type=%s detail=%s", type(exc).__name__, exc)
+            return {"open": 0, "closed": 0, "error": str(exc)}
+
+    def get_buyer_summary(self):
+        with self._lock:
+            items = list(self.open_contracts.values())
+            total_cost = round(sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2)
+            total_val = round(sum(_opt_safe_float(c.get("market_value"), 0.0) or 0.0 for c in items), 2)
+            total_pnl = round(sum(_opt_safe_float(c.get("pnl_dollars"), 0.0) or 0.0 for c in items), 2)
+            total_pct = round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+            return {
+                "open_count": len(items),
+                "total_cost_basis": total_cost,
+                "total_market_value": total_val,
+                "total_pnl_dollars": total_pnl,
+                "total_pnl_pct": total_pct,
+                "backfill_status": self.backfill_status,
+                "backfill_last_utc": self.backfill_last_utc,
+            }
+
+    def get_seller_summary(self):
+        with self._lock:
+            items = list(self.closed_contracts)
+            total_cost = round(sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2)
+            total_proc = round(sum(_opt_safe_float(c.get("proceeds"), 0.0) or 0.0 for c in items), 2)
+            total_pnl = round(sum(_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0 for c in items), 2)
+            total_pct = round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+            wins = sum(1 for c in items if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) > 0)
+            losses = sum(1 for c in items if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) < 0)
+            return {
+                "closed_count": len(items),
+                "win_count": wins,
+                "loss_count": losses,
+                "total_cost_basis": total_cost,
+                "total_proceeds": total_proc,
+                "total_pnl_dollars": total_pnl,
+                "total_pnl_pct": total_pct,
+                "backfill_status": self.backfill_status,
+                "backfill_last_utc": self.backfill_last_utc,
+            }
+
+    def get_snapshot(self):
+        with self._lock:
+            open_list = [
+                {**c, "history": list(c.get("history") or [])}
+                for c in sorted(
+                    self.open_contracts.values(),
+                    key=lambda x: str(x.get("purchased_at_utc") or ""),
+                    reverse=True,
+                )
+            ]
+            closed_list = [
+                {**c, "history": list(c.get("history") or [])}
+                for c in self.closed_contracts
+            ]
+            return {
+                "backfill_status": self.backfill_status,
+                "backfill_last_utc": self.backfill_last_utc,
+                "backfill_error": self.backfill_error,
+                "open_summary": self.get_buyer_summary(),
+                "open_contracts": open_list,
+                "closed_summary": self.get_seller_summary(),
+                "closed_contracts": closed_list,
+            }
+
+
 class MinuteCoordinator:
     """Single event-loop owner of pending closes, RSI state and summary output.
 
@@ -751,6 +2022,7 @@ class MinuteCoordinator:
         self.option_chain_cache = {}
         self.option_buy_events = {}
         self.option_sell_events = {}
+        self.option_history = OptionContractHistoryTracker()
         self.event_loop = None
         self.minute_finalized_event = None
         self.minute_finalized_listeners = []
@@ -4126,9 +5398,10 @@ class TradingviewProvider:
 class AlpacaPositionMonitor:
     """Poll Alpaca account positions every minute and log option holdings."""
 
-    def __init__(self, keys):
+    def __init__(self, keys, coordinator=None):
         self.provider = "POSITIONS"
         self.credentials = dict(keys or {})
+        self.coordinator = coordinator
         self.logger = make_logger("POSITIONS", "ALPACA")
         self.client = build_trading_client(self.credentials)
         # --- NEW: Status Tracking State Variables ---
@@ -4255,6 +5528,11 @@ class AlpacaPositionMonitor:
 
         if not options:
             self.logger.info("OPTIONS_POSITIONS none")
+
+        if self.coordinator is not None and hasattr(self.coordinator, "option_history"):
+            self.coordinator.option_history.record_positions_snapshot(
+                positions, timestamp=self.last_poll_utc
+            )
 
     async def run(self):
         if self.client is None:
@@ -5121,6 +6399,27 @@ class AlpacaOptionBuyer:
                     rsi=entry.get("rsi"),
                     dry_run=False,
                 )
+                if hasattr(self.coordinator, "option_history"):
+                    self.coordinator.option_history.attach_clients(
+                        credentials=self.credentials,
+                        trading_client=self.client,
+                        option_data_client=self.option_data_client,
+                    )
+                    self.coordinator.option_history.record_buy(
+                        contract=contract_symbol,
+                        underlying=symbol,
+                        qty=OPTION_BUY_QTY,
+                        entry_price=actual_unit_price,
+                        executed_at=exec_at,
+                        order_id=order_id,
+                        reason=reason,
+                        dry_run=False,
+                        is_option=True,
+                    )
+                    if filled_avg is None and order_id is not None:
+                        self.coordinator.option_history.schedule_order_fill_refresh(
+                            self.client, order_id, contract_symbol, side="buy"
+                        )
                 self.logger.info(
                     "OPTION_BUY_SUBMITTED order_id=%s status=%s provider=%s symbol=%s "
                     "contract=%s qty=%d order_type=%s bid=%s ask=%s limit_price=%s "
@@ -5801,6 +7100,9 @@ class AlpacaOptionSeller:
             )
             return
 
+        if hasattr(self.coordinator, "option_history"):
+            self.coordinator.option_history.record_positions_snapshot(positions, timestamp=now)
+
         self.last_positions_checked = len(positions)
         if not positions:
             self.stop_loss_state_by_symbol.clear()
@@ -6207,6 +7509,31 @@ class AlpacaOptionSeller:
                     rsi=entry.get("rsi") if entry else None,
                     dry_run=False,
                 )
+                if hasattr(self.coordinator, "option_history"):
+                    self.coordinator.option_history.attach_clients(
+                        credentials=self.credentials,
+                        trading_client=self.client,
+                        option_data_client=self.option_data_client,
+                        stock_data_client=self.stock_data_client,
+                    )
+                    self.coordinator.option_history.record_sell(
+                        contract=pos_sym,
+                        underlying=underlying,
+                        is_option=is_option,
+                        qty=order_qty,
+                        exit_price=actual_sell_unit,
+                        sold_at=exec_at,
+                        order_id=order_id,
+                        reason=reason,
+                        entry_price=AlpacaPositionMonitor._num(pos, "avg_entry_price", None),
+                        cost_basis=AlpacaPositionMonitor._num(pos, "cost_basis", None),
+                        purchased_at=self.first_seen_at_by_symbol.get(pos_sym),
+                        dry_run=False,
+                    )
+                    if filled_avg is None and order_id is not None:
+                        self.coordinator.option_history.schedule_order_fill_refresh(
+                            self.client, order_id, pos_sym, side="sell"
+                        )
                 self.logger.info(
                     "OPTION_SELL_SUBMITTED kind=%s order_type=%s bid=%s ask=%s "
                     "limit_price=%s total_sale=%s order_id=%s status=%s provider=%s "
@@ -8764,9 +10091,18 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
                         </div>
 
-                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400 shrink-0">Option Buyer (1m Sync)</span>
-                            <span id="optionBuyerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
+                        <div onclick="openOptionDrilldown('buyer')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openOptionDrilldown('buyer');}" class="group cursor-pointer p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-cyan-500/50 hover:bg-slate-900/80 transition space-y-1">
+                            <div class="flex justify-between items-center gap-2">
+                                <span class="text-slate-300 group-hover:text-white shrink-0 flex items-center gap-1.5 font-medium">
+                                    Option Buyer (1m Sync)
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold uppercase tracking-wide">Open &#9656;</span>
+                                </span>
+                                <span id="optionBuyerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
+                            </div>
+                            <div class="flex justify-between items-center text-[10px] mono">
+                                <span id="optionBuyerContractsCount" class="text-slate-400">0 open contracts</span>
+                                <span id="optionBuyerValueDelta" class="text-slate-400">--</span>
+                            </div>
                         </div>
 
                         <div id="optionBuyerErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
@@ -8776,9 +10112,18 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="optionBuyerLast" class="mono text-[11px] text-cyan-300 truncate max-w-[160px] text-right">--</span>
                         </div>
 
-                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400 shrink-0">Option Seller (1m Sync)</span>
-                            <span id="optionSellerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
+                        <div onclick="openOptionDrilldown('seller')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openOptionDrilldown('seller');}" class="group cursor-pointer p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-amber-500/50 hover:bg-slate-900/80 transition space-y-1">
+                            <div class="flex justify-between items-center gap-2">
+                                <span class="text-slate-300 group-hover:text-white shrink-0 flex items-center gap-1.5 font-medium">
+                                    Option Seller (1m Sync)
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold uppercase tracking-wide">Closed &#9656;</span>
+                                </span>
+                                <span id="optionSellerStatus" class="mono font-semibold text-slate-200 truncate text-right min-w-0">not_loaded</span>
+                            </div>
+                            <div class="flex justify-between items-center text-[10px] mono">
+                                <span id="optionSellerContractsCount" class="text-slate-400">0 closed contracts</span>
+                                <span id="optionSellerValueDelta" class="text-slate-400">--</span>
+                            </div>
                         </div>
 
                         <div id="optionSellerErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
@@ -8861,6 +10206,82 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Option Buyer / Seller Contracts Drill-Down Modal -->
+    <div id="optionDrilldownModal" onclick="if(event.target===this) closeOptionDrilldown()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-6xl w-full max-h-[92vh] flex flex-col shadow-2xl overflow-hidden">
+            <!-- Modal Header -->
+            <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                <div class="flex flex-wrap items-center gap-3">
+                    <div>
+                        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                            <span id="optModalDot" class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+                            <span id="optModalTitle">Option Buyer — Open Contracts</span>
+                        </h3>
+                        <p id="optModalSubtitle" class="text-[11px] text-slate-400">Minute-by-minute contract valuation, price history, and P/L ($ &amp; %)</p>
+                    </div>
+                    <div class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800 text-[11px] font-semibold">
+                        <button id="tabOptBuyer" onclick="switchOptionDrilldownMode('buyer')" class="px-2.5 py-1 rounded-md transition bg-cyan-600 text-white">
+                            Open Contracts (<span id="optTabOpenCount">0</span>)
+                        </button>
+                        <button id="tabOptSeller" onclick="switchOptionDrilldownMode('seller')" class="px-2.5 py-1 rounded-md transition text-slate-400 hover:text-white">
+                            Closed Contracts (<span id="optTabClosedCount">0</span>)
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-2">
+                    <span id="optBackfillBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">backfill: idle</span>
+                    <button id="btnOptSyncAlpaca" onclick="refreshOptionHistoryFromAlpaca()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                        Sync Alpaca History
+                    </button>
+                    <button onclick="closeOptionDrilldown()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+
+            <!-- Aggregate Summary Banner -->
+            <div id="optAggregateBanner" class="px-5 py-2.5 bg-slate-950/40 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div class="flex flex-wrap items-center gap-4 mono">
+                    <div>
+                        <span class="text-slate-400 text-[11px]">Contracts:</span>
+                        <span id="optAggCount" class="font-bold text-white ml-1">0</span>
+                    </div>
+                    <div>
+                        <span class="text-slate-400 text-[11px]">Total Cost Basis:</span>
+                        <span id="optAggCost" class="font-semibold text-slate-200 ml-1">$0.00</span>
+                    </div>
+                    <div>
+                        <span id="optAggValLabel" class="text-slate-400 text-[11px]">Current Value:</span>
+                        <span id="optAggVal" class="font-semibold text-slate-200 ml-1">$0.00</span>
+                    </div>
+                    <div>
+                        <span id="optAggPnlLabel" class="text-slate-400 text-[11px]">Total Value Change:</span>
+                        <span id="optAggPnl" class="font-bold text-slate-200 ml-1">$0.00 (0.00%)</span>
+                    </div>
+                </div>
+                <div id="optAggExtra" class="text-[11px] mono text-slate-400"></div>
+            </div>
+
+            <!-- Main Two-Column Content -->
+            <div class="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
+                <!-- Left: Contract Selector List -->
+                <div class="w-full lg:w-80 shrink-0 border-b lg:border-b-0 lg:border-r border-slate-800 bg-slate-950/30 flex flex-col max-h-56 lg:max-h-full">
+                    <div class="px-3.5 py-2 border-b border-slate-800/70 text-[10px] font-bold uppercase tracking-wider text-slate-400 flex justify-between items-center">
+                        <span id="optListHeaderLabel">Select Open Contract</span>
+                        <span id="optListHeaderHint" class="font-normal text-slate-500">Click to chart</span>
+                    </div>
+                    <div id="optContractList" class="flex-1 overflow-y-auto p-2.5 space-y-2">
+                        <div class="text-xs text-slate-500 text-center py-8">Loading contracts...</div>
+                    </div>
+                </div>
+
+                <!-- Right: Contract Chart & Minute-by-Minute Breakdown -->
+                <div id="optContractDetailPane" class="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5 space-y-4">
+                    <div class="text-xs text-slate-500 text-center py-12">Select a contract on the left to inspect its minute-by-minute price &amp; P/L chart.</div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -9140,10 +10561,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (refreshIcon) refreshIcon.classList.add('animate-spin');
 
             try {
-                const [statusRes, kinRes] = await Promise.all([
+                const jobs = [
                     fetch('/cli/status').then(r => r.json()).catch(() => null),
                     fetch('/api/kinematics').then(r => r.json()).catch(() => null)
-                ]);
+                ];
+                const modal = document.getElementById('optionDrilldownModal');
+                const modalOpen = modal && !modal.classList.contains('hidden');
+                if (modalOpen) {
+                    jobs.push(fetch('/api/option-history').then(r => r.json()).catch(() => null));
+                }
+
+                const [statusRes, kinRes, optRes] = await Promise.all(jobs);
 
                 if (statusRes && statusRes.metrics) {
                     renderStatusMetrics(statusRes.metrics);
@@ -9153,6 +10581,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     latestData = kinRes;
                     renderKinematics(kinRes);
                     renderSymbolDeepDive();
+                }
+
+                if (modalOpen && optRes && optRes.status === 'ok') {
+                    latestOptionHistory = optRes;
+                    renderOptionDrilldown();
                 }
             } catch (err) {
                 console.error("Telemetry fetch error:", err);
@@ -9198,6 +10631,27 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 }
                 document.getElementById('optionBuyerLast').textContent = ob.last_order_contract || '--';
+                const obSum = ob.history_summary || {};
+                const obCountEl = document.getElementById('optionBuyerContractsCount');
+                const obDeltaEl = document.getElementById('optionBuyerValueDelta');
+                if (obCountEl) {
+                    const cnt = obSum.open_count ?? 0;
+                    obCountEl.textContent = `${cnt} open contract${cnt === 1 ? '' : 's'}`;
+                }
+                if (obDeltaEl) {
+                    const cnt = obSum.open_count ?? 0;
+                    const pnlD = safeNum(obSum.total_pnl_dollars);
+                    const pnlP = safeNum(obSum.total_pnl_pct);
+                    if (cnt > 0 && pnlD !== null) {
+                        const sign = pnlD >= 0 ? '+' : '-';
+                        const pSign = (pnlP ?? 0) >= 0 ? '+' : '';
+                        obDeltaEl.textContent = `${sign}$${Math.abs(pnlD).toFixed(2)} (${pSign}${(pnlP ?? 0).toFixed(2)}%)`;
+                        obDeltaEl.className = pnlD >= 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold';
+                    } else {
+                        obDeltaEl.textContent = 'Click to inspect';
+                        obDeltaEl.className = 'text-slate-500';
+                    }
+                }
             }
             if (m.option_seller) {
                 const os = m.option_seller;
@@ -9221,6 +10675,27 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 }
                 document.getElementById('optionSellerLast').textContent = os.last_order_contract || '--';
+                const osSum = os.history_summary || {};
+                const osCountEl = document.getElementById('optionSellerContractsCount');
+                const osDeltaEl = document.getElementById('optionSellerValueDelta');
+                if (osCountEl) {
+                    const cnt = osSum.closed_count ?? 0;
+                    osCountEl.textContent = `${cnt} closed contract${cnt === 1 ? '' : 's'}`;
+                }
+                if (osDeltaEl) {
+                    const cnt = osSum.closed_count ?? 0;
+                    const pnlD = safeNum(osSum.total_pnl_dollars);
+                    const pnlP = safeNum(osSum.total_pnl_pct);
+                    if (cnt > 0 && pnlD !== null) {
+                        const sign = pnlD >= 0 ? '+' : '-';
+                        const pSign = (pnlP ?? 0) >= 0 ? '+' : '';
+                        osDeltaEl.textContent = `${sign}$${Math.abs(pnlD).toFixed(2)} (${pSign}${(pnlP ?? 0).toFixed(2)}%)`;
+                        osDeltaEl.className = pnlD >= 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold';
+                    } else {
+                        osDeltaEl.textContent = 'Click to inspect';
+                        osDeltaEl.className = 'text-slate-500';
+                    }
+                }
                 const slEl = document.getElementById('optionSellerStopLoss');
                 if (slEl) {
                     const watches = Object.entries(os.stop_loss_watches || {});
@@ -10096,6 +11571,552 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
+        // =========================================================================================
+        // OPTION BUYER / SELLER CONTRACT DRILL-DOWN & MINUTE-BY-MINUTE P/L CHART
+        // =========================================================================================
+        let optionDrilldownMode = 'buyer'; // 'buyer' | 'seller'
+        let selectedBuyerContract = null;
+        let selectedSellerTradeId = null;
+        let latestOptionHistory = null;
+        let activeOptionHistoryPoints = [];
+
+        function fmtSignedDollars(v) {
+            const n = safeNum(v);
+            if (n === null) return '--';
+            const sign = n >= 0 ? '+' : '-';
+            return `${sign}$${Math.abs(n).toFixed(2)}`;
+        }
+
+        function fmtDurationMin(mins) {
+            const m = safeNum(mins);
+            if (m === null) return '--';
+            if (m < 60) return `${Math.round(m)}m`;
+            const h = Math.floor(m / 60);
+            const rem = Math.round(m % 60);
+            return `${h}h ${rem}m`;
+        }
+
+        function fmtShortLocalTs(iso) {
+            if (!iso) return '--';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return String(iso);
+            return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+
+        function fmtClockShort(iso) {
+            if (!iso) return '--';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return String(iso);
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+
+        async function openOptionDrilldown(mode = 'buyer') {
+            optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            const modal = document.getElementById('optionDrilldownModal');
+            if (modal) modal.classList.remove('hidden');
+            await fetchOptionHistory();
+        }
+
+        function closeOptionDrilldown() {
+            const modal = document.getElementById('optionDrilldownModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function switchOptionDrilldownMode(mode) {
+            optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            renderOptionDrilldown();
+        }
+
+        function selectOptionContractItem(key) {
+            if (optionDrilldownMode === 'buyer') {
+                selectedBuyerContract = key;
+            } else {
+                selectedSellerTradeId = key;
+            }
+            renderOptionDrilldown();
+        }
+
+        async function fetchOptionHistory() {
+            try {
+                const res = await fetch('/api/option-history');
+                const data = await res.json();
+                if (res.ok && data && data.status === 'ok') {
+                    latestOptionHistory = data;
+                    renderOptionDrilldown();
+                }
+            } catch (err) {
+                console.error('Option history fetch error:', err);
+            }
+        }
+
+        async function refreshOptionHistoryFromAlpaca() {
+            const btn = document.getElementById('btnOptSyncAlpaca');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Syncing...';
+            }
+            try {
+                const res = await fetch('/api/option-history/refresh', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok && data && data.status === 'ok') {
+                    latestOptionHistory = data;
+                    renderOptionDrilldown();
+                    showToast('Synced open & closed option contract histories from Alpaca.');
+                } else {
+                    showToast(`Sync failed: ${(data && data.message) || 'Unknown error'}`, 'error');
+                }
+            } catch (err) {
+                showToast(`Sync error: ${err.message}`, 'error');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Sync Alpaca History';
+                }
+            }
+        }
+
+        function buildMiniSparklineSvg(points, positive) {
+            if (!Array.isArray(points) || points.length < 2) {
+                return `<span class="text-[9px] text-slate-500 mono">1 pt</span>`;
+            }
+            const vals = points.map(p => safeNum(p.price)).filter(v => v !== null);
+            if (vals.length < 2) return '';
+            const minV = Math.min(...vals);
+            const maxV = Math.max(...vals);
+            const span = Math.max(0.0001, maxV - minV);
+            const w = 68, h = 20;
+            const pts = vals.map((v, i) => {
+                const x = ((i / Math.max(1, vals.length - 1)) * (w - 4) + 2).toFixed(1);
+                const y = (h - 2 - ((v - minV) / span) * (h - 4)).toFixed(1);
+                return `${x},${y}`;
+            }).join(' ');
+            const stroke = positive ? '#34d399' : '#fb7185';
+            return `<svg viewBox="0 0 ${w} ${h}" class="w-[68px] h-[20px] shrink-0"><polyline fill="none" stroke="${stroke}" stroke-width="1.6" points="${pts}" /></svg>`;
+        }
+
+        function buildOptionHistoryChartSvg(points, contract, isClosed) {
+            if (!Array.isArray(points) || points.length === 0) {
+                return `<div class="text-xs text-slate-500 py-10 text-center">No minute-by-minute points recorded yet for this contract.</div>`;
+            }
+            const W = 720, H = 290, padL = 54, padR = 54;
+            const plotW = W - padL - padR;
+            const n = points.length;
+            const xAt = (i) => n === 1 ? (padL + plotW * 0.5) : (padL + (i / Math.max(1, n - 1)) * plotW);
+
+            const entryPrice = safeNum(contract.entry_price) ?? safeNum(points[0].price) ?? 0;
+            const prices = points.map(p => safeNum(p.price) ?? entryPrice);
+            const allPrices = [...prices, entryPrice];
+            const rawMinP = Math.min(...allPrices);
+            const rawMaxP = Math.max(...allPrices);
+            const padP = Math.max(0.01, (rawMaxP - rawMinP) * 0.14);
+            const loP = Math.max(0, rawMinP - padP);
+            const hiP = rawMaxP + padP;
+            const spanP = Math.max(0.01, hiP - loP);
+            const pTop = 24, pBot = 132;
+            const yPrice = (v) => pTop + (1 - (v - loP) / spanP) * (pBot - pTop);
+
+            const pnlDollars = points.map(p => safeNum(p.pnl_dollars) ?? 0);
+            const pnlPcts = points.map(p => safeNum(p.pnl_pct) ?? 0);
+            const maxAbsD = Math.max(1.0, ...pnlDollars.map(Math.abs));
+            const maxAbsPct = Math.max(1.0, ...pnlPcts.map(Math.abs));
+            const qTop = 166, qBot = 260, qMid = (qTop + qBot) / 2;
+            const qHalf = (qBot - qTop) / 2;
+            const yPnl = (dVal) => qMid - (dVal / maxAbsD) * qHalf;
+
+            // Time grid ticks
+            let gridHtml = '';
+            const maxTicks = 7;
+            const step = Math.max(1, Math.ceil(n / maxTicks));
+            for (let i = 0; i < n; i++) {
+                if (i === 0 || i === n - 1 || i % step === 0) {
+                    const x = xAt(i).toFixed(1);
+                    const lbl = fmtClockShort(points[i].timestamp || points[i].minute_utc);
+                    gridHtml += `<line x1="${x}" y1="${pTop}" x2="${x}" y2="${qBot}" stroke="#334155" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
+                    gridHtml += `<text x="${x}" y="279" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
+                }
+            }
+
+            // Top panel: Price polyline & area
+            const priceCoords = prices.map((v, i) => `${xAt(i).toFixed(1)},${yPrice(v).toFixed(1)}`);
+            const pricePoly = priceCoords.join(' ');
+            const priceArea = `${xAt(0).toFixed(1)},${pBot} ${pricePoly} ${xAt(n - 1).toFixed(1)},${pBot}`;
+            const entryY = yPrice(entryPrice).toFixed(1);
+
+            // Bottom panel: P/L zero-baseline & colored segments
+            let pnlSegments = '';
+            for (let i = 1; i < n; i++) {
+                const x1 = xAt(i - 1).toFixed(1), y1 = yPnl(pnlDollars[i - 1]).toFixed(1);
+                const x2 = xAt(i).toFixed(1), y2 = yPnl(pnlDollars[i]).toFixed(1);
+                const col = pnlDollars[i] >= 0 ? '#10b981' : '#f43f5e';
+                pnlSegments += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-width="2" />`;
+            }
+            const lastPnlD = pnlDollars[n - 1] ?? 0;
+            const lastPnlColor = lastPnlD >= 0 ? '#10b981' : '#f43f5e';
+            const pnlAreaPts = `${xAt(0).toFixed(1)},${qMid.toFixed(1)} ` +
+                pnlDollars.map((d, i) => `${xAt(i).toFixed(1)},${yPnl(d).toFixed(1)}`).join(' ') +
+                ` ${xAt(n - 1).toFixed(1)},${qMid.toFixed(1)}`;
+
+            // Start & End markers
+            const startX = xAt(0).toFixed(1), startY = yPrice(prices[0]).toFixed(1);
+            const endX = xAt(n - 1).toFixed(1), endY = yPrice(prices[n - 1]).toFixed(1);
+            const endPnlY = yPnl(lastPnlD).toFixed(1);
+
+            // Interactive hit columns for hover tooltip
+            const colWidth = n === 1 ? plotW : Math.max(4, plotW / n);
+            let hoverZones = '';
+            for (let i = 0; i < n; i++) {
+                const cx = xAt(i);
+                const rx = (n === 1 ? padL : Math.max(padL, cx - colWidth / 2)).toFixed(1);
+                const rw = (n === 1 ? plotW : colWidth).toFixed(1);
+                hoverZones += `<rect x="${rx}" y="${pTop}" width="${rw}" height="${qBot - pTop}" fill="transparent" class="cursor-crosshair" onmouseenter="highlightOptionChartPoint(${i}, ${cx.toFixed(1)}, ${yPrice(prices[i]).toFixed(1)}, ${yPnl(pnlDollars[i]).toFixed(1)})" />`;
+            }
+
+            return `
+                <svg id="optHistorySvg" viewBox="0 0 ${W} ${H}" class="w-full h-auto select-none" onmouseleave="clearOptionChartHighlight()">
+                    <defs>
+                        <linearGradient id="optPriceGrad" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.22" />
+                            <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.01" />
+                        </linearGradient>
+                    </defs>
+
+                    ${gridHtml}
+
+                    <!-- Top Panel: Contract Price -->
+                    <text x="${padL}" y="14" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">CONTRACT PRICE ($ / SHARE) — MINUTE BY MINUTE</text>
+                    <text x="${W - padR}" y="14" text-anchor="end" fill="#94a3b8" font-size="9" font-family="monospace">Entry: $${entryPrice.toFixed(2)} · Low: $${Math.min(...prices).toFixed(2)} · High: $${Math.max(...prices).toFixed(2)}</text>
+
+                    <rect x="${padL}" y="${pTop}" width="${plotW}" height="${pBot - pTop}" fill="#020617" fill-opacity="0.45" stroke="#1e293b" stroke-width="1" rx="4" />
+                    <line x1="${padL}" y1="${entryY}" x2="${W - padR}" y2="${entryY}" stroke="#eab308" stroke-opacity="0.7" stroke-dasharray="4,3" stroke-width="1.1" />
+                    <text x="${padL - 6}" y="${pTop + 8}" text-anchor="end" fill="#94a3b8" font-size="8.5" font-family="monospace">$${hiP.toFixed(2)}</text>
+                    <text x="${padL - 6}" y="${entryY}" text-anchor="end" fill="#facc15" font-size="8.5" font-family="monospace">$${entryPrice.toFixed(2)}</text>
+                    <text x="${padL - 6}" y="${pBot - 2}" text-anchor="end" fill="#94a3b8" font-size="8.5" font-family="monospace">$${loP.toFixed(2)}</text>
+
+                    ${n > 1 ? `<polygon points="${priceArea}" fill="url(#optPriceGrad)" />` : ''}
+                    ${n > 1 ? `<polyline fill="none" stroke="#22d3ee" stroke-width="2" points="${pricePoly}" />` : ''}
+                    <circle cx="${startX}" cy="${startY}" r="4" fill="#38bdf8" stroke="#020617" stroke-width="1.2"><title>Buy @ $${prices[0].toFixed(2)}</title></circle>
+                    <circle cx="${endX}" cy="${endY}" r="4.5" fill="${isClosed ? '#f59e0b' : '#22d3ee'}" stroke="#020617" stroke-width="1.2"><title>${isClosed ? 'Sold' : 'Current'} @ $${prices[n - 1].toFixed(2)}</title></circle>
+
+                    <!-- Bottom Panel: P/L ($ and %) -->
+                    <text x="${padL}" y="156" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">PROFIT / LOSS ($ &amp; %) — MINUTE BY MINUTE</text>
+                    <text x="${W - padR}" y="156" text-anchor="end" fill="${lastPnlColor}" font-size="9.5" font-weight="bold" font-family="monospace">${isClosed ? 'Total Realized:' : 'Current P/L:'} ${fmtSignedDollars(lastPnlD)} (${(pnlPcts[n - 1] ?? 0) >= 0 ? '+' : ''}${(pnlPcts[n - 1] ?? 0).toFixed(2)}%)</text>
+
+                    <rect x="${padL}" y="${qTop}" width="${plotW}" height="${qBot - qTop}" fill="#020617" fill-opacity="0.45" stroke="#1e293b" stroke-width="1" rx="4" />
+                    <line x1="${padL}" y1="${qMid.toFixed(1)}" x2="${W - padR}" y2="${qMid.toFixed(1)}" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" />
+
+                    <!-- Left Y-axis ($) & Right Y-axis (%) -->
+                    <text x="${padL - 6}" y="${qTop + 8}" text-anchor="end" fill="#34d399" font-size="8.5" font-family="monospace">+$${maxAbsD.toFixed(0)}</text>
+                    <text x="${padL - 6}" y="${(qMid + 3).toFixed(1)}" text-anchor="end" fill="#64748b" font-size="8.5" font-family="monospace">$0</text>
+                    <text x="${padL - 6}" y="${qBot - 2}" text-anchor="end" fill="#fb7185" font-size="8.5" font-family="monospace">-$${maxAbsD.toFixed(0)}</text>
+
+                    <text x="${W - padR + 6}" y="${qTop + 8}" text-anchor="start" fill="#34d399" font-size="8.5" font-family="monospace">+${maxAbsPct.toFixed(1)}%</text>
+                    <text x="${W - padR + 6}" y="${(qMid + 3).toFixed(1)}" text-anchor="start" fill="#64748b" font-size="8.5" font-family="monospace">0%</text>
+                    <text x="${W - padR + 6}" y="${qBot - 2}" text-anchor="start" fill="#fb7185" font-size="8.5" font-family="monospace">-${maxAbsPct.toFixed(1)}%</text>
+
+                    ${n > 1 ? `<polygon points="${pnlAreaPts}" fill="${lastPnlColor}" fill-opacity="0.08" />` : ''}
+                    ${pnlSegments}
+                    <circle cx="${endX}" cy="${endPnlY}" r="4" fill="${lastPnlColor}" stroke="#020617" stroke-width="1.2" />
+
+                    <!-- Crosshair elements (updated on hover) -->
+                    <line id="optHoverLine" x1="0" y1="${pTop}" x2="0" y2="${qBot}" stroke="#e2e8f0" stroke-opacity="0.45" stroke-dasharray="2,2" stroke-width="1" class="hidden" />
+                    <circle id="optHoverDotP" cx="0" cy="0" r="4" fill="#22d3ee" stroke="#020617" stroke-width="1.5" class="hidden" />
+                    <circle id="optHoverDotPnl" cx="0" cy="0" r="4" fill="#f8fafc" stroke="#020617" stroke-width="1.5" class="hidden" />
+
+                    ${hoverZones}
+                </svg>
+            `;
+        }
+
+        function highlightOptionChartPoint(idx, cx, cyP, cyPnl) {
+            const pt = activeOptionHistoryPoints[idx];
+            if (!pt) return;
+            const line = document.getElementById('optHoverLine');
+            const dotP = document.getElementById('optHoverDotP');
+            const dotQ = document.getElementById('optHoverDotPnl');
+            const readout = document.getElementById('optChartHoverReadout');
+            if (line) { line.setAttribute('x1', cx); line.setAttribute('x2', cx); line.classList.remove('hidden'); }
+            if (dotP) { dotP.setAttribute('cx', cx); dotP.setAttribute('cy', cyP); dotP.classList.remove('hidden'); }
+            if (dotQ) {
+                dotQ.setAttribute('cx', cx);
+                dotQ.setAttribute('cy', cyPnl);
+                dotQ.setAttribute('fill', (pt.pnl_dollars ?? 0) >= 0 ? '#10b981' : '#f43f5e');
+                dotQ.classList.remove('hidden');
+            }
+            if (readout) {
+                const dPnl = safeNum(pt.pnl_dollars) ?? 0;
+                const pPnl = safeNum(pt.pnl_pct) ?? 0;
+                const pDiff = safeNum(pt.price_change_dollars) ?? 0;
+                const cls = dPnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
+                readout.innerHTML = `<span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span> · Price <strong class="text-cyan-300">$${Number(pt.price).toFixed(2)}</strong> (${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)}) · Value <strong class="text-slate-100">$${Number(pt.market_value).toFixed(2)}</strong> · P/L <strong class="${cls}">${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%)</strong> <span class="text-slate-500">[${escSvg(pt.source || 'poll')}]</span>`;
+            }
+        }
+
+        function clearOptionChartHighlight() {
+            const line = document.getElementById('optHoverLine');
+            const dotP = document.getElementById('optHoverDotP');
+            const dotQ = document.getElementById('optHoverDotPnl');
+            const readout = document.getElementById('optChartHoverReadout');
+            if (line) line.classList.add('hidden');
+            if (dotP) dotP.classList.add('hidden');
+            if (dotQ) dotQ.classList.add('hidden');
+            if (readout) readout.innerHTML = `<span class="text-slate-500">Hover over any minute on the chart to inspect exact contract price and P/L ($ and %).</span>`;
+        }
+
+        function renderOptionDrilldown() {
+            const data = latestOptionHistory || { open_contracts: [], closed_contracts: [], open_summary: {}, closed_summary: {} };
+            const openList = data.open_contracts || [];
+            const closedList = data.closed_contracts || [];
+            const isBuyer = optionDrilldownMode === 'buyer';
+
+            // Header tabs & styling
+            document.getElementById('optTabOpenCount').textContent = openList.length;
+            document.getElementById('optTabClosedCount').textContent = closedList.length;
+            const tabBuyer = document.getElementById('tabOptBuyer');
+            const tabSeller = document.getElementById('tabOptSeller');
+            const modalDot = document.getElementById('optModalDot');
+            const modalTitle = document.getElementById('optModalTitle');
+            const listHeaderLabel = document.getElementById('optListHeaderLabel');
+
+            if (isBuyer) {
+                tabBuyer.className = 'px-2.5 py-1 rounded-md transition bg-cyan-600 text-white';
+                tabSeller.className = 'px-2.5 py-1 rounded-md transition text-slate-400 hover:text-white';
+                modalDot.className = 'w-2.5 h-2.5 rounded-full bg-cyan-400';
+                modalTitle.textContent = 'Option Buyer (1m Sync) — Open Contracts';
+                listHeaderLabel.textContent = 'Select Open Contract';
+            } else {
+                tabSeller.className = 'px-2.5 py-1 rounded-md transition bg-amber-600 text-white';
+                tabBuyer.className = 'px-2.5 py-1 rounded-md transition text-slate-400 hover:text-white';
+                modalDot.className = 'w-2.5 h-2.5 rounded-full bg-amber-400';
+                modalTitle.textContent = 'Option Seller (1m Sync) — Closed Contracts';
+                listHeaderLabel.textContent = 'Select Closed Contract';
+            }
+
+            const bfBadge = document.getElementById('optBackfillBadge');
+            if (bfBadge) {
+                const st = data.backfill_status || 'idle';
+                bfBadge.textContent = `backfill: ${st}`;
+                bfBadge.className = `text-[10px] mono px-2 py-0.5 rounded border ${
+                    st === 'completed'
+                        ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/60'
+                        : (st === 'running' ? 'bg-cyan-950/50 text-cyan-300 border-cyan-800/60' : 'bg-slate-800 text-slate-300 border-slate-700')
+                }`;
+            }
+
+            // Aggregate Banner
+            const sum = isBuyer ? (data.open_summary || {}) : (data.closed_summary || {});
+            const aggCount = isBuyer ? (sum.open_count ?? openList.length) : (sum.closed_count ?? closedList.length);
+            const aggCost = safeNum(sum.total_cost_basis) ?? 0;
+            const aggVal = safeNum(isBuyer ? sum.total_market_value : sum.total_proceeds) ?? 0;
+            const aggPnlD = safeNum(sum.total_pnl_dollars) ?? 0;
+            const aggPnlP = safeNum(sum.total_pnl_pct) ?? 0;
+
+            document.getElementById('optAggCount').textContent = aggCount;
+            document.getElementById('optAggCost').textContent = `$${aggCost.toFixed(2)}`;
+            document.getElementById('optAggValLabel').textContent = isBuyer ? 'Current Market Value:' : 'Total Sale Proceeds:';
+            document.getElementById('optAggVal').textContent = `$${aggVal.toFixed(2)}`;
+            document.getElementById('optAggPnlLabel').textContent = isBuyer ? 'Total Unrealized P/L:' : 'Total Realized Profit/Loss:';
+            const aggPnlEl = document.getElementById('optAggPnl');
+            aggPnlEl.textContent = `${fmtSignedDollars(aggPnlD)} (${aggPnlP >= 0 ? '+' : ''}${aggPnlP.toFixed(2)}%)`;
+            aggPnlEl.className = `font-bold ml-1 ${aggPnlD >= 0 ? 'text-emerald-400' : 'text-rose-400'}`;
+            const aggExtraEl = document.getElementById('optAggExtra');
+            if (aggExtraEl) {
+                aggExtraEl.textContent = isBuyer
+                    ? (data.backfill_last_utc ? `Last Sync: ${fmtShortLocalTs(data.backfill_last_utc)}` : '')
+                    : `Wins: ${sum.win_count ?? 0} · Losses: ${sum.loss_count ?? 0}`;
+            }
+
+            // Contract List & Selection (preserve scroll position)
+            const listEl = document.getElementById('optContractList');
+            const detailEl = document.getElementById('optContractDetailPane');
+            const items = isBuyer ? openList : closedList;
+            const prevScroll = listEl ? listEl.scrollTop : 0;
+
+            if (items.length === 0) {
+                listEl.innerHTML = `
+                    <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-1.5">
+                        <div class="text-xs font-semibold text-slate-300">No ${isBuyer ? 'Open' : 'Closed'} Contracts Found</div>
+                        <p class="text-[11px] text-slate-500">${isBuyer ? 'Open option positions or newly placed Option Buyer orders will appear here and track minute by minute.' : 'Completed Option Seller exits or historical closed orders will appear here.'}</p>
+                    </div>`;
+                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session.</div>`;
+                activeOptionHistoryPoints = [];
+                return;
+            }
+
+            const getKey = (c) => isBuyer ? c.contract : c.trade_id;
+            let activeKey = isBuyer ? selectedBuyerContract : selectedSellerTradeId;
+            let selectedItem = items.find(c => getKey(c) === activeKey) || items[0];
+            activeKey = getKey(selectedItem);
+            if (isBuyer) selectedBuyerContract = activeKey;
+            else selectedSellerTradeId = activeKey;
+
+            listEl.innerHTML = items.map(c => {
+                const k = getKey(c);
+                const selected = k === activeKey;
+                const pnlD = safeNum(isBuyer ? c.pnl_dollars : c.total_pnl_dollars) ?? 0;
+                const pnlP = safeNum(isBuyer ? c.pnl_pct : c.total_pnl_pct) ?? 0;
+                const endPrice = safeNum(isBuyer ? c.current_price : c.exit_price) ?? 0;
+                const entryP = safeNum(c.entry_price) ?? 0;
+                const pos = pnlD >= 0;
+                const borderCls = selected
+                    ? (isBuyer ? 'border-cyan-500/80 bg-cyan-950/25 shadow-md shadow-cyan-950/40' : 'border-amber-500/80 bg-amber-950/25 shadow-md shadow-amber-950/40')
+                    : 'border-slate-800/80 bg-slate-950/60 hover:border-slate-700';
+                const spec = c.strike ? `${c.underlying} $${Number(c.strike).toFixed(c.strike % 1 === 0 ? 0 : 2)} ${c.right}` : (c.underlying || '');
+                const pts = c.history || [];
+
+                return `
+                    <button type="button" onclick="selectOptionContractItem('${escSvg(k)}')" class="w-full text-left p-2.5 rounded-xl border transition ${borderCls} space-y-1.5">
+                        <div class="flex items-start justify-between gap-2">
+                            <div class="min-w-0">
+                                <div class="mono text-[11px] font-bold text-white truncate">${escSvg(c.contract)}</div>
+                                <div class="text-[10px] text-slate-400 mono truncate">${escSvg(spec)} · x${c.qty} ${c.expiry ? '· ' + escSvg(c.expiry) : ''}</div>
+                            </div>
+                            ${buildMiniSparklineSvg(pts, pos)}
+                        </div>
+                        <div class="flex items-center justify-between text-[11px] mono pt-1 border-t border-slate-800/60">
+                            <span class="text-slate-300">$${entryP.toFixed(2)} &rarr; $${endPrice.toFixed(2)}</span>
+                            <span class="font-bold ${pos ? 'text-emerald-400' : 'text-rose-400'}">${fmtSignedDollars(pnlD)} (${pnlP >= 0 ? '+' : ''}${pnlP.toFixed(2)}%)</span>
+                        </div>
+                        <div class="flex items-center justify-between text-[9.5px] text-slate-500 mono">
+                            <span>${isBuyer ? 'Bought' : 'Sold'}: ${escSvg(fmtShortLocalTs(isBuyer ? c.purchased_at_utc : c.sold_at_utc))}</span>
+                            <span>${pts.length}m tracked</span>
+                        </div>
+                    </button>
+                `;
+            }).join('');
+            listEl.scrollTop = prevScroll;
+
+            // Render Right Detail Pane for selectedItem
+            const pts = selectedItem.history || [];
+            activeOptionHistoryPoints = pts;
+            const entryP = safeNum(selectedItem.entry_price) ?? 0;
+            const endP = safeNum(isBuyer ? selectedItem.current_price : selectedItem.exit_price) ?? 0;
+            const costB = safeNum(selectedItem.cost_basis) ?? 0;
+            const endVal = safeNum(isBuyer ? selectedItem.market_value : selectedItem.proceeds) ?? 0;
+            const totalPnlD = safeNum(isBuyer ? selectedItem.pnl_dollars : selectedItem.total_pnl_dollars) ?? 0;
+            const totalPnlP = safeNum(isBuyer ? selectedItem.pnl_pct : selectedItem.total_pnl_pct) ?? 0;
+            const isWin = totalPnlD >= 0;
+
+            const pricesArr = pts.map(p => safeNum(p.price)).filter(v => v !== null);
+            const pnlsArr = pts.map(p => safeNum(p.pnl_dollars)).filter(v => v !== null);
+            const lowP = pricesArr.length ? Math.min(...pricesArr) : endP;
+            const highP = pricesArr.length ? Math.max(...pricesArr) : endP;
+            const peakPnlD = pnlsArr.length ? Math.max(...pnlsArr) : totalPnlD;
+            const minPnlD = pnlsArr.length ? Math.min(...pnlsArr) : totalPnlD;
+            const holdMins = isBuyer
+                ? (selectedItem.purchased_at_utc ? Math.max(0, (Date.now() - Date.parse(selectedItem.purchased_at_utc)) / 60000) : pts.length)
+                : (safeNum(selectedItem.hold_minutes) ?? pts.length);
+
+            const ledgerRows = [...pts].reverse().map(pt => {
+                const dPnl = safeNum(pt.pnl_dollars) ?? 0;
+                const pPnl = safeNum(pt.pnl_pct) ?? 0;
+                const pDiff = safeNum(pt.price_change_dollars) ?? 0;
+                const pCls = dPnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
+                return `
+                    <tr class="hover:bg-slate-900/60">
+                        <td class="px-3 py-1.5 text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</td>
+                        <td class="px-3 py-1.5 text-right text-cyan-300 font-semibold">$${Number(pt.price).toFixed(2)}</td>
+                        <td class="px-3 py-1.5 text-right ${pDiff >= 0 ? 'text-emerald-300' : 'text-rose-300'}">${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)}</td>
+                        <td class="px-3 py-1.5 text-right text-slate-200">$${Number(pt.market_value).toFixed(2)}</td>
+                        <td class="px-3 py-1.5 text-right font-bold ${pCls}">${fmtSignedDollars(dPnl)}</td>
+                        <td class="px-3 py-1.5 text-right font-bold ${pCls}">${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%</td>
+                        <td class="px-3 py-1.5 text-center text-slate-500">${escSvg(pt.source || '')}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const detailHeaderMeta = selectedItem.strike
+                ? `${selectedItem.underlying} $${Number(selectedItem.strike).toFixed(selectedItem.strike % 1 === 0 ? 0 : 2)} ${selectedItem.right} · Exp ${selectedItem.expiry || '--'} · Qty ${selectedItem.qty}`
+                : `${selectedItem.underlying} · Qty ${selectedItem.qty}`;
+
+            detailEl.innerHTML = `
+                <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="mono text-base font-extrabold text-white">${escSvg(selectedItem.contract)}</span>
+                            <span class="text-[10px] px-2 py-0.5 rounded-full font-semibold border ${isBuyer ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30' : 'bg-amber-500/10 text-amber-300 border-amber-500/30'}">${isBuyer ? 'OPEN POSITION' : 'CLOSED TRADE'}</span>
+                        </div>
+                        <div class="text-[11px] text-slate-400 mono mt-0.5">
+                            ${escSvg(detailHeaderMeta)} · Bought ${escSvg(fmtShortLocalTs(selectedItem.purchased_at_utc))}
+                            ${isBuyer ? `· Holding ${fmtDurationMin(holdMins)}` : ` &rarr; Sold ${escSvg(fmtShortLocalTs(selectedItem.sold_at_utc))} (${fmtDurationMin(holdMins)})`}
+                        </div>
+                    </div>
+                    <div class="text-right mono text-[10px] text-slate-400">
+                        <div>Source: <span class="text-slate-200">${escSvg(selectedItem.history_source || 'live')}</span></div>
+                        ${(isBuyer ? selectedItem.buy_reason : selectedItem.reason) ? `<div class="max-w-[240px] truncate" title="${escSvg(isBuyer ? selectedItem.buy_reason : selectedItem.reason)}">Trigger: <span class="text-slate-300">${escSvg(isBuyer ? selectedItem.buy_reason : selectedItem.reason)}</span></div>` : ''}
+                    </div>
+                </div>
+
+                <!-- 4 KPI Cards -->
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                    <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                        <div class="text-[10px] uppercase tracking-wider text-slate-400">Entry / Cost Basis</div>
+                        <div class="mono text-sm font-bold text-white mt-1">$${entryP.toFixed(2)} <span class="text-[11px] font-normal text-slate-400">/ct</span></div>
+                        <div class="mono text-[10px] text-slate-400 mt-0.5">Cost: $${costB.toFixed(2)}</div>
+                    </div>
+                    <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                        <div class="text-[10px] uppercase tracking-wider text-slate-400">${isBuyer ? 'Current / Market Val' : 'Exit / Proceeds'}</div>
+                        <div class="mono text-sm font-bold text-cyan-300 mt-1">$${endP.toFixed(2)} <span class="text-[11px] font-normal text-slate-400">/ct</span></div>
+                        <div class="mono text-[10px] text-slate-400 mt-0.5">${isBuyer ? 'Value' : 'Proceeds'}: $${endVal.toFixed(2)}</div>
+                    </div>
+                    <div class="p-3 rounded-xl border ${isWin ? 'bg-emerald-950/20 border-emerald-800/60' : 'bg-rose-950/20 border-rose-800/60'}">
+                        <div class="text-[10px] uppercase tracking-wider ${isWin ? 'text-emerald-300' : 'text-rose-300'}">${isBuyer ? 'Unrealized P/L' : 'Total Profit / Loss'}</div>
+                        <div class="mono text-sm font-extrabold ${isWin ? 'text-emerald-400' : 'text-rose-400'} mt-1">${fmtSignedDollars(totalPnlD)}</div>
+                        <div class="mono text-[11px] font-bold ${isWin ? 'text-emerald-300' : 'text-rose-300'} mt-0.5">${totalPnlP >= 0 ? '+' : ''}${totalPnlP.toFixed(2)}%</div>
+                    </div>
+                    <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80">
+                        <div class="text-[10px] uppercase tracking-wider text-slate-400">Hold Range (${pts.length}m)</div>
+                        <div class="mono text-[11px] font-semibold text-slate-200 mt-1">$${lowP.toFixed(2)} – $${highP.toFixed(2)}</div>
+                        <div class="mono text-[10px] text-slate-400 mt-0.5">Peak ${fmtSignedDollars(peakPnlD)} · Low ${fmtSignedDollars(minPnlD)}</div>
+                    </div>
+                </div>
+
+                <!-- 2-Panel Chart + Hover Bar -->
+                <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3.5 space-y-2">
+                    <div id="optChartHoverReadout" class="text-[11px] mono bg-slate-900/90 border border-slate-800 rounded-lg px-3 py-1.5 min-h-[28px] flex items-center">
+                        <span class="text-slate-500">Hover over any minute on the chart to inspect exact contract price and P/L ($ and %).</span>
+                    </div>
+                    <div>
+                        ${buildOptionHistoryChartSvg(pts, selectedItem, !isBuyer)}
+                    </div>
+                </div>
+
+                <!-- Minute-by-Minute History Table -->
+                <div class="rounded-xl border border-slate-800/80 bg-slate-950/50 overflow-hidden">
+                    <div class="px-3.5 py-2 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        <span>Minute-by-Minute History (${pts.length} bars)</span>
+                        <span class="font-normal text-slate-500">Newest First</span>
+                    </div>
+                    <div class="max-h-52 overflow-y-auto">
+                        <table class="w-full text-left text-[11px] mono">
+                            <thead class="sticky top-0 bg-slate-950 text-slate-400 border-b border-slate-800">
+                                <tr>
+                                    <th class="px-3 py-1.5">Minute</th>
+                                    <th class="px-3 py-1.5 text-right">Price</th>
+                                    <th class="px-3 py-1.5 text-right">Price &Delta;</th>
+                                    <th class="px-3 py-1.5 text-right">Total Value</th>
+                                    <th class="px-3 py-1.5 text-right">P/L ($)</th>
+                                    <th class="px-3 py-1.5 text-right">P/L (%)</th>
+                                    <th class="px-3 py-1.5 text-center">Source</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800/50">
+                                ${ledgerRows || `<tr><td colspan="7" class="px-3 py-4 text-center text-slate-500">No minute bars yet.</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const modal = document.getElementById('optionDrilldownModal');
+                if (modal && !modal.classList.contains('hidden')) {
+                    closeOptionDrilldown();
+                }
+            }
+        });
+
         // Initialize engine telemetry loop
         fetchAllData();
         fetchMinuteSummaries();
@@ -10176,6 +12197,40 @@ class AdminCliProvider:
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
 
+        @app.get("/api/option-history")
+        def get_option_history():
+            if not hasattr(self.coordinator, "option_history"):
+                return jsonify(status="error", message="Option history tracker unavailable"), 503
+            return jsonify(status="ok", **self.coordinator.option_history.get_snapshot()), 200
+
+        @app.post("/api/option-history/refresh")
+        def refresh_option_history():
+            if not hasattr(self.coordinator, "option_history"):
+                return jsonify(status="error", message="Option history tracker unavailable"), 503
+            pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
+            pm = pm_entry.get("router")
+            ob_entry = PROVIDER_REGISTRY.get("OPTION_BUYER", {})
+            ob = ob_entry.get("router")
+            os_entry = PROVIDER_REGISTRY.get("OPTION_SELLER", {})
+            osel = os_entry.get("router")
+            t_client = (pm.client if pm and pm.client else None) or (ob.client if ob and ob.client else None) or (osel.client if osel and osel.client else None)
+            o_client = (ob.option_data_client if ob else None) or (osel.option_data_client if osel else None)
+            s_client = osel.stock_data_client if osel else None
+            future = asyncio.run_coroutine_threadsafe(
+                asyncio.to_thread(
+                    self.coordinator.option_history.startup_backfill,
+                    t_client,
+                    o_client,
+                    s_client,
+                ),
+                self.loop,
+            )
+            try:
+                future.result(timeout=20.0)
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
+            return jsonify(status="ok", **self.coordinator.option_history.get_snapshot()), 200
+
         @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
             pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
@@ -10202,6 +12257,11 @@ class AdminCliProvider:
                 "last_order_reason": ob.last_order_reason if ob else None,
                 "last_error_detail": getattr(ob, "last_error_detail", None) if ob else None,
                 "cached_contracts": len(self.coordinator.option_chain_cache),
+                "history_summary": (
+                    self.coordinator.option_history.get_buyer_summary()
+                    if hasattr(self.coordinator, "option_history")
+                    else {}
+                ),
             }
             option_seller_report = {
                 "status": osel.last_status if osel else "not_loaded",
@@ -10236,6 +12296,11 @@ class AdminCliProvider:
                 "last_order_reason": osel.last_order_reason if osel else None,
                 "last_error_detail": getattr(osel, "last_error_detail", None) if osel else None,
                 "positions_checked": osel.last_positions_checked if osel else 0,
+                "history_summary": (
+                    self.coordinator.option_history.get_seller_summary()
+                    if hasattr(self.coordinator, "option_history")
+                    else {}
+                ),
             }
             latest_kinematics = {}
             for (provider, symbol), hist in self.coordinator.kinematics_history.items():
@@ -10603,7 +12668,7 @@ async def main():
     # account every minute and prints current option positions to its own log.
     # Starts whenever Alpaca credentials are available; otherwise it logs a
     # single disabled warning and exits.
-    position_monitor = AlpacaPositionMonitor(keys)
+    position_monitor = AlpacaPositionMonitor(keys, coordinator=coordinator)
     pm_task = asyncio.create_task(
         run_provider_isolated(position_monitor, coordinator),
         name="ALPACA_POSITION_MONITOR",
@@ -10623,6 +12688,26 @@ async def main():
         name="ALPACA_OPTION_SELLER",
     )
     tasks.append(os_task)
+
+    startup_t_client = position_monitor.client or option_buyer.client or option_seller.client
+    coordinator.option_history.attach_clients(
+        credentials=keys,
+        trading_client=startup_t_client,
+        option_data_client=option_buyer.option_data_client or option_seller.option_data_client,
+        stock_data_client=option_seller.stock_data_client,
+    )
+    if startup_t_client is not None:
+        tasks.append(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    coordinator.option_history.startup_backfill,
+                    startup_t_client,
+                    option_buyer.option_data_client or option_seller.option_data_client,
+                    option_seller.stock_data_client,
+                ),
+                name="OPTION_HISTORY_BACKFILL",
+            )
+        )
 
     chart_capture = ChartCaptureManager(coordinator)
     cc_task = asyncio.create_task(
