@@ -45,6 +45,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import zlib
 
 from dataclasses import dataclass
@@ -98,6 +99,13 @@ SUMMARY_TO_CONSOLE = os.getenv("SUMMARY_TO_CONSOLE", "true").lower() in {
 YAHOO_POLL_SECONDS = float(os.getenv("YAHOO_POLL_SECONDS", "30"))
 if not math.isfinite(YAHOO_POLL_SECONDS) or YAHOO_POLL_SECONDS <= 0:
     raise ValueError("YAHOO_POLL_SECONDS must be finite and positive")
+TASTYTRADE_PROD_BASE_URL = os.getenv(
+    "TASTYTRADE_PROD_BASE_URL", "https://api.tastyworks.com"
+).rstrip("/")
+TASTYTRADE_SANDBOX_BASE_URL = os.getenv(
+    "TASTYTRADE_SANDBOX_BASE_URL", "https://api.cert.tastyworks.com"
+).rstrip("/")
+TASTYTRADE_USER_AGENT = os.getenv("TASTYTRADE_USER_AGENT", "multiStreamRSI/1.0")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -617,6 +625,8 @@ def sanitize_provider_event(value, secrets=()):
         "api_key",
         "secret",
         "secret_key",
+        "client_secret",
+        "refresh_token",
         "token",
         "access_token",
         "authorization",
@@ -2816,6 +2826,9 @@ class ProviderRouter:
         self.recovery_pending = set()
         self.historical = None
         self.stream = None
+        self._tt_access_cache = {}
+        self._tt_quote_cache = None
+        self._tt_token_lock = asyncio.Lock()
         if provider == "ALPACA":
             self.historical = StockHistoricalDataClient(
                 credentials["alpaca_key"], credentials["alpaca_secret"]
@@ -2891,6 +2904,7 @@ class ProviderRouter:
                 "YAHOOFINANCE": self.run_yfinance,
                 "TWELVEDATA": self.run_websocket,
                 "TRADIER": self.run_websocket,
+                "TASTYTRADE": self.run_tastytrade,
             }[self.provider]
             tasks = [
                 asyncio.create_task(self.consume()),
@@ -3148,6 +3162,10 @@ class ProviderRouter:
 
             return bars
 
+        if self.provider == "TASTYTRADE":
+            grouped = await self._dxlink_fetch_candles_batch([symbol], start, end)
+            return grouped.get(symbol, [])
+
         raise ValueError(f"Unsupported historical provider: {self.provider}")
 
     def prior_sessions(self):
@@ -3179,6 +3197,43 @@ class ProviderRouter:
         """
         sessions = self.prior_sessions()
         if not sessions:
+            return
+        if self.provider == "TASTYTRADE":
+            oldest_open = sessions[0][1][0]
+            newest_close = sessions[-1][1][1]
+            try:
+                async with self.history_lock:
+                    grouped = await self._dxlink_fetch_candles_batch(
+                        list(self.symbols),
+                        oldest_open,
+                        newest_close,
+                        overall_timeout=max(25.0, len(self.symbols) * 1.5),
+                    )
+            except FatalProviderError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "RSI_WARMUP_SKIP provider=%s symbol=ALL error_type=%s",
+                    self.provider,
+                    type(exc).__name__,
+                )
+                return
+            for symbol in self.symbols:
+                bars = grouped.get(symbol, [])
+                applied_total = 0
+                for _day, (opening, closing) in sessions:
+                    day_bars = [b for b in bars if opening <= b.timestamp < closing]
+                    if day_bars:
+                        applied_total += self.coordinator.seed_history(
+                            self.provider, symbol, day_bars
+                        )
+                self.logger.info(
+                    "RSI_WARMUP_DONE provider=%s symbol=%s sessions=%d bars_applied=%d",
+                    self.provider,
+                    symbol,
+                    len(sessions),
+                    applied_total,
+                )
             return
         for symbol in self.symbols:
             applied_total = 0
@@ -3517,6 +3572,575 @@ class ProviderRouter:
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             self.logger.warning("INVALID_TICK symbol=%s", symbol)
 
+    def _tastytrade_env_config(self, env="prod"):
+        env_key = "sandbox" if str(env).strip().lower() == "sandbox" else "prod"
+        if env_key == "sandbox":
+            return {
+                "env": "sandbox",
+                "base_url": TASTYTRADE_SANDBOX_BASE_URL,
+                "client_id": self.credentials.get("tastytrade_sandbox_client_id", ""),
+                "client_secret": self.credentials.get("tastytrade_sandbox_client_secret", ""),
+                "refresh_token": self.credentials.get("tastytrade_sandbox_refresh_token", ""),
+            }
+        return {
+            "env": "prod",
+            "base_url": TASTYTRADE_PROD_BASE_URL,
+            "client_id": self.credentials.get("tastytrade_prod_client_id", ""),
+            "client_secret": self.credentials.get("tastytrade_prod_client_secret", ""),
+            "refresh_token": self.credentials.get("tastytrade_prod_refresh_token", ""),
+        }
+
+    async def _tastytrade_get_access_token(self, env="prod", force_refresh=False):
+        """Exchange OAuth2 refresh_token for a 15-minute access token (prod or sandbox)."""
+        cfg = self._tastytrade_env_config(env)
+        env_key = cfg["env"]
+        if not cfg["client_secret"] or not cfg["refresh_token"]:
+            raise FatalProviderError(
+                f"Tastytrade {env_key} client_secret/refresh_token not configured"
+            )
+        async with self._tt_token_lock:
+            now_mono = time.monotonic()
+            cached = self._tt_access_cache.get(env_key)
+            if (
+                not force_refresh
+                and cached
+                and cached.get("token")
+                and now_mono < cached.get("expires_at", 0) - 60.0
+            ):
+                return cached["token"]
+
+            body = {
+                "grant_type": "refresh_token",
+                "refresh_token": cfg["refresh_token"],
+                "client_secret": cfg["client_secret"],
+            }
+            if cfg["client_id"]:
+                body["client_id"] = cfg["client_id"]
+
+            headers = {
+                "User-Agent": TASTYTRADE_USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            url = f"{cfg['base_url']}/oauth/token"
+            for attempt in range(4):
+                try:
+                    async with self.session.post(url, headers=headers, json=body) as resp:
+                        text = await resp.text()
+                        if resp.status in {401, 403}:
+                            raise FatalProviderError(
+                                f"Tastytrade {env_key} OAuth HTTP {resp.status}: access rejected"
+                            )
+                        if resp.status == 400:
+                            lower = text.lower()
+                            if "invalid_grant" in lower or "invalid_client" in lower or "unauthorized" in lower:
+                                raise FatalProviderError(
+                                    f"Tastytrade {env_key} OAuth rejected (invalid credentials/grant)"
+                                )
+                            raise RuntimeError(f"Tastytrade OAuth HTTP 400")
+                        if resp.status == 429 or resp.status >= 500:
+                            if attempt == 3:
+                                raise RuntimeError(f"Tastytrade OAuth HTTP {resp.status}")
+                            await asyncio.sleep(2**attempt)
+                            continue
+                        if resp.status >= 400:
+                            raise RuntimeError(f"Tastytrade OAuth HTTP {resp.status}")
+                        data = json.loads(text)
+                        break
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                    if attempt == 3:
+                        raise RuntimeError("Tastytrade OAuth network retries exhausted") from None
+                    await asyncio.sleep(2**attempt)
+
+            token = data.get("access_token") if isinstance(data, dict) else None
+            if not isinstance(token, str) or not token.strip():
+                raise FatalProviderError("Tastytrade OAuth response missing access_token")
+            expires_in = float(data.get("expires_in", 900) or 900)
+            token = token.strip()
+            self._tt_access_cache[env_key] = {
+                "token": token,
+                "expires_at": time.monotonic() + max(120.0, expires_in),
+            }
+            return token
+
+    async def _tastytrade_get_quote_token(self, force_refresh=False):
+        """Fetch production DXLink quote token + URL via GET /api-quote-tokens."""
+        now_mono = time.monotonic()
+        if (
+            not force_refresh
+            and self._tt_quote_cache
+            and now_mono < self._tt_quote_cache.get("expires_at", 0)
+        ):
+            return self._tt_quote_cache["dxlink_url"], self._tt_quote_cache["token"]
+
+        for retry_auth in (False, True):
+            access_token = await self._tastytrade_get_access_token(
+                env="prod", force_refresh=(force_refresh or retry_auth)
+            )
+            url = f"{TASTYTRADE_PROD_BASE_URL}/api-quote-tokens"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": TASTYTRADE_USER_AGENT,
+                "Accept": "application/json",
+            }
+            try:
+                payload = await request_json(self.session, "GET", url, headers=headers)
+            except FatalProviderError:
+                if not retry_auth:
+                    continue
+                raise
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            if not isinstance(data, dict):
+                raise RuntimeError("Tastytrade /api-quote-tokens invalid payload")
+            quote_token = str(data.get("token") or "").strip()
+            dxlink_url = str(data.get("dxlink-url") or data.get("dxlink_url") or "").strip()
+            if not quote_token or not dxlink_url:
+                raise RuntimeError("Tastytrade /api-quote-tokens missing dxlink-url or token")
+            # Tokens last 24h; proactively refresh after 20h.
+            self._tt_quote_cache = {
+                "token": quote_token,
+                "dxlink_url": dxlink_url,
+                "expires_at": time.monotonic() + 20 * 3600.0,
+            }
+            return dxlink_url, quote_token
+
+        raise FatalProviderError("Tastytrade /api-quote-tokens authentication rejected")
+
+    @staticmethod
+    def _dxlink_parse_candle_data(data, field_order=None):
+        """Parse DXLink FEED_DATA payload (COMPACT or FULL) into list of (symbol, ts_ms, close, flags)."""
+        order = list(field_order or ("eventSymbol", "time", "close", "eventFlags"))
+        results = []
+
+        def _extract_dict(obj):
+            if not isinstance(obj, dict):
+                return None
+            ev_sym = obj.get("eventSymbol") or obj.get("symbol")
+            raw_time = obj.get("time")
+            raw_close = obj.get("close")
+            raw_flags = obj.get("eventFlags", 0)
+            if ev_sym is None or raw_time is None:
+                return None
+            return (str(ev_sym), raw_time, raw_close, raw_flags)
+
+        def _extract_row(row_vals):
+            if not isinstance(row_vals, (list, tuple)) or len(row_vals) < len(order):
+                return None
+            mapping = {field: row_vals[idx] for idx, field in enumerate(order)}
+            return _extract_dict(mapping)
+
+        if not isinstance(data, list):
+            return results
+
+        if data and all(isinstance(item, dict) for item in data):
+            for item in data:
+                ev_type = str(item.get("eventType") or "Candle")
+                if ev_type != "Candle":
+                    continue
+                parsed = _extract_dict(item)
+                if parsed:
+                    results.append(parsed)
+            return results
+
+        idx = 0
+        n = len(data)
+        while idx < n:
+            head = data[idx]
+            if isinstance(head, str):
+                ev_name = head
+                idx += 1
+                while idx < n and not isinstance(data[idx], str):
+                    chunk = data[idx]
+                    idx += 1
+                    if ev_name != "Candle" or not isinstance(chunk, list) or not chunk:
+                        continue
+                    if isinstance(chunk[0], list):
+                        for sub in chunk:
+                            parsed = _extract_row(sub)
+                            if parsed:
+                                results.append(parsed)
+                    elif isinstance(chunk[0], dict):
+                        for sub in chunk:
+                            parsed = _extract_dict(sub)
+                            if parsed:
+                                results.append(parsed)
+                    else:
+                        step = len(order)
+                        if step > 0:
+                            for pos in range(0, len(chunk) - step + 1, step):
+                                parsed = _extract_row(chunk[pos : pos + step])
+                                if parsed:
+                                    results.append(parsed)
+                continue
+            elif isinstance(head, dict):
+                if str(head.get("eventType") or "Candle") == "Candle":
+                    parsed = _extract_dict(head)
+                    if parsed:
+                        results.append(parsed)
+            idx += 1
+
+        return results
+
+    @staticmethod
+    def _dxlink_normalize_candle(raw_sym, raw_time, raw_close, raw_flags):
+        """Return (base_symbol, candle_minute_utc, close_float, flags_int) or (base_symbol, None, None, flags_int)."""
+        base_sym = str(raw_sym or "").split("{", 1)[0].strip().upper()
+        try:
+            flags = int(raw_flags or 0) if not isinstance(raw_flags, bool) else 0
+        except (TypeError, ValueError):
+            flags = 0
+
+        # 0x02 = REMOVE_EVENT in dxFeed IndexedEvent bitmask
+        if flags & 0x02:
+            return base_sym, None, None, flags
+        if raw_close is None or isinstance(raw_close, bool):
+            return base_sym, None, None, flags
+        try:
+            price = positive_price(raw_close)
+            epoch_ms = float(raw_time)
+            if not math.isfinite(epoch_ms) or epoch_ms <= 0:
+                return base_sym, None, None, flags
+            dt = minute_utc(datetime.fromtimestamp(epoch_ms / 1000.0, UTC))
+            return base_sym, dt, price, flags
+        except (TypeError, ValueError, OverflowError, OSError):
+            return base_sym, None, None, flags
+
+    async def _dxlink_keepalive(self, ws):
+        while True:
+            await asyncio.sleep(25.0)
+            await ws.send_json({"type": "KEEPALIVE", "channel": 0})
+
+    async def _dxlink_fetch_candles_batch(
+        self, symbols, start, end, idle_timeout=1.5, overall_timeout=20.0
+    ):
+        """Dedicated aiohttp DXLink #1 client for historical 1m Candle snapshots (warmup/recovery)."""
+        start_utc = as_utc(start)
+        end_utc = as_utc(end)
+        target_syms = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        out = {s: {} for s in target_syms}
+        if not target_syms or start_utc >= end_utc:
+            return {s: [] for s in target_syms}
+
+        start_ms = int(start_utc.timestamp() * 1000)
+        dxlink_url, quote_token = await self._tastytrade_get_quote_token()
+        field_order = ["eventSymbol", "time", "close", "eventFlags"]
+        completed_syms = set()
+        target_set = set(target_syms)
+        deadline = time.monotonic() + float(overall_timeout)
+        last_activity = time.monotonic()
+
+        async with self.session.ws_connect(
+            dxlink_url, heartbeat=20, max_msg_size=16 * 1024 * 1024
+        ) as ws:
+            await ws.send_json(
+                {
+                    "type": "SETUP",
+                    "channel": 0,
+                    "version": "0.1-DXF-JS/0.3.0",
+                    "keepaliveTimeout": 60,
+                    "acceptKeepaliveTimeout": 60,
+                }
+            )
+            channel_opened = False
+            subscribed = False
+
+            while time.monotonic() < deadline:
+                wait_for = min(float(idle_timeout), max(0.05, deadline - time.monotonic()))
+                try:
+                    msg = await ws.receive(timeout=wait_for)
+                except asyncio.TimeoutError:
+                    if subscribed and (time.monotonic() - last_activity) >= idle_timeout:
+                        break
+                    continue
+
+                if msg.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    break
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+
+                try:
+                    frame = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+
+                ftype = str(frame.get("type") or "").upper()
+                if ftype == "AUTH_STATE":
+                    state = str(frame.get("state") or "").upper()
+                    if state == "UNAUTHORIZED":
+                        await ws.send_json(
+                            {"type": "AUTH", "channel": 0, "token": quote_token}
+                        )
+                    elif state == "AUTHORIZED" and not channel_opened:
+                        await ws.send_json(
+                            {
+                                "type": "CHANNEL_REQUEST",
+                                "channel": 1,
+                                "service": "FEED",
+                                "parameters": {"contract": "AUTO"},
+                            }
+                        )
+                elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                    channel_opened = True
+                    await ws.send_json(
+                        {
+                            "type": "FEED_SETUP",
+                            "channel": 1,
+                            "acceptAggregationPeriod": 60.0,
+                            "acceptDataFormat": "COMPACT",
+                            "acceptEventFields": {
+                                "Candle": ["eventSymbol", "time", "close", "eventFlags"]
+                            },
+                        }
+                    )
+                    await ws.send_json(
+                        {
+                            "type": "FEED_SUBSCRIPTION",
+                            "channel": 1,
+                            "add": [
+                                {
+                                    "type": "Candle",
+                                    "symbol": f"{sym}{{=1m}}",
+                                    "fromTime": start_ms,
+                                }
+                                for sym in target_syms
+                            ],
+                        }
+                    )
+                    subscribed = True
+                    last_activity = time.monotonic()
+                elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
+                    ev_fields = frame.get("eventFields") or {}
+                    if isinstance(ev_fields, dict) and isinstance(ev_fields.get("Candle"), list):
+                        field_order = list(ev_fields["Candle"])
+                elif ftype == "ERROR":
+                    err_msg = str(frame.get("message") or frame.get("error") or "")
+                    if "token" in err_msg.lower() or "auth" in err_msg.lower() or "unauth" in err_msg.lower():
+                        self._tt_quote_cache = None
+                    raise RuntimeError(f"DXLink history error: {err_msg[:120]}")
+                elif ftype == "FEED_DATA" and frame.get("channel") == 1:
+                    last_activity = time.monotonic()
+                    events = self._dxlink_parse_candle_data(frame.get("data"), field_order)
+                    for raw_sym, raw_time, raw_close, raw_flags in events:
+                        base_sym, dt, price, flags = self._dxlink_normalize_candle(
+                            raw_sym, raw_time, raw_close, raw_flags
+                        )
+                        if base_sym not in target_set:
+                            continue
+                        if dt is not None and price is not None:
+                            if start_utc <= dt < end_utc and regular_session(dt):
+                                out[base_sym][dt] = price
+                        # 0x08 = SNAPSHOT_END, 0x10 = SNAPSHOT_SNIP
+                        if flags & 0x18:
+                            completed_syms.add(base_sym)
+                    if completed_syms >= target_set:
+                        break
+
+        return {
+            sym: [Bar(ts, px) for ts, px in sorted(candles.items())]
+            for sym, candles in out.items()
+        }
+
+    async def run_tastytrade(self):
+        """Dedicated aiohttp DXLink #2 persistent client streaming live Candle{=1m} closes."""
+        delay = 1
+        force_quote_refresh = False
+
+        while True:
+            keepalive_task = None
+            try:
+                dxlink_url, quote_token = await self._tastytrade_get_quote_token(
+                    force_refresh=force_quote_refresh
+                )
+                force_quote_refresh = False
+                field_order = ["eventSymbol", "time", "close", "eventFlags"]
+                token_started_at = time.monotonic()
+
+                async with self.session.ws_connect(
+                    dxlink_url, heartbeat=20, max_msg_size=16 * 1024 * 1024
+                ) as ws:
+                    await ws.send_json(
+                        {
+                            "type": "SETUP",
+                            "channel": 0,
+                            "version": "0.1-DXF-JS/0.3.0",
+                            "keepaliveTimeout": 60,
+                            "acceptKeepaliveTimeout": 60,
+                        }
+                    )
+                    keepalive_task = asyncio.create_task(self._dxlink_keepalive(ws))
+                    channel_opened = False
+
+                    async for message in ws:
+                        if message.type == aiohttp.WSMsgType.ERROR:
+                            raise ConnectionError("Tastytrade DXLink WebSocket transport failed")
+                        if message.type != aiohttp.WSMsgType.TEXT:
+                            continue
+
+                        for line in message.data.splitlines():
+                            if not line.strip():
+                                continue
+                            try:
+                                frame = json.loads(line)
+                            except json.JSONDecodeError:
+                                self.logger.warning("INVALID_JSON")
+                                continue
+                            if not isinstance(frame, dict):
+                                continue
+
+                            ftype = str(frame.get("type") or "").upper()
+                            if ftype == "AUTH_STATE":
+                                state = str(frame.get("state") or "").upper()
+                                if state == "UNAUTHORIZED":
+                                    await ws.send_json(
+                                        {"type": "AUTH", "channel": 0, "token": quote_token}
+                                    )
+                                elif state == "AUTHORIZED" and not channel_opened:
+                                    await ws.send_json(
+                                        {
+                                            "type": "CHANNEL_REQUEST",
+                                            "channel": 1,
+                                            "service": "FEED",
+                                            "parameters": {"contract": "AUTO"},
+                                        }
+                                    )
+                            elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                                channel_opened = True
+                                self.coordinator.set_connected(self.provider, True)
+                                now_utc = datetime.now(UTC)
+                                for symbol in self.symbols:
+                                    self.enqueue(symbol, "recover", now_utc)
+                                recent_floor = minute_utc(now_utc) - timedelta(minutes=2)
+                                if self.coordinator.last_finalized is not None:
+                                    recent_floor = max(
+                                        recent_floor, self.coordinator.last_finalized + MINUTE
+                                    )
+                                from_ms = int(recent_floor.timestamp() * 1000)
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SETUP",
+                                        "channel": 1,
+                                        "acceptAggregationPeriod": 60.0,
+                                        "acceptDataFormat": "COMPACT",
+                                        "acceptEventFields": {
+                                            "Candle": ["eventSymbol", "time", "close", "eventFlags"]
+                                        },
+                                    }
+                                )
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SUBSCRIPTION",
+                                        "channel": 1,
+                                        "add": [
+                                            {
+                                                "type": "Candle",
+                                                "symbol": f"{sym}{{=1m}}",
+                                                "fromTime": from_ms,
+                                            }
+                                            for sym in self.symbols
+                                        ],
+                                    }
+                                )
+                                self.logger.info(
+                                    "CONNECTED provider=%s env=prod symbols=%s from_utc=%s",
+                                    self.provider,
+                                    self.symbols,
+                                    recent_floor.isoformat(),
+                                )
+                            elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
+                                ev_fields = frame.get("eventFields") or {}
+                                if isinstance(ev_fields, dict) and isinstance(
+                                    ev_fields.get("Candle"), list
+                                ):
+                                    field_order = list(ev_fields["Candle"])
+                            elif ftype == "FEED_DATA" and frame.get("channel") == 1:
+                                events = self._dxlink_parse_candle_data(
+                                    frame.get("data"), field_order
+                                )
+                                for raw_sym, raw_time, raw_close, raw_flags in events:
+                                    base_sym, dt, price, _flags = self._dxlink_normalize_candle(
+                                        raw_sym, raw_time, raw_close, raw_flags
+                                    )
+                                    if (
+                                        base_sym not in self.symbols
+                                        or dt is None
+                                        or price is None
+                                    ):
+                                        continue
+                                    if (
+                                        self.coordinator.last_finalized is not None
+                                        and dt <= self.coordinator.last_finalized
+                                    ):
+                                        continue
+                                    self.enqueue(base_sym, "bar", Bar(dt, price))
+                                delay = 1
+                            elif ftype == "ERROR":
+                                safe = sanitize_provider_event(
+                                    frame, secrets=tuple(self.credentials.values())
+                                )
+                                details = json.dumps(safe, separators=(",", ":"), default=str)
+                                self.logger.warning(
+                                    "WS_CONTROL provider=%s payload=%s",
+                                    self.provider,
+                                    details,
+                                )
+                                err_lower = str(
+                                    frame.get("message") or frame.get("error") or ""
+                                ).lower()
+                                if "token" in err_lower or "auth" in err_lower or "unauth" in err_lower:
+                                    force_quote_refresh = True
+                                    self._tt_quote_cache = None
+                                    raise ConnectionError("DXLink quote token rejected")
+                            elif ftype == "KEEPALIVE":
+                                continue
+
+                        # Rotate DXLink session cleanly before the 24h quote token expires
+                        if time.monotonic() - token_started_at >= 19 * 3600.0:
+                            force_quote_refresh = True
+                            break
+
+                    self.logger.warning("DISCONNECTED; recovering on reconnect")
+            except asyncio.CancelledError:
+                raise
+            except aiohttp.WSServerHandshakeError as exc:
+                if exc.status in {401, 403}:
+                    force_quote_refresh = True
+                    self._tt_quote_cache = None
+                    self.logger.warning(
+                        "TASTYTRADE_WS_AUTH_RETRY status=%s", exc.status
+                    )
+                else:
+                    self.logger.warning(
+                        "WS_RETRY error_type=%s status=%s",
+                        type(exc).__name__,
+                        exc.status,
+                    )
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                ConnectionError,
+                RuntimeError,
+            ) as exc:
+                self.logger.warning(
+                    "WS_RETRY provider=%s error_type=%s detail=%s",
+                    self.provider,
+                    type(exc).__name__,
+                    str(exc)[:120],
+                )
+            finally:
+                self.coordinator.set_connected(self.provider, False)
+                if keepalive_task is not None:
+                    keepalive_task.cancel()
+                    await asyncio.gather(keepalive_task, return_exceptions=True)
+
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
 
 def load_tradier_token(config, credentials):
     value = os.getenv("TRADIER_TOKEN", "")
@@ -3560,7 +4184,14 @@ def load_tradier_token(config, credentials):
 
 _INI_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[;#].*)?$")
 _INI_FEATURE_SECTIONS = frozenset(
-    {"providers", "kinematics", "option_buyer", "option_seller", "chart_capture"}
+    {
+        "providers",
+        "kinematics",
+        "option_buyer",
+        "option_seller",
+        "chart_capture",
+        "tastytrade_api",
+    }
 )
 
 
@@ -4300,6 +4931,7 @@ def load_settings():
         "ALPACA": ["alpaca_key", "alpaca_secret"],
         "TRADIER": ["tradier_token"],
         "TWELVEDATA": ["twelvedata_key"],
+        "TASTYTRADE": ["tastytrade_prod_client_secret", "tastytrade_prod_refresh_token"],
         "YAHOOFINANCE": [],
         "TRADINGVIEW": [],
     }
@@ -4388,6 +5020,12 @@ def load_settings():
             "alpaca_secret": "",
             "tradier_token": "",
             "twelvedata_key": "",
+            "tastytrade_prod_client_id": "",
+            "tastytrade_prod_client_secret": "",
+            "tastytrade_prod_refresh_token": "",
+            "tastytrade_sandbox_client_id": "",
+            "tastytrade_sandbox_client_secret": "",
+            "tastytrade_sandbox_refresh_token": "",
         }
 
         if selected:
@@ -4409,6 +5047,32 @@ def load_settings():
                 except Exception:
                     td_key = ""
             keys["twelvedata_key"] = td_key
+
+        tt_ini_map = (
+            ("tastytrade_prod_client_id", "prod_client_id", "TASTYTRADE_PROD_CLIENT_ID"),
+            ("tastytrade_prod_client_secret", "prod_client_secret", "TASTYTRADE_PROD_CLIENT_SECRET"),
+            ("tastytrade_prod_refresh_token", "prod_refresh_token", "TASTYTRADE_PROD_REFRESH_TOKEN"),
+            ("tastytrade_sandbox_client_id", "sandbox_client_id", "TASTYTRADE_SANDBOX_CLIENT_ID"),
+            ("tastytrade_sandbox_client_secret", "sandbox_client_secret", "TASTYTRADE_SANDBOX_CLIENT_SECRET"),
+            ("tastytrade_sandbox_refresh_token", "sandbox_refresh_token", "TASTYTRADE_SANDBOX_REFRESH_TOKEN"),
+        )
+        for dest_key, ini_opt, env_opt in tt_ini_map:
+            keys[dest_key] = _ini_str(provider_config, "tastytrade_api", ini_opt, env_opt, "")
+
+        if "TASTYTRADE" in selected:
+            prod_ready = bool(
+                keys["tastytrade_prod_client_secret"].strip()
+                and keys["tastytrade_prod_refresh_token"].strip()
+            )
+            sandbox_ready = bool(
+                keys["tastytrade_sandbox_client_secret"].strip()
+                and keys["tastytrade_sandbox_refresh_token"].strip()
+            )
+            logging.info(
+                "Tastytrade credentials loaded source=tastytrade_api prod_ready=%s sandbox_ready=%s",
+                prod_ready,
+                sandbox_ready,
+            )
     finally:
         if tmp_path:
             try:
@@ -10939,6 +11603,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <option value="TRADIER">TRADIER</option>
                         <option value="YAHOOFINANCE">YAHOOFINANCE</option>
                         <option value="TWELVEDATA">TWELVEDATA</option>
+                        <option value="TASTYTRADE">TASTYTRADE</option>
                     </select>
                 </div>
 
