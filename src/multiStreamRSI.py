@@ -2561,7 +2561,8 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_BUY_MAX_OPEN_CONTRACTS, OPTION_BUY_MAX_AGE_SECONDS
     global OPTION_BUY_FETCH_IF_MISSING, OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING
     global OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT, OPTION_BUY_REQUIRE_RIGHT_MATCH
-    global OPTION_BUY_ALLOWED_FORECASTS
+    global OPTION_BUY_ALLOWED_FORECASTS, OPTION_BUY_REQUIRE_POSITIVE_VELOCITY
+    global OPTION_BUY_MAX_SPREAD_PCT, OPTION_BUY_LIMIT_AGGRESSION, OPTION_BUY_MAX_BUYS_PER_MINUTE
     global OPTION_SELL_ENABLED, OPTION_SELL_DRY_RUN, OPTION_SELL_PAPER
     global OPTION_SELL_QTY, OPTION_SELL_CLOSE_FULL_POSITION
     global OPTION_SELL_ORDER_TYPE, OPTION_SELL_COOLDOWN_MINUTES
@@ -2574,7 +2575,7 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_SELL_TRAILING_DRAWDOWN_PCT, OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY
     global OPTION_SELL_PEAK_PROFIT_CALLS_ONLY
     global OPTION_SELL_STOP_LOSS_ENABLED, OPTION_SELL_STOP_LOSS_PCT
-    global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES
+    global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES, OPTION_SELL_MIN_HOLD_MINUTES
     global OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS, OPTION_SELL_STOP_LOSS_HARD_PCT
     global CHART_CAPTURE_ENABLED, CHART_CAPTURE_DIR, CHART_CAPTURE_HISTORY_BARS
     global CHART_CAPTURE_WIDTH, CHART_CAPTURE_HEIGHT
@@ -2621,7 +2622,7 @@ def _apply_ini_feature_settings(cfg):
         cfg, "option_buyer", "qty", "OPTION_BUY_QTY", 1, minimum=1
     )
     OPTION_BUY_ORDER_TYPE = (
-        _ini_str(cfg, "option_buyer", "order_type", "OPTION_BUY_ORDER_TYPE", "market")
+        _ini_str(cfg, "option_buyer", "order_type", "OPTION_BUY_ORDER_TYPE", "limit")
         .strip()
         .lower()
     )
@@ -2673,6 +2674,46 @@ def _apply_ini_feature_settings(cfg):
         "OPTION_BUY_REQUIRE_RIGHT_MATCH",
         True,
     )
+    OPTION_BUY_REQUIRE_POSITIVE_VELOCITY = _ini_bool(
+        cfg,
+        "option_buyer",
+        "require_positive_velocity",
+        "OPTION_BUY_REQUIRE_POSITIVE_VELOCITY",
+        True,
+    )
+    OPTION_BUY_MAX_SPREAD_PCT = max(
+        0.0,
+        abs(
+            _ini_float(
+                cfg,
+                "option_buyer",
+                "max_spread_pct",
+                "OPTION_BUY_MAX_SPREAD_PCT",
+                5.0,
+            )
+        ),
+    )
+    OPTION_BUY_LIMIT_AGGRESSION = min(
+        1.0,
+        max(
+            0.0,
+            _ini_float(
+                cfg,
+                "option_buyer",
+                "limit_aggression",
+                "OPTION_BUY_LIMIT_AGGRESSION",
+                0.25,
+            ),
+        ),
+    )
+    OPTION_BUY_MAX_BUYS_PER_MINUTE = _ini_int(
+        cfg,
+        "option_buyer",
+        "max_buys_per_minute",
+        "OPTION_BUY_MAX_BUYS_PER_MINUTE",
+        1,
+        minimum=0,
+    )
     raw_forecasts = _ini_str(
         cfg,
         "option_buyer",
@@ -2704,7 +2745,7 @@ def _apply_ini_feature_settings(cfg):
         True,
     )
     OPTION_SELL_ORDER_TYPE = (
-        _ini_str(cfg, "option_seller", "order_type", "OPTION_SELL_ORDER_TYPE", "market")
+        _ini_str(cfg, "option_seller", "order_type", "OPTION_SELL_ORDER_TYPE", "limit")
         .strip()
         .lower()
     )
@@ -2714,6 +2755,14 @@ def _apply_ini_feature_settings(cfg):
         "cooldown_minutes",
         "OPTION_SELL_COOLDOWN_MINUTES",
         15,
+        minimum=0,
+    )
+    OPTION_SELL_MIN_HOLD_MINUTES = _ini_int(
+        cfg,
+        "option_seller",
+        "min_hold_minutes",
+        "OPTION_SELL_MIN_HOLD_MINUTES",
+        5,
         minimum=0,
     )
     OPTION_SELL_OPTIONS_ONLY = _ini_bool(
@@ -2744,7 +2793,7 @@ def _apply_ini_feature_settings(cfg):
                 "option_seller",
                 "limit_discount_pct",
                 "OPTION_SELL_LIMIT_DISCOUNT_PCT",
-                1.0,
+                0.5,
             )
         ),
     )
@@ -2846,7 +2895,7 @@ def _apply_ini_feature_settings(cfg):
                 "option_seller",
                 "stop_loss_pct",
                 "OPTION_SELL_STOP_LOSS_PCT",
-                4.0,
+                10.0,
             )
         ),
     )
@@ -2855,7 +2904,7 @@ def _apply_ini_feature_settings(cfg):
         "option_seller",
         "stop_loss_consecutive_minutes",
         "OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES",
-        3,
+        5,
         minimum=1,
     )
     OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS = _ini_bool(
@@ -2873,7 +2922,7 @@ def _apply_ini_feature_settings(cfg):
                 "option_seller",
                 "stop_loss_hard_pct",
                 "OPTION_SELL_STOP_LOSS_HARD_PCT",
-                0.0,
+                25.0,
             )
         ),
     )
@@ -3126,7 +3175,7 @@ OPTION_BUY_DRY_RUN = os.getenv("OPTION_BUY_DRY_RUN", "true").strip().lower() in 
     "yes",
 }
 OPTION_BUY_QTY = max(1, int(os.getenv("OPTION_BUY_QTY", "1")))
-OPTION_BUY_ORDER_TYPE = os.getenv("OPTION_BUY_ORDER_TYPE", "market").strip().lower()
+OPTION_BUY_ORDER_TYPE = os.getenv("OPTION_BUY_ORDER_TYPE", "limit").strip().lower()
 OPTION_BUY_COOLDOWN_MINUTES = max(
     0, int(os.getenv("OPTION_BUY_COOLDOWN_MINUTES", "15"))
 )
@@ -3148,6 +3197,18 @@ OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT = os.getenv(
 OPTION_BUY_REQUIRE_RIGHT_MATCH = os.getenv(
     "OPTION_BUY_REQUIRE_RIGHT_MATCH", "true"
 ).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_REQUIRE_POSITIVE_VELOCITY = os.getenv(
+    "OPTION_BUY_REQUIRE_POSITIVE_VELOCITY", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_MAX_SPREAD_PCT = max(
+    0.0, abs(float(os.getenv("OPTION_BUY_MAX_SPREAD_PCT", "5.0")))
+)
+OPTION_BUY_LIMIT_AGGRESSION = min(
+    1.0, max(0.0, float(os.getenv("OPTION_BUY_LIMIT_AGGRESSION", "0.25")))
+)
+OPTION_BUY_MAX_BUYS_PER_MINUTE = max(
+    0, int(os.getenv("OPTION_BUY_MAX_BUYS_PER_MINUTE", "1"))
+)
 OPTION_BUY_ALLOWED_FORECASTS = {
     s.strip().lower()
     for s in os.getenv(
@@ -3173,9 +3234,12 @@ OPTION_SELL_QTY = max(1, int(os.getenv("OPTION_SELL_QTY", "1")))
 OPTION_SELL_CLOSE_FULL_POSITION = os.getenv(
     "OPTION_SELL_CLOSE_FULL_POSITION", "true"
 ).strip().lower() in {"1", "true", "yes"}
-OPTION_SELL_ORDER_TYPE = os.getenv("OPTION_SELL_ORDER_TYPE", "market").strip().lower()
+OPTION_SELL_ORDER_TYPE = os.getenv("OPTION_SELL_ORDER_TYPE", "limit").strip().lower()
 OPTION_SELL_COOLDOWN_MINUTES = max(
     0, int(os.getenv("OPTION_SELL_COOLDOWN_MINUTES", "15"))
+)
+OPTION_SELL_MIN_HOLD_MINUTES = max(
+    0, int(os.getenv("OPTION_SELL_MIN_HOLD_MINUTES", "5"))
 )
 OPTION_SELL_OPTIONS_ONLY = os.getenv(
     "OPTION_SELL_OPTIONS_ONLY", "false"
@@ -3192,7 +3256,7 @@ OPTION_SELL_ALLOWED_FORECASTS = {
     if s.strip()
 }
 OPTION_SELL_LIMIT_DISCOUNT_PCT = max(
-    0.0, abs(float(os.getenv("OPTION_SELL_LIMIT_DISCOUNT_PCT", "1.0")))
+    0.0, abs(float(os.getenv("OPTION_SELL_LIMIT_DISCOUNT_PCT", "0.5")))
 )
 OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT = max(
     0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT", "3.0")))
@@ -3225,16 +3289,16 @@ OPTION_SELL_STOP_LOSS_ENABLED = os.getenv(
     "OPTION_SELL_STOP_LOSS_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes"}
 OPTION_SELL_STOP_LOSS_PCT = max(
-    0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_PCT", "4.0")))
+    0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_PCT", "10.0")))
 )
 OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES = max(
-    1, int(os.getenv("OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES", "3"))
+    1, int(os.getenv("OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES", "5"))
 )
 OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS = os.getenv(
     "OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS", "true"
 ).strip().lower() in {"1", "true", "yes"}
 OPTION_SELL_STOP_LOSS_HARD_PCT = max(
-    0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_HARD_PCT", "0.0")))
+    0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_HARD_PCT", "25.0")))
 )
 CHART_CAPTURE_ENABLED = os.getenv("CHART_CAPTURE_ENABLED", "true").strip().lower() in {
     "1",
@@ -4555,19 +4619,30 @@ class AlpacaOptionBuyer:
         crossover = str(entry.get("crossover_signal") or "none").lower()
         proj_delta = entry.get("projected_delta")
 
+        if OPTION_BUY_REQUIRE_POSITIVE_VELOCITY and vel <= 0:
+            return (
+                False,
+                None,
+                f"velocity_not_positive(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f})",
+            )
+
         reason = None
         if vel > 0 and acc > 0:
             reason = f"rsi={rsi:.2f}<=low&bullish_thrust(v={vel:+.4f},a={acc:+.4f})"
-        elif vel < 0 and acc > 0:
+        elif not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY and vel < 0 and acc > 0:
             tag = (
                 forecast
                 if forecast in OPTION_BUY_ALLOWED_FORECASTS
                 else "oversold_decel_bottom"
             )
             reason = f"rsi={rsi:.2f}<=low&{tag}(v={vel:+.4f},a={acc:+.4f})"
-        elif crossover in {"leading_bullish", "confirmed_bullish"} and acc >= 0:
+        elif crossover in {"leading_bullish", "confirmed_bullish"} and acc >= 0 and (
+            not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0
+        ):
             reason = f"rsi={rsi:.2f}<=low&crossover={crossover}"
-        elif forecast in OPTION_BUY_ALLOWED_FORECASTS and acc > 0:
+        elif forecast in OPTION_BUY_ALLOWED_FORECASTS and acc > 0 and (
+            not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0
+        ):
             reason = f"rsi={rsi:.2f}<=low&forecast={forecast}"
 
         if reason is None:
@@ -4670,6 +4745,7 @@ class AlpacaOptionBuyer:
         open_contracts = set()
         open_underlyings = set()
         open_option_count = 0
+        buys_this_cycle = 0
 
         async def ensure_open_positions():
             nonlocal positions_loaded, open_contracts, open_underlyings, open_option_count
@@ -4688,6 +4764,15 @@ class AlpacaOptionBuyer:
             positions_loaded = True
 
         for symbol in self.coordinator.symbols:
+            if OPTION_BUY_MAX_BUYS_PER_MINUTE > 0 and buys_this_cycle >= OPTION_BUY_MAX_BUYS_PER_MINUTE:
+                self.logger.info(
+                    "OPTION_BUY_CYCLE_CAP_REACHED count=%d limit=%d minute=%s",
+                    buys_this_cycle,
+                    OPTION_BUY_MAX_BUYS_PER_MINUTE,
+                    minute_key,
+                )
+                break
+
             dedup_key = (symbol, minute_key)
             if dedup_key in self.attempted_minutes:
                 continue
@@ -4851,11 +4936,43 @@ class AlpacaOptionBuyer:
                     contract_ask = live_ask
 
             if (
-                OPTION_BUY_ORDER_TYPE == "limit"
-                and (limit_price is None or limit_price <= 0)
+                contract_bid is not None
                 and contract_ask is not None
+                and contract_ask >= contract_bid
             ):
-                limit_price = round(contract_ask, 2)
+                mid_quote = (contract_bid + contract_ask) / 2.0
+                spread_pct = (
+                    ((contract_ask - contract_bid) / mid_quote) * 100.0
+                    if mid_quote > 0
+                    else 0.0
+                )
+                if OPTION_BUY_MAX_SPREAD_PCT > 0 and spread_pct > OPTION_BUY_MAX_SPREAD_PCT:
+                    self.logger.info(
+                        "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=spread_too_wide "
+                        "spread_pct=%.2f%% max=%.2f%% bid=%.2f ask=%.2f",
+                        symbol,
+                        contract_symbol,
+                        spread_pct,
+                        OPTION_BUY_MAX_SPREAD_PCT,
+                        contract_bid,
+                        contract_ask,
+                    )
+                    continue
+
+            if OPTION_BUY_ORDER_TYPE == "limit":
+                if (
+                    contract_bid is not None
+                    and contract_ask is not None
+                    and contract_ask >= contract_bid
+                ):
+                    raw_lp = contract_bid + (contract_ask - contract_bid) * OPTION_BUY_LIMIT_AGGRESSION
+                    limit_price = round(
+                        max(0.01, min(contract_ask, max(contract_bid, raw_lp))), 2
+                    )
+                elif (limit_price is None or limit_price <= 0) and contract_ask is not None:
+                    limit_price = round(max(0.01, contract_ask), 2)
+                elif (limit_price is None or limit_price <= 0) and contract_bid is not None:
+                    limit_price = round(max(0.01, contract_bid), 2)
 
             est_unit_price = (
                 limit_price
@@ -4872,6 +4989,7 @@ class AlpacaOptionBuyer:
 
             if OPTION_BUY_DRY_RUN:
                 self.dry_run_orders += 1
+                buys_this_cycle += 1
                 self.last_buy_by_symbol[symbol] = now
                 self.last_order_utc = now.isoformat()
                 self.last_order_contract = contract_symbol
@@ -4982,6 +5100,7 @@ class AlpacaOptionBuyer:
                         pass
 
                 self.orders_submitted += 1
+                buys_this_cycle += 1
                 self.last_error_detail = None
                 open_option_count += 1
                 open_contracts.add(contract_symbol)
@@ -5067,10 +5186,16 @@ class AlpacaOptionBuyer:
 
         self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
         self.logger.info(
-            "OPTION_BUYER_START mode=%s rsi_low<=%.2f qty=%d cooldown_min=%d max_open=%d allowed=%s",
+            "OPTION_BUYER_START mode=%s rsi_low<=%.2f qty=%d order_type=%s aggr=%.2f "
+            "max_spread=%.2f%% pos_vel=%s max_per_min=%d cooldown_min=%d max_open=%d allowed=%s",
             self.mode,
             OPTION_CHAIN_RSI_LOW,
             OPTION_BUY_QTY,
+            OPTION_BUY_ORDER_TYPE,
+            OPTION_BUY_LIMIT_AGGRESSION,
+            OPTION_BUY_MAX_SPREAD_PCT,
+            OPTION_BUY_REQUIRE_POSITIVE_VELOCITY,
+            OPTION_BUY_MAX_BUYS_PER_MINUTE,
             OPTION_BUY_COOLDOWN_MINUTES,
             OPTION_BUY_MAX_OPEN_CONTRACTS,
             sorted(OPTION_BUY_ALLOWED_FORECASTS),
@@ -5157,6 +5282,7 @@ class AlpacaOptionSeller:
         self.trailing_stop_orders = 0
         self.stop_loss_orders = 0
         self.last_sell_by_symbol = {}
+        self.first_seen_at_by_symbol = {}
         self.peak_profit_state_by_symbol = {}
         self.stop_loss_state_by_symbol = {}
         self.attempted_minutes = set()
@@ -5573,9 +5699,12 @@ class AlpacaOptionSeller:
         return limit_price
 
     async def _resolve_sell_order_params(self, pos_sym, cur_price, is_option, trigger_kind):
-        """Compute (order_type, live_bid, live_ask, limit_price) with marketable discount
-        below min(live_bid, current_price), and deeper discount / optional market override
-        for stop-loss exits."""
+        """Compute (order_type, live_bid, live_ask, limit_price) for SELL orders.
+
+        Profit/kinematic exits price from Mid (floored at Bid) so they don't
+        needlessly undercut the Bid, while stop-loss exits discount below Bid
+        or optionally submit Market orders when configured.
+        """
         live_bid, live_ask = await asyncio.to_thread(
             self._fetch_live_quote, pos_sym, is_option
         )
@@ -5585,6 +5714,17 @@ class AlpacaOptionSeller:
             return "market", live_bid, live_ask, None
 
         cur_val = cur_price if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0) else None
+        if (
+            trigger_kind != "stop_loss"
+            and live_bid is not None
+            and live_ask is not None
+            and live_ask >= live_bid
+        ):
+            mid = (live_bid + live_ask) / 2.0
+            raw_limit = mid * (1.0 - (OPTION_SELL_LIMIT_DISCOUNT_PCT / 100.0))
+            limit_price = round(max(0.01, max(live_bid, min(live_ask, raw_limit))), 2)
+            return "limit", live_bid, live_ask, limit_price
+
         candidates = [p for p in (live_bid, cur_val) if p is not None]
         if not candidates:
             return "market", live_bid, live_ask, None
@@ -5689,9 +5829,23 @@ class AlpacaOptionSeller:
             if OPTION_SELL_OPTIONS_ONLY and not is_option:
                 continue
 
-            seen_long_symbols.add(pos_sym)
             is_call = self._is_call_contract(pos_sym, is_option)
             underlying = self._extract_underlying(pos, pos_sym, is_option)
+            seen_long_symbols.add(pos_sym)
+            if pos_sym not in self.first_seen_at_by_symbol:
+                inferred_entry_dt = now
+                for buy_evt in reversed(self.coordinator.option_buy_events.get(underlying, []) or []):
+                    buy_ts = buy_evt.get("executed_at_utc") or buy_evt.get("executed_at")
+                    if str(buy_evt.get("contract") or "").strip().upper() == pos_sym and buy_ts:
+                        try:
+                            parsed_buy = datetime.fromisoformat(str(buy_ts).replace("Z", "+00:00"))
+                            if parsed_buy.tzinfo is not None:
+                                inferred_entry_dt = as_utc(parsed_buy)
+                                break
+                        except Exception:
+                            pass
+                self.first_seen_at_by_symbol[pos_sym] = inferred_entry_dt
+            hold_minutes = max(0.0, (now - self.first_seen_at_by_symbol[pos_sym]).total_seconds() / 60.0)
             pnl_pct = self._position_pnl_pct(pos)
             peak_pnl, drawdown_pct = self._update_peak_profit_state(
                 pos_sym, pnl_pct, now.isoformat()
@@ -5774,8 +5928,12 @@ class AlpacaOptionSeller:
                         ts_vel_reason,
                     )
 
-            # 4. Stop-Loss Protection (hard circuit breaker OR consecutive minutes + downward pressure)
+            # 4. Stop-Loss Protection (respects min_hold_minutes grace period to avoid Ask/Bid spread liquidation)
             if not qualifies and OPTION_SELL_STOP_LOSS_ENABLED:
+                in_hold_grace = (
+                    OPTION_SELL_MIN_HOLD_MINUTES > 0
+                    and hold_minutes < OPTION_SELL_MIN_HOLD_MINUTES
+                )
                 hard_pct = OPTION_SELL_STOP_LOSS_HARD_PCT
                 if (
                     hard_pct > 0
@@ -5783,50 +5941,74 @@ class AlpacaOptionSeller:
                     and math.isfinite(pnl_pct)
                     and pnl_pct < -hard_pct
                 ):
-                    qualifies = True
-                    trigger_kind = "stop_loss"
-                    reason = (
-                        f"hard_stop_loss(pnl={pnl_pct:.2f}%<-{hard_pct:.2f}%,"
-                        f"streak={loss_streak})"
-                    )
+                    if in_hold_grace:
+                        self.logger.info(
+                            "OPTION_SELL_HOLD_GRACE_ACTIVE symbol=%s underlying=%s "
+                            "pnl_pct=%.2f%% hold_min=%.2f<%d (suppressing hard_stop_loss)",
+                            pos_sym,
+                            underlying,
+                            pnl_pct,
+                            hold_minutes,
+                            OPTION_SELL_MIN_HOLD_MINUTES,
+                        )
+                    else:
+                        qualifies = True
+                        trigger_kind = "stop_loss"
+                        reason = (
+                            f"hard_stop_loss(pnl={pnl_pct:.2f}%<-{hard_pct:.2f}%,"
+                            f"streak={loss_streak})"
+                        )
                 elif (
                     OPTION_SELL_STOP_LOSS_PCT > 0
                     and loss_streak >= OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES
                 ):
-                    if OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS:
-                        sl_kin_ok, sl_kin_reason = self._evaluate_stop_loss_kinematics(entry)
-                    else:
-                        sl_kin_ok, sl_kin_reason = True, "kinematics_bypassed"
-
-                    if sl_kin_ok:
-                        qualifies = True
-                        trigger_kind = "stop_loss"
-                        reason = (
-                            f"stop_loss(pnl={pnl_pct:.2f}%<-{OPTION_SELL_STOP_LOSS_PCT:.2f}%,"
-                            f"streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES})&"
-                            f"{sl_kin_reason}"
-                        )
-                    else:
+                    if in_hold_grace:
                         self.logger.info(
-                            "OPTION_SELL_STOP_LOSS_HOLD symbol=%s underlying=%s "
-                            "pnl_pct=%.2f%% streak=%d/%d reason=%s",
+                            "OPTION_SELL_HOLD_GRACE_ACTIVE symbol=%s underlying=%s "
+                            "pnl_pct=%.2f%% hold_min=%.2f<%d streak=%d (suppressing stop_loss)",
                             pos_sym,
                             underlying,
                             pnl_pct if pnl_pct is not None else 0.0,
+                            hold_minutes,
+                            OPTION_SELL_MIN_HOLD_MINUTES,
                             loss_streak,
-                            OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
-                            sl_kin_reason,
                         )
+                    else:
+                        if OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS:
+                            sl_kin_ok, sl_kin_reason = self._evaluate_stop_loss_kinematics(entry)
+                        else:
+                            sl_kin_ok, sl_kin_reason = True, "kinematics_bypassed"
+
+                        if sl_kin_ok:
+                            qualifies = True
+                            trigger_kind = "stop_loss"
+                            reason = (
+                                f"stop_loss(pnl={pnl_pct:.2f}%<-{OPTION_SELL_STOP_LOSS_PCT:.2f}%,"
+                                f"streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES})&"
+                                f"{sl_kin_reason}"
+                            )
+                        else:
+                            self.logger.info(
+                                "OPTION_SELL_STOP_LOSS_HOLD symbol=%s underlying=%s "
+                                "pnl_pct=%.2f%% streak=%d/%d reason=%s",
+                                pos_sym,
+                                underlying,
+                                pnl_pct if pnl_pct is not None else 0.0,
+                                loss_streak,
+                                OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
+                                sl_kin_reason,
+                            )
                 elif loss_streak > 0:
                     self.logger.info(
                         "OPTION_SELL_STOP_LOSS_WATCH symbol=%s underlying=%s "
-                        "pnl_pct=%.2f%% threshold=-%.2f%% streak=%d/%d",
+                        "pnl_pct=%.2f%% threshold=-%.2f%% streak=%d/%d hold_min=%.2f",
                         pos_sym,
                         underlying,
                         pnl_pct if pnl_pct is not None else 0.0,
                         OPTION_SELL_STOP_LOSS_PCT,
                         loss_streak,
                         OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
+                        hold_minutes,
                     )
 
             if not qualifies:
@@ -6079,6 +6261,9 @@ class AlpacaOptionSeller:
         for stale_sym in list(self.peak_profit_state_by_symbol.keys()):
             if stale_sym not in seen_long_symbols:
                 self.peak_profit_state_by_symbol.pop(stale_sym, None)
+        for stale_sym in list(self.first_seen_at_by_symbol.keys()):
+            if stale_sym not in seen_long_symbols:
+                self.first_seen_at_by_symbol.pop(stale_sym, None)
 
         if not str(self.last_status).startswith(("order_error", "positions_error")):
             self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
@@ -6101,7 +6286,7 @@ class AlpacaOptionSeller:
         self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
         self.logger.info(
             "OPTION_SELLER_START mode=%s rsi_high>=%.2f qty=%d close_full=%s "
-            "options_only=%s cooldown_min=%d order_type=%s limit_disc=%.2f%% sl_disc=%.2f%% "
+            "options_only=%s cooldown_min=%d min_hold=%dm order_type=%s limit_disc=%.2f%% sl_disc=%.2f%% "
             "pt_enabled=%s pt=%.1f%% ts_enabled=%s ts_act=%.1f%% ts_dd=%.1f%% ts_vel=%s "
             "allowed=%s sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_kin=%s sl_hard=%.2f%%",
             self.mode,
@@ -6110,6 +6295,7 @@ class AlpacaOptionSeller:
             OPTION_SELL_CLOSE_FULL_POSITION,
             OPTION_SELL_OPTIONS_ONLY,
             OPTION_SELL_COOLDOWN_MINUTES,
+            OPTION_SELL_MIN_HOLD_MINUTES,
             OPTION_SELL_ORDER_TYPE,
             OPTION_SELL_LIMIT_DISCOUNT_PCT,
             OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT,
