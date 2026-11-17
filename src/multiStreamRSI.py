@@ -391,6 +391,7 @@ class SessionRSI:
         self.latest_price_velocity = None
         self.latest_price_acceleration = None
         self.latest = None
+        self._last_metrics = None
         self.provider = provider
 
     def reset_session(self, day):
@@ -406,6 +407,7 @@ class SessionRSI:
         self.latest_rsi_acceleration = None
         self.latest_price_velocity = None
         self.latest_price_acceleration = None
+        self._last_metrics = None
         self.logger.info("SESSION_START date=%s", day)
 
     def begin_session(self, day):
@@ -538,6 +540,18 @@ class SessionRSI:
             self.latest_rsi_velocity = rsi_velocity
             self.latest_rsi_acceleration = rsi_acceleration
             self.previous_rsi = value
+
+        self._last_metrics = {
+            "timestamp": timestamp,
+            "close": close,
+            "rsi": value,
+            "rsi_velocity": rsi_velocity,
+            "rsi_acceleration": rsi_acceleration,
+            "price_velocity": price_velocity,
+            "price_velocity_pct": price_velocity_pct,
+            "price_acceleration": price_acceleration,
+            "changes": self.changes,
+        }
 
         observation = None
 
@@ -2319,36 +2333,65 @@ class MinuteCoordinator:
             return 0
         tracker = self.trackers[(provider, symbol)]
         applied = 0
-        sorted_bars = sorted(bars, key=lambda item: item.timestamp)
+        deduped_by_min = {}
+        for bar in sorted(bars, key=lambda item: item.timestamp):
+            deduped_by_min[normalized_time(bar.timestamp)] = bar
+        sorted_bars = [deduped_by_min[k] for k in sorted(deduped_by_min.keys())]
+        per_bar_metrics = {}
         for bar in sorted_bars:
             before = tracker.changes
+            bar_ts = normalized_time(bar.timestamp)
             tracker.process_bar(bar, "WARMUP_BACKFILL", warmup=True)
             if tracker.changes != before or tracker.previous_close is not None:
                 applied += 1
-        # Seed warmup kinematics history so initial live summaries have velocity & smoothed context
+            snap = getattr(tracker, "_last_metrics", None)
+            if snap is not None and snap.get("timestamp") == bar_ts:
+                per_bar_metrics[bar_ts] = snap
+        # Seed warmup kinematics history so initial live summaries & charts have full RSI, velocity & smoothed context
         if sorted_bars:
             history = self.kinematics_history.setdefault((provider, symbol), [])
+            existing_by_min = {
+                entry.get("minute"): idx_existing
+                for idx_existing, entry in enumerate(history)
+                if entry.get("minute") is not None
+            }
             seed_slice = sorted_bars[-60:]
             seed_closes = [b.close for b in seed_slice]
             smoothed_seed = compute_smoothed_series(seed_closes)
             prev_sv = None
             prev_sa = None
             for idx, b in enumerate(seed_slice):
+                b_ts = normalized_time(b.timestamp)
+                m = per_bar_metrics.get(b_ts)
                 sc = round(smoothed_seed[idx], 4)
                 sv = round(sc - smoothed_seed[idx - 1], 4) if idx >= 1 else None
                 sa = round(sv - prev_sv, 4) if (sv is not None and prev_sv is not None) else None
-                pv = tracker.latest_price_velocity if idx == len(seed_slice) - 1 else (
-                    round(b.close - seed_slice[idx - 1].close, 4) if idx >= 1 else None
+                pv = (
+                    m["price_velocity"]
+                    if (m is not None and m.get("price_velocity") is not None)
+                    else (
+                        round(b.close - seed_slice[idx - 1].close, 4)
+                        if idx >= 1
+                        else None
+                    )
                 )
-                pa = tracker.latest_price_acceleration if idx == len(seed_slice) - 1 else None
-                rv = tracker.latest_rsi_velocity if idx == len(seed_slice) - 1 else None
-                ra = tracker.latest_rsi_acceleration if idx == len(seed_slice) - 1 else None
-                seed_rsi = (
-                    tracker.latest["rsi"]
-                    if tracker.latest is not None
-                    else tracker.previous_rsi
-                )
-                rsi_val = seed_rsi if idx == len(seed_slice) - 1 else None
+                pv_pct = m.get("price_velocity_pct") if m is not None else None
+                pa = m.get("price_acceleration") if m is not None else None
+                rv = m.get("rsi_velocity") if m is not None else None
+                ra = m.get("rsi_acceleration") if m is not None else None
+                if m is not None:
+                    rsi_val = m.get("rsi")
+                    rsi_changes = m.get("changes")
+                elif idx == len(seed_slice) - 1:
+                    rsi_val = (
+                        tracker.latest["rsi"]
+                        if tracker.latest is not None
+                        else tracker.previous_rsi
+                    )
+                    rsi_changes = tracker.changes
+                else:
+                    rsi_val = None
+                    rsi_changes = None
                 reg = classify_kinematic_regime(rv, ra, sv if sv is not None else pv, sa if sa is not None else pa)
                 fc = compute_kinematic_forecast(
                     b.close,
@@ -2359,37 +2402,47 @@ class MinuteCoordinator:
                     prev_acceleration=prev_sa,
                 )
                 if idx >= len(seed_slice) - 20:
-                    history.append(
-                        {
-                            "minute": minute_utc(b.timestamp),
-                            "timestamp": (
-                                b.timestamp.isoformat()
-                                if hasattr(b.timestamp, "isoformat")
-                                else str(b.timestamp)
-                            ),
-                            "close": b.close,
-                            "smoothed_close": sc,
-                            "rsi": rsi_val,
-                            "price_velocity": pv,
-                            "price_velocity_pct": None,
-                            "price_acceleration": pa,
-                            "smoothed_velocity": sv,
-                            "smoothed_acceleration": sa,
-                            "rsi_velocity": rv,
-                            "rsi_acceleration": ra,
-                            "projected_price_next": fc["projected_price_next"],
-                            "projected_delta_pct": fc["projected_delta_pct"],
-                            "rsi_zone": fc["rsi_zone"],
-                            "forecast_direction": fc["forecast_direction"],
-                            "trading_action": fc["trading_action"],
-                            "crossover_signal": fc["crossover_signal"],
-                            "regime": reg,
-                            "rsi_changes": tracker.changes if idx == len(seed_slice) - 1 else None,
-                            "rsi_period": tracker.period,
-                        }
-                    )
+                    b_min = minute_utc(b.timestamp)
+                    if b_min in existing_by_min and m is None:
+                        prev_sv = sv
+                        prev_sa = sa
+                        continue
+                    seed_entry = {
+                        "minute": b_min,
+                        "timestamp": (
+                            b.timestamp.isoformat()
+                            if hasattr(b.timestamp, "isoformat")
+                            else str(b.timestamp)
+                        ),
+                        "close": b.close,
+                        "smoothed_close": sc,
+                        "rsi": rsi_val,
+                        "price_velocity": pv,
+                        "price_velocity_pct": pv_pct,
+                        "price_acceleration": pa,
+                        "smoothed_velocity": sv,
+                        "smoothed_acceleration": sa,
+                        "rsi_velocity": rv,
+                        "rsi_acceleration": ra,
+                        "projected_price_next": fc["projected_price_next"],
+                        "projected_delta_pct": fc["projected_delta_pct"],
+                        "rsi_zone": fc["rsi_zone"],
+                        "forecast_direction": fc["forecast_direction"],
+                        "trading_action": fc["trading_action"],
+                        "crossover_signal": fc["crossover_signal"],
+                        "regime": reg,
+                        "rsi_changes": rsi_changes,
+                        "rsi_period": tracker.period,
+                    }
+                    if b_min in existing_by_min:
+                        history[existing_by_min[b_min]] = seed_entry
+                    else:
+                        existing_by_min[b_min] = len(history)
+                        history.append(seed_entry)
                 prev_sv = sv
                 prev_sa = sa
+            if len(history) > 60:
+                del history[:-60]
         logging.info(
             "RSI_WARMUP provider=%s symbol=%s bars=%d applied=%d changes=%d "
             "converged=%s",
@@ -9349,6 +9402,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "momentums": [],
                 "regimes": [],
                 "best_history": [],
+                "best_history_score": (-1, -1, ""),
                 "latest_timestamps": [],
             },
         )
@@ -9356,7 +9410,12 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
         sym_group["entries"].append(entry)
         if entry["timestamp"]:
             sym_group["latest_timestamps"].append(str(entry["timestamp"]))
-        if len(eff_hist) > len(sym_group["best_history"]):
+        window_slice = eff_hist[-hist_cap:]
+        window_rsi_count = sum(1 for h in window_slice if h.get("rsi") is not None)
+        window_last_ts = str(window_slice[-1].get("timestamp") or "") if window_slice else ""
+        window_score = (window_rsi_count, len(window_slice), window_last_ts)
+        if window_score > sym_group["best_history_score"]:
+            sym_group["best_history_score"] = window_score
             sym_group["best_history"] = [
                 {
                     "timestamp": h.get("timestamp"),
@@ -9369,7 +9428,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                     "rsi": h.get("rsi"),
                     "crossover_signal": h.get("crossover_signal"),
                 }
-                for h in eff_hist[-hist_cap:]
+                for h in window_slice
             ]
         if entry["close"] is not None:
             sym_group["closes"].append(entry["close"])
@@ -12698,7 +12757,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const smoothPts = poly(points.map(p => safeNum(p.smoothed_close)), yP);
             const velPts = poly(vels, yVA);
             const accPts = poly(accs, yVA);
-            const rsiPts = poly(points.map(p => safeNum(p.rsi)), yR);
+            const rsiCoords = points.map((p, i) => {
+                const rv = safeNum(p.rsi);
+                return rv === null ? null : { x: xAt(i), y: yR(rv), v: rv };
+            }).filter(Boolean);
+            const rsiPts = rsiCoords.map(c => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
 
             const lastX = xAt(n - 1);
             const lastY = yP(points[n - 1].close);
@@ -12808,7 +12871,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <polyline fill="none" stroke="#fb923c" stroke-width="1.5" points="${accPts}" />
                     ${crossMarkers}
 
-                    ${rsiPts ? `<polyline fill="none" stroke="#c084fc" stroke-width="1.6" points="${rsiPts}" />` : ''}
+                    ${rsiCoords.length >= 2 ? `<polyline fill="none" stroke="#c084fc" stroke-width="1.6" points="${rsiPts}" /><circle cx="${rsiCoords[rsiCoords.length - 1].x.toFixed(1)}" cy="${rsiCoords[rsiCoords.length - 1].y.toFixed(1)}" r="2.6" fill="#c084fc" stroke="#0f172a" stroke-width="0.9" />` : (rsiCoords.length === 1 ? `<circle cx="${rsiCoords[0].x.toFixed(1)}" cy="${rsiCoords[0].y.toFixed(1)}" r="3.0" fill="#c084fc" stroke="#0f172a" stroke-width="1" />` : '')}
                     ${buyMarkers}
                 </svg>
             `;
