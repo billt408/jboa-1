@@ -10348,34 +10348,42 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div id="symbolDeepDiveContent" class="mt-4 space-y-4">
                     <!-- Kinematic Projection & 3-Panel Synchronized Crossover Chart -->
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                        <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-4 space-y-3">
-                            <div class="flex items-center justify-between">
-                                <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Next-Step Projection</span>
-                                <span id="detailSmoothTag" class="text-[10px] mono text-indigo-300">HMA(14) Synced</span>
+                        <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between gap-3">
+                            <div class="space-y-3">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Next-Step Projection</span>
+                                    <span id="detailSmoothTag" class="text-[10px] mono text-indigo-300">HMA(14) Synced</span>
+                                </div>
+                                <div class="flex items-baseline justify-between">
+                                    <div>
+                                        <div class="text-[11px] text-slate-400">P̂<sub>t+1</sub> = P<sub>t</sub> + v<sub>t</sub> + &frac12;a<sub>t</sub></div>
+                                        <div id="detailProjectedPrice" class="text-2xl font-extrabold mono text-cyan-300 mt-0.5">--</div>
+                                    </div>
+                                    <div class="text-right">
+                                        <div class="text-[11px] text-slate-400">Expected &Delta;</div>
+                                        <div id="detailProjectedDelta" class="text-sm font-bold mono text-slate-300 mt-0.5">--</div>
+                                    </div>
+                                </div>
+                                <div class="pt-2.5 border-t border-slate-800/80 space-y-1.5 text-[11px]">
+                                    <div class="flex justify-between">
+                                        <span class="text-slate-400">RSI Boundary Zone:</span>
+                                        <span id="detailRsiZone" class="mono font-semibold text-slate-200">--</span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span class="text-slate-400">Crossover Event:</span>
+                                        <span id="detailCrossoverSignal" class="mono font-semibold text-slate-200">none</span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span class="text-slate-400">Forecast Action:</span>
+                                        <span id="detailTradingAction" class="font-semibold text-amber-300 text-right">--</span>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="flex items-baseline justify-between">
-                                <div>
-                                    <div class="text-[11px] text-slate-400">P̂<sub>t+1</sub> = P<sub>t</sub> + v<sub>t</sub> + &frac12;a<sub>t</sub></div>
-                                    <div id="detailProjectedPrice" class="text-2xl font-extrabold mono text-cyan-300 mt-0.5">--</div>
-                                </div>
-                                <div class="text-right">
-                                    <div class="text-[11px] text-slate-400">Expected &Delta;</div>
-                                    <div id="detailProjectedDelta" class="text-sm font-bold mono text-slate-300 mt-0.5">--</div>
-                                </div>
-                            </div>
-                            <div class="pt-2.5 border-t border-slate-800/80 space-y-1.5 text-[11px]">
-                                <div class="flex justify-between">
-                                    <span class="text-slate-400">RSI Boundary Zone:</span>
-                                    <span id="detailRsiZone" class="mono font-semibold text-slate-200">--</span>
-                                </div>
-                                <div class="flex justify-between">
-                                    <span class="text-slate-400">Crossover Event:</span>
-                                    <span id="detailCrossoverSignal" class="mono font-semibold text-slate-200">none</span>
-                                </div>
-                                <div class="flex justify-between">
-                                    <span class="text-slate-400">Forecast Action:</span>
-                                    <span id="detailTradingAction" class="font-semibold text-amber-300 text-right">--</span>
-                                </div>
+                            <div class="pt-2 border-t border-slate-800/70 flex items-center justify-between gap-2">
+                                <button id="btnDetailBuySellLog" type="button" onclick="openOptionLogsPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="View Buy/Sell Decision Log for this symbol">
+                                    Buy/Sell Log
+                                </button>
+                                <span class="text-[10px] text-slate-500 mono">1m Option Analysis</span>
                             </div>
                         </div>
 
@@ -11519,12 +11527,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                         </td>
                         <td class="px-4 py-2.5 text-center">
-                            <div class="flex items-center justify-center gap-1">
-                                <button onclick="event.stopPropagation(); selectAndInspectSymbol('${item.symbol}')" class="px-2 py-0.5 bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 rounded border border-indigo-800 text-[10px] mono transition">
-                                    Inspect
-                                </button>
-                                <button onclick="event.stopPropagation(); toggleInjectModal('${item.symbol}')" class="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition" title="Inject Test Bar">
-                                    +
+                            <div class="flex flex-col items-center justify-center gap-1">
+                                <div class="flex items-center justify-center gap-1">
+                                    <button onclick="event.stopPropagation(); selectAndInspectSymbol('${item.symbol}')" class="px-2 py-0.5 bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 rounded border border-indigo-800 text-[10px] mono transition">
+                                        Inspect
+                                    </button>
+                                    <button onclick="event.stopPropagation(); toggleInjectModal('${item.symbol}')" class="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition" title="Inject Test Bar">
+                                        +
+                                    </button>
+                                </div>
+                                <button type="button" onclick="event.stopPropagation(); openOptionLogsPanel('${item.symbol}')" class="px-2 py-0.5 bg-emerald-950/70 hover:bg-emerald-800/70 text-emerald-300 hover:text-white rounded border border-emerald-700/60 text-[10px] mono transition whitespace-nowrap" title="View Buy/Sell Decision Log for ${item.symbol}">
+                                    Buy/Sell Log
                                 </button>
                             </div>
                         </td>
@@ -11584,9 +11597,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold border ${fConf.cls}">${fConf.label}</span>
                         </td>
                         <td class="px-4 py-2.5 text-center">
-                            <button onclick="event.stopPropagation(); toggleInjectModal('${inst.symbol}')" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition">
-                                Inject
-                            </button>
+                            <div class="flex flex-col items-center justify-center gap-1">
+                                <button onclick="event.stopPropagation(); toggleInjectModal('${inst.symbol}')" class="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded border border-slate-700 text-[10px] mono transition">
+                                    Inject
+                                </button>
+                                <button type="button" onclick="event.stopPropagation(); openOptionLogsPanel('${inst.symbol}')" class="px-2 py-0.5 bg-emerald-950/70 hover:bg-emerald-800/70 text-emerald-300 hover:text-white rounded border border-emerald-700/60 text-[10px] mono transition whitespace-nowrap" title="View Buy/Sell Decision Log for ${inst.symbol}">
+                                    Buy/Sell Log
+                                </button>
+                            </div>
                         </td>
                     </tr>
                 `;
@@ -11818,6 +11836,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('detailRsiZone').textContent = (symbolData.rsi_zone || 'unknown').replace('_', ' ');
             document.getElementById('detailCrossoverSignal').textContent = (symbolData.crossover_signal || 'none').replace('_', ' ');
             document.getElementById('detailTradingAction').textContent = symbolData.trading_action || fConf.label;
+            const detailLogBtn = document.getElementById('btnDetailBuySellLog');
+            if (detailLogBtn) {
+                detailLogBtn.textContent = `Buy/Sell Log · ${sym}`;
+                detailLogBtn.setAttribute('onclick', `openOptionLogsPanel('${escSvg(sym)}')`);
+            }
 
             renderCrossoverChart(
                 document.getElementById('detailCrossoverChart'),
@@ -12089,8 +12112,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (typeof symbolFilter === 'string') {
                 optionLogSearchFilter = symbolFilter.trim().toUpperCase();
             }
+            const modal = document.getElementById('optionDrilldownModal');
+            if (modal && modal.classList.contains('hidden')) {
+                modal.classList.remove('hidden');
+            }
             syncOptionSubViewVisibility();
-            await fetchOptionLogs();
+            if (latestOptionHistory) {
+                await fetchOptionLogs();
+            } else {
+                await Promise.all([fetchOptionLogs(), fetchOptionHistory()]);
+            }
         }
 
         function toggleOptionLogsPanel() {
@@ -12649,12 +12680,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="text-slate-300">$${entryP.toFixed(2)} &rarr; $${endPrice.toFixed(2)}</span>
                             <span class="font-bold ${pos ? 'text-emerald-400' : 'text-rose-400'}">${fmtSignedDollars(pnlD)} (${pnlP >= 0 ? '+' : ''}${pnlP.toFixed(2)}%)</span>
                         </div>
-                        <div class="flex items-center justify-between gap-1.5 text-[9.5px] text-slate-500 mono pt-0.5">
-                            <span class="truncate">${isBuyer ? 'Bought' : 'Sold'}: ${escSvg(fmtShortLocalTs(isBuyer ? c.purchased_at_utc : c.sold_at_utc))}</span>
-                            <button type="button" onclick="event.stopPropagation(); openOptionLogsPanel('${escSvg(c.underlying || c.contract)}')" class="shrink-0 px-2 py-0.5 rounded-md bg-slate-800/90 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[9.5px] font-semibold transition" title="View Buy/Sell Decision Log for ${escSvg(c.underlying || c.contract)}">
-                                Buy/Sell Log
-                            </button>
-                            <span class="shrink-0">${pts.length}m tracked</span>
+                        <div class="flex items-center justify-between text-[9.5px] text-slate-500 mono pt-0.5">
+                            <span>${isBuyer ? 'Bought' : 'Sold'}: ${escSvg(fmtShortLocalTs(isBuyer ? c.purchased_at_utc : c.sold_at_utc))}</span>
+                            <span>${pts.length}m tracked</span>
                         </div>
                     </div>
                 `;
