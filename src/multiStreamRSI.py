@@ -2374,6 +2374,8 @@ class MinuteCoordinator:
                             "trading_action": fc["trading_action"],
                             "crossover_signal": fc["crossover_signal"],
                             "regime": reg,
+                            "rsi_changes": tracker.changes if idx == len(seed_slice) - 1 else None,
+                            "rsi_period": tracker.period,
                         }
                     )
                 prev_sv = sv
@@ -2619,6 +2621,16 @@ class MinuteCoordinator:
                     "trading_action": forecast["trading_action"],
                     "crossover_signal": forecast["crossover_signal"],
                     "regime": regime,
+                    "rsi_changes": (
+                        self.trackers[(provider, symbol)].changes
+                        if provider != "TRADINGVIEW" and (provider, symbol) in self.trackers
+                        else None
+                    ),
+                    "rsi_period": (
+                        self.trackers[(provider, symbol)].period
+                        if provider != "TRADINGVIEW" and (provider, symbol) in self.trackers
+                        else None
+                    ),
                 }
             )
             if len(history) > 60:
@@ -4897,43 +4909,112 @@ def build_option_chain_client(keys):
     return StockHistoricalDataClient(keys["alpaca_key"], keys["alpaca_secret"])
 
 
+_OCC_CONTRACT_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def _is_valid_occ_symbol(value):
+    """Return True strictly for valid OCC option contract symbols (e.g., AAPL261218C00250000)."""
+    if not isinstance(value, str):
+        return False
+    return bool(_OCC_CONTRACT_RE.match(value.strip().upper()))
+
+
+def _extract_option_chain_error_message(contract, clean_payload=None):
+    """Extract a readable non-OCC error/status string from an option-chain failure response."""
+    visited = set()
+
+    def _walk(node, depth=0):
+        if node is None or depth > 3:
+            return None
+        if isinstance(node, str):
+            text = " ".join(node.split()).strip()
+            if text and not _is_valid_occ_symbol(text):
+                return text[:160]
+            return None
+        node_id = id(node)
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+        if isinstance(node, dict):
+            for key in ("error", "message", "detail", "reason", "status_message", "msg"):
+                val = node.get(key)
+                if isinstance(val, str) and val.strip():
+                    text = " ".join(val.split()).strip()
+                    if text and not _is_valid_occ_symbol(text):
+                        return text[:160]
+            for val in node.values():
+                found = _walk(val, depth + 1)
+                if found:
+                    return found
+        elif isinstance(node, (list, tuple)):
+            for el in node:
+                found = _walk(el, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return _walk(contract) or _walk(clean_payload)
+
+
 def _looks_like_single_option_contract(obj):
-    """Heuristic check for a single option contract (OCC symbol, dict, or SDK model)."""
+    """Heuristic check for a single valid OCC option contract (symbol, dict, or SDK model)."""
     if obj is None:
         return False
     if isinstance(obj, str):
-        return bool(obj.strip())
+        return _is_valid_occ_symbol(obj)
     if isinstance(obj, dict):
         if any(k in obj for k in ("call", "put", "contracts", "chain", "clean_payload")):
             return False
         return any(
-            isinstance(obj.get(k), str) and obj.get(k).strip()
+            _is_valid_occ_symbol(obj.get(k))
             for k in ("symbol", "contract_symbol", "option_symbol", "contract")
         )
-    return bool(getattr(obj, "symbol", None))
+    return _is_valid_occ_symbol(getattr(obj, "symbol", None))
 
 
 def _unpack_pruned_option_chain_result(res):
     """Safely unpack get_pruned_option_chain return values of varying shapes into (contract, clean_payload)."""
     if res is None:
         return None, None
+    if isinstance(res, str):
+        text = res.strip()
+        if _is_valid_occ_symbol(text):
+            return text.upper(), res
+        return None, ({"error": text} if text else None)
     if isinstance(res, dict):
         if "contract" in res and "clean_payload" in res:
-            return res.get("contract"), res.get("clean_payload")
+            c = res.get("contract")
+            p = res.get("clean_payload")
+            if isinstance(c, str) and c.strip() and not _is_valid_occ_symbol(c):
+                err_payload = p if isinstance(p, dict) else {"error": c.strip(), "clean_payload": p}
+                return None, err_payload
+            return c, p
         return res, res
     if isinstance(res, list):
         if not res:
             return None, []
         if len(res) == 2 and not _looks_like_single_option_contract(res[1]):
-            return res[0], res[1]
+            c, p = res[0], res[1]
+            if isinstance(c, str) and c.strip() and not _is_valid_occ_symbol(c):
+                return None, (p if p is not None else {"error": c.strip()})
+            return c, p
+        if all(isinstance(el, str) and not _is_valid_occ_symbol(el) for el in res):
+            return None, {"error": "; ".join(el.strip() for el in res if el.strip())[:240]}
         return res, res
     if isinstance(res, tuple):
         if not res:
             return None, None
         if len(res) == 1:
-            return res[0], res[0]
+            return _unpack_pruned_option_chain_result(res[0])
         if len(res) == 2:
-            return res[0], res[1]
+            c, p = res[0], res[1]
+            if isinstance(c, str) and c.strip() and not _is_valid_occ_symbol(c):
+                if isinstance(p, dict):
+                    merged = dict(p)
+                    merged.setdefault("error", c.strip())
+                    return None, merged
+                return None, ({"error": c.strip(), "detail": p} if p is not None else {"error": c.strip()})
+            return c, p
         # 3+ tuple: handle both (contract, clean_payload, extra...) and (call_contract, put_contract, clean_payload, ...)
         if _looks_like_single_option_contract(res[0]) and _looks_like_single_option_contract(res[1]):
             pair = {}
@@ -4955,9 +5036,9 @@ def _unpack_pruned_option_chain_result(res):
                         continue
                 else:
                     sym = str(getattr(item, "symbol", "") or "").strip().upper()
-                m_occ = re.match(r"^[A-Z]{1,6}\d{6}([CP])\d{8}$", sym)
+                m_occ = _OCC_CONTRACT_RE.match(sym)
                 if m_occ:
-                    rk = "call" if m_occ.group(1) == "C" else "put"
+                    rk = "call" if sym[-9] == "C" else "put"
                     if rk not in pair:
                         pair[rk] = item
                         continue
@@ -4967,7 +5048,15 @@ def _unpack_pruned_option_chain_result(res):
                     pair["put"] = item
             payload = res[2] if isinstance(res[2], (dict, list)) else {"contracts": list(res[:2]), "extra": list(res[2:])}
             return pair, payload
-        return res[0], (res[1] if res[1] is not None else res[2])
+        first = res[0]
+        second = res[1] if res[1] is not None else res[2]
+        if isinstance(first, str) and first.strip() and not _is_valid_occ_symbol(first):
+            if isinstance(second, dict):
+                merged = dict(second)
+                merged.setdefault("error", first.strip())
+                return None, merged
+            return None, {"error": first.strip(), "detail": list(res[1:])}
+        return first, second
     return res, res
 
 
@@ -4998,6 +5087,89 @@ def _has_complete_kinematics(entry):
         )
     except (TypeError, ValueError):
         return False
+
+
+def _has_finite_field(entry, *keys):
+    if not isinstance(entry, dict):
+        return False
+    for k in keys:
+        val = entry.get(k)
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            if math.isfinite(float(val)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _kinematics_entry_rank(provider, entry):
+    """Rank kinematics entry quality so incomplete bars with rsi=None never override finite RSI feeds."""
+    if not isinstance(entry, dict):
+        return (-1, 0, 0, 0, 0, "")
+    is_tv = 1 if provider == "TRADINGVIEW" else 0
+    has_complete = _has_complete_kinematics(entry)
+    has_rsi = _has_finite_field(entry, "rsi")
+    has_vel = _has_finite_field(entry, "smoothed_velocity", "price_velocity")
+    has_close = _has_finite_field(entry, "close")
+    changes = entry.get("rsi_changes")
+    changes_val = int(changes) if isinstance(changes, (int, float)) and not isinstance(changes, bool) else -1
+    ts = str(entry.get("timestamp") or "")
+    if is_tv and has_complete:
+        tier = 4
+    elif has_complete:
+        tier = 3
+    elif has_rsi:
+        tier = 2
+    elif has_close or has_vel:
+        tier = 1
+    else:
+        tier = 0
+    return (tier, 1 if has_vel else 0, is_tv, changes_val, 1 if has_close else 0, ts)
+
+
+def _select_best_kinematics_entry(coordinator, symbol):
+    """Return (provider, latest_entry) for symbol ranked by completeness tier, then freshness."""
+    best_provider = None
+    best_entry = None
+    best_rank = None
+    for (provider, sym), hist in coordinator.kinematics_history.items():
+        if sym != symbol or not hist:
+            continue
+        cand = hist[-1]
+        rank = _kinematics_entry_rank(provider, cand)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_provider = provider
+            best_entry = cand
+    return best_provider, best_entry
+
+
+def _format_rsi_unavailable_reason(entry):
+    """Build a concise, informative rsi_unavailable reason preserving the prefix."""
+    if not isinstance(entry, dict):
+        return "rsi_unavailable"
+    changes = entry.get("rsi_changes")
+    period = entry.get("rsi_period")
+    if (
+        isinstance(changes, (int, float))
+        and not isinstance(changes, bool)
+        and isinstance(period, (int, float))
+        and not isinstance(period, bool)
+        and int(period) > 0
+        and int(changes) < int(period)
+    ):
+        return f"rsi_unavailable(warming={int(changes)}/{int(period)})"
+    close_val = entry.get("close")
+    if close_val is not None and not isinstance(close_val, bool):
+        try:
+            cf = float(close_val)
+            if math.isfinite(cf):
+                return f"rsi_unavailable(close={cf:.2f})"
+        except (TypeError, ValueError):
+            pass
+    return "rsi_unavailable"
 
 
 class TradingviewProvider:
@@ -5381,6 +5553,23 @@ class TradingviewProvider:
                     exc,
                 )
                 return
+            parsed_sym, _, _ = AlpacaOptionBuyer._extract_contract_details(
+                contract, clean_payload
+            )
+            if contract is None or not parsed_sym:
+                err_detail = _extract_option_chain_error_message(
+                    contract, clean_payload
+                ) or "empty_chain"
+                self.logger.warning(
+                    "OPTION_CHAIN_NO_CONTRACT provider=%s signal=%s symbol=%s rsi=%.4f detail=%s file=%s",
+                    self.provider,
+                    label,
+                    symbol,
+                    rsi,
+                    err_detail,
+                    path.name,
+                )
+                return
             self.coordinator.record_option_contract(
                 symbol=symbol,
                 contract=contract,
@@ -5395,7 +5584,7 @@ class TradingviewProvider:
                 label,
                 symbol,
                 rsi,
-                contract,
+                parsed_sym,
                 path.name,
             )
 
@@ -5839,7 +6028,8 @@ class AlpacaOptionBuyer:
                     extracted = fallback[0]
             elif isinstance(cand, str) and cand.strip():
                 sym = cand.strip().upper()
-                extracted = (sym, None, cls._infer_occ_right(sym))
+                if _is_valid_occ_symbol(sym):
+                    extracted = (sym, None, cls._infer_occ_right(sym))
             elif isinstance(cand, dict):
                 if desired_key and cand.get(desired_key) is not None:
                     nested = cand[desired_key]
@@ -5857,7 +6047,7 @@ class AlpacaOptionBuyer:
                 if extracted is None:
                     for key in ("symbol", "contract_symbol", "option_symbol", "contract"):
                         raw_sym = cand.get(key)
-                        if isinstance(raw_sym, str) and raw_sym.strip():
+                        if isinstance(raw_sym, str) and _is_valid_occ_symbol(raw_sym):
                             sym = raw_sym.strip().upper()
                             lp = None
                             for pk in ("limit_price", "ask_price", "ask", "close_price", "last_price"):
@@ -5874,18 +6064,19 @@ class AlpacaOptionBuyer:
                             break
             elif hasattr(cand, "symbol") and getattr(cand, "symbol", None):
                 sym = str(getattr(cand, "symbol")).strip().upper()
-                lp = None
-                for pk in ("limit_price", "ask_price", "close_price"):
-                    try:
-                        pv = getattr(cand, pk, None)
-                        if pv is not None and not isinstance(pv, bool):
-                            f = float(pv)
-                            if math.isfinite(f) and f > 0:
-                                lp = round(f, 2)
-                                break
-                    except (TypeError, ValueError):
-                        pass
-                extracted = (sym, lp, cls._infer_occ_right(sym))
+                if _is_valid_occ_symbol(sym):
+                    lp = None
+                    for pk in ("limit_price", "ask_price", "close_price"):
+                        try:
+                            pv = getattr(cand, pk, None)
+                            if pv is not None and not isinstance(pv, bool):
+                                f = float(pv)
+                                if math.isfinite(f) and f > 0:
+                                    lp = round(f, 2)
+                                    break
+                        except (TypeError, ValueError):
+                            pass
+                    extracted = (sym, lp, cls._infer_occ_right(sym))
 
             if extracted and extracted[0]:
                 if (not desired_right) or (extracted[2] == desired_right):
@@ -6029,7 +6220,7 @@ class AlpacaOptionBuyer:
 
         raw_rsi = entry.get("rsi")
         if raw_rsi is None or isinstance(raw_rsi, bool):
-            return False, None, "rsi_unavailable"
+            return False, None, _format_rsi_unavailable_reason(entry)
         try:
             rsi = float(raw_rsi)
         except (TypeError, ValueError):
@@ -6126,33 +6317,8 @@ class AlpacaOptionBuyer:
         return True, "CALL", reason
 
     def _select_kinematics_entry(self, symbol):
-        """Return (provider, latest_entry) for symbol, preferring TRADINGVIEW once its (rsi, v, a) are complete."""
-        tv_hist = self.coordinator.kinematics_history.get(("TRADINGVIEW", symbol))
-        if tv_hist and _has_complete_kinematics(tv_hist[-1]):
-            return "TRADINGVIEW", tv_hist[-1]
-
-        best_complete = (None, None, "")
-        best_any = (
-            ("TRADINGVIEW", tv_hist[-1], str(tv_hist[-1].get("timestamp") or ""))
-            if tv_hist
-            else (None, None, "")
-        )
-        for (provider, sym), hist in self.coordinator.kinematics_history.items():
-            if sym != symbol or not hist:
-                continue
-            cand = hist[-1]
-            ts = str(cand.get("timestamp") or "")
-            if _has_complete_kinematics(cand):
-                if best_complete[1] is None or ts >= best_complete[2]:
-                    best_complete = (provider, cand, ts)
-            elif best_any[1] is None or (
-                best_any[0] != "TRADINGVIEW" and ts >= best_any[2]
-            ):
-                best_any = (provider, cand, ts)
-
-        if best_complete[1] is not None:
-            return best_complete[0], best_complete[1]
-        return best_any[0], best_any[1]
+        """Return (provider, latest_entry) for symbol, prioritizing complete kinematics and finite RSI."""
+        return _select_best_kinematics_entry(self.coordinator, symbol)
 
     def _log_buy_analysis(
         self,
@@ -6374,15 +6540,19 @@ class AlpacaOptionBuyer:
                     )
                     contract, clean_payload = _unpack_pruned_option_chain_result(raw_chain_res)
                     signal_label = "buy" if desired_right == "CALL" else "sell"
-                    self.coordinator.record_option_contract(
-                        symbol=symbol,
-                        contract=contract,
-                        signal=signal_label,
-                        event_time=entry.get("timestamp"),
-                        clean_payload=clean_payload,
-                        source="ALPACA_OPTION_BUYER",
+                    parsed_sym, _, _ = self._extract_contract_details(
+                        contract, clean_payload, desired_right=desired_right
                     )
-                    contract_source = "ALPACA_OPTION_BUYER"
+                    if contract is not None and parsed_sym:
+                        self.coordinator.record_option_contract(
+                            symbol=symbol,
+                            contract=contract,
+                            signal=signal_label,
+                            event_time=entry.get("timestamp"),
+                            clean_payload=clean_payload,
+                            source="ALPACA_OPTION_BUYER",
+                        )
+                        contract_source = "ALPACA_OPTION_BUYER"
                     await asyncio.to_thread(
                         self._write_fallback_option_chain,
                         symbol,
@@ -6409,17 +6579,24 @@ class AlpacaOptionBuyer:
                     continue
 
             if contract is None:
+                chain_err = _extract_option_chain_error_message(contract, clean_payload)
+                reject_reason = (
+                    f"no_option_contract({chain_err})"
+                    if chain_err
+                    else "no_contract_from_collect_option_chain"
+                )
                 self._log_buy_analysis(
                     minute_key,
                     symbol,
                     provider,
                     entry,
                     "REJECTED",
-                    "no_contract_from_collect_option_chain",
+                    reject_reason,
                 )
                 self.logger.info(
-                    "OPTION_BUY_SKIPPED symbol=%s reason=no_contract_from_collect_option_chain trigger=%s",
+                    "OPTION_BUY_SKIPPED symbol=%s reason=%s trigger=%s",
                     symbol,
+                    reject_reason,
                     reason,
                 )
                 continue
@@ -6428,17 +6605,24 @@ class AlpacaOptionBuyer:
                 contract, clean_payload, desired_right=desired_right
             )
             if not contract_symbol:
+                chain_err = _extract_option_chain_error_message(contract, clean_payload)
+                reject_reason = (
+                    f"unparseable_contract({chain_err})"
+                    if chain_err
+                    else "unparseable_contract"
+                )
                 self._log_buy_analysis(
                     minute_key,
                     symbol,
                     provider,
                     entry,
                     "REJECTED",
-                    "unparseable_contract",
+                    reject_reason,
                 )
                 self.logger.warning(
-                    "OPTION_BUY_SKIPPED symbol=%s reason=unparseable_contract raw_contract=%s",
+                    "OPTION_BUY_SKIPPED symbol=%s reason=%s raw_contract=%s",
                     symbol,
+                    reject_reason,
                     contract,
                 )
                 continue
@@ -6835,7 +7019,8 @@ class AlpacaOptionBuyer:
                     contract_symbol=contract_symbol,
                 )
                 self.logger.error(
-                    "OPTION_BUY_FAILED symbol=%s contract=%s error_type=%s detail=%s",
+                    "OPTION_BUY_FAILED provider=%s symbol=%s contract=%s error_type=%s detail=%s",
+                    provider or "none",
                     symbol,
                     contract_symbol,
                     type(exc).__name__,
@@ -6996,7 +7181,7 @@ class AlpacaOptionSeller:
 
         raw_rsi = entry.get("rsi")
         if raw_rsi is None or isinstance(raw_rsi, bool):
-            return False, "rsi_unavailable"
+            return False, _format_rsi_unavailable_reason(entry)
         try:
             rsi = float(raw_rsi)
         except (TypeError, ValueError):
@@ -7258,33 +7443,8 @@ class AlpacaOptionSeller:
         return False, vel, f"v={vel:+.4f}>=0"
 
     def _select_kinematics_entry(self, symbol):
-        """Return (provider, latest_entry) for symbol, preferring TRADINGVIEW once its (rsi, v, a) are complete."""
-        tv_hist = self.coordinator.kinematics_history.get(("TRADINGVIEW", symbol))
-        if tv_hist and _has_complete_kinematics(tv_hist[-1]):
-            return "TRADINGVIEW", tv_hist[-1]
-
-        best_complete = (None, None, "")
-        best_any = (
-            ("TRADINGVIEW", tv_hist[-1], str(tv_hist[-1].get("timestamp") or ""))
-            if tv_hist
-            else (None, None, "")
-        )
-        for (provider, sym), hist in self.coordinator.kinematics_history.items():
-            if sym != symbol or not hist:
-                continue
-            cand = hist[-1]
-            ts = str(cand.get("timestamp") or "")
-            if _has_complete_kinematics(cand):
-                if best_complete[1] is None or ts >= best_complete[2]:
-                    best_complete = (provider, cand, ts)
-            elif best_any[1] is None or (
-                best_any[0] != "TRADINGVIEW" and ts >= best_any[2]
-            ):
-                best_any = (provider, cand, ts)
-
-        if best_complete[1] is not None:
-            return best_complete[0], best_complete[1]
-        return best_any[0], best_any[1]
+        """Return (provider, latest_entry) for symbol, prioritizing complete kinematics and finite RSI."""
+        return _select_best_kinematics_entry(self.coordinator, symbol)
 
     def _log_sell_analysis(
         self,
