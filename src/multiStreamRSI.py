@@ -5613,6 +5613,38 @@ def _is_no_quote_market_rejection(exc):
     )
 
 
+def _extract_analysis_metrics(entry):
+    """Return formatted (rsi, v, a, projected_delta) strings from a kinematics entry."""
+    if not isinstance(entry, dict):
+        return "n/a", "n/a", "n/a", "n/a"
+
+    def _fmt(raw, fmt):
+        if raw is None or isinstance(raw, bool):
+            return "n/a"
+        try:
+            f = float(raw)
+            return format(f, fmt) if math.isfinite(f) else "n/a"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    raw_v = (
+        entry.get("smoothed_velocity")
+        if entry.get("smoothed_velocity") is not None
+        else entry.get("price_velocity")
+    )
+    raw_a = (
+        entry.get("smoothed_acceleration")
+        if entry.get("smoothed_acceleration") is not None
+        else entry.get("price_acceleration")
+    )
+    return (
+        _fmt(entry.get("rsi"), ".2f"),
+        _fmt(raw_v, "+.4f"),
+        _fmt(raw_a, "+.4f"),
+        _fmt(entry.get("projected_delta"), "+.4f"),
+    )
+
+
 class AlpacaOptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
@@ -5963,6 +5995,32 @@ class AlpacaOptionBuyer:
                 best_ts = ts
         return best_provider, best_entry
 
+    def _log_buy_analysis(
+        self,
+        minute_key,
+        symbol,
+        provider,
+        entry,
+        decision,
+        reason,
+        contract_symbol=None,
+    ):
+        rsi_s, v_s, a_s, pdelta_s = _extract_analysis_metrics(entry)
+        self.logger.info(
+            "OPTION_BUY_ANALYSIS minute=%s symbol=%s provider=%s rsi=%s v=%s a=%s "
+            "projected_delta=%s pnl%%=n/a decision=%s reason=%s contract=%s",
+            minute_key,
+            symbol,
+            provider or "none",
+            rsi_s,
+            v_s,
+            a_s,
+            pdelta_s,
+            decision,
+            reason,
+            contract_symbol or "n/a",
+        )
+
     def _submit_option_order(self, contract_symbol, qty, limit_price=None, force_limit=False):
         """Place the option BUY order on Alpaca TradingClient (blocking)."""
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -6041,26 +6099,63 @@ class AlpacaOptionBuyer:
                             open_underlyings.add(und)
             positions_loaded = True
 
+        cap_logged = False
         for symbol in self.coordinator.symbols:
             if OPTION_BUY_MAX_BUYS_PER_MINUTE > 0 and buys_this_cycle >= OPTION_BUY_MAX_BUYS_PER_MINUTE:
-                self.logger.info(
-                    "OPTION_BUY_CYCLE_CAP_REACHED count=%d limit=%d minute=%s",
-                    buys_this_cycle,
-                    OPTION_BUY_MAX_BUYS_PER_MINUTE,
+                if not cap_logged:
+                    self.logger.info(
+                        "OPTION_BUY_CYCLE_CAP_REACHED count=%d limit=%d minute=%s",
+                        buys_this_cycle,
+                        OPTION_BUY_MAX_BUYS_PER_MINUTE,
+                        minute_key,
+                    )
+                    cap_logged = True
+                provider, entry = self._select_kinematics_entry(symbol)
+                self._log_buy_analysis(
                     minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"max_buys_per_minute_reached({buys_this_cycle}/{OPTION_BUY_MAX_BUYS_PER_MINUTE})",
                 )
-                break
+                continue
 
             dedup_key = (symbol, minute_key)
             if dedup_key in self.attempted_minutes:
+                provider, entry = self._select_kinematics_entry(symbol)
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "SKIPPED",
+                    "already_attempted_minute",
+                )
                 continue
 
             provider, entry = self._select_kinematics_entry(symbol)
             if not entry:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "no_kinematics_entry",
+                )
                 continue
 
             qualifies, desired_right, reason = self._evaluate_kinematics(entry)
             if not qualifies:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    reason,
+                )
                 continue
 
             self.attempted_minutes.add(dedup_key)
@@ -6071,6 +6166,14 @@ class AlpacaOptionBuyer:
                 and OPTION_BUY_COOLDOWN_MINUTES > 0
                 and (now - last_buy).total_seconds() < OPTION_BUY_COOLDOWN_MINUTES * 60
             ):
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "cooldown_active",
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s reason=cooldown_active minute=%s",
                     symbol,
@@ -6089,6 +6192,14 @@ class AlpacaOptionBuyer:
                 if not self.credentials.get("alpaca_key") or not self.credentials.get(
                     "alpaca_secret"
                 ):
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        "missing_alpaca_credentials",
+                    )
                     self.logger.warning(
                         "OPTION_BUY_SKIPPED symbol=%s reason=missing_alpaca_credentials",
                         symbol,
@@ -6120,6 +6231,14 @@ class AlpacaOptionBuyer:
                         clean_payload,
                     )
                 except Exception as exc:
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        f"option_chain_failed({type(exc).__name__})",
+                    )
                     self.logger.error(
                         "OPTION_BUY_CHAIN_FAILED symbol=%s error_type=%s detail=%s",
                         symbol,
@@ -6129,6 +6248,14 @@ class AlpacaOptionBuyer:
                     continue
 
             if contract is None:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "no_contract_from_collect_option_chain",
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s reason=no_contract_from_collect_option_chain trigger=%s",
                     symbol,
@@ -6140,6 +6267,14 @@ class AlpacaOptionBuyer:
                 contract, clean_payload, desired_right=desired_right
             )
             if not contract_symbol:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "unparseable_contract",
+                )
                 self.logger.warning(
                     "OPTION_BUY_SKIPPED symbol=%s reason=unparseable_contract raw_contract=%s",
                     symbol,
@@ -6152,6 +6287,15 @@ class AlpacaOptionBuyer:
                 and inferred_right is not None
                 and inferred_right != desired_right
             ):
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"right_mismatch(expected={desired_right},got={inferred_right})",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=right_mismatch expected=%s got=%s",
                     symbol,
@@ -6164,6 +6308,15 @@ class AlpacaOptionBuyer:
             try:
                 await ensure_open_positions()
             except Exception as exc:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"positions_check_failed({type(exc).__name__})",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.warning(
                     "OPTION_BUY_POSITIONS_CHECK_FAILED symbol=%s error_type=%s detail=%s",
                     symbol,
@@ -6173,6 +6326,15 @@ class AlpacaOptionBuyer:
                 continue
 
             if open_option_count >= OPTION_BUY_MAX_OPEN_CONTRACTS:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"max_open_contracts({open_option_count}/{OPTION_BUY_MAX_OPEN_CONTRACTS})",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=max_open_contracts count=%d limit=%d",
                     symbol,
@@ -6183,6 +6345,15 @@ class AlpacaOptionBuyer:
                 continue
 
             if contract_symbol in open_contracts:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "contract_already_held",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=contract_already_held",
                     symbol,
@@ -6191,6 +6362,15 @@ class AlpacaOptionBuyer:
                 continue
 
             if not OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING and symbol in open_underlyings:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "underlying_option_already_held",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=underlying_option_already_held",
                     symbol,
@@ -6225,6 +6405,15 @@ class AlpacaOptionBuyer:
                     else 0.0
                 )
                 if OPTION_BUY_MAX_SPREAD_PCT > 0 and spread_pct > OPTION_BUY_MAX_SPREAD_PCT:
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        f"spread_too_wide({spread_pct:.2f}%>{OPTION_BUY_MAX_SPREAD_PCT:.2f}%)",
+                        contract_symbol=contract_symbol,
+                    )
                     self.logger.info(
                         "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=spread_too_wide "
                         "spread_pct=%.2f%% max=%.2f%% bid=%.2f ask=%.2f",
@@ -6273,6 +6462,15 @@ class AlpacaOptionBuyer:
                 self.last_order_contract = contract_symbol
                 self.last_order_symbol = symbol
                 self.last_order_reason = reason
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "QUALIFIED_DRY_RUN",
+                    reason,
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_DRY_RUN provider=%s symbol=%s contract=%s qty=%d "
                     "order_type=%s bid=%s ask=%s limit_price=%s total_purchase=%s "
@@ -6420,6 +6618,15 @@ class AlpacaOptionBuyer:
                         self.coordinator.option_history.schedule_order_fill_refresh(
                             self.client, order_id, contract_symbol, side="buy"
                         )
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "QUALIFIED_SUBMITTED",
+                    reason,
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.info(
                     "OPTION_BUY_SUBMITTED order_id=%s status=%s provider=%s symbol=%s "
                     "contract=%s qty=%d order_type=%s bid=%s ask=%s limit_price=%s "
@@ -6457,6 +6664,15 @@ class AlpacaOptionBuyer:
             except Exception as exc:
                 self.last_status = f"order_error: {type(exc).__name__}"
                 self.last_error_detail = f"{symbol} ({contract_symbol}): {str(exc)[:140]}"
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "QUALIFIED_ORDER_FAILED",
+                    f"{type(exc).__name__}:{str(exc)[:120]}",
+                    contract_symbol=contract_symbol,
+                )
                 self.logger.error(
                     "OPTION_BUY_FAILED symbol=%s contract=%s error_type=%s detail=%s",
                     symbol,
@@ -6889,6 +7105,42 @@ class AlpacaOptionSeller:
                 best_ts = ts
         return best_provider, best_entry
 
+    def _log_sell_analysis(
+        self,
+        minute_key,
+        contract_symbol,
+        underlying,
+        provider,
+        entry,
+        pnl_pct,
+        decision,
+        reason,
+    ):
+        rsi_s, v_s, a_s, pdelta_s = _extract_analysis_metrics(entry)
+        if pnl_pct is not None and not isinstance(pnl_pct, bool):
+            try:
+                pf = float(pnl_pct)
+                pnl_s = f"{pf:+.2f}%" if math.isfinite(pf) else "n/a"
+            except (TypeError, ValueError):
+                pnl_s = "n/a"
+        else:
+            pnl_s = "n/a"
+        self.logger.info(
+            "OPTION_SELL_ANALYSIS minute=%s contract=%s underlying=%s provider=%s "
+            "rsi=%s v=%s a=%s projected_delta=%s pnl%%=%s decision=%s reason=%s",
+            minute_key,
+            contract_symbol or "none",
+            underlying or "n/a",
+            provider or "none",
+            rsi_s,
+            v_s,
+            a_s,
+            pdelta_s,
+            pnl_s,
+            decision,
+            reason,
+        )
+
     def _fetch_live_quote(self, pos_sym, is_option):
         """Fetch latest live (bid, ask) prices for an option contract or equity symbol."""
         key = self.credentials.get("alpaca_key")
@@ -7107,6 +7359,16 @@ class AlpacaOptionSeller:
         if not positions:
             self.stop_loss_state_by_symbol.clear()
             self.peak_profit_state_by_symbol.clear()
+            self._log_sell_analysis(
+                minute_key,
+                "none",
+                "none",
+                "none",
+                None,
+                None,
+                "SKIPPED",
+                "no_open_positions",
+            )
             self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
             return
 
@@ -7125,14 +7387,34 @@ class AlpacaOptionSeller:
             )
             side = str(getattr(raw_side, "value", raw_side) or "long").lower()
             if raw_qty <= 0 or side == "short":
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    pos_sym,
+                    "none",
+                    None,
+                    self._position_pnl_pct(pos),
+                    "SKIPPED",
+                    f"non_long_position(side={side},qty={raw_qty})",
+                )
                 continue
 
             is_option = AlpacaPositionMonitor._is_option(pos)
+            underlying = self._extract_underlying(pos, pos_sym, is_option)
             if OPTION_SELL_OPTIONS_ONLY and not is_option:
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    "none",
+                    None,
+                    self._position_pnl_pct(pos),
+                    "SKIPPED",
+                    "options_only_equity_ignored",
+                )
                 continue
 
             is_call = self._is_call_contract(pos_sym, is_option)
-            underlying = self._extract_underlying(pos, pos_sym, is_option)
             seen_long_symbols.add(pos_sym)
             if pos_sym not in self.first_seen_at_by_symbol:
                 inferred_entry_dt = now
@@ -7160,40 +7442,77 @@ class AlpacaOptionSeller:
 
             dedup_key = (pos_sym, minute_key)
             if dedup_key in self.attempted_minutes:
-                continue
-
-            qty_avail = AlpacaPositionMonitor._num(pos, "qty_available", None)
-            if qty_avail is not None and qty_avail <= 0:
+                provider, entry = self._select_kinematics_entry(underlying)
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    "SKIPPED",
+                    "already_attempted_minute",
+                )
                 continue
 
             provider, entry = self._select_kinematics_entry(underlying)
+
+            qty_avail = AlpacaPositionMonitor._num(pos, "qty_available", None)
+            if qty_avail is not None and qty_avail <= 0:
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    "REJECTED",
+                    f"no_qty_available(qty_avail={qty_avail})",
+                )
+                continue
 
             qualifies = False
             reason = None
             trigger_kind = "take_profit"
             peak_eligible = (not OPTION_SELL_PEAK_PROFIT_CALLS_ONLY) or is_call
+            rejection_notes = []
 
             # 1. Fixed Profit Target (lock in spikes before RSI >= OPTION_CHAIN_RSI_HIGH)
             if (
                 peak_eligible
                 and OPTION_SELL_PROFIT_TARGET_ENABLED
                 and OPTION_SELL_PROFIT_TARGET_PCT > 0
-                and pnl_pct is not None
-                and math.isfinite(pnl_pct)
-                and pnl_pct >= OPTION_SELL_PROFIT_TARGET_PCT
             ):
-                qualifies = True
-                trigger_kind = "profit_target"
-                reason = (
-                    f"profit_target(pnl={pnl_pct:+.2f}%>="
-                    f"{OPTION_SELL_PROFIT_TARGET_PCT:.2f}%)"
-                )
+                if (
+                    pnl_pct is not None
+                    and math.isfinite(pnl_pct)
+                    and pnl_pct >= OPTION_SELL_PROFIT_TARGET_PCT
+                ):
+                    qualifies = True
+                    trigger_kind = "profit_target"
+                    reason = (
+                        f"profit_target(pnl={pnl_pct:+.2f}%>="
+                        f"{OPTION_SELL_PROFIT_TARGET_PCT:.2f}%)"
+                    )
+                else:
+                    pt_cur = (
+                        f"{pnl_pct:+.2f}%"
+                        if (pnl_pct is not None and math.isfinite(pnl_pct))
+                        else "n/a"
+                    )
+                    rejection_notes.append(
+                        f"pt={pt_cur}<{OPTION_SELL_PROFIT_TARGET_PCT:.2f}%"
+                    )
 
             # 2. Overbought RSI + Bearish Kinematics
-            if not qualifies and entry:
-                qualifies, reason = self._evaluate_sell_kinematics(entry)
-                if qualifies:
+            if not qualifies:
+                rsi_ok, rsi_reason = self._evaluate_sell_kinematics(entry)
+                if rsi_ok:
+                    qualifies = True
                     trigger_kind = "take_profit"
+                    reason = rsi_reason
+                else:
+                    rejection_notes.append(rsi_reason)
 
             # 3. Session High-Water Mark Trailing Stop (exit when drawdown > X% with v < 0)
             if (
@@ -7202,32 +7521,45 @@ class AlpacaOptionSeller:
                 and OPTION_SELL_TRAILING_STOP_ENABLED
                 and OPTION_SELL_TRAILING_DRAWDOWN_PCT > 0
                 and peak_pnl is not None
-                and peak_pnl >= OPTION_SELL_TRAILING_ACTIVATION_PCT
-                and drawdown_pct > OPTION_SELL_TRAILING_DRAWDOWN_PCT
             ):
-                if OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY:
-                    ts_vel_ok, _, ts_vel_reason = self._evaluate_trailing_stop_velocity(entry)
-                else:
-                    ts_vel_ok, _, ts_vel_reason = True, None, "velocity_bypassed"
+                if (
+                    peak_pnl >= OPTION_SELL_TRAILING_ACTIVATION_PCT
+                    and drawdown_pct > OPTION_SELL_TRAILING_DRAWDOWN_PCT
+                ):
+                    if OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY:
+                        ts_vel_ok, _, ts_vel_reason = self._evaluate_trailing_stop_velocity(entry)
+                    else:
+                        ts_vel_ok, _, ts_vel_reason = True, None, "velocity_bypassed"
 
-                if ts_vel_ok:
-                    qualifies = True
-                    trigger_kind = "trailing_stop"
-                    reason = (
-                        f"trailing_stop(peak={peak_pnl:+.2f}%,pnl={pnl_pct:+.2f}%,"
-                        f"dd={drawdown_pct:.2f}%>{OPTION_SELL_TRAILING_DRAWDOWN_PCT:.2f}%)&"
-                        f"{ts_vel_reason}"
+                    if ts_vel_ok:
+                        qualifies = True
+                        trigger_kind = "trailing_stop"
+                        reason = (
+                            f"trailing_stop(peak={peak_pnl:+.2f}%,pnl={pnl_pct:+.2f}%,"
+                            f"dd={drawdown_pct:.2f}%>{OPTION_SELL_TRAILING_DRAWDOWN_PCT:.2f}%)&"
+                            f"{ts_vel_reason}"
+                        )
+                    else:
+                        rejection_notes.append(
+                            f"ts_hold(dd={drawdown_pct:.2f}%,{ts_vel_reason})"
+                        )
+                        self.logger.info(
+                            "OPTION_SELL_TRAILING_HOLD symbol=%s underlying=%s "
+                            "peak=%.2f%% pnl=%.2f%% dd=%.2f%% reason=%s",
+                            pos_sym,
+                            underlying,
+                            peak_pnl,
+                            pnl_pct if pnl_pct is not None else 0.0,
+                            drawdown_pct,
+                            ts_vel_reason,
+                        )
+                elif peak_pnl >= OPTION_SELL_TRAILING_ACTIVATION_PCT:
+                    rejection_notes.append(
+                        f"ts_dd={drawdown_pct:.2f}%<={OPTION_SELL_TRAILING_DRAWDOWN_PCT:.2f}%"
                     )
                 else:
-                    self.logger.info(
-                        "OPTION_SELL_TRAILING_HOLD symbol=%s underlying=%s "
-                        "peak=%.2f%% pnl=%.2f%% dd=%.2f%% reason=%s",
-                        pos_sym,
-                        underlying,
-                        peak_pnl,
-                        pnl_pct if pnl_pct is not None else 0.0,
-                        drawdown_pct,
-                        ts_vel_reason,
+                    rejection_notes.append(
+                        f"ts_peak={peak_pnl:+.2f}%<{OPTION_SELL_TRAILING_ACTIVATION_PCT:.2f}%"
                     )
 
             # 4. Stop-Loss Protection (respects min_hold_minutes grace period to avoid Ask/Bid spread liquidation)
@@ -7244,6 +7576,9 @@ class AlpacaOptionSeller:
                     and pnl_pct < -hard_pct
                 ):
                     if in_hold_grace:
+                        rejection_notes.append(
+                            f"hard_sl_hold_grace({hold_minutes:.2f}m<{OPTION_SELL_MIN_HOLD_MINUTES}m)"
+                        )
                         self.logger.info(
                             "OPTION_SELL_HOLD_GRACE_ACTIVE symbol=%s underlying=%s "
                             "pnl_pct=%.2f%% hold_min=%.2f<%d (suppressing hard_stop_loss)",
@@ -7265,6 +7600,9 @@ class AlpacaOptionSeller:
                     and loss_streak >= OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES
                 ):
                     if in_hold_grace:
+                        rejection_notes.append(
+                            f"sl_hold_grace({hold_minutes:.2f}m<{OPTION_SELL_MIN_HOLD_MINUTES}m,streak={loss_streak})"
+                        )
                         self.logger.info(
                             "OPTION_SELL_HOLD_GRACE_ACTIVE symbol=%s underlying=%s "
                             "pnl_pct=%.2f%% hold_min=%.2f<%d streak=%d (suppressing stop_loss)",
@@ -7290,6 +7628,9 @@ class AlpacaOptionSeller:
                                 f"{sl_kin_reason}"
                             )
                         else:
+                            rejection_notes.append(
+                                f"sl_hold(streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES},{sl_kin_reason})"
+                            )
                             self.logger.info(
                                 "OPTION_SELL_STOP_LOSS_HOLD symbol=%s underlying=%s "
                                 "pnl_pct=%.2f%% streak=%d/%d reason=%s",
@@ -7301,6 +7642,9 @@ class AlpacaOptionSeller:
                                 sl_kin_reason,
                             )
                 elif loss_streak > 0:
+                    rejection_notes.append(
+                        f"sl_watch(streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES})"
+                    )
                     self.logger.info(
                         "OPTION_SELL_STOP_LOSS_WATCH symbol=%s underlying=%s "
                         "pnl_pct=%.2f%% threshold=-%.2f%% streak=%d/%d hold_min=%.2f",
@@ -7314,6 +7658,16 @@ class AlpacaOptionSeller:
                     )
 
             if not qualifies:
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    "REJECTED",
+                    "; ".join(rejection_notes) if rejection_notes else "no_sell_trigger",
+                )
                 continue
 
             self.attempted_minutes.add(dedup_key)
@@ -7324,6 +7678,16 @@ class AlpacaOptionSeller:
                 and OPTION_SELL_COOLDOWN_MINUTES > 0
                 and (now - last_sell).total_seconds() < OPTION_SELL_COOLDOWN_MINUTES * 60
             ):
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    "REJECTED",
+                    f"cooldown_active(trigger={reason})",
+                )
                 self.logger.info(
                     "OPTION_SELL_SKIPPED symbol=%s underlying=%s reason=cooldown_active minute=%s",
                     pos_sym,
@@ -7336,6 +7700,16 @@ class AlpacaOptionSeller:
                 float(OPTION_SELL_QTY), raw_qty
             )
             if target_qty <= 0:
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    "REJECTED",
+                    f"zero_target_qty(trigger={reason})",
+                )
                 continue
             if is_option or abs(target_qty - round(target_qty)) < 1e-9:
                 order_qty = max(1, int(round(target_qty)))
@@ -7378,6 +7752,16 @@ class AlpacaOptionSeller:
                 self.last_order_contract = pos_sym
                 self.last_order_symbol = underlying
                 self.last_order_reason = reason
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    f"QUALIFIED_DRY_RUN({trigger_kind})",
+                    reason,
+                )
                 self.logger.info(
                     "OPTION_SELL_DRY_RUN kind=%s order_type=%s bid=%s ask=%s "
                     "limit_price=%s total_sale=%s provider=%s underlying=%s symbol=%s "
@@ -7534,6 +7918,16 @@ class AlpacaOptionSeller:
                         self.coordinator.option_history.schedule_order_fill_refresh(
                             self.client, order_id, pos_sym, side="sell"
                         )
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    f"QUALIFIED_SUBMITTED({trigger_kind})",
+                    reason,
+                )
                 self.logger.info(
                     "OPTION_SELL_SUBMITTED kind=%s order_type=%s bid=%s ask=%s "
                     "limit_price=%s total_sale=%s order_id=%s status=%s provider=%s "
@@ -7574,6 +7968,16 @@ class AlpacaOptionSeller:
             except Exception as exc:
                 self.last_status = f"order_error: {type(exc).__name__}"
                 self.last_error_detail = f"{underlying} ({pos_sym}): {str(exc)[:140]}"
+                self._log_sell_analysis(
+                    minute_key,
+                    pos_sym,
+                    underlying,
+                    provider,
+                    entry,
+                    pnl_pct,
+                    f"QUALIFIED_ORDER_FAILED({trigger_kind})",
+                    f"{type(exc).__name__}:{str(exc)[:120]}",
+                )
                 self.logger.error(
                     "OPTION_SELL_FAILED underlying=%s symbol=%s error_type=%s detail=%s",
                     underlying,
@@ -10234,6 +10638,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div class="flex items-center gap-2">
                     <span id="optBackfillBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">backfill: idle</span>
+                    <button id="btnOptViewLogs" onclick="toggleOptionLogsPanel()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[11px] font-semibold transition">
+                        Buy/Sell Logs
+                    </button>
                     <button id="btnOptSyncAlpaca" onclick="refreshOptionHistoryFromAlpaca()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
                         Sync Alpaca History
                     </button>
@@ -10277,9 +10684,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Right: Contract Chart & Minute-by-Minute Breakdown -->
+                <!-- Right: Contract Chart & Minute-by-Minute Breakdown / Buy-Sell Logs -->
                 <div id="optContractDetailPane" class="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5 space-y-4">
                     <div class="text-xs text-slate-500 text-center py-12">Select a contract on the left to inspect its minute-by-minute price &amp; P/L chart.</div>
+                </div>
+                <div id="optLogsPane" class="hidden flex-1 min-w-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
+                    <div class="text-xs text-slate-500 text-center py-12">Loading buy/sell logs...</div>
                 </div>
             </div>
         </div>
@@ -10567,11 +10977,19 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 ];
                 const modal = document.getElementById('optionDrilldownModal');
                 const modalOpen = modal && !modal.classList.contains('hidden');
+                const logsOpen = modalOpen && optionDrilldownSubView === 'logs';
                 if (modalOpen) {
                     jobs.push(fetch('/api/option-history').then(r => r.json()).catch(() => null));
+                } else {
+                    jobs.push(Promise.resolve(null));
+                }
+                if (logsOpen) {
+                    jobs.push(fetch('/api/option-logs?limit=500').then(r => r.json()).catch(() => null));
+                } else {
+                    jobs.push(Promise.resolve(null));
                 }
 
-                const [statusRes, kinRes, optRes] = await Promise.all(jobs);
+                const [statusRes, kinRes, optRes, optLogsRes] = await Promise.all(jobs);
 
                 if (statusRes && statusRes.metrics) {
                     renderStatusMetrics(statusRes.metrics);
@@ -10586,6 +11004,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (modalOpen && optRes && optRes.status === 'ok') {
                     latestOptionHistory = optRes;
                     renderOptionDrilldown();
+                }
+                if (logsOpen && optLogsRes && optLogsRes.status === 'ok') {
+                    latestOptionLogs = optLogsRes;
+                    renderOptionLogsPanel();
                 }
             } catch (err) {
                 console.error("Telemetry fetch error:", err);
@@ -11575,9 +11997,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         // OPTION BUYER / SELLER CONTRACT DRILL-DOWN & MINUTE-BY-MINUTE P/L CHART
         // =========================================================================================
         let optionDrilldownMode = 'buyer'; // 'buyer' | 'seller'
+        let optionDrilldownSubView = 'chart'; // 'chart' | 'logs'
         let selectedBuyerContract = null;
         let selectedSellerTradeId = null;
         let latestOptionHistory = null;
+        let latestOptionLogs = null;
+        let optionLogStreamFilter = 'all'; // 'all' | 'BUY' | 'SELL'
+        let optionLogDecisionFilter = 'all'; // 'all' | 'QUALIFIED' | 'REJECTED'
+        let optionLogSearchFilter = '';
         let activeOptionHistoryPoints = [];
 
         function fmtSignedDollars(v) {
@@ -11612,8 +12039,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         async function openOptionDrilldown(mode = 'buyer') {
             optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            optionDrilldownSubView = 'chart';
             const modal = document.getElementById('optionDrilldownModal');
             if (modal) modal.classList.remove('hidden');
+            syncOptionSubViewVisibility();
             await fetchOptionHistory();
         }
 
@@ -11624,6 +12053,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function switchOptionDrilldownMode(mode) {
             optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            optionDrilldownSubView = 'chart';
+            syncOptionSubViewVisibility();
             renderOptionDrilldown();
         }
 
@@ -11633,7 +12064,246 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             } else {
                 selectedSellerTradeId = key;
             }
+            optionDrilldownSubView = 'chart';
+            syncOptionSubViewVisibility();
             renderOptionDrilldown();
+        }
+
+        function syncOptionSubViewVisibility() {
+            const detailEl = document.getElementById('optContractDetailPane');
+            const logsEl = document.getElementById('optLogsPane');
+            const logsBtn = document.getElementById('btnOptViewLogs');
+            const showLogs = optionDrilldownSubView === 'logs';
+            if (detailEl) detailEl.classList.toggle('hidden', showLogs);
+            if (logsEl) logsEl.classList.toggle('hidden', !showLogs);
+            if (logsBtn) {
+                logsBtn.textContent = showLogs ? 'Back to Chart' : 'Buy/Sell Logs';
+                logsBtn.className = showLogs
+                    ? 'px-2.5 py-1 rounded-lg bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-200 border border-cyan-500/50 text-[11px] font-semibold transition'
+                    : 'px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[11px] font-semibold transition';
+            }
+        }
+
+        async function openOptionLogsPanel(symbolFilter = '') {
+            optionDrilldownSubView = 'logs';
+            if (typeof symbolFilter === 'string') {
+                optionLogSearchFilter = symbolFilter.trim().toUpperCase();
+            }
+            syncOptionSubViewVisibility();
+            await fetchOptionLogs();
+        }
+
+        function toggleOptionLogsPanel() {
+            if (optionDrilldownSubView === 'logs') {
+                optionDrilldownSubView = 'chart';
+                syncOptionSubViewVisibility();
+                renderOptionDrilldown();
+            } else {
+                openOptionLogsPanel('');
+            }
+        }
+
+        async function fetchOptionLogs() {
+            const logsEl = document.getElementById('optLogsPane');
+            if (logsEl && !latestOptionLogs) {
+                logsEl.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Retrieving buy &amp; sell analysis logs...</div>`;
+            }
+            try {
+                const res = await fetch('/api/option-logs?limit=500');
+                const data = await res.json();
+                if (res.ok && data && data.status === 'ok') {
+                    latestOptionLogs = data;
+                    renderOptionLogsPanel();
+                } else if (logsEl) {
+                    logsEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-10">Failed to load logs: ${escSvg((data && data.message) || 'Unknown error')}</div>`;
+                }
+            } catch (err) {
+                if (logsEl) {
+                    logsEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-10">Error loading logs: ${escSvg(err.message)}</div>`;
+                }
+            }
+        }
+
+        function setOptionLogStreamFilter(val) {
+            optionLogStreamFilter = val || 'all';
+            renderOptionLogsPanel();
+        }
+
+        function setOptionLogDecisionFilter(val) {
+            optionLogDecisionFilter = val || 'all';
+            renderOptionLogsPanel();
+        }
+
+        function setOptionLogSearchFilter(val) {
+            optionLogSearchFilter = String(val || '').trim().toUpperCase();
+            renderOptionLogsPanel(true);
+        }
+
+        function renderOptionLogsPanel(preserveInputFocus = false) {
+            const logsEl = document.getElementById('optLogsPane');
+            if (!logsEl) return;
+            const prevScroll = document.getElementById('optLogsScrollContainer')?.scrollTop || 0;
+            const activeEl = document.activeElement;
+            const wasSearchFocused = !!(activeEl && activeEl.id === 'optLogSearchInput');
+            const selStart = wasSearchFocused ? activeEl.selectionStart : null;
+            const selEnd = wasSearchFocused ? activeEl.selectionEnd : null;
+            const shouldFocusSearch = preserveInputFocus || wasSearchFocused;
+            const payload = latestOptionLogs || { entries: [], buyer_log_file: null, seller_log_file: null, counts: {} };
+            const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
+            const q = optionLogSearchFilter.trim().toUpperCase();
+
+            const filtered = allEntries.filter(e => {
+                if (optionLogStreamFilter !== 'all' && e.stream !== optionLogStreamFilter) return false;
+                const dec = String(e.decision || '').toUpperCase();
+                const ev = String(e.event || '').toUpperCase();
+                if (optionLogDecisionFilter === 'QUALIFIED') {
+                    if (!dec.includes('QUALIFIED') && !ev.includes('SUBMITTED') && !ev.includes('DRY_RUN')) return false;
+                } else if (optionLogDecisionFilter === 'REJECTED') {
+                    if (!dec.includes('REJECTED') && !ev.includes('SKIPPED') && !ev.includes('HOLD') && !ev.includes('FAILED')) return false;
+                }
+                if (q) {
+                    const hay = `${e.symbol || ''} ${e.contract || ''} ${e.provider || ''} ${e.reason || ''} ${e.event || ''}`.toUpperCase();
+                    if (!hay.includes(q)) return false;
+                }
+                return true;
+            });
+
+            const rowsHtml = filtered.map(e => {
+                const isBuy = e.stream === 'BUY';
+                const streamBadge = isBuy
+                    ? `<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold">BUY</span>`
+                    : `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-bold">SELL</span>`;
+
+                const dec = String(e.decision || e.event || 'INFO');
+                const decUpper = dec.toUpperCase();
+                let decCls = 'bg-slate-800 text-slate-300 border-slate-700';
+                if (decUpper.includes('QUALIFIED_SUBMITTED') || decUpper.includes('QUALIFIED_DRY_RUN') || decUpper.includes('SUBMITTED') || decUpper.includes('DRY_RUN')) {
+                    decCls = 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40';
+                } else if (decUpper.includes('REJECTED') || decUpper.includes('FAILED')) {
+                    decCls = 'bg-rose-500/15 text-rose-300 border-rose-500/40';
+                } else if (decUpper.includes('HOLD') || decUpper.includes('WATCH') || decUpper.includes('SKIPPED')) {
+                    decCls = 'bg-amber-500/15 text-amber-300 border-amber-500/40';
+                }
+
+                const pnlVal = e.pnl_pct && e.pnl_pct !== 'n/a' ? String(e.pnl_pct) : '--';
+                const pnlCls = pnlVal.startsWith('+') ? 'text-emerald-400' : (pnlVal.startsWith('-') ? 'text-rose-400' : 'text-slate-400');
+                const vVal = e.v && e.v !== 'n/a' ? String(e.v) : '--';
+                const vCls = vVal.startsWith('+') ? 'text-emerald-300' : (vVal.startsWith('-') ? 'text-rose-300' : 'text-slate-400');
+                const aVal = e.a && e.a !== 'n/a' ? String(e.a) : '--';
+                const pdVal = e.projected_delta && e.projected_delta !== 'n/a' ? String(e.projected_delta) : '--';
+                const symLabel = e.symbol && e.symbol !== 'none' ? e.symbol : '--';
+                const contractLabel = e.contract && e.contract !== 'n/a' && e.contract !== 'none' && e.contract !== symLabel ? e.contract : '';
+                const reasonText = e.reason || e.raw_message || e.event || '';
+
+                return `
+                    <tr class="hover:bg-slate-900/70 align-top border-b border-slate-800/50">
+                        <td class="px-2.5 py-2 text-slate-300 whitespace-nowrap">${escSvg(e.timestamp_short || e.timestamp || '--')}</td>
+                        <td class="px-2 py-2 whitespace-nowrap">${streamBadge}</td>
+                        <td class="px-2.5 py-2 whitespace-nowrap">
+                            <div class="font-bold text-white">${escSvg(symLabel)}</div>
+                            ${contractLabel ? `<div class="text-[9.5px] text-slate-400">${escSvg(contractLabel)}</div>` : ''}
+                        </td>
+                        <td class="px-2 py-2 text-indigo-300 whitespace-nowrap">${escSvg(e.provider || '--')}</td>
+                        <td class="px-2 py-2 text-right text-slate-200 whitespace-nowrap">${escSvg(e.rsi && e.rsi !== 'n/a' ? e.rsi : '--')}</td>
+                        <td class="px-2 py-2 text-right ${vCls} whitespace-nowrap">${escSvg(vVal)}</td>
+                        <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(aVal)}</td>
+                        <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(pdVal)}</td>
+                        <td class="px-2 py-2 text-right font-semibold ${pnlCls} whitespace-nowrap">${escSvg(pnlVal)}</td>
+                        <td class="px-2 py-2 whitespace-nowrap">
+                            <span class="inline-block px-1.5 py-0.5 rounded border text-[9.5px] font-semibold ${decCls}">${escSvg(dec)}</span>
+                        </td>
+                        <td class="px-2.5 py-2 text-slate-300 break-words max-w-[320px]">${escSvg(reasonText)}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const streamBtnCls = (k) => optionLogStreamFilter === k
+                ? 'px-2.5 py-1 rounded-md bg-indigo-600 text-white font-semibold'
+                : 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white';
+            const decBtnCls = (k) => optionLogDecisionFilter === k
+                ? 'px-2.5 py-1 rounded-md bg-slate-700 text-white font-semibold'
+                : 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white';
+
+            const fileInfoParts = [];
+            if (payload.buyer_log_file) fileInfoParts.push(`Buyer: ${payload.buyer_log_file}`);
+            if (payload.seller_log_file) fileInfoParts.push(`Seller: ${payload.seller_log_file}`);
+
+            logsEl.innerHTML = `
+                <div class="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800/80 shrink-0">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</span>
+                            <span class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">${filtered.length} / ${allEntries.length} rows</span>
+                        </div>
+                        <div class="text-[10px] text-slate-400 mono mt-0.5 truncate max-w-2xl" title="${escSvg(fileInfoParts.join(' · '))}">
+                            ${escSvg(fileInfoParts.join(' · ') || 'No option_buyer / option_seller log files found yet')}
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button type="button" onclick="fetchOptionLogs()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                            Refresh Logs
+                        </button>
+                        <button type="button" onclick="toggleOptionLogsPanel()" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] font-semibold transition">
+                            &larr; Back to Chart
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                            <button type="button" onclick="setOptionLogStreamFilter('all')" class="${streamBtnCls('all')}">All (${allEntries.length})</button>
+                            <button type="button" onclick="setOptionLogStreamFilter('BUY')" class="${streamBtnCls('BUY')}">Buy (${payload.counts?.buy ?? 0})</button>
+                            <button type="button" onclick="setOptionLogStreamFilter('SELL')" class="${streamBtnCls('SELL')}">Sell (${payload.counts?.sell ?? 0})</button>
+                        </div>
+                        <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                            <button type="button" onclick="setOptionLogDecisionFilter('all')" class="${decBtnCls('all')}">All Decisions</button>
+                            <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${payload.counts?.qualified ?? 0})</button>
+                            <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${payload.counts?.rejected ?? 0})</button>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                        <input id="optLogSearchInput" type="text" value="${escSvg(optionLogSearchFilter)}" oninput="setOptionLogSearchFilter(this.value)" placeholder="Filter symbol / contract / reason..." class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] text-white mono w-48 focus:outline-none focus:border-indigo-500">
+                        ${optionLogSearchFilter ? `<button type="button" onclick="setOptionLogSearchFilter('')" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold">Show All</button>` : ''}
+                    </div>
+                </div>
+
+                <div id="optLogsScrollContainer" class="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-800/80 bg-slate-950/60">
+                    <table class="w-full text-left text-[11px] mono border-collapse">
+                        <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
+                            <tr>
+                                <th class="px-2.5 py-2">Time</th>
+                                <th class="px-2 py-2">Side</th>
+                                <th class="px-2.5 py-2">Symbol / Contract</th>
+                                <th class="px-2 py-2">Provider</th>
+                                <th class="px-2 py-2 text-right">RSI</th>
+                                <th class="px-2 py-2 text-right">v</th>
+                                <th class="px-2 py-2 text-right">a</th>
+                                <th class="px-2 py-2 text-right">&Delta;P&#770;</th>
+                                <th class="px-2 py-2 text-right">P/L %</th>
+                                <th class="px-2 py-2">Decision</th>
+                                <th class="px-2.5 py-2">Reason / Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rowsHtml || `<tr><td colspan="11" class="px-4 py-10 text-center text-slate-500">No log entries match the current filter.</td></tr>`}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+
+            const scrollBox = document.getElementById('optLogsScrollContainer');
+            if (scrollBox) scrollBox.scrollTop = prevScroll;
+            if (shouldFocusSearch) {
+                const inp = document.getElementById('optLogSearchInput');
+                if (inp) {
+                    inp.focus();
+                    const len = inp.value.length;
+                    const s = typeof selStart === 'number' ? Math.min(selStart, len) : len;
+                    const e = typeof selEnd === 'number' ? Math.min(selEnd, len) : len;
+                    inp.setSelectionRange(s, e);
+                }
+            }
         }
 
         async function fetchOptionHistory() {
@@ -11933,11 +12603,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             if (items.length === 0) {
                 listEl.innerHTML = `
-                    <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-1.5">
+                    <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-2">
                         <div class="text-xs font-semibold text-slate-300">No ${isBuyer ? 'Open' : 'Closed'} Contracts Found</div>
                         <p class="text-[11px] text-slate-500">${isBuyer ? 'Open option positions or newly placed Option Buyer orders will appear here and track minute by minute.' : 'Completed Option Seller exits or historical closed orders will appear here.'}</p>
+                        <button type="button" onclick="openOptionLogsPanel('')" class="px-2.5 py-1 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 border border-emerald-500/40 text-[10.5px] font-semibold transition">
+                            View Buy/Sell Log
+                        </button>
                     </div>`;
-                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session.</div>`;
+                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session, or click "Buy/Sell Logs" above to inspect per-minute decisions.</div>`;
                 activeOptionHistoryPoints = [];
                 return;
             }
@@ -11964,7 +12637,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const pts = c.history || [];
 
                 return `
-                    <button type="button" onclick="selectOptionContractItem('${escSvg(k)}')" class="w-full text-left p-2.5 rounded-xl border transition ${borderCls} space-y-1.5">
+                    <div role="button" tabindex="0" onclick="selectOptionContractItem('${escSvg(k)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectOptionContractItem('${escSvg(k)}');}" class="w-full text-left p-2.5 rounded-xl border transition cursor-pointer ${borderCls} space-y-1.5">
                         <div class="flex items-start justify-between gap-2">
                             <div class="min-w-0">
                                 <div class="mono text-[11px] font-bold text-white truncate">${escSvg(c.contract)}</div>
@@ -11976,11 +12649,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="text-slate-300">$${entryP.toFixed(2)} &rarr; $${endPrice.toFixed(2)}</span>
                             <span class="font-bold ${pos ? 'text-emerald-400' : 'text-rose-400'}">${fmtSignedDollars(pnlD)} (${pnlP >= 0 ? '+' : ''}${pnlP.toFixed(2)}%)</span>
                         </div>
-                        <div class="flex items-center justify-between text-[9.5px] text-slate-500 mono">
-                            <span>${isBuyer ? 'Bought' : 'Sold'}: ${escSvg(fmtShortLocalTs(isBuyer ? c.purchased_at_utc : c.sold_at_utc))}</span>
-                            <span>${pts.length}m tracked</span>
+                        <div class="flex items-center justify-between gap-1.5 text-[9.5px] text-slate-500 mono pt-0.5">
+                            <span class="truncate">${isBuyer ? 'Bought' : 'Sold'}: ${escSvg(fmtShortLocalTs(isBuyer ? c.purchased_at_utc : c.sold_at_utc))}</span>
+                            <button type="button" onclick="event.stopPropagation(); openOptionLogsPanel('${escSvg(c.underlying || c.contract)}')" class="shrink-0 px-2 py-0.5 rounded-md bg-slate-800/90 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[9.5px] font-semibold transition" title="View Buy/Sell Decision Log for ${escSvg(c.underlying || c.contract)}">
+                                Buy/Sell Log
+                            </button>
+                            <span class="shrink-0">${pts.length}m tracked</span>
                         </div>
-                    </button>
+                    </div>
                 `;
             }).join('');
             listEl.scrollTop = prevScroll;
@@ -12148,6 +12824,284 @@ def get_lan_ip():
         return "127.0.0.1"
 
 
+def _resolve_latest_option_log_file(subdir: str, preferred_name: str):
+    """Return current session's option log file if non-empty, else newest *.log in subdir."""
+    directory = LOG_ROOT / subdir
+    if not directory.exists() or not directory.is_dir():
+        return None
+    preferred = directory / preferred_name
+    try:
+        if preferred.exists() and preferred.is_file() and preferred.stat().st_size > 0:
+            return preferred
+    except OSError:
+        pass
+    candidates = []
+    for p in directory.glob("*.log"):
+        try:
+            st = p.stat()
+            if p.is_file():
+                candidates.append((st.st_size > 0, st.st_mtime, p.name, p))
+        except OSError:
+            continue
+    if not candidates:
+        return preferred if preferred.exists() and preferred.is_file() else None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return candidates[0][3]
+
+
+_OPTION_LOG_HEADER_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:,\d+)?)\s+"
+    r"(INFO|WARNING|ERROR|DEBUG|CRITICAL)\s+(\S+)(?:\s+(.*))?$"
+)
+_OPTION_BUY_ANALYSIS_RE = re.compile(
+    r"^minute=(\S+)\s+symbol=(\S+)\s+provider=(\S+)\s+rsi=(\S+)\s+"
+    r"v=(\S+)\s+a=(\S+)\s+projected_delta=(\S+)\s+pnl%=(\S+)\s+"
+    r"decision=(\S+)\s+reason=(.*?)\s+contract=(\S+)\s*$"
+)
+_OPTION_SELL_ANALYSIS_RE = re.compile(
+    r"^minute=(\S+)\s+contract=(\S+)\s+underlying=(\S+)\s+provider=(\S+)\s+"
+    r"rsi=(\S+)\s+v=(\S+)\s+a=(\S+)\s+projected_delta=(\S+)\s+pnl%=(\S+)\s+"
+    r"decision=(\S+)\s+reason=(.*)$"
+)
+_OPTION_KV_KEY_RE = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_%]*)=")
+
+
+def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
+    """Parse one line from option_buyer or option_seller log into a structured record."""
+    line = (raw_line or "").strip()
+    if not line:
+        return None
+    m = _OPTION_LOG_HEADER_RE.match(line)
+    if not m:
+        return None
+
+    ts_full = m.group(1)
+    ts_short = ts_full[5:19] if len(ts_full) >= 19 else ts_full
+    level = m.group(2)
+    event = m.group(3)
+    rest = (m.group(4) or "").strip()
+
+    rec = {
+        "timestamp": ts_full,
+        "timestamp_short": ts_short,
+        "level": level,
+        "event": event,
+        "stream": stream,
+        "minute": None,
+        "symbol": "none",
+        "contract": "n/a",
+        "provider": "none",
+        "rsi": "n/a",
+        "v": "n/a",
+        "a": "n/a",
+        "projected_delta": "n/a",
+        "pnl_pct": "n/a",
+        "decision": event,
+        "reason": rest,
+        "raw_message": rest,
+        "_sort_key": (ts_full, seq),
+    }
+
+    if event == "OPTION_BUY_ANALYSIS":
+        bm = _OPTION_BUY_ANALYSIS_RE.match(rest)
+        if bm:
+            rec["minute"] = bm.group(1)
+            rec["symbol"] = bm.group(2)
+            rec["provider"] = bm.group(3)
+            rec["rsi"] = bm.group(4)
+            rec["v"] = bm.group(5)
+            rec["a"] = bm.group(6)
+            rec["projected_delta"] = bm.group(7)
+            rec["pnl_pct"] = bm.group(8)
+            rec["decision"] = bm.group(9)
+            rec["reason"] = bm.group(10).strip()
+            rec["contract"] = bm.group(11)
+            return rec
+
+    if event == "OPTION_SELL_ANALYSIS":
+        sm = _OPTION_SELL_ANALYSIS_RE.match(rest)
+        if sm:
+            contract_val = sm.group(2)
+            underlying_val = sm.group(3)
+            rec["minute"] = sm.group(1)
+            rec["contract"] = contract_val
+            rec["symbol"] = (
+                underlying_val
+                if underlying_val not in {"n/a", "none", ""}
+                else contract_val
+            )
+            rec["provider"] = sm.group(4)
+            rec["rsi"] = sm.group(5)
+            rec["v"] = sm.group(6)
+            rec["a"] = sm.group(7)
+            rec["projected_delta"] = sm.group(8)
+            rec["pnl_pct"] = sm.group(9)
+            rec["decision"] = sm.group(10)
+            rec["reason"] = sm.group(11).strip()
+            return rec
+
+    # Fallback / generic parser for execution, hold, watch, skip, start, and error lines
+    kv_matches = list(_OPTION_KV_KEY_RE.finditer(rest))
+    kv = {}
+    for idx, km in enumerate(kv_matches):
+        key = km.group(1)
+        val_start = km.end()
+        val_end = kv_matches[idx + 1].start() if idx + 1 < len(kv_matches) else len(rest)
+        kv[key] = rest[val_start:val_end].strip()
+
+    if kv.get("minute"):
+        rec["minute"] = kv["minute"]
+    if kv.get("provider") and kv["provider"] not in {"None", ""}:
+        rec["provider"] = kv["provider"]
+    if kv.get("rsi") and kv["rsi"] not in {"None", ""}:
+        rec["rsi"] = kv["rsi"]
+    if kv.get("v") and kv["v"] not in {"None", ""}:
+        rec["v"] = kv["v"]
+    if kv.get("a") and kv["a"] not in {"None", ""}:
+        rec["a"] = kv["a"]
+    if kv.get("projected_delta") and kv["projected_delta"] not in {"None", ""}:
+        rec["projected_delta"] = kv["projected_delta"]
+
+    pnl_raw = kv.get("pnl%") or kv.get("pnl_pct") or kv.get("pnl")
+    if pnl_raw and pnl_raw not in {"None", ""}:
+        rec["pnl_pct"] = pnl_raw
+
+    if stream == "SELL":
+        und = kv.get("underlying")
+        raw_sym = kv.get("symbol")
+        contract_val = kv.get("contract")
+        rec["symbol"] = (
+            und
+            if (und and und not in {"n/a", "none", "None"})
+            else (raw_sym or "none")
+        )
+        if contract_val and contract_val not in {"n/a", "none", "None"}:
+            rec["contract"] = contract_val
+        elif raw_sym and raw_sym != rec["symbol"]:
+            rec["contract"] = raw_sym
+    else:
+        if kv.get("symbol"):
+            rec["symbol"] = kv["symbol"]
+        if kv.get("contract") and kv["contract"] not in {"None", ""}:
+            rec["contract"] = kv["contract"]
+
+    decision_map = {
+        "OPTION_BUY_DRY_RUN": "DRY_RUN_ORDER",
+        "OPTION_BUY_SUBMITTED": "ORDER_SUBMITTED",
+        "OPTION_BUY_SKIPPED": "SKIPPED",
+        "OPTION_BUY_FAILED": "ORDER_FAILED",
+        "OPTION_BUY_MARKET_FALLBACK_TO_LIMIT": "MARKET_FALLBACK_LIMIT",
+        "OPTION_BUYER_START": "ENGINE_START",
+        "OPTION_BUYER_DISABLED": "ENGINE_DISABLED",
+        "OPTION_SELL_TRAILING_HOLD": "TRAILING_HOLD",
+        "OPTION_SELL_STOP_LOSS_HOLD": "STOP_LOSS_HOLD",
+        "OPTION_SELL_STOP_LOSS_WATCH": "STOP_LOSS_WATCH",
+        "OPTION_SELL_HOLD_GRACE_ACTIVE": "HOLD_GRACE",
+        "OPTION_SELL_SKIPPED": "SKIPPED",
+        "OPTION_SELL_FAILED": "ORDER_FAILED",
+        "OPTION_SELL_MARKET_FALLBACK_TO_LIMIT": "MARKET_FALLBACK_LIMIT",
+        "OPTION_SELLER_START": "ENGINE_START",
+        "OPTION_SELLER_DISABLED": "ENGINE_DISABLED",
+    }
+    if event in {"OPTION_SELL_DRY_RUN", "OPTION_SELL_SUBMITTED"}:
+        base_dec = "DRY_RUN_ORDER" if event == "OPTION_SELL_DRY_RUN" else "ORDER_SUBMITTED"
+        kind_val = kv.get("kind")
+        rec["decision"] = f"{base_dec}({kind_val})" if kind_val else base_dec
+    elif event in decision_map:
+        rec["decision"] = decision_map[event]
+    elif kv.get("decision"):
+        rec["decision"] = kv["decision"]
+
+    # Build clean human-readable reason for non-analysis lines
+    if kv.get("trigger"):
+        parts = [kv["trigger"]]
+        if kv.get("order_type"):
+            parts.append(f"type={kv['order_type']}")
+        if kv.get("qty"):
+            parts.append(f"qty={kv['qty']}")
+        if kv.get("bid") or kv.get("ask"):
+            parts.append(f"bid={kv.get('bid', 'n/a')} ask={kv.get('ask', 'n/a')}")
+        if kv.get("total_purchase"):
+            parts.append(f"cost={kv['total_purchase']}")
+        elif kv.get("total_sale"):
+            parts.append(f"proceeds={kv['total_sale']}")
+        rec["reason"] = " · ".join(parts)
+    elif kv.get("detail"):
+        err_t = kv.get("error_type", "")
+        rec["reason"] = f"{err_t}: {kv['detail']}".strip(": ")
+    elif kv.get("reason"):
+        rec["reason"] = kv["reason"]
+    else:
+        rec["reason"] = rest or event
+
+    return rec
+
+
+def read_option_analysis_logs(limit_per_file: int = 500):
+    """Read and parse recent Option Buyer & Option Seller log lines (newest first)."""
+    from collections import deque
+
+    buyer_path = _resolve_latest_option_log_file(
+        "option_buyer", f"ALPACA-OPTION_BUYER-{RUN_ID}.log"
+    )
+    seller_path = _resolve_latest_option_log_file(
+        "option_seller", f"ALPACA-OPTION_SELLER-{RUN_ID}.log"
+    )
+
+    entries = []
+    seq = 0
+    for stream, path in (("BUY", buyer_path), ("SELL", seller_path)):
+        if path is None:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                tail_lines = deque(f, maxlen=limit_per_file)
+            for raw in tail_lines:
+                seq += 1
+                parsed = _parse_option_log_line(raw, stream=stream, seq=seq)
+                if parsed is not None:
+                    entries.append(parsed)
+        except OSError:
+            continue
+
+    entries.sort(key=lambda r: r["_sort_key"], reverse=True)
+
+    buy_count = 0
+    sell_count = 0
+    qualified_count = 0
+    rejected_count = 0
+    for r in entries:
+        r.pop("_sort_key", None)
+        if r["stream"] == "BUY":
+            buy_count += 1
+        else:
+            sell_count += 1
+        dec_u = str(r.get("decision") or "").upper()
+        ev_u = str(r.get("event") or "").upper()
+        if "QUALIFIED" in dec_u or "SUBMITTED" in ev_u or "DRY_RUN" in ev_u:
+            qualified_count += 1
+        elif (
+            "REJECTED" in dec_u
+            or "SKIPPED" in ev_u
+            or "HOLD" in ev_u
+            or "FAILED" in ev_u
+        ):
+            rejected_count += 1
+
+    return {
+        "buyer_log_file": buyer_path.name if buyer_path else None,
+        "seller_log_file": seller_path.name if seller_path else None,
+        "counts": {
+            "total": len(entries),
+            "buy": buy_count,
+            "sell": sell_count,
+            "qualified": qualified_count,
+            "rejected": rejected_count,
+        },
+        "entries": entries,
+    }
+
+
 class AdminCliProvider:
     def __init__(self, coordinator, host=None, port=None):
         import threading
@@ -12202,6 +13156,16 @@ class AdminCliProvider:
             if not hasattr(self.coordinator, "option_history"):
                 return jsonify(status="error", message="Option history tracker unavailable"), 503
             return jsonify(status="ok", **self.coordinator.option_history.get_snapshot()), 200
+
+        @app.get("/api/option-logs")
+        def get_option_logs():
+            try:
+                raw_limit = request.args.get("limit", "500")
+                limit = max(20, min(2000, int(raw_limit)))
+            except (TypeError, ValueError):
+                limit = 500
+            payload = read_option_analysis_logs(limit_per_file=limit)
+            return jsonify(status="ok", run_id=RUN_ID, **payload), 200
 
         @app.post("/api/option-history/refresh")
         def refresh_option_history():
