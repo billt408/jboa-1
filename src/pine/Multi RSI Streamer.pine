@@ -88,7 +88,7 @@ enable24 = input.bool(true, "Enable symbol 24", group = GRP_SYMBOLS)
 symbol24 = input.symbol("NASDAQ:INTC", "Symbol 24", group = GRP_SYMBOLS)
 
 enable25 = input.bool(true, "Enable symbol 25", group = GRP_SYMBOLS)
-symbol25 = input.symbol("AMEX:SPCX", "Symbol 25", group = GRP_SYMBOLS)
+symbol25 = input.symbol("NASDAQ:SPCX", "Symbol 25", group = GRP_SYMBOLS)
 
 enable26 = input.bool(true, "Enable symbol 26", group = GRP_SYMBOLS)
 symbol26 = input.symbol("NASDAQ:AAPL", "Symbol 26", group = GRP_SYMBOLS)
@@ -209,34 +209,37 @@ f_sourceValues() =>
          session.ismarket[1]
     ]
 
-f_completedSample(simple string requestedSymbol) =>
-    string sourceTicker = ticker.modify(
-         ticker.standard(requestedSymbol),
-         session = includeExtended ? session.extended : session.regular
-    )
+f_completedSample(simple bool enabled, simple string requestedSymbol) =>
+    if not enabled or str.length(str.trim(requestedSymbol)) == 0
+        [int(na), int(na), float(na), float(na), false]
+    else
+        string sourceTicker = ticker.modify(
+             ticker.standard(requestedSymbol),
+             session = includeExtended ? session.extended : session.regular
+        )
 
-    [t0, end0, price0, rsi0, regular0,
-     t1, end1, price1, rsi1, regular1] = request.security(
-         sourceTicker,
-         "1",
-         f_sourceValues(),
-         gaps = barmerge.gaps_off,
-         lookahead = barmerge.lookahead_off,
-         ignore_invalid_symbol = true
-    )
+        [t0, end0, price0, rsi0, regular0,
+         t1, end1, price1, rsi1, regular1] = request.security(
+             sourceTicker,
+             "1",
+             f_sourceValues(),
+             gaps = barmerge.gaps_off,
+             lookahead = barmerge.lookahead_off,
+             ignore_invalid_symbol = true
+        )
 
-    bool latestHasEnded = (
-         not na(end0) and
-         end0 + settleSeconds * 1000 <= timenow
-    )
+        bool latestHasEnded = (
+             not na(end0) and
+             end0 + settleSeconds * 1000 <= timenow
+        )
 
-    [
-         latestHasEnded ? t0 : t1,
-         latestHasEnded ? end0 : end1,
-         latestHasEnded ? price0 : price1,
-         latestHasEnded ? rsi0 : rsi1,
-         latestHasEnded ? regular0 : regular1
-    ]
+        [
+             latestHasEnded ? t0 : t1,
+             latestHasEnded ? end0 : end1,
+             latestHasEnded ? price0 : price1,
+             latestHasEnded ? rsi0 : rsi1,
+             latestHasEnded ? regular0 : regular1
+        ]
 
 f_jsonEscape(string value) =>
     string escaped = str.replace_all(value, "\\", "\\\\")
@@ -248,33 +251,33 @@ f_jsonEscape(string value) =>
 
 // ----------------------------- Source data (27 Symbols <= 40 security limit) -----------------------------
 
-[t1, e1, p1, r1, g1] = f_completedSample(symbol1)
-[t2, e2, p2, r2, g2] = f_completedSample(symbol2)
-[t3, e3, p3, r3, g3] = f_completedSample(symbol3)
-[t4, e4, p4, r4, g4] = f_completedSample(symbol4)
-[t5, e5, p5, r5, g5] = f_completedSample(symbol5)
-[t6, e6, p6, r6, g6] = f_completedSample(symbol6)
-[t7, e7, p7, r7, g7] = f_completedSample(symbol7)
-[t8, e8, p8, r8, g8] = f_completedSample(symbol8)
-[t9, e9, p9, r9, g9] = f_completedSample(symbol9)
-[t10, e10, p10, r10, g10] = f_completedSample(symbol10)
-[t11, e11, p11, r11, g11] = f_completedSample(symbol11)
-[t12, e12, p12, r12, g12] = f_completedSample(symbol12)
-[t13, e13, p13, r13, g13] = f_completedSample(symbol13)
-[t14, e14, p14, r14, g14] = f_completedSample(symbol14)
-[t15, e15, p15, r15, g15] = f_completedSample(symbol15)
-[t16, e16, p16, r16, g16] = f_completedSample(symbol16)
-[t17, e17, p17, r17, g17] = f_completedSample(symbol17)
-[t18, e18, p18, r18, g18] = f_completedSample(symbol18)
-[t19, e19, p19, r19, g19] = f_completedSample(symbol19)
-[t20, e20, p20, r20, g20] = f_completedSample(symbol20)
-[t21, e21, p21, r21, g21] = f_completedSample(symbol21)
-[t22, e22, p22, r22, g22] = f_completedSample(symbol22)
-[t23, e23, p23, r23, g23] = f_completedSample(symbol23)
-[t24, e24, p24, r24, g24] = f_completedSample(symbol24)
-[t25, e25, p25, r25, g25] = f_completedSample(symbol25)
-[t26, e26, p26, r26, g26] = f_completedSample(symbol26)
-[t27, e27, p27, r27, g27] = f_completedSample(symbol27)
+[t1, e1, p1, r1, g1] = f_completedSample(enable1, symbol1)
+[t2, e2, p2, r2, g2] = f_completedSample(enable2, symbol2)
+[t3, e3, p3, r3, g3] = f_completedSample(enable3, symbol3)
+[t4, e4, p4, r4, g4] = f_completedSample(enable4, symbol4)
+[t5, e5, p5, r5, g5] = f_completedSample(enable5, symbol5)
+[t6, e6, p6, r6, g6] = f_completedSample(enable6, symbol6)
+[t7, e7, p7, r7, g7] = f_completedSample(enable7, symbol7)
+[t8, e8, p8, r8, g8] = f_completedSample(enable8, symbol8)
+[t9, e9, p9, r9, g9] = f_completedSample(enable9, symbol9)
+[t10, e10, p10, r10, g10] = f_completedSample(enable10, symbol10)
+[t11, e11, p11, r11, g11] = f_completedSample(enable11, symbol11)
+[t12, e12, p12, r12, g12] = f_completedSample(enable12, symbol12)
+[t13, e13, p13, r13, g13] = f_completedSample(enable13, symbol13)
+[t14, e14, p14, r14, g14] = f_completedSample(enable14, symbol14)
+[t15, e15, p15, r15, g15] = f_completedSample(enable15, symbol15)
+[t16, e16, p16, r16, g16] = f_completedSample(enable16, symbol16)
+[t17, e17, p17, r17, g17] = f_completedSample(enable17, symbol17)
+[t18, e18, p18, r18, g18] = f_completedSample(enable18, symbol18)
+[t19, e19, p19, r19, g19] = f_completedSample(enable19, symbol19)
+[t20, e20, p20, r20, g20] = f_completedSample(enable20, symbol20)
+[t21, e21, p21, r21, g21] = f_completedSample(enable21, symbol21)
+[t22, e22, p22, r22, g22] = f_completedSample(enable22, symbol22)
+[t23, e23, p23, r23, g23] = f_completedSample(enable23, symbol23)
+[t24, e24, p24, r24, g24] = f_completedSample(enable24, symbol24)
+[t25, e25, p25, r25, g25] = f_completedSample(enable25, symbol25)
+[t26, e26, p26, r26, g26] = f_completedSample(enable26, symbol26)
+[t27, e27, p27, r27, g27] = f_completedSample(enable27, symbol27)
 
 allT = array.from(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27)
 allE = array.from(e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13, e14, e15, e16, e17, e18, e19, e20, e21, e22, e23, e24, e25, e26, e27)
