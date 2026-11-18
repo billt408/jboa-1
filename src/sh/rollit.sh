@@ -4,6 +4,7 @@ set -euo pipefail
 STOP_SERVICE="jboa-rsi.service"
 START_SERVICE="jboa-rsi.service"
 
+BASE_DIR="/home/billt/jboa-1/src"
 WORK_DIR="/home/billt/jboa-1/OLDLOGS"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="${WORK_DIR}/logs"
@@ -27,7 +28,7 @@ else
     echo "==> No '${LOG_DIR}' directory found; skipping backup."
 fi
 
-mv "${LOG_DIR}"/jboa.log "${BACKUP_DIR}"/jboa.log
+mv "${BASE_DIR}"/jboa.log "${BACKUP_DIR}"/jboa.log
 echo "==> Starting ${START_SERVICE}..."
 sudo systemctl start "${START_SERVICE}"
 

@@ -315,6 +315,9 @@ if KINEMATICS_SMOOTH_METHOD not in {"hma", "ema", "none"}:
 KINEMATICS_SMOOTH_PERIOD = max(2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD))))
 KINEMATICS_RSI_OVERBOUGHT = float(os.getenv("KINEMATICS_RSI_OVERBOUGHT", "70.0"))
 KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
+KINEMATICS_HISTORY_MAX_BARS = max(
+    60, int(os.getenv("KINEMATICS_HISTORY_MAX_BARS", "2400"))
+)
 
 
 def compute_wma(values, period):
@@ -3403,7 +3406,7 @@ class MinuteCoordinator:
             snap = getattr(tracker, "_last_metrics", None)
             if snap is not None and snap.get("timestamp") == bar_ts:
                 per_bar_metrics[bar_ts] = snap
-        # Seed warmup kinematics history so initial live summaries & charts have full RSI, velocity & smoothed context
+        # Seed warmup kinematics history so initial live summaries & charts retain deep intraday/multi-session context
         if sorted_bars:
             history = self.kinematics_history.setdefault((provider, symbol), [])
             existing_by_min = {
@@ -3411,7 +3414,7 @@ class MinuteCoordinator:
                 for idx_existing, entry in enumerate(history)
                 if entry.get("minute") is not None
             }
-            seed_slice = sorted_bars[-60:]
+            seed_slice = sorted_bars[-KINEMATICS_HISTORY_MAX_BARS:]
             seed_closes = [b.close for b in seed_slice]
             smoothed_seed = compute_smoothed_series(seed_closes)
             prev_sv = None
@@ -3457,48 +3460,47 @@ class MinuteCoordinator:
                     prev_velocity=prev_sv,
                     prev_acceleration=prev_sa,
                 )
-                if idx >= len(seed_slice) - 20:
-                    b_min = minute_utc(b.timestamp)
-                    if b_min in existing_by_min and m is None:
-                        prev_sv = sv
-                        prev_sa = sa
-                        continue
-                    seed_entry = {
-                        "minute": b_min,
-                        "timestamp": (
-                            b.timestamp.isoformat()
-                            if hasattr(b.timestamp, "isoformat")
-                            else str(b.timestamp)
-                        ),
-                        "close": b.close,
-                        "smoothed_close": sc,
-                        "rsi": rsi_val,
-                        "price_velocity": pv,
-                        "price_velocity_pct": pv_pct,
-                        "price_acceleration": pa,
-                        "smoothed_velocity": sv,
-                        "smoothed_acceleration": sa,
-                        "rsi_velocity": rv,
-                        "rsi_acceleration": ra,
-                        "projected_price_next": fc["projected_price_next"],
-                        "projected_delta_pct": fc["projected_delta_pct"],
-                        "rsi_zone": fc["rsi_zone"],
-                        "forecast_direction": fc["forecast_direction"],
-                        "trading_action": fc["trading_action"],
-                        "crossover_signal": fc["crossover_signal"],
-                        "regime": reg,
-                        "rsi_changes": rsi_changes,
-                        "rsi_period": tracker.period,
-                    }
-                    if b_min in existing_by_min:
-                        history[existing_by_min[b_min]] = seed_entry
-                    else:
-                        existing_by_min[b_min] = len(history)
-                        history.append(seed_entry)
+                b_min = minute_utc(b.timestamp)
+                if b_min in existing_by_min and m is None:
+                    prev_sv = sv
+                    prev_sa = sa
+                    continue
+                seed_entry = {
+                    "minute": b_min,
+                    "timestamp": (
+                        b.timestamp.isoformat()
+                        if hasattr(b.timestamp, "isoformat")
+                        else str(b.timestamp)
+                    ),
+                    "close": b.close,
+                    "smoothed_close": sc,
+                    "rsi": rsi_val,
+                    "price_velocity": pv,
+                    "price_velocity_pct": pv_pct,
+                    "price_acceleration": pa,
+                    "smoothed_velocity": sv,
+                    "smoothed_acceleration": sa,
+                    "rsi_velocity": rv,
+                    "rsi_acceleration": ra,
+                    "projected_price_next": fc["projected_price_next"],
+                    "projected_delta_pct": fc["projected_delta_pct"],
+                    "rsi_zone": fc["rsi_zone"],
+                    "forecast_direction": fc["forecast_direction"],
+                    "trading_action": fc["trading_action"],
+                    "crossover_signal": fc["crossover_signal"],
+                    "regime": reg,
+                    "rsi_changes": rsi_changes,
+                    "rsi_period": tracker.period,
+                }
+                if b_min in existing_by_min:
+                    history[existing_by_min[b_min]] = seed_entry
+                else:
+                    existing_by_min[b_min] = len(history)
+                    history.append(seed_entry)
                 prev_sv = sv
                 prev_sa = sa
-            if len(history) > 60:
-                del history[:-60]
+            if len(history) > KINEMATICS_HISTORY_MAX_BARS:
+                del history[:-KINEMATICS_HISTORY_MAX_BARS]
         logging.info(
             "RSI_WARMUP provider=%s symbol=%s bars=%d applied=%d changes=%d "
             "converged=%s",
@@ -3654,7 +3656,7 @@ class MinuteCoordinator:
                         price_velocity_pct - prev_entry["price_velocity_pct"], 4
                     )
 
-            valid_closes = [e for e in history if e.get("close") is not None]
+            valid_closes = [e for e in history[-16:] if e.get("close") is not None]
             if len(valid_closes) >= 3:
                 c3m = valid_closes[-3]["close"]
                 if c3m > 0:
@@ -3673,7 +3675,7 @@ class MinuteCoordinator:
                         rsi_velocity - prev_rsi_entry["rsi_velocity"], 4
                     )
 
-            valid_rsis = [e for e in history if e.get("rsi") is not None]
+            valid_rsis = [e for e in history[-16:] if e.get("rsi") is not None]
             if len(valid_rsis) >= 3:
                 r3m = valid_rsis[-3]["rsi"]
                 rsi_velocity_3m = round(curr_rsi - r3m, 4)
@@ -3682,7 +3684,7 @@ class MinuteCoordinator:
         smoothed_velocity = None
         smoothed_acceleration = None
         if curr_close is not None:
-            close_series = [e["close"] for e in history if e.get("close") is not None] + [curr_close]
+            close_series = [e["close"] for e in history[-120:] if e.get("close") is not None] + [curr_close]
             smoothed_vals = compute_smoothed_series(close_series)
             if smoothed_vals:
                 smoothed_close = round(smoothed_vals[-1], 4)
@@ -3771,8 +3773,8 @@ class MinuteCoordinator:
                     ),
                 }
             )
-            if len(history) > 60:
-                del history[:-60]
+            if len(history) > KINEMATICS_HISTORY_MAX_BARS:
+                del history[:-KINEMATICS_HISTORY_MAX_BARS]
 
         base.update(
             {
@@ -5692,6 +5694,7 @@ def _apply_ini_feature_settings(cfg):
     global TASTYTRADE_PROD_ACCOUNT_NUMBER, TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
+    global KINEMATICS_HISTORY_MAX_BARS
     global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
     global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
@@ -5790,6 +5793,9 @@ def _apply_ini_feature_settings(cfg):
     )
     KINEMATICS_RSI_OVERSOLD = _ini_float(
         cfg, "kinematics", "rsi_oversold", "KINEMATICS_RSI_OVERSOLD", 30.0
+    )
+    KINEMATICS_HISTORY_MAX_BARS = _ini_int(
+        cfg, "kinematics", "history_max_bars", "KINEMATICS_HISTORY_MAX_BARS", 2400, minimum=60
     )
     RSI_WARMUP_SESSIONS = _ini_int(
         cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
@@ -6266,7 +6272,7 @@ def _apply_ini_feature_settings(cfg):
     logging.info(
         "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s "
-        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f "
+        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
@@ -6285,6 +6291,7 @@ def _apply_ini_feature_settings(cfg):
         KINEMATICS_SMOOTH_PERIOD,
         KINEMATICS_RSI_OVERBOUGHT,
         KINEMATICS_RSI_OVERSOLD,
+        KINEMATICS_HISTORY_MAX_BARS,
         OPTION_BUY_ENABLED,
         OPTION_BUY_DRY_RUN,
         OPTION_SELL_ENABLED,
@@ -10985,7 +10992,7 @@ def _preview_pending_candidate_point(provider, hist, p_minute, cand):
     smoothed_velocity = None
     smoothed_acceleration = None
     if curr_close is not None:
-        close_series = [e["close"] for e in hist if e.get("close") is not None] + [
+        close_series = [e["close"] for e in hist[-120:] if e.get("close") is not None] + [
             curr_close
         ]
         smoothed_vals = compute_smoothed_series(close_series)
@@ -11156,6 +11163,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "momentums": [],
                 "regimes": [],
                 "best_history": [],
+                "best_history_total_bars": 0,
                 "best_history_score": (-1, -1, ""),
                 "latest_timestamps": [],
             },
@@ -11170,6 +11178,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
         window_score = (window_rsi_count, len(window_slice), window_last_ts)
         if window_score > sym_group["best_history_score"]:
             sym_group["best_history_score"] = window_score
+            sym_group["best_history_total_bars"] = len(eff_hist)
             sym_group["best_history"] = [
                 {
                     "timestamp": h.get("timestamp"),
@@ -11351,6 +11360,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "crossover_signal": c_forecast["crossover_signal"],
                 "regime": c_regime,
                 "history_window": g["best_history"],
+                "history_total_bars": g["best_history_total_bars"],
                 "buy_events": [
                     e
                     for e in coordinator.option_buy_events.get(sym, [])
@@ -11403,7 +11413,9 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             "period": KINEMATICS_SMOOTH_PERIOD,
             "overbought": KINEMATICS_RSI_OVERBOUGHT,
             "oversold": KINEMATICS_RSI_OVERSOLD,
+            "history_max_bars": KINEMATICS_HISTORY_MAX_BARS,
         },
+        "history_max_bars": KINEMATICS_HISTORY_MAX_BARS,
         "regime_counts": regime_counts,
         "display_timezone": {
             "setting": DISPLAY_TIMEZONE_SETTING,
@@ -11413,6 +11425,111 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
         "latest_by_provider": latest,
         "consolidated_symbols": consolidated_symbols,
         "instruments": records_flat,
+    }
+
+
+def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
+    """Return extended chronological bar history (up to KINEMATICS_HISTORY_MAX_BARS) for one symbol."""
+    target_sym = str(symbol or "").strip().upper()
+    cap = max(
+        2,
+        min(
+            KINEMATICS_HISTORY_MAX_BARS,
+            int(history_limit or KINEMATICS_HISTORY_MAX_BARS),
+        ),
+    )
+    if not target_sym:
+        return {
+            "symbol": "",
+            "provider": None,
+            "total_bars": 0,
+            "returned_bars": 0,
+            "max_history_bars": KINEMATICS_HISTORY_MAX_BARS,
+            "history": [],
+            "buy_events": [],
+            "sell_events": [],
+        }
+
+    latest_pending = {}
+    for (p_prov, p_sym, p_min), p_cand in list(getattr(coordinator, "pending", {}).items()):
+        if str(p_sym or "").strip().upper() != target_sym:
+            continue
+        existing = latest_pending.get(p_prov)
+        if existing is None or p_min > existing[0]:
+            latest_pending[p_prov] = (p_min, p_cand)
+
+    stream_providers = list(
+        dict.fromkeys(
+            [
+                prov
+                for (prov, sym) in coordinator.kinematics_history.keys()
+                if str(sym or "").strip().upper() == target_sym
+            ]
+            + list(latest_pending.keys())
+        )
+    )
+
+    best_score = (-1, -1, -1, "")
+    best_provider = None
+    best_eff_hist = []
+
+    for prov in stream_providers:
+        hist = list(coordinator.kinematics_history.get((prov, target_sym), []) or [])
+        eff_hist = hist
+        pending_pair = latest_pending.get(prov)
+        if pending_pair is not None:
+            p_min, p_cand = pending_pair
+            last_hist_min = _hist_minute_utc(hist[-1]) if hist else None
+            is_newer = last_hist_min is None or p_min > last_hist_min
+            should_preview = p_cand.kind != "tick" or not hist
+            if is_newer and should_preview:
+                preview_cur = _preview_pending_candidate_point(prov, hist, p_min, p_cand)
+                eff_hist = hist + [preview_cur]
+
+        if not eff_hist:
+            continue
+
+        tail_20 = eff_hist[-20:]
+        rsi_count_tail = sum(1 for h in tail_20 if h.get("rsi") is not None)
+        last_ts = str(eff_hist[-1].get("timestamp") or "")
+        score = (rsi_count_tail, len(eff_hist), len(tail_20), last_ts)
+        if score > best_score:
+            best_score = score
+            best_provider = prov
+            best_eff_hist = eff_hist
+
+    sliced = best_eff_hist[-cap:] if best_eff_hist else []
+    history_payload = [
+        {
+            "timestamp": h.get("timestamp"),
+            "close": h.get("close"),
+            "smoothed_close": h.get("smoothed_close"),
+            "price_velocity": h.get("price_velocity"),
+            "price_acceleration": h.get("price_acceleration"),
+            "smoothed_velocity": h.get("smoothed_velocity"),
+            "smoothed_acceleration": h.get("smoothed_acceleration"),
+            "rsi": h.get("rsi"),
+            "crossover_signal": h.get("crossover_signal"),
+        }
+        for h in sliced
+    ]
+    return {
+        "symbol": target_sym,
+        "provider": best_provider,
+        "total_bars": len(best_eff_hist),
+        "returned_bars": len(history_payload),
+        "max_history_bars": KINEMATICS_HISTORY_MAX_BARS,
+        "history": history_payload,
+        "buy_events": [
+            e
+            for e in coordinator.option_buy_events.get(target_sym, [])
+            if not e.get("dry_run")
+        ],
+        "sell_events": [
+            e
+            for e in coordinator.option_sell_events.get(target_sym, [])
+            if not e.get("dry_run")
+        ],
     }
 
 
@@ -13405,19 +13522,43 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <div class="lg:col-span-2 bg-slate-950/70 border border-slate-800/80 rounded-xl p-4">
-                            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-                                <span class="text-[11px] font-bold uppercase tracking-wider text-slate-300">3-Panel Synchronized Kinematic Crossover (Price · v/a · RSI)</span>
-                                <span class="flex flex-wrap items-center gap-3 text-[10px] text-slate-400 mono">
-                                    <span>a crosses 0 = Leading · v crosses 0 = Confirmed</span>
-                                    <span class="inline-flex items-center gap-1 text-red-400">
-                                        <svg viewBox="0 0 16 16" class="w-3 h-3 inline-block"><polygon points="8,1 10.1,5.6 15,6.2 11.4,9.6 12.3,14.5 8,12.1 3.7,14.5 4.6,9.6 1,6.2 5.9,5.6" fill="#ef4444" stroke="#020617" stroke-width="0.8"/></svg>
-                                        Executed Buy
+                        <div class="lg:col-span-2 bg-slate-950/70 border border-slate-800/80 rounded-xl p-4 space-y-2">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-[11px] font-bold uppercase tracking-wider text-slate-300">3-Panel Synchronized Kinematic Crossover (Price · v/a · RSI)</span>
+                                    <span id="cxModeBadge" class="text-[9.5px] mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">LIVE</span>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <div id="cxWindowButtons" class="inline-flex items-center rounded-lg bg-slate-900/90 border border-slate-800 p-0.5 text-[10px] mono">
+                                        <button type="button" data-cx-win="20" onclick="setCxWindowBars(20)" class="cx-win-btn px-1.5 py-0.5 rounded bg-indigo-600 text-white font-semibold transition">20m</button>
+                                        <button type="button" data-cx-win="60" onclick="setCxWindowBars(60)" class="cx-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">1h</button>
+                                        <button type="button" data-cx-win="120" onclick="setCxWindowBars(120)" class="cx-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">2h</button>
+                                        <button type="button" data-cx-win="240" onclick="setCxWindowBars(240)" class="cx-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">4h</button>
+                                        <button type="button" data-cx-win="390" onclick="setCxWindowBars(390)" class="cx-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition" title="Full 6.5h regular trading session">6.5h</button>
+                                    </div>
+                                    <span class="flex flex-wrap items-center gap-2.5 text-[10px] text-slate-400 mono">
+                                        <span class="hidden sm:inline">Drag chart to slide history</span>
+                                        <span class="inline-flex items-center gap-1 text-red-400">
+                                            <svg viewBox="0 0 16 16" class="w-3 h-3 inline-block"><polygon points="8,1 10.1,5.6 15,6.2 11.4,9.6 12.3,14.5 8,12.1 3.7,14.5 4.6,9.6 1,6.2 5.9,5.6" fill="#ef4444" stroke="#020617" stroke-width="0.8"/></svg>
+                                            Executed Buy
+                                        </span>
                                     </span>
-                                </span>
+                                </div>
                             </div>
                             <div id="detailCrossoverChart" class="w-full min-h-[210px] flex flex-col items-stretch justify-center text-xs text-slate-500">
                                 Collecting multi-bar history...
+                            </div>
+                            <div id="cxTimelineBar" class="hidden pt-1.5 border-t border-slate-800/70 flex flex-wrap items-center gap-2 text-[10px] mono text-slate-400">
+                                <div class="flex items-center gap-1 shrink-0">
+                                    <button type="button" id="btnCxOldest" onclick="stepCxPan('oldest')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Jump to earliest cached bar">|&lt;</button>
+                                    <button type="button" id="btnCxBack" onclick="stepCxPan('back')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide older">&lt;</button>
+                                </div>
+                                <input id="cxPanRange" type="range" min="0" max="0" value="0" step="1" class="flex-1 min-w-[120px] h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400" title="Slide through intraday and multi-session bar history" />
+                                <div class="flex items-center gap-1 shrink-0">
+                                    <button type="button" id="btnCxForward" onclick="stepCxPan('forward')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide newer">&gt;</button>
+                                    <button type="button" id="btnCxLive" onclick="snapCxToLive()" class="px-2 py-0.5 rounded border font-semibold transition bg-slate-900 text-slate-400 border-slate-800" title="Snap back to live edge">Live</button>
+                                </div>
+                                <span id="cxRangeSummary" class="text-[10px] text-slate-400 ml-auto truncate max-w-full"></span>
                             </div>
                         </div>
                     </div>
@@ -13897,6 +14038,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let displayTzAbbr = '__DISPLAY_TZ_LABEL__';
         window._cxHoverIdx = null;
         window._cxChartState = null;
+        window._cxWindowBars = 20;
+        window._cxPanOffset = 0;
+        window._cxAnchorTs = null;
+        window._cxHistoryCache = {};
+        window._cxHistoryInFlight = {};
+        window._cxDragState = { active: false, startX: 0, lastX: 0, accumPx: 0, moved: false };
+        window._cxRangeDragging = false;
+        window._cxActiveRenderParams = null;
 
         function syncDisplayTimezoneMeta(tzMeta) {
             if (!tzMeta || typeof tzMeta !== 'object') return;
@@ -14059,6 +14208,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const val = (document.getElementById('symbolSearch').value || '').trim().toUpperCase();
             document.getElementById('btnClearSearch').classList.toggle('hidden', !val);
             if (val) {
+                if (selectedSymbol !== val) {
+                    window._cxPanOffset = 0;
+                    window._cxAnchorTs = null;
+                    window._cxHoverIdx = null;
+                }
                 selectedSymbol = val;
                 userSelectedSymbol = true;
             }
@@ -14091,14 +14245,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function selectSymbolFromDropdown(sym) {
             if (!sym) return;
+            const changed = selectedSymbol !== sym;
             selectedSymbol = sym;
             userSelectedSymbol = true;
+            if (changed) {
+                window._cxPanOffset = 0;
+                window._cxAnchorTs = null;
+                window._cxHoverIdx = null;
+            }
             renderSymbolDeepDive();
         }
 
         function selectAndInspectSymbol(sym) {
+            const changed = selectedSymbol !== sym;
             selectedSymbol = sym;
             userSelectedSymbol = true;
+            if (changed) {
+                window._cxPanOffset = 0;
+                window._cxAnchorTs = null;
+                window._cxHoverIdx = null;
+            }
             renderSymbolDeepDive();
             const el = document.getElementById('bottomInspectorSection');
             if (el) {
@@ -14861,8 +15027,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (grp) grp.style.display = 'none';
                 if (hud) {
                     const lastCol = st.cols[Math.min(st.cols.length - 1, Math.max(0, st.n - 1))];
-                    hud.innerHTML = `<span class="text-slate-400">Flyover cursor over chart to inspect values (${escSvg(displayTzAbbr)})</span>`
-                        + (lastCol ? `<span class="text-slate-300">Latest <strong class="text-white">${escSvg(lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}</span>` : '');
+                    const isHist = (window._cxPanOffset || 0) > 0;
+                    const hint = st.canPan
+                        ? `Hover to inspect · Grab &amp; slide chart to view history (${escSvg(displayTzAbbr)})`
+                        : `Flyover cursor over chart to inspect values (${escSvg(displayTzAbbr)})`;
+                    const edgeLbl = isHist ? 'Window End' : 'Latest';
+                    hud.innerHTML = `<span class="text-slate-400">${hint}</span>`
+                        + (lastCol ? `<span class="text-slate-300">${edgeLbl} <strong class="text-white">${escSvg(lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}</span>` : '');
                 }
                 return;
             }
@@ -14974,6 +15145,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function onCxChartMouseMove(ev) {
+            if (window._cxDragState && window._cxDragState.active) return;
             const st = window._cxChartState;
             const svg = document.getElementById('cxCrossoverSvg');
             if (!st || !svg || !Array.isArray(st.cols) || st.cols.length === 0) return;
@@ -14994,17 +15166,287 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function onCxChartMouseLeave() {
+            if (window._cxDragState && window._cxDragState.active) return;
             window._cxHoverIdx = null;
             applyCxHover(null);
         }
 
-        function renderCrossoverChart(container, points, projectedNext, buyEvents = []) {
+        function _mergeCxHistorySeries(deepPoints, liveWindow) {
+            const byKey = new Map();
+            const addList = (arr) => {
+                if (!Array.isArray(arr)) return;
+                for (const pt of arr) {
+                    if (!pt || !pt.timestamp) continue;
+                    byKey.set(String(pt.timestamp), pt);
+                }
+            };
+            addList(deepPoints);
+            addList(liveWindow);
+            const merged = Array.from(byKey.values());
+            merged.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+            const maxKeep = Math.max(60, Number((latestData && latestData.history_max_bars) || 2400));
+            if (merged.length > maxKeep) {
+                return merged.slice(merged.length - maxKeep);
+            }
+            return merged;
+        }
+
+        async function ensureDeepHistoryForSymbol(sym, totalHint = 0) {
+            if (!sym) return;
+            const cache = window._cxHistoryCache[sym];
+            const nowMs = Date.now();
+            const cachedLen = cache && Array.isArray(cache.points) ? cache.points.length : 0;
+            const needsInitial = !cache;
+            const needsCatchup = totalHint > cachedLen + 1;
+            const isStale = cache && (nowMs - (cache.fetchedAtMs || 0) > 30000);
+            if (!needsInitial && !needsCatchup && !isStale) return;
+            if (window._cxHistoryInFlight[sym]) return;
+
+            window._cxHistoryInFlight[sym] = true;
+            try {
+                const maxLimit = Math.max(60, Number((latestData && latestData.history_max_bars) || 2400));
+                const res = await fetch(`/api/kinematics/history?symbol=${encodeURIComponent(sym)}&limit=${maxLimit}`, { cache: 'no-store' });
+                if (!res || !res.ok) return;
+                const data = await res.json();
+                if (!data || data.status !== 'ok') return;
+                window._cxHistoryCache[sym] = {
+                    points: Array.isArray(data.history) ? data.history : [],
+                    totalBars: Number(data.total_bars || 0),
+                    provider: data.provider || null,
+                    fetchedAtMs: Date.now(),
+                };
+                if (selectedSymbol === sym && !window._cxDragState.active && !window._cxRangeDragging) {
+                    renderSymbolDeepDive();
+                }
+            } catch (_) {
+                // ignore transient network errors; 2.5s snapshot still renders
+            } finally {
+                delete window._cxHistoryInFlight[sym];
+            }
+        }
+
+        function _fmtCxRangeStamp(pt) {
+            if (!pt || !pt.timestamp) return '--';
+            const d = new Date(pt.timestamp);
+            if (Number.isNaN(d.getTime())) return formatMinuteTick(pt, 0);
+            try {
+                if (displayTzIana) {
+                    const parts = new Intl.DateTimeFormat('en-US', {
+                        timeZone: displayTzIana,
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: false,
+                    }).format(d);
+                    return parts;
+                }
+            } catch (_) {}
+            return formatMinuteTick(pt, 0);
+        }
+
+        function _updateCxToolbarControls(totalBars, visibleCount, maxOffset, offsetFromRight, startPt, endPt) {
+            document.querySelectorAll('.cx-win-btn').forEach(btn => {
+                const w = Number(btn.getAttribute('data-cx-win'));
+                if (w === window._cxWindowBars) {
+                    btn.className = 'cx-win-btn px-1.5 py-0.5 rounded bg-indigo-600 text-white font-semibold transition';
+                } else {
+                    btn.className = 'cx-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition';
+                }
+            });
+
+            const modeBadge = document.getElementById('cxModeBadge');
+            if (modeBadge) {
+                if (offsetFromRight > 0) {
+                    modeBadge.textContent = `HISTORY -${offsetFromRight}m`;
+                    modeBadge.className = 'text-[9.5px] mono px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/35 font-semibold';
+                } else {
+                    modeBadge.textContent = 'LIVE';
+                    modeBadge.className = 'text-[9.5px] mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold';
+                }
+            }
+
+            const bar = document.getElementById('cxTimelineBar');
+            if (!bar) return;
+            if (totalBars < 2) {
+                bar.classList.add('hidden');
+                return;
+            }
+            bar.classList.remove('hidden');
+
+            const rangeEl = document.getElementById('cxPanRange');
+            if (rangeEl) {
+                rangeEl.max = String(maxOffset);
+                // Slider value: 0 (left) = oldest, maxOffset (right) = Live
+                const sliderVal = Math.max(0, maxOffset - offsetFromRight);
+                if (!window._cxRangeDragging) {
+                    rangeEl.value = String(sliderVal);
+                }
+                rangeEl.disabled = maxOffset <= 0;
+            }
+
+            const btnOldest = document.getElementById('btnCxOldest');
+            const btnBack = document.getElementById('btnCxBack');
+            const btnFwd = document.getElementById('btnCxForward');
+            const btnLive = document.getElementById('btnCxLive');
+            if (btnOldest) btnOldest.disabled = offsetFromRight >= maxOffset;
+            if (btnBack) btnBack.disabled = offsetFromRight >= maxOffset;
+            if (btnFwd) btnFwd.disabled = offsetFromRight <= 0;
+            if (btnLive) {
+                if (offsetFromRight > 0) {
+                    btnLive.className = 'px-2 py-0.5 rounded border font-semibold transition bg-cyan-500/20 hover:bg-cyan-500/35 text-cyan-200 border-cyan-500/50 cursor-pointer';
+                    btnLive.disabled = false;
+                } else {
+                    btnLive.className = 'px-2 py-0.5 rounded border font-semibold transition bg-slate-900 text-emerald-400 border-emerald-500/30';
+                    btnLive.disabled = true;
+                }
+            }
+
+            const summaryEl = document.getElementById('cxRangeSummary');
+            if (summaryEl) {
+                const startTxt = _fmtCxRangeStamp(startPt);
+                const endTxt = _fmtCxRangeStamp(endPt);
+                summaryEl.textContent = `${startTxt} – ${endTxt} ${displayTzAbbr} · ${visibleCount}/${totalBars}m`
+                    + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+            }
+        }
+
+        function _rerenderActiveCxChart() {
+            const p = window._cxActiveRenderParams;
+            if (!p || !p.container) return;
+            renderCrossoverChart(p.container, p.allPoints, p.projectedNext, p.buyEvents, true);
+        }
+
+        function setCxWindowBars(bars) {
+            const nextWin = Math.max(10, Math.min(600, Number(bars) || 20));
+            if (window._cxWindowBars === nextWin) return;
+            window._cxWindowBars = nextWin;
+            window._cxHoverIdx = null;
+            _rerenderActiveCxChart();
+        }
+
+        function stepCxPan(dir) {
+            const p = window._cxActiveRenderParams;
+            if (!p || !Array.isArray(p.allPoints)) return;
+            const total = p.allPoints.length;
+            const winSize = Math.min(total, Math.max(2, window._cxWindowBars));
+            const maxOffset = Math.max(0, total - winSize);
+            const step = Math.max(1, Math.round(winSize / 2));
+            if (dir === 'oldest') {
+                window._cxPanOffset = maxOffset;
+            } else if (dir === 'back') {
+                window._cxPanOffset = Math.min(maxOffset, (window._cxPanOffset || 0) + step);
+            } else if (dir === 'forward') {
+                window._cxPanOffset = Math.max(0, (window._cxPanOffset || 0) - step);
+            }
+            window._cxHoverIdx = null;
+            _rerenderActiveCxChart();
+        }
+
+        function snapCxToLive() {
+            window._cxPanOffset = 0;
+            window._cxAnchorTs = null;
+            window._cxHoverIdx = null;
+            _rerenderActiveCxChart();
+        }
+
+        (function initCxPanListeners() {
+            const rangeEl = document.getElementById('cxPanRange');
+            if (rangeEl) {
+                rangeEl.addEventListener('pointerdown', () => { window._cxRangeDragging = true; });
+                rangeEl.addEventListener('input', () => {
+                    const maxOff = Number(rangeEl.max) || 0;
+                    const sliderVal = Number(rangeEl.value) || 0;
+                    window._cxPanOffset = Math.max(0, Math.min(maxOff, maxOff - sliderVal));
+                    window._cxHoverIdx = null;
+                    _rerenderActiveCxChart();
+                });
+                const endRangeDrag = () => { window._cxRangeDragging = false; };
+                rangeEl.addEventListener('pointerup', endRangeDrag);
+                rangeEl.addEventListener('change', endRangeDrag);
+            }
+
+            window.addEventListener('pointermove', (ev) => {
+                const ds = window._cxDragState;
+                if (!ds || !ds.active) return;
+                const st = window._cxChartState;
+                const svg = document.getElementById('cxCrossoverSvg');
+                if (!st || !svg) return;
+                const dx = ev.clientX - ds.lastX;
+                ds.lastX = ev.clientX;
+                if (Math.abs(ev.clientX - ds.startX) > 3) ds.moved = true;
+                ds.accumPx += dx;
+
+                const rect = svg.getBoundingClientRect();
+                const plotPxW = rect && rect.width > 0 ? rect.width * ((st.plotW || 570) / (st.W || 640)) : 500;
+                const pxPerBar = Math.max(2, plotPxW / Math.max(1, (st.n || 20) - 1));
+                const barShift = Math.trunc(ds.accumPx / pxPerBar);
+                if (barShift !== 0) {
+                    ds.accumPx -= barShift * pxPerBar;
+                    const p = window._cxActiveRenderParams;
+                    const total = p && Array.isArray(p.allPoints) ? p.allPoints.length : (st.n || 0);
+                    const winSize = Math.min(total, Math.max(2, window._cxWindowBars));
+                    const maxOff = Math.max(0, total - winSize);
+                    const nextOff = Math.max(0, Math.min(maxOff, (window._cxPanOffset || 0) + barShift));
+                    if (nextOff !== window._cxPanOffset) {
+                        window._cxPanOffset = nextOff;
+                        window._cxHoverIdx = null;
+                        _rerenderActiveCxChart();
+                    }
+                }
+            });
+
+            const finishDrag = () => {
+                const ds = window._cxDragState;
+                if (!ds || !ds.active) return;
+                ds.active = false;
+                const overlay = document.getElementById('cxHoverOverlay');
+                if (overlay) {
+                    overlay.style.cursor = (window._cxChartState && window._cxChartState.canPan) ? 'grab' : 'crosshair';
+                }
+            };
+            window.addEventListener('pointerup', finishDrag);
+            window.addEventListener('pointercancel', finishDrag);
+        })();
+
+        function renderCrossoverChart(container, allPoints, projectedNext, buyEvents = [], fromInteraction = false) {
             if (!container) return;
-            if (!points || points.length < 2) {
+            window._cxActiveRenderParams = { container, allPoints, projectedNext, buyEvents };
+            if (!fromInteraction && ((window._cxDragState && window._cxDragState.active) || window._cxRangeDragging)) {
+                return;
+            }
+            if (!allPoints || allPoints.length < 2) {
                 window._cxChartState = null;
+                _updateCxToolbarControls(0, 0, 0, 0, null, null);
                 container.innerHTML = '<div class="text-xs text-slate-500 py-8 text-center">Need at least 2 closed minute bars to draw synchronized Price / Velocity / Acceleration / RSI panels.</div>';
                 return;
             }
+
+            const total = allPoints.length;
+            const winSize = Math.min(total, Math.max(2, window._cxWindowBars || 20));
+            const maxOffset = Math.max(0, total - winSize);
+
+            // Preserve viewed historical slice across live 2.5s polls when panned back
+            if (!fromInteraction && window._cxPanOffset > 0 && window._cxAnchorTs) {
+                const anchorIdx = allPoints.findIndex(pt => pt && pt.timestamp === window._cxAnchorTs);
+                if (anchorIdx >= 0) {
+                    window._cxPanOffset = Math.max(0, (total - 1) - anchorIdx);
+                }
+            }
+            window._cxPanOffset = Math.max(0, Math.min(maxOffset, window._cxPanOffset || 0));
+            const offset = window._cxPanOffset;
+            const endIdx = total - offset;
+            const startIdx = Math.max(0, endIdx - winSize);
+            const points = allPoints.slice(startIdx, endIdx);
+            const effProjectedNext = offset === 0 ? projectedNext : null;
+            if (offset > 0) {
+                window._cxAnchorTs = points[points.length - 1]?.timestamp || null;
+            } else {
+                window._cxAnchorTs = null;
+            }
+
+            _updateCxToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
+
             const W = 640, H = 232, padL = 44, padR = 26;
             const plotW = W - padL - padR;
             const n = points.length;
@@ -15013,7 +15455,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const prices = points.map(p => safeNum(p.close)).filter(v => v !== null);
             const smooths = points.map(p => safeNum(p.smoothed_close)).filter(v => v !== null);
             const allP = [...prices, ...smooths];
-            if (projectedNext !== null) allP.push(projectedNext);
+            if (effProjectedNext !== null) allP.push(effProjectedNext);
             const minP = Math.min(...allP), maxP = Math.max(...allP);
             const spanP = Math.max(0.01, maxP - minP);
             const yP = (val) => 12 + (1 - (val - minP) / spanP) * 52;
@@ -15025,7 +15467,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const yR = (val) => 162 + (1 - Math.min(100, Math.max(0, val)) / 100) * 48;
 
-            const poly = (vals, yFn, offset = 0) => vals.map((v, i) => v === null ? null : `${xAt(i + offset).toFixed(1)},${yFn(v).toFixed(1)}`).filter(Boolean).join(' ');
+            const poly = (vals, yFn, idxOffset = 0) => vals.map((v, i) => v === null ? null : `${xAt(i + idxOffset).toFixed(1)},${yFn(v).toFixed(1)}`).filter(Boolean).join(' ');
 
             const closePts = poly(points.map(p => safeNum(p.close)), yP);
             const smoothPts = poly(points.map(p => safeNum(p.smoothed_close)), yP);
@@ -15040,10 +15482,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const lastX = xAt(n - 1);
             const lastY = yP(points[n - 1].close);
             const nextX = xAt(n);
-            const nextY = projectedNext !== null ? yP(projectedNext) : lastY;
+            const nextY = effProjectedNext !== null ? yP(effProjectedNext) : lastY;
 
-            // Subtle 1-minute vertical boundaries drawn BEHIND all series
-            const labelStep = n <= 8 ? 1 : (n <= 15 ? 3 : 4);
+            // Adaptive vertical time gridlines + legible axis ticks across 20m..390m viewports
+            const labelStep = n <= 8 ? 1 : (n <= 24 ? 4 : (n <= 90 ? 15 : 30));
+            const gridInterval = n <= 30 ? 1 : (n <= 90 ? 5 : (n <= 240 ? 15 : 30));
             let minuteGrid = '';
             let lastLabelX = -999;
             const latestBarX = xAt(n - 1);
@@ -15053,22 +15496,31 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const tickStr = formatMinuteTick(points[i], i);
                 const minNum = parseInt((tickStr.split(':')[1] || ''), 10);
                 const isMajor5m = !Number.isNaN(minNum) && minNum % 5 === 0;
+                const isMajor15m = !Number.isNaN(minNum) && minNum % 15 === 0;
+                const isMajor30m = !Number.isNaN(minNum) && minNum % 30 === 0;
                 const isLatest = i === n - 1;
-                const strokeColor = isMajor5m ? '#64748b' : '#475569';
-                const strokeOpacity = isMajor5m ? '0.80' : '0.55';
-                const dash = isMajor5m ? '3,2' : '2,3';
+                const showGridLine = i === 0 || isLatest || (gridInterval === 1)
+                    || (gridInterval === 5 && isMajor5m)
+                    || (gridInterval === 15 && isMajor15m)
+                    || (gridInterval === 30 && isMajor30m);
 
-                minuteGrid += `<line x1="${x}" y1="10" x2="${x}" y2="212" stroke="${strokeColor}" stroke-opacity="${strokeOpacity}" stroke-dasharray="${dash}" stroke-width="1"><title>Bar ${tickStr} ${escSvg(displayTzAbbr)}</title></line>`;
+                if (showGridLine) {
+                    const isMajor = (gridInterval === 1) ? isMajor5m : (gridInterval <= 15 ? isMajor15m : isMajor30m);
+                    const strokeColor = isMajor ? '#64748b' : '#475569';
+                    const strokeOpacity = isMajor ? '0.75' : '0.45';
+                    const dash = isMajor ? '3,2' : '2,3';
+                    minuteGrid += `<line x1="${x}" y1="10" x2="${x}" y2="212" stroke="${strokeColor}" stroke-opacity="${strokeOpacity}" stroke-dasharray="${dash}" stroke-width="1"><title>Bar ${tickStr} ${escSvg(displayTzAbbr)}</title></line>`;
+                }
 
-                const fitsSpacing = (xNum - lastLabelX >= 38) && (isLatest || (latestBarX - xNum >= 38));
-                const isCandidate = i === 0 || isMajor5m || (i % labelStep === 0) || isLatest;
+                const fitsSpacing = (xNum - lastLabelX >= 42) && (isLatest || (latestBarX - xNum >= 42));
+                const isCandidate = i === 0 || (n <= 30 ? isMajor5m : (n <= 90 ? isMajor15m : isMajor30m)) || (i % labelStep === 0) || isLatest;
                 if (isCandidate && fitsSpacing) {
                     const textColor = isLatest ? '#cbd5e1' : '#94a3b8';
                     minuteGrid += `<text x="${x}" y="225" text-anchor="middle" fill="${textColor}" font-size="8.5" font-family="monospace">${tickStr}</text>`;
                     lastLabelX = xNum;
                 }
             }
-            if (projectedNext !== null) {
+            if (effProjectedNext !== null) {
                 const px = xAt(n).toFixed(1);
                 minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
                 minuteGrid += `<text x="${px}" y="225" text-anchor="middle" fill="#22d3ee" fill-opacity="0.90" font-size="8.5" font-family="monospace">+1m</text>`;
@@ -15076,10 +15528,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const crossMarkers = points.map((p, i) => {
                 if (p.crossover_signal === 'leading_bearish' || p.crossover_signal === 'leading_bullish') {
-                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(accs[i]).toFixed(1)}" r="3.5" fill="#fb923c" stroke="#0f172a" stroke-width="1"><title>Leading Signal (${p.crossover_signal})</title></circle>`;
+                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(accs[i]).toFixed(1)}" r="${n > 90 ? 2.5 : 3.5}" fill="#fb923c" stroke="#0f172a" stroke-width="0.9"><title>Leading Signal (${p.crossover_signal})</title></circle>`;
                 }
                 if (p.crossover_signal === 'confirmed_bearish' || p.crossover_signal === 'confirmed_bullish') {
-                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(vels[i]).toFixed(1)}" r="3.5" fill="#38bdf8" stroke="#0f172a" stroke-width="1"><title>Velocity Crossover (${p.crossover_signal})</title></circle>`;
+                    return `<circle cx="${xAt(i).toFixed(1)}" cy="${yVA(vels[i]).toFixed(1)}" r="${n > 90 ? 2.5 : 3.5}" fill="#38bdf8" stroke="#0f172a" stroke-width="0.9"><title>Velocity Crossover (${p.crossover_signal})</title></circle>`;
                 }
                 return '';
             }).join('');
@@ -15107,7 +15559,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         colIdx = barIdx;
                         const bp = safeNum(points[barIdx].close);
                         by = bp !== null ? yP(bp) : lastY;
-                    } else if (lastBarMinIdx !== null && evMin === lastBarMinIdx + 1) {
+                    } else if (effProjectedNext !== null && lastBarMinIdx !== null && evMin === lastBarMinIdx + 1) {
                         bx = nextX;
                         by = nextY;
                         colIdx = n;
@@ -15150,12 +15602,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     buyNote: buyNoteByCol[i] || null,
                 };
             });
-            if (projectedNext !== null) {
+            if (effProjectedNext !== null) {
                 cols.push({
                     x: nextX,
                     tick: '+1m',
                     isProj: true,
-                    close: projectedNext,
+                    close: effProjectedNext,
                     smooth: null,
                     vel: null,
                     acc: null,
@@ -15169,17 +15621,23 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     buyNote: buyNoteByCol[n] || null,
                 });
             }
-            window._cxChartState = { W, H, n, cols };
+            const canPan = maxOffset > 0;
+            window._cxChartState = { W, H, plotW, n, cols, canPan };
 
             const overlayX = Math.max(0, padL - 10);
             const overlayW = W - overlayX - Math.max(0, padR - 14);
+            const cursorStyle = (window._cxDragState && window._cxDragState.active)
+                ? 'grabbing'
+                : (canPan ? 'grab' : 'crosshair');
 
             container.innerHTML = `
                 <div id="cxHoverHud" class="w-full mb-1.5 px-2.5 py-1 rounded-lg bg-slate-900/90 border border-slate-800/80 text-[10.5px] mono flex flex-wrap items-center justify-between gap-2 text-slate-400"></div>
-                <svg id="cxCrossoverSvg" viewBox="0 0 ${W} ${H}" class="w-full h-auto overflow-visible select-none">
+                <svg id="cxCrossoverSvg" viewBox="0 0 ${W} ${H}" class="w-full h-auto overflow-visible select-none" style="touch-action: pan-y;">
                     ${minuteGrid}
 
                     <text x="4" y="20" fill="#94a3b8" font-size="9" font-family="monospace">Price</text>
+                    <text x="4" y="31" fill="#64748b" font-size="7.5" font-family="monospace">${maxP.toFixed(2)}</text>
+                    <text x="4" y="64" fill="#64748b" font-size="7.5" font-family="monospace">${minP.toFixed(2)}</text>
                     <text x="4" y="102" fill="#94a3b8" font-size="9" font-family="monospace">v / a</text>
                     <text x="4" y="176" fill="#94a3b8" font-size="9" font-family="monospace">RSI</text>
 
@@ -15194,7 +15652,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                     <polyline fill="none" stroke="#e2e8f0" stroke-width="1.6" points="${closePts}" />
                     ${smoothPts ? `<polyline fill="none" stroke="#818cf8" stroke-width="1.4" stroke-dasharray="4,2" points="${smoothPts}" />` : ''}
-                    ${projectedNext !== null ? `<line x1="${lastX.toFixed(1)}" y1="${lastY.toFixed(1)}" x2="${nextX.toFixed(1)}" y2="${nextY.toFixed(1)}" stroke="#22d3ee" stroke-dasharray="3,2" stroke-width="1.5" /><circle cx="${nextX.toFixed(1)}" cy="${nextY.toFixed(1)}" r="3.5" fill="#22d3ee" />` : ''}
+                    ${effProjectedNext !== null ? `<line x1="${lastX.toFixed(1)}" y1="${lastY.toFixed(1)}" x2="${nextX.toFixed(1)}" y2="${nextY.toFixed(1)}" stroke="#22d3ee" stroke-dasharray="3,2" stroke-width="1.5" /><circle cx="${nextX.toFixed(1)}" cy="${nextY.toFixed(1)}" r="3.5" fill="#22d3ee" />` : ''}
 
                     <polyline fill="none" stroke="#38bdf8" stroke-width="1.5" points="${velPts}" />
                     <polyline fill="none" stroke="#fb923c" stroke-width="1.5" points="${accPts}" />
@@ -15220,7 +15678,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <text id="cxTagRsiTxt" x="0" y="170.5" fill="#f3e8ff" font-size="8.2" font-family="monospace"></text>
                     </g>
 
-                    <rect id="cxHoverOverlay" x="${overlayX}" y="6" width="${overlayW}" height="222" fill="transparent" style="cursor: crosshair;" />
+                    <rect id="cxHoverOverlay" x="${overlayX}" y="6" width="${overlayW}" height="222" fill="transparent" style="cursor: ${cursorStyle};" />
                 </svg>
             `;
 
@@ -15228,6 +15686,37 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (overlayEl) {
                 overlayEl.addEventListener('mousemove', onCxChartMouseMove);
                 overlayEl.addEventListener('mouseleave', onCxChartMouseLeave);
+                overlayEl.addEventListener('pointerdown', (ev) => {
+                    if (ev.button !== undefined && ev.button !== 0) return;
+                    if (!window._cxChartState || !window._cxChartState.canPan) return;
+                    ev.preventDefault();
+                    window._cxDragState = {
+                        active: true,
+                        startX: ev.clientX,
+                        lastX: ev.clientX,
+                        accumPx: 0,
+                        moved: false,
+                    };
+                    overlayEl.style.cursor = 'grabbing';
+                });
+                overlayEl.addEventListener('wheel', (ev) => {
+                    const p = window._cxActiveRenderParams;
+                    if (!p || !Array.isArray(p.allPoints)) return;
+                    const isHorizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) || ev.shiftKey;
+                    if (!isHorizontal) return;
+                    ev.preventDefault();
+                    const rawDelta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+                    const stepBars = Math.round(-rawDelta / 16) || (rawDelta < 0 ? 1 : -1);
+                    const totalLen = p.allPoints.length;
+                    const wSize = Math.min(totalLen, Math.max(2, window._cxWindowBars || 20));
+                    const maxOff = Math.max(0, totalLen - wSize);
+                    const nextOff = Math.max(0, Math.min(maxOff, (window._cxPanOffset || 0) + stepBars));
+                    if (nextOff !== window._cxPanOffset) {
+                        window._cxPanOffset = nextOff;
+                        window._cxHoverIdx = null;
+                        _rerenderActiveCxChart();
+                    }
+                }, { passive: false });
             }
             if (window._cxHoverIdx !== null && window._cxHoverIdx !== undefined) {
                 const clamped = Math.min(cols.length - 1, Math.max(0, window._cxHoverIdx));
@@ -15292,9 +15781,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 detailLogBtn.setAttribute('onclick', `openOptionLogsPanel('${escSvg(sym)}')`);
             }
 
+            ensureDeepHistoryForSymbol(sym, Number(symbolData.history_total_bars || 0));
+            const deepCached = window._cxHistoryCache[sym];
+            const mergedHistory = _mergeCxHistorySeries(
+                deepCached ? deepCached.points : [],
+                symbolData.history_window || []
+            );
+
             renderCrossoverChart(
                 document.getElementById('detailCrossoverChart'),
-                symbolData.history_window || [],
+                mergedHistory,
                 safeNum(symbolData.projected_price_next),
                 symbolData.buy_events || []
             );
@@ -17166,8 +17662,28 @@ class AdminCliProvider:
 
         @app.get("/api/kinematics")
         def get_kinematics():
-            snap = build_kinematics_snapshot_data(self.coordinator, history_limit=20)
+            try:
+                raw_limit = request.args.get("history_limit", "20")
+                hist_limit = max(2, min(KINEMATICS_HISTORY_MAX_BARS, int(raw_limit)))
+            except (TypeError, ValueError):
+                hist_limit = 20
+            snap = build_kinematics_snapshot_data(self.coordinator, history_limit=hist_limit)
             return jsonify(status="ok", run_id=RUN_ID, **snap), 200
+
+        @app.get("/api/kinematics/history")
+        def get_kinematics_symbol_history():
+            symbol = str(request.args.get("symbol") or "").strip().upper()
+            if not symbol:
+                return jsonify(status="error", message="Missing symbol parameter"), 400
+            try:
+                raw_limit = request.args.get("limit", str(KINEMATICS_HISTORY_MAX_BARS))
+                hist_limit = max(2, min(KINEMATICS_HISTORY_MAX_BARS, int(raw_limit)))
+            except (TypeError, ValueError):
+                hist_limit = KINEMATICS_HISTORY_MAX_BARS
+            payload = build_symbol_kinematics_history(
+                self.coordinator, symbol, history_limit=hist_limit
+            )
+            return jsonify(status="ok", run_id=RUN_ID, **payload), 200
 
         @app.get("/api/minute-summaries")
         def get_minute_summaries():
