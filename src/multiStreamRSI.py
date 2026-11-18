@@ -13490,7 +13490,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <p id="optLogsFileSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Minute-by-minute Option Buyer &amp; Option Seller evaluations</p>
                 </div>
                 <div class="flex items-center gap-2">
-                    <button type="button" onclick="fetchOptionLogs()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                    <button type="button" onclick="fetchOptionLogs(true)" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
                         Refresh Logs
                     </button>
                     <button type="button" onclick="closeOptionLogsModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
@@ -13821,7 +13821,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     jobs.push(Promise.resolve(null));
                 }
                 if (logsOpen) {
-                    jobs.push(fetch('/api/option-logs?limit=500').then(r => r.json()).catch(() => null));
+                    jobs.push(fetch(`/api/option-logs?limit=2000&_ts=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
@@ -15170,9 +15170,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 modal.classList.remove('hidden');
             }
             if (latestOptionLogs) {
-                renderOptionLogsPanel();
+                renderOptionLogsPanel(false, true);
             }
-            await fetchOptionLogs();
+            await fetchOptionLogs(true);
         }
 
         function closeOptionLogsModal() {
@@ -15180,17 +15180,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (modal) modal.classList.add('hidden');
         }
 
-        async function fetchOptionLogs() {
+        async function fetchOptionLogs(resetScroll = false) {
             const logsEl = document.getElementById('optLogsPane');
             if (logsEl && !latestOptionLogs) {
                 logsEl.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Retrieving buy &amp; sell analysis logs...</div>`;
             }
             try {
-                const res = await fetch('/api/option-logs?limit=500');
+                const res = await fetch(`/api/option-logs?limit=2000&_ts=${Date.now()}`, { cache: 'no-store' });
                 const data = await res.json();
                 if (res.ok && data && data.status === 'ok') {
                     latestOptionLogs = data;
-                    renderOptionLogsPanel();
+                    renderOptionLogsPanel(false, !!resetScroll);
                 } else if (logsEl) {
                     logsEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-10">Failed to load logs: ${escSvg((data && data.message) || 'Unknown error')}</div>`;
                 }
@@ -15203,23 +15203,23 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function setOptionLogStreamFilter(val) {
             optionLogStreamFilter = val || 'all';
-            renderOptionLogsPanel();
+            renderOptionLogsPanel(false, true);
         }
 
         function setOptionLogDecisionFilter(val) {
             optionLogDecisionFilter = val || 'all';
-            renderOptionLogsPanel();
+            renderOptionLogsPanel(false, true);
         }
 
         function setOptionLogSearchFilter(val) {
             optionLogSearchFilter = String(val || '').trim().toUpperCase();
-            renderOptionLogsPanel(true);
+            renderOptionLogsPanel(true, true);
         }
 
-        function renderOptionLogsPanel(preserveInputFocus = false) {
+        function renderOptionLogsPanel(preserveInputFocus = false, resetScroll = false) {
             const logsEl = document.getElementById('optLogsPane');
             if (!logsEl) return;
-            const prevScroll = document.getElementById('optLogsScrollContainer')?.scrollTop || 0;
+            const prevScroll = resetScroll ? 0 : (document.getElementById('optLogsScrollContainer')?.scrollTop || 0);
             const activeEl = document.activeElement;
             const wasSearchFocused = !!(activeEl && activeEl.id === 'optLogSearchInput');
             const selStart = wasSearchFocused ? activeEl.selectionStart : null;
@@ -15975,7 +15975,11 @@ def _resolve_latest_option_log_file(subdir: str, preferred_name: str):
 
 
 def _list_provider_option_log_files(subdir: str, prefix: str):
-    """Return all non-empty *.log files in LOG_ROOT/subdir matching prefix (newest first)."""
+    """Return all *.log files in LOG_ROOT/subdir matching prefix (newest first).
+
+    Does not filter on st_size > 0 because open, actively-appended log files on
+    Windows NTFS can report stale st_size == 0 in directory metadata until flushed.
+    """
     directory = LOG_ROOT / subdir
     if not directory.exists() or not directory.is_dir():
         return []
@@ -15988,8 +15992,7 @@ def _list_provider_option_log_files(subdir: str, prefix: str):
             if prefix_upper and not p.name.upper().startswith(prefix_upper):
                 continue
             st = p.stat()
-            if st.st_size > 0:
-                candidates.append((st.st_mtime, p.name, p))
+            candidates.append((st.st_mtime, p.name, p))
         except OSError:
             continue
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -16013,6 +16016,81 @@ _OPTION_SELL_ANALYSIS_RE = re.compile(
 _OPTION_KV_KEY_RE = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_%]*)=")
 
 
+def _parse_option_log_timestamp(ts_full: str):
+    """Parse log header timestamp 'YYYY-MM-DD HH:MM:SS[,mmm]' -> (naive_dt, ms) or (None, 0)."""
+    if not ts_full:
+        return None, 0
+    s = ts_full.strip()
+    ms = 0
+    base = s
+    if "," in s:
+        base, ms_part = s.split(",", 1)
+        try:
+            ms = int(ms_part[:3].ljust(3, "0"))
+        except ValueError:
+            ms = 0
+    try:
+        naive = datetime.strptime(base, "%Y-%m-%d %H:%M:%S").replace(microsecond=ms * 1000)
+        return naive, ms
+    except ValueError:
+        return None, ms
+
+
+def _normalize_option_log_record_tz(rec: dict, force_utc_source=None):
+    """Normalize log record timestamp to DISPLAY_TZ and compute UTC epoch sort key.
+
+    Older runs before TzFormatter logged %(asctime)s in UTC while newer runs emit
+    DISPLAY_TZ; comparing against minute=... (which carries an explicit offset)
+    detects legacy UTC lines and normalizes them so BUY/SELL rows sort and
+    interleave accurately across files.
+    Returns 'utc', 'display', or None indicating detected source timezone.
+    """
+    ts_full = rec.get("timestamp") or ""
+    naive, ms = _parse_option_log_timestamp(ts_full)
+    seq = rec.get("_seq", 0)
+    if naive is None:
+        rec["_sort_key"] = (0.0, seq)
+        return None
+
+    dt_utc = naive.replace(tzinfo=timezone.utc)
+    dt_disp = naive.replace(tzinfo=DISPLAY_TZ)
+    detected = None
+    minute_raw = rec.get("minute")
+    if minute_raw and minute_raw not in {"n/a", "none", "None"}:
+        try:
+            parsed_min = datetime.fromisoformat(str(minute_raw).strip().replace("Z", "+00:00"))
+            if parsed_min.tzinfo is None:
+                parsed_min = parsed_min.replace(tzinfo=timezone.utc)
+            diff_utc = abs((dt_utc - parsed_min).total_seconds())
+            diff_disp = abs((dt_disp - parsed_min).total_seconds())
+            if diff_utc + 1800.0 < diff_disp and diff_utc < 7200.0:
+                detected = "utc"
+            elif diff_disp + 1800.0 < diff_utc and diff_disp < 7200.0:
+                detected = "display"
+            elif diff_utc <= diff_disp and diff_disp - diff_utc > 900.0:
+                detected = "utc"
+            else:
+                detected = "display"
+        except ValueError:
+            detected = None
+
+    use_utc = (detected == "utc") or (detected is None and force_utc_source is True)
+    if use_utc:
+        dt_local = dt_utc.astimezone(DISPLAY_TZ)
+        rec["timestamp"] = (
+            f"{dt_local.strftime('%Y-%m-%d %H:%M:%S')},{ms:03d}"
+            if "," in ts_full
+            else dt_local.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        rec["timestamp_short"] = dt_local.strftime("%m-%d %H:%M:%S")
+        epoch = dt_utc.timestamp()
+    else:
+        epoch = dt_disp.astimezone(timezone.utc).timestamp()
+
+    rec["_sort_key"] = (epoch, seq)
+    return detected
+
+
 def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     """Parse one line from option_buyer or option_seller log into a structured record."""
     line = (raw_line or "").strip()
@@ -16024,7 +16102,6 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
 
     ts_full = m.group(1)
     ts_short = ts_full[5:19] if len(ts_full) >= 19 else ts_full
-    sort_ts = ts_full if "," in ts_full else f"{ts_full},000"
     level = m.group(2)
     event = m.group(3)
     rest = (m.group(4) or "").strip()
@@ -16057,7 +16134,8 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         "decision": event,
         "reason": rest,
         "raw_message": rest,
-        "_sort_key": (sort_ts, seq),
+        "_seq": seq,
+        "_sort_key": (0.0, seq),
     }
 
     if event == "OPTION_BUY_ANALYSIS":
@@ -16195,32 +16273,67 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     return rec
 
 
-def read_option_analysis_logs(limit_per_file: int = 500, max_total_entries: int = 5000):
-    """Read, merge, and sort all Option Buyer & Option Seller log files for the configured trading provider (newest first)."""
+def read_option_analysis_logs(limit_per_file: int = 2000, max_total_entries: int = 5000):
+    """Read, merge, and interleave all Option Buyer & Option Seller log files for the configured provider (newest first)."""
     from collections import deque
 
     tx_tag = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().upper() or "ALPACA"
-    buyer_files = _list_provider_option_log_files("option_buyer", f"{tx_tag}-OPTION_BUYER-")
-    seller_files = _list_provider_option_log_files("option_seller", f"{tx_tag}-OPTION_SELLER-")
+    buyer_candidates = _list_provider_option_log_files("option_buyer", f"{tx_tag}-OPTION_BUYER-")
+    seller_candidates = _list_provider_option_log_files("option_seller", f"{tx_tag}-OPTION_SELLER-")
+
+    try:
+        requested_limit = max(20, int(limit_per_file or 2000))
+    except (TypeError, ValueError):
+        requested_limit = 2000
+    per_file_cap = max(requested_limit, 5000)
+    total_cap = max(20, min(int(max_total_entries or 5000), max(requested_limit, 2000)))
 
     entries = []
+    active_files = {"BUY": [], "SELL": []}
     seq = 0
-    for stream, paths in (("BUY", buyer_files), ("SELL", seller_files)):
+    for stream, paths in (("BUY", buyer_candidates), ("SELL", seller_candidates)):
+        # Collect active file names newest-first while reading oldest-to-newest for clean tie-break seq
+        file_has_records = set()
         for path in reversed(paths):
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    tail_lines = deque(f, maxlen=limit_per_file)
-                for raw in tail_lines:
-                    seq += 1
-                    parsed = _parse_option_log_line(raw, stream=stream, seq=seq)
-                    if parsed is not None:
-                        entries.append(parsed)
+                    tail_lines = deque(f, maxlen=per_file_cap)
             except OSError:
                 continue
 
+            if not tail_lines:
+                continue
+            file_has_records.add(path)
+
+            file_records = []
+            utc_votes = 0
+            disp_votes = 0
+            for raw in tail_lines:
+                seq += 1
+                parsed = _parse_option_log_line(raw, stream=stream, seq=seq)
+                if parsed is not None:
+                    hint = _normalize_option_log_record_tz(parsed)
+                    if hint == "utc":
+                        utc_votes += 1
+                    elif hint == "display":
+                        disp_votes += 1
+                    file_records.append((parsed, hint))
+
+            # If this file predominantly logged UTC timestamps, normalize lines without minute= (e.g. executions)
+            file_is_utc = utc_votes > 0 and utc_votes > disp_votes
+            for parsed, hint in file_records:
+                if hint is None and file_is_utc:
+                    _normalize_option_log_record_tz(parsed, force_utc_source=True)
+                entries.append(parsed)
+
+        active_files[stream] = [p for p in paths if p in file_has_records]
+
+    buyer_files = active_files["BUY"]
+    seller_files = active_files["SELL"]
+
     entries.sort(key=lambda r: r["_sort_key"], reverse=True)
-    if max_total_entries and len(entries) > max_total_entries:
-        del entries[max_total_entries:]
+    if total_cap and len(entries) > total_cap:
+        del entries[total_cap:]
 
     buy_count = 0
     sell_count = 0
@@ -16228,6 +16341,7 @@ def read_option_analysis_logs(limit_per_file: int = 500, max_total_entries: int 
     rejected_count = 0
     for r in entries:
         r.pop("_sort_key", None)
+        r.pop("_seq", None)
         if r["stream"] == "BUY":
             buy_count += 1
         else:
@@ -16329,11 +16443,11 @@ class AdminCliProvider:
         @app.get("/api/option-logs")
         def get_option_logs():
             try:
-                raw_limit = request.args.get("limit", "500")
-                limit = max(20, min(2000, int(raw_limit)))
+                raw_limit = request.args.get("limit", "2000")
+                limit = max(20, min(5000, int(raw_limit)))
             except (TypeError, ValueError):
-                limit = 500
-            payload = read_option_analysis_logs(limit_per_file=limit)
+                limit = 2000
+            payload = read_option_analysis_logs(limit_per_file=5000, max_total_entries=limit)
             return jsonify(status="ok", run_id=RUN_ID, **payload), 200
 
         @app.post("/api/option-history/refresh")
