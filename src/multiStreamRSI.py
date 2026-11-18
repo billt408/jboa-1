@@ -34,7 +34,9 @@ are not instantiated or included in minute summaries.
 
 import argparse
 import asyncio
+import base64
 import configparser
+import hashlib
 import ipaddress
 import json
 import logging
@@ -42,6 +44,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import socket
 import ssl
 import struct
@@ -5717,6 +5720,8 @@ def _apply_ini_feature_settings(cfg):
     global CHART_CAPTURE_ONLY_UPDATED, CHART_CAPTURE_WRITE_LATEST, CHART_CAPTURE_STALE_AFTER_SECONDS
     global DASHBOARD_SSL_ENABLED, DASHBOARD_SSL_MODE, DASHBOARD_SSL_CERT
     global DASHBOARD_SSL_KEY, DASHBOARD_SSL_AUTO_SELF_SIGNED
+    global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
+    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES
 
     tz_setting = _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
     DISPLAY_TIMEZONE_SETTING = tz_setting
@@ -6211,6 +6216,52 @@ def _apply_ini_feature_settings(cfg):
     DASHBOARD_SSL_AUTO_SELF_SIGNED = _ini_bool(
         cfg, "dashboard", "ssl_auto_self_signed", "DASHBOARD_SSL_AUTO_SELF_SIGNED", True
     )
+    DASHBOARD_AUTH_ENABLED = _ini_bool(
+        cfg, "dashboard", "auth_enabled", "DASHBOARD_AUTH_ENABLED", True
+    )
+    DASHBOARD_PASSWORD = _ini_str(
+        cfg, "dashboard", "password", "DASHBOARD_PASSWORD", ""
+    )
+    DASHBOARD_SESSION_TTL_HOURS = _ini_int(
+        cfg, "dashboard", "session_ttl_hours", "DASHBOARD_SESSION_TTL_HOURS", 24, minimum=1
+    )
+    if cfg.has_option("dashboard", "inactivity_timeout_minutes"):
+        DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = _ini_int(
+            cfg,
+            "dashboard",
+            "inactivity_timeout_minutes",
+            "DASHBOARD_INACTIVITY_TIMEOUT_MINUTES",
+            15,
+            minimum=0,
+        )
+    elif cfg.has_option("dashboard", "session_inactivity_minutes"):
+        DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = _ini_int(
+            cfg,
+            "dashboard",
+            "session_inactivity_minutes",
+            "DASHBOARD_INACTIVITY_TIMEOUT_MINUTES",
+            15,
+            minimum=0,
+        )
+    else:
+        DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = _ini_int(
+            cfg,
+            "dashboard",
+            "inactivity_timeout_minutes",
+            "DASHBOARD_INACTIVITY_TIMEOUT_MINUTES",
+            15,
+            minimum=0,
+        )
+    if (
+        cfg.has_option("dashboard", "auth_enabled")
+        and DASHBOARD_AUTH_ENABLED
+        and not DASHBOARD_PASSWORD
+    ):
+        logging.warning(
+            "DASHBOARD_AUTH_ENABLED_NO_PASSWORD: [dashboard] auth_enabled=true "
+            "but [dashboard] password is empty; UI authentication stays inactive "
+            "until a non-empty password is set."
+        )
 
     logging.info(
         "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
@@ -6221,7 +6272,7 @@ def _apply_ini_feature_settings(cfg):
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
-        "ssl_enabled=%s ssl_mode=%s",
+        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
         RSI_SESSION_MODE,
@@ -6263,6 +6314,9 @@ def _apply_ini_feature_settings(cfg):
         CHART_CAPTURE_STALE_AFTER_SECONDS,
         DASHBOARD_SSL_ENABLED,
         DASHBOARD_SSL_MODE,
+        bool(DASHBOARD_AUTH_ENABLED and DASHBOARD_PASSWORD),
+        DASHBOARD_SESSION_TTL_HOURS,
+        DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
     )
 
 
@@ -6671,6 +6725,24 @@ DASHBOARD_SSL_KEY = os.getenv("DASHBOARD_SSL_KEY", "certs/dashboard.key").strip(
 DASHBOARD_SSL_AUTO_SELF_SIGNED = os.getenv(
     "DASHBOARD_SSL_AUTO_SELF_SIGNED", "true"
 ).strip().lower() in {"1", "true", "yes"}
+DASHBOARD_AUTH_ENABLED = os.getenv("DASHBOARD_AUTH_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+try:
+    DASHBOARD_SESSION_TTL_HOURS = max(
+        1, int(os.getenv("DASHBOARD_SESSION_TTL_HOURS", "24"))
+    )
+except ValueError:
+    DASHBOARD_SESSION_TTL_HOURS = 24
+try:
+    DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = max(
+        0, int(os.getenv("DASHBOARD_INACTIVITY_TIMEOUT_MINUTES", "15"))
+    )
+except ValueError:
+    DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = 15
 
 
 def rsi_signal(rsi):
@@ -12817,6 +12889,168 @@ class ChartCaptureManager:
 PROVIDER_REGISTRY = {}
 
 
+LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In &mdash; RSI &amp; Price Kinematics Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
+    </style>
+</head>
+<body class="bg-[#080d19] text-slate-100 min-h-screen flex items-center justify-center p-4 antialiased selection:bg-indigo-500 selection:text-white">
+    <div class="w-full max-w-md bg-slate-900/90 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden">
+        <div class="px-6 py-5 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between gap-3">
+            <div class="flex items-center gap-3 min-w-0">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center text-white shadow-md shadow-indigo-500/20 shrink-0">
+                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                </div>
+                <div class="min-w-0">
+                    <h1 class="text-sm font-bold text-white tracking-tight truncate">RSI &amp; Price Kinematics Engine</h1>
+                    <p class="text-[11px] text-slate-400">Protected Access &bull; Enter password to continue</p>
+                </div>
+            </div>
+            <span class="px-2 py-0.5 rounded-md bg-slate-800 border border-slate-700 text-[10px] mono text-cyan-300 shrink-0">__DISPLAY_TZ_LABEL__</span>
+        </div>
+
+        <form id="loginForm" method="POST" action="/auth/login" class="p-6 space-y-4">
+            <input type="hidden" id="nextInput" name="next" value="__NEXT_URL__">
+
+            <div id="loginNoticeBox" class="__NOTICE_CLASS__ p-3 rounded-xl bg-amber-950/40 border border-amber-500/35 text-xs text-amber-200 flex items-start gap-2">
+                <svg class="w-4 h-4 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span id="loginNoticeText">__INITIAL_NOTICE__</span>
+            </div>
+
+            <div id="loginErrorBox" class="__ERROR_CLASS__ p-3 rounded-xl bg-rose-950/50 border border-rose-500/40 text-xs text-rose-300 flex items-start gap-2">
+                <svg class="w-4 h-4 text-rose-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span id="loginErrorText">__INITIAL_ERROR__</span>
+            </div>
+
+            <div class="space-y-1.5">
+                <label for="passwordInput" class="block text-xs font-semibold text-slate-300">Dashboard Password</label>
+                <div class="relative">
+                    <input
+                        id="passwordInput"
+                        name="password"
+                        type="password"
+                        autocomplete="current-password"
+                        required
+                        autofocus
+                        placeholder="Enter password..."
+                        class="w-full bg-slate-950 border border-slate-700/80 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-3.5 py-2.5 pr-16 text-sm text-white mono placeholder:text-slate-600 focus:outline-none transition"
+                    >
+                    <button
+                        type="button"
+                        id="btnTogglePwd"
+                        onclick="togglePasswordVisibility()"
+                        class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 rounded-md text-[11px] font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition"
+                    >Show</button>
+                </div>
+                <p class="text-[11px] text-slate-500">Configured via <code class="text-slate-400">[dashboard] password</code> in <code class="text-slate-400">lib/parms.ini</code>.</p>
+            </div>
+
+            <button
+                type="submit"
+                id="btnSubmitLogin"
+                class="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-semibold text-sm transition shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2"
+            >
+                <span id="btnLoginLabel">Unlock Dashboard</span>
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                </svg>
+            </button>
+
+            <div class="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10.5px] text-slate-500 mono">
+                <span>Run: __RUN_ID__</span>
+                <span>Session-protected UI</span>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        function togglePasswordVisibility() {
+            const inp = document.getElementById('passwordInput');
+            const btn = document.getElementById('btnTogglePwd');
+            if (!inp || !btn) return;
+            const show = inp.type === 'password';
+            inp.type = show ? 'text' : 'password';
+            btn.textContent = show ? 'Hide' : 'Show';
+            inp.focus();
+        }
+
+        function showLoginError(msg) {
+            const box = document.getElementById('loginErrorBox');
+            const txt = document.getElementById('loginErrorText');
+            if (txt) txt.textContent = msg || 'Invalid password.';
+            if (box) box.classList.remove('hidden');
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const inp = document.getElementById('passwordInput');
+            const nextInp = document.getElementById('nextInput');
+            const btn = document.getElementById('btnSubmitLogin');
+            const lbl = document.getElementById('btnLoginLabel');
+            const errBox = document.getElementById('loginErrorBox');
+            if (errBox) errBox.classList.add('hidden');
+
+            const password = inp ? inp.value : '';
+            if (!password) {
+                showLoginError('Please enter the dashboard password.');
+                if (inp) inp.focus();
+                return;
+            }
+
+            if (btn) btn.disabled = true;
+            if (lbl) lbl.textContent = 'Verifying...';
+
+            try {
+                const res = await fetch('/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        password,
+                        next: nextInp ? nextInp.value : '/'
+                    })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data && data.status === 'ok') {
+                    window.location.replace(data.redirect || '/');
+                    return;
+                }
+                showLoginError((data && data.message) || 'Invalid password.');
+                if (inp) {
+                    inp.focus();
+                    inp.select();
+                }
+            } catch (err) {
+                showLoginError(`Connection error: ${err.message}`);
+            } finally {
+                if (btn) btn.disabled = false;
+                if (lbl) lbl.textContent = 'Unlock Dashboard';
+            }
+        });
+    </script>
+</body>
+</html>"""
+
+
 DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -12886,6 +13120,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <button id="btnRefresh" onclick="fetchAllData()" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
                     <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                </button>
+
+                <button id="btnLogout" onclick="signOutDashboard()" class="hidden px-2.5 py-1 bg-slate-800 hover:bg-rose-950/60 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-500/40 rounded-lg text-xs font-semibold transition flex items-center gap-1" title="Lock Dashboard / Sign Out">
+                    <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                    Lock
                 </button>
             </div>
         </div>
@@ -13504,6 +13743,147 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- JavaScript Application Engine -->
     <script>
+        const DASHBOARD_AUTH_ENABLED = ('__DASHBOARD_AUTH_ENABLED__' === 'true');
+        const DASHBOARD_INACTIVITY_MINUTES = Math.max(0, Number('__DASHBOARD_INACTIVITY_MINUTES__') || 0);
+        const _ACTIVITY_STORAGE_KEY = 'msi_dashboard_last_activity';
+        let _lastUserActivityMs = Date.now();
+        let _lastServerHeartbeatMs = Date.now();
+        let _idleRedirecting = false;
+        let _idleWatchTimer = null;
+
+        if (DASHBOARD_AUTH_ENABLED) {
+            const logoutBtn = document.getElementById('btnLogout');
+            if (logoutBtn) logoutBtn.classList.remove('hidden');
+        }
+
+        function _buildLoginRedirectUrl(reason = '') {
+            const curPath = window.location.pathname || '/';
+            const params = new URLSearchParams();
+            if (reason) params.set('reason', reason);
+            if (curPath && curPath !== '/' && !curPath.startsWith('/login')) {
+                params.set('next', curPath);
+            }
+            const qs = params.toString();
+            return qs ? `/login?${qs}` : '/login';
+        }
+
+        const _nativeFetch = window.fetch.bind(window);
+        window.fetch = async function(...args) {
+            const res = await _nativeFetch(...args);
+            if (res && res.status === 401 && DASHBOARD_AUTH_ENABLED && !_idleRedirecting) {
+                let reason = '';
+                try {
+                    const body = await res.clone().json();
+                    if (body && body.reason === 'inactivity_timeout') {
+                        reason = 'idle';
+                    }
+                } catch (_) {
+                    // ignore JSON parse issues
+                }
+                _idleRedirecting = true;
+                window.location.replace(_buildLoginRedirectUrl(reason));
+            }
+            return res;
+        };
+
+        async function signOutDashboard(reason = '') {
+            if (_idleRedirecting) return;
+            _idleRedirecting = true;
+            if (_idleWatchTimer) {
+                clearInterval(_idleWatchTimer);
+                _idleWatchTimer = null;
+            }
+            try {
+                await _nativeFetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
+            } catch (_) {
+                // redirect to login regardless
+            }
+            window.location.replace(_buildLoginRedirectUrl(reason));
+        }
+
+        function _syncActivityStorage(tsMs) {
+            try {
+                localStorage.setItem(_ACTIVITY_STORAGE_KEY, String(tsMs));
+            } catch (_) {
+                // ignore storage access issues
+            }
+        }
+
+        function _readSharedActivityMs() {
+            try {
+                const raw = Number(localStorage.getItem(_ACTIVITY_STORAGE_KEY) || 0);
+                if (isFinite(raw) && raw > _lastUserActivityMs) {
+                    _lastUserActivityMs = raw;
+                }
+            } catch (_) {
+                // ignore
+            }
+            return _lastUserActivityMs;
+        }
+
+        function _sendActivityHeartbeat() {
+            if (!DASHBOARD_AUTH_ENABLED || _idleRedirecting) return;
+            const now = Date.now();
+            if (now - _lastServerHeartbeatMs < 20000) return;
+            _lastServerHeartbeatMs = now;
+            _nativeFetch('/auth/heartbeat', {
+                method: 'POST',
+                credentials: 'same-origin',
+                cache: 'no-store'
+            }).then(async (res) => {
+                if (res && res.status === 401 && !_idleRedirecting) {
+                    _idleRedirecting = true;
+                    window.location.replace(_buildLoginRedirectUrl('idle'));
+                }
+            }).catch(() => {});
+        }
+
+        function _recordUserActivity(fromPointerMove = false) {
+            if (!DASHBOARD_AUTH_ENABLED || DASHBOARD_INACTIVITY_MINUTES <= 0 || _idleRedirecting) return;
+            const now = Date.now();
+            if (fromPointerMove && now - _lastUserActivityMs < 1000) return;
+            const timeoutMs = DASHBOARD_INACTIVITY_MINUTES * 60 * 1000;
+            if (now - _readSharedActivityMs() >= timeoutMs) {
+                signOutDashboard('idle');
+                return;
+            }
+            _lastUserActivityMs = now;
+            _syncActivityStorage(now);
+            _sendActivityHeartbeat();
+        }
+
+        function _checkInactivityTimeout() {
+            if (!DASHBOARD_AUTH_ENABLED || DASHBOARD_INACTIVITY_MINUTES <= 0 || _idleRedirecting) return;
+            const timeoutMs = DASHBOARD_INACTIVITY_MINUTES * 60 * 1000;
+            const lastSeen = _readSharedActivityMs();
+            if (Date.now() - lastSeen >= timeoutMs) {
+                signOutDashboard('idle');
+            }
+        }
+
+        if (DASHBOARD_AUTH_ENABLED && DASHBOARD_INACTIVITY_MINUTES > 0) {
+            _lastUserActivityMs = Date.now();
+            _syncActivityStorage(_lastUserActivityMs);
+            ['pointerdown', 'mousedown', 'keydown', 'wheel', 'touchstart', 'scroll'].forEach(evt => {
+                window.addEventListener(evt, () => _recordUserActivity(false), { passive: true });
+            });
+            window.addEventListener('mousemove', () => _recordUserActivity(true), { passive: true });
+            window.addEventListener('storage', (ev) => {
+                if (ev && ev.key === _ACTIVITY_STORAGE_KEY && ev.newValue) {
+                    const val = Number(ev.newValue);
+                    if (isFinite(val) && val > _lastUserActivityMs) {
+                        _lastUserActivityMs = val;
+                    }
+                }
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) {
+                    _checkInactivityTimeout();
+                }
+            });
+            _idleWatchTimer = setInterval(_checkInactivityTimeout, 5000);
+        }
+
         let currentFilter = 'all';
         let currentViewMode = 'consolidated'; // 'consolidated' or 'streams'
         let selectedSymbol = null;
@@ -16382,8 +16762,13 @@ def read_option_analysis_logs(limit_per_file: int = 2000, max_total_entries: int
 
 
 class AdminCliProvider:
+    _AUTH_COOKIE_NAME = "msi_dashboard_auth"
+    _AUTH_MAX_FAILURES = 10
+    _AUTH_LOCKOUT_SECONDS = 60
+
     def __init__(self, coordinator, host=None, port=None):
         import threading
+        from collections import defaultdict
 
         self.coordinator = coordinator
         self.host = host or DASHBOARD_HOST
@@ -16392,13 +16777,370 @@ class AdminCliProvider:
         self.stop = threading.Event()
         self.server = None
         self.thread = None
+        self._auth_signing_key = secrets.token_bytes(32)
+        self._auth_lock = threading.Lock()
+        self._auth_failures = defaultdict(list)
+        self._active_sessions = {}
         self.app = self.create_app()
 
+    @staticmethod
+    def _is_auth_active():
+        return bool(DASHBOARD_AUTH_ENABLED and DASHBOARD_PASSWORD)
+
+    @staticmethod
+    def _inactivity_timeout_seconds():
+        try:
+            mins = int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0)
+        except (TypeError, ValueError):
+            mins = 0
+        return max(0, mins) * 60
+
+    @staticmethod
+    def _password_fingerprint():
+        return hashlib.sha256(str(DASHBOARD_PASSWORD).encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _safe_next_url(raw_next):
+        candidate = str(raw_next or "/").strip()
+        if (
+            not candidate
+            or not candidate.startswith("/")
+            or candidate.startswith("//")
+            or candidate.startswith("/\\")
+            or candidate.startswith("/login")
+            or candidate.startswith("/auth/")
+        ):
+            return "/"
+        return candidate
+
+    def _verify_password(self, candidate):
+        if not self._is_auth_active():
+            return True
+        if not isinstance(candidate, str) or not candidate:
+            return False
+        return hmac.compare_digest(candidate, str(DASHBOARD_PASSWORD))
+
+    def _prune_sessions_locked(self, now: float):
+        max_ttl = max(3600, int(DASHBOARD_SESSION_TTL_HOURS or 24) * 3600)
+        idle_sec = self._inactivity_timeout_seconds()
+        expired = []
+        for sid, meta in self._active_sessions.items():
+            if (now - meta.get("created_at", now)) >= max_ttl:
+                expired.append(sid)
+            elif idle_sec > 0 and (now - meta.get("last_active", now)) >= idle_sec:
+                expired.append(sid)
+        for sid in expired:
+            self._active_sessions.pop(sid, None)
+
+    def _issue_auth_token(self):
+        now = time.time()
+        ttl = max(3600, int(DASHBOARD_SESSION_TTL_HOURS or 24) * 3600)
+        sid = secrets.token_hex(12)
+        payload = {
+            "iat": int(now),
+            "exp": int(now) + ttl,
+            "pwd": self._password_fingerprint(),
+            "nonce": sid,
+        }
+        with self._auth_lock:
+            self._prune_sessions_locked(now)
+            self._active_sessions[sid] = {"created_at": now, "last_active": now}
+        payload_b64 = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        sig = hmac.new(
+            self._auth_signing_key, payload_b64.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        return f"{payload_b64}.{sig}"
+
+    def _revoke_auth_token(self, token):
+        if not token or not isinstance(token, str) or "." not in token:
+            return
+        try:
+            payload_b64, _ = token.split(".", 1)
+            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+            sid = str(payload.get("nonce") or "")
+            if sid:
+                with self._auth_lock:
+                    self._active_sessions.pop(sid, None)
+        except Exception:
+            pass
+
+    def _validate_auth_token(self, token, touch_activity=False):
+        """Return (ok: bool, reason: str|None)."""
+        if not token or not isinstance(token, str) or "." not in token:
+            return False, "missing_token"
+        try:
+            payload_b64, sig = token.split(".", 1)
+            expected_sig = hmac.new(
+                self._auth_signing_key, payload_b64.encode("ascii"), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig, expected_sig):
+                return False, "invalid_token"
+            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+            now = time.time()
+            if float(payload.get("exp", 0)) <= now:
+                return False, "session_expired"
+            if not hmac.compare_digest(
+                str(payload.get("pwd", "")), self._password_fingerprint()
+            ):
+                return False, "password_changed"
+
+            sid = str(payload.get("nonce") or "")
+            idle_sec = self._inactivity_timeout_seconds()
+            with self._auth_lock:
+                self._prune_sessions_locked(now)
+                sess = self._active_sessions.get(sid)
+                if sess is None:
+                    # Also handle case where session timed out or user signed out
+                    if idle_sec > 0:
+                        return False, "inactivity_timeout"
+                    return False, "session_revoked"
+                if idle_sec > 0 and (now - sess.get("last_active", now)) >= idle_sec:
+                    self._active_sessions.pop(sid, None)
+                    return False, "inactivity_timeout"
+                if touch_activity:
+                    sess["last_active"] = now
+            return True, None
+        except Exception:
+            return False, "invalid_token"
+
+    def _verify_auth_token(self, token, touch_activity=False):
+        ok, _ = self._validate_auth_token(token, touch_activity=touch_activity)
+        return ok
+
+    def _client_rate_key(self, req):
+        xff = req.headers.get("X-Forwarded-For", "")
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+        return req.remote_addr or "unknown"
+
+    def _check_auth_rate_limit(self, key):
+        now = time.time()
+        cutoff = now - self._AUTH_LOCKOUT_SECONDS
+        with self._auth_lock:
+            recent = [t for t in self._auth_failures.get(key, []) if t > cutoff]
+            self._auth_failures[key] = recent
+            if len(recent) >= self._AUTH_MAX_FAILURES:
+                retry_after = max(1, int(math.ceil(recent[0] + self._AUTH_LOCKOUT_SECONDS - now)))
+                return False, retry_after
+        return True, 0
+
+    def _record_auth_failure(self, key):
+        now = time.time()
+        cutoff = now - self._AUTH_LOCKOUT_SECONDS
+        with self._auth_lock:
+            recent = [t for t in self._auth_failures.get(key, []) if t > cutoff]
+            recent.append(now)
+            self._auth_failures[key] = recent
+
+    def _clear_auth_failures(self, key):
+        with self._auth_lock:
+            self._auth_failures.pop(key, None)
+
+    @staticmethod
+    def _request_counts_as_user_activity(req):
+        path = getattr(req, "path", "") or ""
+        method = (getattr(req, "method", "GET") or "GET").upper()
+        if path == "/auth/heartbeat":
+            return True
+        if path in {"/", "/dashboard", "/kinematics"} and method == "GET":
+            return True
+        if method == "POST" and path in {
+            "/cli/inject",
+            "/cli/finalize",
+            "/cli/reconnect",
+            "/cli/chart-capture",
+            "/api/option-history/refresh",
+        }:
+            return True
+        return False
+
+    def _authenticate_request_detail(self, req, touch_activity=False):
+        """Return (ok: bool, reason: str|None)."""
+        if not self._is_auth_active():
+            return True, None
+        hdr_pwd = req.headers.get("X-Dashboard-Password")
+        if hdr_pwd and self._verify_password(hdr_pwd):
+            return True, None
+        token = req.cookies.get(self._AUTH_COOKIE_NAME)
+        return self._validate_auth_token(token, touch_activity=touch_activity)
+
+    def _is_request_authenticated(self, req, touch_activity=False):
+        ok, _ = self._authenticate_request_detail(req, touch_activity=touch_activity)
+        return ok
+
     def create_app(self):
-        from flask import Flask, request, jsonify
+        from flask import Flask, request, jsonify, redirect, make_response
 
         app = Flask("admin_cli_interface")
         app.config["MAX_CONTENT_LENGTH"] = 16384
+
+        def _render_login_html(next_url="/", error_msg="", notice_msg="", status_code=200):
+            import html as _html
+
+            safe_next = self._safe_next_url(next_url)
+            err_cls = "" if error_msg else "hidden"
+            notice_cls = "" if notice_msg else "hidden"
+            page = (
+                LOGIN_HTML_TEMPLATE.replace("__RUN_ID__", _html.escape(str(RUN_ID)))
+                .replace("__DISPLAY_TZ_LABEL__", _html.escape(str(display_tz_abbr())))
+                .replace("__NEXT_URL__", _html.escape(safe_next, quote=True))
+                .replace("__NOTICE_CLASS__", notice_cls)
+                .replace("__INITIAL_NOTICE__", _html.escape(str(notice_msg or "")))
+                .replace("__ERROR_CLASS__", err_cls)
+                .replace("__INITIAL_ERROR__", _html.escape(str(error_msg or "")))
+            )
+            resp = make_response(page, status_code)
+            resp.headers["Content-Type"] = "text/html; charset=utf-8"
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return resp
+
+        @app.before_request
+        def _enforce_dashboard_auth():
+            if not self._is_auth_active():
+                return None
+            if request.path in {"/login", "/auth/login", "/auth/logout"}:
+                return None
+            if request.path == "/favicon.ico":
+                return "", 204
+            touch = self._request_counts_as_user_activity(request)
+            ok, reason = self._authenticate_request_detail(request, touch_activity=touch)
+            if ok:
+                return None
+            if request.path.startswith("/api/") or request.path.startswith("/cli/") or request.path == "/auth/heartbeat":
+                resp = make_response(
+                    jsonify(
+                        status="error",
+                        auth_required=True,
+                        reason=reason or "auth_required",
+                        message=(
+                            "Session closed due to inactivity."
+                            if reason == "inactivity_timeout"
+                            else "Authentication required"
+                        ),
+                    ),
+                    401,
+                )
+                resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+                resp.headers["Cache-Control"] = "no-store"
+                return resp
+            raw_next = request.full_path.rstrip("?")
+            safe_next = self._safe_next_url(raw_next)
+            params = []
+            if reason == "inactivity_timeout":
+                params.append("reason=idle")
+            if safe_next != "/":
+                params.append(f"next={urllib.parse.quote(safe_next, safe='/')}")
+            target = f"/login?{'&'.join(params)}" if params else "/login"
+            resp = make_response(redirect(target, code=302))
+            resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+            return resp
+
+        @app.get("/login")
+        def login_page():
+            safe_next = self._safe_next_url(request.args.get("next", "/"))
+            if not self._is_auth_active() or self._is_request_authenticated(request, touch_activity=False):
+                return redirect(safe_next, code=302)
+            notice_msg = ""
+            if str(request.args.get("reason") or "").strip().lower() == "idle":
+                mins = int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0)
+                if mins > 0:
+                    notice_msg = f"Session closed after {mins} minute{'s' if mins != 1 else ''} of inactivity. Enter your password to continue."
+                else:
+                    notice_msg = "Session closed due to inactivity. Enter your password to continue."
+            return _render_login_html(next_url=safe_next, notice_msg=notice_msg)
+
+        @app.post("/auth/login")
+        def auth_login():
+            wants_json = (
+                request.is_json
+                or "application/json" in (request.headers.get("Accept") or "").lower()
+            )
+            payload = request.get_json(silent=True) if request.is_json else None
+            if isinstance(payload, dict):
+                candidate = str(payload.get("password") or "")
+                raw_next = payload.get("next") or request.args.get("next") or "/"
+            else:
+                candidate = str(request.form.get("password") or "")
+                raw_next = request.form.get("next") or request.args.get("next") or "/"
+            safe_next = self._safe_next_url(raw_next)
+
+            if not self._is_auth_active():
+                if wants_json:
+                    return jsonify(status="ok", redirect=safe_next), 200
+                return redirect(safe_next, code=302)
+
+            rate_key = self._client_rate_key(request)
+            allowed, retry_after = self._check_auth_rate_limit(rate_key)
+            if not allowed:
+                msg = f"Too many failed attempts. Try again in {retry_after}s."
+                if wants_json:
+                    return jsonify(status="error", message=msg), 429
+                return _render_login_html(next_url=safe_next, error_msg=msg, status_code=429)
+
+            if not self._verify_password(candidate):
+                self._record_auth_failure(rate_key)
+                logging.warning("DASHBOARD_AUTH_FAILED client=%s", rate_key)
+                msg = "Invalid password. Check [dashboard] password in parms.ini."
+                if wants_json:
+                    return jsonify(status="error", message=msg), 401
+                return _render_login_html(next_url=safe_next, error_msg=msg, status_code=401)
+
+            self._clear_auth_failures(rate_key)
+            logging.info("DASHBOARD_AUTH_SUCCESS client=%s", rate_key)
+            token = self._issue_auth_token()
+            ttl_seconds = max(3600, int(DASHBOARD_SESSION_TTL_HOURS or 24) * 3600)
+            is_https = bool(
+                request.is_secure
+                or request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+            )
+            if wants_json:
+                resp = make_response(jsonify(status="ok", redirect=safe_next), 200)
+            else:
+                resp = make_response(redirect(safe_next, code=302))
+            resp.set_cookie(
+                self._AUTH_COOKIE_NAME,
+                token,
+                max_age=ttl_seconds,
+                httponly=True,
+                samesite="Lax",
+                secure=is_https,
+                path="/",
+            )
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        @app.post("/auth/heartbeat")
+        def auth_heartbeat():
+            resp = make_response(
+                jsonify(
+                    status="ok",
+                    inactivity_timeout_minutes=int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0),
+                ),
+                200,
+            )
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        @app.route("/auth/logout", methods=["GET", "POST"])
+        def auth_logout():
+            self._revoke_auth_token(request.cookies.get(self._AUTH_COOKIE_NAME))
+            wants_json = (
+                request.method == "POST"
+                or "application/json" in (request.headers.get("Accept") or "").lower()
+            )
+            if wants_json:
+                resp = make_response(jsonify(status="ok", redirect="/login"), 200)
+            else:
+                resp = make_response(redirect("/login", code=302))
+            resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
 
         @app.route("/", methods=["GET"])
         @app.route("/dashboard", methods=["GET"])
@@ -16408,8 +17150,19 @@ class AdminCliProvider:
                 DASHBOARD_HTML_TEMPLATE.replace("__RUN_ID__", RUN_ID)
                 .replace("__DISPLAY_TZ_LABEL__", display_tz_abbr())
                 .replace("__DISPLAY_TZ_IANA__", DISPLAY_TZ_IANA)
+                .replace(
+                    "__DASHBOARD_AUTH_ENABLED__",
+                    "true" if self._is_auth_active() else "false",
+                )
+                .replace(
+                    "__DASHBOARD_INACTIVITY_MINUTES__",
+                    str(int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0)),
+                )
             )
-            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+            headers = {"Content-Type": "text/html; charset=utf-8"}
+            if self._is_auth_active():
+                headers["Cache-Control"] = "no-store"
+            return html, 200, headers
 
         @app.get("/api/kinematics")
         def get_kinematics():
@@ -16618,6 +17371,11 @@ class AdminCliProvider:
                     "mode": DASHBOARD_SSL_MODE,
                     "active": bool(getattr(self, "ssl_active", False)),
                     "cert_path": getattr(self, "ssl_cert_path", None),
+                },
+                "dashboard_auth": {
+                    "enabled": self._is_auth_active(),
+                    "session_ttl_hours": DASHBOARD_SESSION_TTL_HOURS,
+                    "inactivity_timeout_minutes": DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
                 },
                 "connected_providers": self.coordinator.connected,
                 "tracked_instruments": self.coordinator.symbols,
@@ -17306,23 +18064,46 @@ async def main():
     return 0
 
 
-def _call_running_chart_capture_cli(action, port=DASHBOARD_PORT, timeout=2.0):
+def _read_dashboard_password_from_ini(ini_path=None):
+    cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
+    if cfg_path.is_file():
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8-sig")
+            cfg = configparser.ConfigParser(interpolation=None)
+            cfg.read_string(raw_text)
+            auth_on = _ini_bool(cfg, "dashboard", "auth_enabled", "DASHBOARD_AUTH_ENABLED", True)
+            if not auth_on:
+                return ""
+            return _ini_str(cfg, "dashboard", "password", "DASHBOARD_PASSWORD", "")
+        except Exception:
+            pass
+    if not DASHBOARD_AUTH_ENABLED:
+        return ""
+    return os.getenv("DASHBOARD_PASSWORD", DASHBOARD_PASSWORD or "")
+
+
+def _call_running_chart_capture_cli(action, port=DASHBOARD_PORT, timeout=2.0, ini_path=None):
     import urllib.error
     import urllib.request
 
+    dash_pwd = _read_dashboard_password_from_ini(ini_path=ini_path)
     last_exc = None
     for scheme in ("http", "https"):
         url = f"{scheme}://127.0.0.1:{int(port)}/cli/chart-capture"
         ctx = ssl._create_unverified_context() if scheme == "https" else None
         try:
+            headers = {}
+            if dash_pwd:
+                headers["X-Dashboard-Password"] = dash_pwd
             if action == "status":
-                req = urllib.request.Request(url, method="GET")
+                req = urllib.request.Request(url, headers=headers, method="GET")
             else:
                 body = json.dumps({"action": action}).encode("utf-8")
+                headers["Content-Type"] = "application/json"
                 req = urllib.request.Request(
                     url,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     method="POST",
                 )
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
@@ -17388,7 +18169,7 @@ def handle_cli_command(argv=None):
     if action in {"start", "stop"}:
         target_enabled = action == "start"
         ini_updated = update_chart_capture_ini(target_enabled, ini_path=ini_path)
-        live_res = _call_running_chart_capture_cli(action, port=port)
+        live_res = _call_running_chart_capture_cli(action, port=port, ini_path=ini_path)
         out = {
             "status": "ok",
             "action": action,
@@ -17402,7 +18183,7 @@ def handle_cli_command(argv=None):
         return 0
 
     ini_enabled = _read_chart_capture_ini_enabled(ini_path=ini_path)
-    live_res = _call_running_chart_capture_cli("status", port=port)
+    live_res = _call_running_chart_capture_cli("status", port=port, ini_path=ini_path)
     out = {
         "status": "ok",
         "action": "status",
