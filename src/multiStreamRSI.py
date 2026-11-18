@@ -80,14 +80,23 @@ from lib.getOptionsContracts import get_pruned_option_chain
 MARKET_TZ = ZoneInfo("America/New_York")
 OPEN_TIME = clock_time(9, 30)
 CLOSE_TIME = clock_time(16, 0)
+EXTENDED_OPEN_TIME = clock_time(4, 0)
+EXTENDED_CLOSE_TIME = clock_time(20, 0)
 MODE = "wilder"
 RSI_PERIOD = 14
 # Cross-session warmup: at startup each provider's SessionRSI is seeded with
-# this many prior NYSE sessions of 1-minute closes so the Wilder averages are
-# converged, matching TradingView's continuous-history RSI. 0 disables the
-# startup backfill (state still rolls over across sessions once converged).
+# this many prior NYSE sessions of 1-minute closes (including pre-market /
+# extended hours when rsi_session=extended) so the Wilder averages are
+# converged at the 09:30 ET open, matching TradingView's continuous RSI.
 RSI_WARMUP_SESSIONS = int(os.getenv("RSI_WARMUP_SESSIONS", "5"))
-FEED = DataFeed.IEX
+RSI_SESSION_MODE = os.getenv("RSI_SESSION_MODE", "extended").strip().lower() or "extended"
+if RSI_SESSION_MODE in {"eth", "ext", "all"}:
+    RSI_SESSION_MODE = "extended"
+elif RSI_SESSION_MODE in {"rth", "reg"}:
+    RSI_SESSION_MODE = "regular"
+if RSI_SESSION_MODE not in {"extended", "regular"}:
+    RSI_SESSION_MODE = "extended"
+FEED = DataFeed.SIP if os.getenv("ALPACA_FEED", "iex").strip().lower() == "sip" else DataFeed.IEX
 # Populated by load_settings(); provider startup is controlled only by parms.ini.
 selected: list[str] = []
 required: dict[str, list[str]] = {}
@@ -259,6 +268,29 @@ def regular_session(timestamp):
     value = as_utc(timestamp)
     bounds = session_bounds(value.astimezone(MARKET_TZ).date())
     return bounds is not None and bounds[0] <= value < bounds[1]
+
+
+def extended_bounds(day):
+    """Return (04:00 ET in UTC, 20:00 ET in UTC) for a valid NYSE trading day."""
+    if session_bounds(day) is None:
+        return None
+    ext_open = as_utc(datetime.combine(day, EXTENDED_OPEN_TIME, tzinfo=MARKET_TZ))
+    ext_close = as_utc(datetime.combine(day, EXTENDED_CLOSE_TIME, tzinfo=MARKET_TZ))
+    return (ext_open, ext_close)
+
+
+def extended_session(timestamp):
+    """Return True if timestamp falls within NYSE extended trading hours (04:00–20:00 ET) on a trading day."""
+    value = as_utc(timestamp)
+    bounds = extended_bounds(value.astimezone(MARKET_TZ).date())
+    return bounds is not None and bounds[0] <= value < bounds[1]
+
+
+def session_allowed(timestamp):
+    """Return True if bar timestamp matches configured RSI_SESSION_MODE (extended or regular)."""
+    if RSI_SESSION_MODE == "extended":
+        return extended_session(timestamp)
+    return regular_session(timestamp)
 
 
 def parse_local(value):
@@ -500,6 +532,7 @@ class SessionRSI:
         self.latest_price_acceleration = None
         self.latest = None
         self._last_metrics = None
+        self.warmup_bars = 0
         self.provider = provider
 
     def reset_session(self, day):
@@ -516,6 +549,7 @@ class SessionRSI:
         self.latest_price_velocity = None
         self.latest_price_acceleration = None
         self._last_metrics = None
+        self.warmup_bars = 0
         self.logger.info("SESSION_START date=%s", day)
 
     def begin_session(self, day):
@@ -555,7 +589,7 @@ class SessionRSI:
         if timestamp.second or timestamp.microsecond:
             raise ValueError("Bar must be minute-aligned")
 
-        if not regular_session(timestamp):
+        if not session_allowed(timestamp):
             return None
 
         if self.session_date is not None and timestamp.date() < self.session_date:
@@ -566,6 +600,9 @@ class SessionRSI:
 
         if self.session_date != timestamp.date():
             self.begin_session(timestamp.date())
+
+        if warmup:
+            self.warmup_bars += 1
 
         value = None
 
@@ -3287,7 +3324,10 @@ class MinuteCoordinator:
             raise ValueError("Bar timestamps must identify the exact minute start")
         if event_time > received_at + timedelta(seconds=30):
             raise ValueError("Future event timestamp")
-        if not regular_session(minute):
+        if provider == "TRADINGVIEW":
+            if not regular_session(minute):
+                return False
+        elif not session_allowed(minute):
             return False
         price = positive_price(close)
         if provider == "TRADINGVIEW" and kind != "webhook":
@@ -3298,8 +3338,8 @@ class MinuteCoordinator:
             reported_rsi = float(reported_rsi)
             if not math.isfinite(reported_rsi) or not 0 <= reported_rsi <= 100:
                 raise ValueError("Invalid RSI")
-        warmup = minute < self.report_start
-        first_deadline = self.report_start + MINUTE + self.delay
+        warmup = minute < self.next_minute
+        first_deadline = self.next_minute + MINUTE + self.delay
         deadline = first_deadline if warmup else minute + MINUTE + self.delay
         if (
             self.last_finalized is not None and minute <= self.last_finalized
@@ -3308,12 +3348,11 @@ class MinuteCoordinator:
             return False
         if kind == "webhook" and received_at < minute + MINUTE:
             raise ValueError("bar_closed=true cannot precede the minute end")
-        # Retain only current/recent sessions, never arbitrary old warmup data.
-        if (
-            warmup
-            and minute.astimezone(MARKET_TZ).date()
-            != self.report_start.astimezone(MARKET_TZ).date()
-        ):
+        if provider == "TRADINGVIEW" and warmup:
+            return False
+        # Retain extended/pre-market warmup bars leading into the next RTH open,
+        # but reject ancient historical bars older than one prior session.
+        if warmup and (self.next_minute - minute) > timedelta(days=5):
             return False
         key = (provider, symbol, minute)
         old = self.pending.get(key)
@@ -3469,6 +3508,12 @@ class MinuteCoordinator:
         )
         return applied
 
+    def _apply_warmup_candidate(self, provider, symbol, minute, candidate):
+        tracker = self.trackers[(provider, symbol)]
+        return tracker.process_bar(
+            Bar(minute, candidate.close), candidate.source, warmup=True
+        )
+
     def _apply(self, provider, symbol, minute, candidate):
         tracker = self.trackers[(provider, symbol)]
         result = tracker.process_bar(Bar(minute, candidate.close), candidate.source)
@@ -3486,26 +3531,39 @@ class MinuteCoordinator:
             day = minute.astimezone(MARKET_TZ).date()
             if tracker.session_date != day:
                 tracker.begin_session(day)
-            # Bootstrap only with data already present at this deadline.
+            opening, _ = session_bounds(day)
+            # Apply pre-market/extended or earlier-today pending bars strictly in order
+            # before evaluating the current RTH minute. Pre-open bars warm Wilder state
+            # without inflating RTH observed_closes.
             warmup = sorted(
                 other
                 for other in self.pending
                 if other[0] == provider
                 and other[1] == symbol
                 and other[2] < minute
-                and other[2].astimezone(MARKET_TZ).date() == day
+                and (
+                    RSI_SESSION_MODE == "extended"
+                    or other[2].astimezone(MARKET_TZ).date() == day
+                )
             )
             for other in warmup:
-                self._apply(provider, symbol, other[2], self.pending.pop(other))
+                w_cand = self.pending.pop(other)
+                if other[2] < opening:
+                    self._apply_warmup_candidate(provider, symbol, other[2], w_cand)
+                else:
+                    self._apply(provider, symbol, other[2], w_cand)
             observation = None
             if candidate:
                 observation = self._apply(provider, symbol, minute, candidate)
-            opening, _ = session_bounds(day)
             expected = int((minute - opening) / MINUTE) + 1
             observed = self.counts.get((provider, symbol, day), 0)
             base.update(
                 {
                     "rsi_source": "local_session_rsi",
+                    "rsi_session_mode": RSI_SESSION_MODE,
+                    "rsi_converged": tracker.average_gain is not None,
+                    "rsi_total_changes": tracker.changes,
+                    "rsi_warmup_bars": tracker.warmup_bars,
                     "observed_closes": observed,
                     "expected_minutes": expected,
                     "missing_minutes": max(0, expected - observed),
@@ -3855,12 +3913,12 @@ class MinuteCoordinator:
                 emitted += 1
             self.last_finalized = minute
             self.next_minute = next_session_minute(minute + MINUTE)
-            # Old dates cannot influence new-session RSI or grow memory forever.
+            # Discard pending records already at or before the just-finalized minute.
             next_day = self.next_minute.astimezone(MARKET_TZ).date()
             self.pending = {
                 key: value
                 for key, value in self.pending.items()
-                if key[2].astimezone(MARKET_TZ).date() >= next_day
+                if key[2] > minute
             }
             self.counts = {
                 key: value for key, value in self.counts.items() if key[2] >= next_day
@@ -3896,6 +3954,8 @@ class ProviderRouter:
         self._tt_access_cache = {}
         self._tt_quote_cache = None
         self._tt_token_lock = asyncio.Lock()
+        self.session = None
+        self._initial_warmup_done = False
         if provider == "ALPACA":
             self.historical = StockHistoricalDataClient(
                 credentials["alpaca_key"], credentials["alpaca_secret"]
@@ -3962,10 +4022,13 @@ class ProviderRouter:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
-            # Seed RSI state with prior sessions before any live minute is
-            # finalized, so the first summary of the run reports converged
-            # Wilder averages instead of a since-open cold start.
-            await self.warmup()
+            # Ensure RSI state is warmed up before live streaming starts (skips if
+            # main() already warmed this router and trackers are converged).
+            needs_warmup = (not self._initial_warmup_done) or any(
+                t.average_gain is None for t in self.trackers.values()
+            )
+            if needs_warmup and RSI_WARMUP_SESSIONS > 0:
+                await self.warmup()
             collector = {
                 "ALPACA": self.run_alpaca,
                 "YAHOOFINANCE": self.run_yfinance,
@@ -3984,6 +4047,7 @@ class ProviderRouter:
                 raise RuntimeError("Provider worker exited unexpectedly")
             finally:
                 self.coordinator.set_connected(self.provider, False)
+                self.session = None
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -4018,7 +4082,7 @@ class ProviderRouter:
             end=end,
             interval="1m",
             auto_adjust=False,
-            prepost=False,
+            prepost=(RSI_SESSION_MODE == "extended"),
             threads=False,
             progress=False,
             timeout=20,
@@ -4085,7 +4149,7 @@ class ProviderRouter:
                     f"timestamp for {symbol}: {timestamp.isoformat()}"
                 )
 
-            if not regular_session(timestamp):
+            if not session_allowed(timestamp):
                 continue
 
             if timestamp + MINUTE > watermark:
@@ -4154,7 +4218,7 @@ class ProviderRouter:
                 params={
                     "symbol": symbol,
                     "interval": "1min",
-                    "session_filter": "open",
+                    "session_filter": ("all" if RSI_SESSION_MODE == "extended" else "open"),
                     "start": start.strftime("%Y-%m-%d %H:%M"),
                     "end": end.strftime("%Y-%m-%d %H:%M"),
                 },
@@ -4257,79 +4321,143 @@ class ProviderRouter:
         return list(reversed(sessions))
 
     async def warmup(self):
-        """Seed each symbol's RSI state with prior sessions' 1-minute closes.
+        """Seed each symbol's RSI state with continuous prior + pre-market/pre-start 1m closes.
 
-        Best effort: a provider that cannot fetch history still runs with a
-        cold session reset, exactly as before this warmup existed.
+        Pulls bars continuously from `oldest_start` (RSI_WARMUP_SESSIONS back) right
+        up to `min(now_minute, coordinator.report_start)` so local_session_rsi is
+        already converged and synced with extended/regular session history before
+        the first minute finalizes.
         """
         sessions = self.prior_sessions()
         if not sessions:
+            self._initial_warmup_done = True
             return
-        if self.provider == "TASTYTRADE":
-            oldest_open = sessions[0][1][0]
-            newest_close = sessions[-1][1][1]
-            try:
-                async with self.history_lock:
-                    grouped = await self._dxlink_fetch_candles_batch(
-                        list(self.symbols),
-                        oldest_open,
-                        newest_close,
-                        overall_timeout=max(25.0, len(self.symbols) * 1.5),
-                    )
-            except FatalProviderError:
-                raise
-            except Exception as exc:
-                self.logger.warning(
-                    "RSI_WARMUP_SKIP provider=%s symbol=ALL error_type=%s",
-                    self.provider,
-                    type(exc).__name__,
-                )
-                return
-            for symbol in self.symbols:
-                bars = grouped.get(symbol, [])
-                applied_total = 0
-                for _day, (opening, closing) in sessions:
-                    day_bars = [b for b in bars if opening <= b.timestamp < closing]
-                    if day_bars:
-                        applied_total += self.coordinator.seed_history(
-                            self.provider, symbol, day_bars
+
+        oldest_day, (oldest_rth_open, _oldest_rth_close) = sessions[0]
+        if RSI_SESSION_MODE == "extended":
+            ext = extended_bounds(oldest_day)
+            oldest_start = ext[0] if ext is not None else oldest_rth_open
+        else:
+            oldest_start = oldest_rth_open
+
+        now_utc = minute_utc(datetime.now(UTC))
+        report_start = getattr(self.coordinator, "report_start", None)
+        seed_end = min(now_utc, as_utc(report_start)) if report_start is not None else now_utc
+        if seed_end <= oldest_start:
+            seed_end = sessions[-1][1][1]
+
+        # Yahoo Finance 1-minute endpoints reject lookbacks > ~7 calendar days.
+        fetch_start = oldest_start
+        if self.provider == "YAHOOFINANCE":
+            yf_floor = datetime.now(UTC) - timedelta(days=6, hours=20)
+            if fetch_start < yf_floor:
+                fetch_start = minute_utc(yf_floor)
+
+        owns_session = self.session is None and self.provider in {
+            "TASTYTRADE",
+            "TWELVEDATA",
+            "TRADIER",
+        }
+        temp_session = None
+        if owns_session:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            temp_session = aiohttp.ClientSession(timeout=timeout)
+            self.session = temp_session
+
+        try:
+            if self.provider == "TASTYTRADE":
+                grouped = None
+                for attempt in range(2):
+                    try:
+                        async with self.history_lock:
+                            grouped = await self._dxlink_fetch_candles_batch(
+                                list(self.symbols),
+                                fetch_start,
+                                seed_end,
+                                overall_timeout=max(25.0, len(self.symbols) * 1.5),
+                            )
+                        break
+                    except FatalProviderError:
+                        raise
+                    except Exception as exc:
+                        if attempt == 0:
+                            await asyncio.sleep(1.0)
+                            continue
+                        self.logger.warning(
+                            "RSI_WARMUP_SKIP provider=%s symbol=ALL error_type=%s",
+                            self.provider,
+                            type(exc).__name__,
                         )
+                        return
+                for symbol in self.symbols:
+                    bars = [
+                        b
+                        for b in (grouped or {}).get(symbol, [])
+                        if b.timestamp < seed_end and session_allowed(b.timestamp)
+                    ]
+                    applied_total = (
+                        self.coordinator.seed_history(self.provider, symbol, bars)
+                        if bars
+                        else 0
+                    )
+                    self.logger.info(
+                        "RSI_WARMUP_DONE provider=%s symbol=%s mode=%s sessions=%d bars_applied=%d",
+                        self.provider,
+                        symbol,
+                        RSI_SESSION_MODE,
+                        len(sessions),
+                        applied_total,
+                    )
+                self._initial_warmup_done = True
+                return
+
+            for symbol in self.symbols:
+                bars = []
+                fetched_ok = False
+                for attempt in range(2):
+                    try:
+                        async with self.history_lock:
+                            bars = await self.fetch_history(symbol, fetch_start, seed_end)
+                        fetched_ok = True
+                        break
+                    except FatalProviderError:
+                        raise
+                    except Exception as exc:
+                        if attempt == 0:
+                            await asyncio.sleep(1.0)
+                            continue
+                        self.logger.warning(
+                            "RSI_WARMUP_SKIP provider=%s symbol=%s error_type=%s",
+                            self.provider,
+                            symbol,
+                            type(exc).__name__,
+                        )
+                if not fetched_ok:
+                    continue
+                valid_bars = [
+                    b
+                    for b in (bars or [])
+                    if fetch_start <= as_utc(b.timestamp) < seed_end
+                    and session_allowed(b.timestamp)
+                ]
+                applied_total = (
+                    self.coordinator.seed_history(self.provider, symbol, valid_bars)
+                    if valid_bars
+                    else 0
+                )
                 self.logger.info(
-                    "RSI_WARMUP_DONE provider=%s symbol=%s sessions=%d bars_applied=%d",
+                    "RSI_WARMUP_DONE provider=%s symbol=%s mode=%s sessions=%d bars_applied=%d",
                     self.provider,
                     symbol,
+                    RSI_SESSION_MODE,
                     len(sessions),
                     applied_total,
                 )
-            return
-        for symbol in self.symbols:
-            applied_total = 0
-            for day, (opening, closing) in sessions:
-                try:
-                    async with self.history_lock:
-                        bars = await self.fetch_history(symbol, opening, closing)
-                except FatalProviderError:
-                    raise
-                except Exception as exc:
-                    self.logger.warning(
-                        "RSI_WARMUP_SKIP provider=%s symbol=%s date=%s "
-                        "error_type=%s",
-                        self.provider,
-                        symbol,
-                        day,
-                        type(exc).__name__,
-                    )
-                    continue
-                applied_total += self.coordinator.seed_history(
-                    self.provider, symbol, bars
-                )
-            self.logger.info(
-                "RSI_WARMUP_DONE provider=%s symbol=%s sessions=%d bars_applied=%d",
-                self.provider,
-                symbol,
-                len(sessions),
-                applied_total,
-            )
+            self._initial_warmup_done = True
+        finally:
+            if temp_session is not None:
+                self.session = None
+                await temp_session.close()
 
     async def recover(self, symbol, through):
         through = minute_utc(through)
@@ -4337,8 +4465,21 @@ class ProviderRouter:
         bounds = session_bounds(day)
         if bounds is None:
             return
-        start, closing = bounds
-        end = min(through, closing, minute_utc(datetime.now(UTC)))
+        rth_open, closing = bounds
+        if RSI_SESSION_MODE == "extended":
+            ext = extended_bounds(day)
+            session_start = ext[0] if ext is not None else rth_open
+            tracker = self.trackers.get(symbol)
+            last_ts = as_utc(tracker.last_timestamp) if (tracker and tracker.last_timestamp) else None
+            start = (
+                max(session_start, last_ts + MINUTE)
+                if (last_ts is not None and last_ts.astimezone(MARKET_TZ).date() == day)
+                else session_start
+            )
+            end = min(through, closing, minute_utc(datetime.now(UTC)))
+        else:
+            start = rth_open
+            end = min(through, closing, minute_utc(datetime.now(UTC)))
         if self.coordinator.last_finalized is not None:
             start = max(start, self.coordinator.last_finalized + MINUTE)
         if start >= end:
@@ -4348,7 +4489,7 @@ class ProviderRouter:
         accepted = 0
         for bar in sorted(bars, key=lambda item: item.timestamp):
             timestamp = as_utc(bar.timestamp)
-            if start <= timestamp < end:
+            if start <= timestamp < end and session_allowed(timestamp):
                 accepted += self.coordinator.submit(
                     self.provider, symbol, timestamp, bar.close, source="REST_BACKFILL"
                 )
@@ -5000,7 +5141,7 @@ class ProviderRouter:
                         if base_sym not in target_set:
                             continue
                         if dt is not None and price is not None:
-                            if start_utc <= dt < end_utc and regular_session(dt):
+                            if start_utc <= dt < end_utc and session_allowed(dt):
                                 out[base_sym][dt] = price
                         # 0x08 = SNAPSHOT_END, 0x10 = SNAPSHOT_SNIP
                         if flags & 0x18:
@@ -5318,6 +5459,7 @@ def _sanitize_parms_for_json_ini(raw_text):
     while preserving 1:1 line numbering.
     """
     out_lines = []
+    current_section = ""
     in_feature_section = False
     for line in raw_text.splitlines(keepends=True):
         newline = "\n" if line.endswith("\n") else ""
@@ -5328,8 +5470,8 @@ def _sanitize_parms_for_json_ini(raw_text):
         stripped = body.strip()
         sec_match = _INI_SECTION_RE.match(body)
         if sec_match:
-            sec_name = sec_match.group(1).strip().lower()
-            in_feature_section = sec_name in _INI_FEATURE_SECTIONS
+            current_section = sec_match.group(1).strip().lower()
+            in_feature_section = current_section in _INI_FEATURE_SECTIONS
             out_lines.append(f"[{sec_match.group(1).strip()}]{newline}")
             continue
         if not stripped or stripped[0] in {";", "#"}:
@@ -5340,6 +5482,9 @@ def _sanitize_parms_for_json_ini(raw_text):
             continue
         if "=" in body:
             key_part, val_part = body.split("=", 1)
+            if current_section in {"alpaca_api", "alpaca"} and key_part.strip().lower() == "feed":
+                out_lines.append(f"; ini-feature-option{newline}")
+                continue
             cleaned_val = _strip_trailing_json_comment(val_part)
             out_lines.append(f"{key_part.rstrip()} = {cleaned_val}{newline}")
             continue
@@ -5544,6 +5689,7 @@ def _apply_ini_feature_settings(cfg):
     global TASTYTRADE_PROD_ACCOUNT_NUMBER, TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
+    global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
     global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
     global OPTION_BUY_QTY, OPTION_BUY_ORDER_TYPE, OPTION_BUY_COOLDOWN_MINUTES
@@ -5640,6 +5786,39 @@ def _apply_ini_feature_settings(cfg):
     KINEMATICS_RSI_OVERSOLD = _ini_float(
         cfg, "kinematics", "rsi_oversold", "KINEMATICS_RSI_OVERSOLD", 30.0
     )
+    RSI_WARMUP_SESSIONS = _ini_int(
+        cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
+    )
+    rsi_sess = (
+        _ini_str(cfg, "kinematics", "rsi_session", "RSI_SESSION_MODE", "extended")
+        .strip()
+        .lower()
+    )
+    if rsi_sess in {"eth", "ext", "all"}:
+        rsi_sess = "extended"
+    elif rsi_sess in {"rth", "reg"}:
+        rsi_sess = "regular"
+    if rsi_sess not in {"extended", "regular"}:
+        raise ValueError(
+            f"[kinematics] rsi_session must be extended or regular; got {rsi_sess!r}"
+        )
+    RSI_SESSION_MODE = rsi_sess
+
+    if cfg.has_option("alpaca_api", "feed"):
+        alpaca_feed_raw = (
+            _ini_str(cfg, "alpaca_api", "feed", "ALPACA_FEED", "iex").strip().lower()
+        )
+    elif cfg.has_option("alpaca", "feed"):
+        alpaca_feed_raw = (
+            _ini_str(cfg, "alpaca", "feed", "ALPACA_FEED", "iex").strip().lower()
+        )
+    else:
+        alpaca_feed_raw = os.getenv("ALPACA_FEED", "iex").strip().lower() or "iex"
+    if alpaca_feed_raw not in {"iex", "sip"}:
+        raise ValueError(
+            f"[alpaca_api] feed must be iex or sip; got {alpaca_feed_raw!r}"
+        )
+    FEED = DataFeed.SIP if alpaca_feed_raw == "sip" else DataFeed.IEX
 
     OPTION_CHAIN_RSI_LOW = _ini_float(
         cfg, "option_buyer", "rsi_low", "OPTION_CHAIN_RSI_LOW", 35.0
@@ -6034,7 +6213,8 @@ def _apply_ini_feature_settings(cfg):
     )
 
     logging.info(
-        "FEATURE_CONFIG tz=%s(%s) opt_chain=%s opt_tx=%s tt_tx_env=%s "
+        "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
+        "opt_chain=%s opt_tx=%s tt_tx_env=%s "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s "
@@ -6044,6 +6224,9 @@ def _apply_ini_feature_settings(cfg):
         "ssl_enabled=%s ssl_mode=%s",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
+        RSI_SESSION_MODE,
+        RSI_WARMUP_SESSIONS,
+        "sip" if FEED == DataFeed.SIP else "iex",
         OPTION_CHAIN_PROVIDER,
         OPTION_TRANSACTION_PROVIDER,
         TASTYTRADE_TRANSACTION_ENV,
@@ -16790,7 +16973,33 @@ async def main():
 
         PROVIDER_REGISTRY[provider] = {"router": router_instance, "task": None}
 
-    # 4. Gather up all execution tasks securely
+    # 4a. Pre-seed all local RSI providers BEFORE coordinator finalizes any minute
+    # so local_session_rsi is converged prior to 09:30 ET open (no startup race).
+    warmup_routers = [
+        entry["router"]
+        for entry in PROVIDER_REGISTRY.values()
+        if hasattr(entry.get("router"), "warmup")
+    ]
+    if warmup_routers and RSI_WARMUP_SESSIONS > 0:
+        logging.info(
+            "RSI_PRE_WARMUP_START providers=%s mode=%s sessions=%d",
+            [r.provider for r in warmup_routers],
+            RSI_SESSION_MODE,
+            RSI_WARMUP_SESSIONS,
+        )
+        warmup_results = await asyncio.gather(
+            *(r.warmup() for r in warmup_routers), return_exceptions=True
+        )
+        for r, res in zip(warmup_routers, warmup_results):
+            if isinstance(res, Exception):
+                logging.warning(
+                    "RSI_PRE_WARMUP_ERROR provider=%s error_type=%s detail=%s",
+                    r.provider,
+                    type(res).__name__,
+                    res,
+                )
+
+    # 4b. Gather up all execution tasks securely
     tasks = [
         asyncio.create_task(coordinator.run(), name="MINUTE_COORDINATOR"),
         asyncio.create_task(
