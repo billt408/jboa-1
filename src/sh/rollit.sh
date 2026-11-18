@@ -7,7 +7,7 @@ START_SERVICE="jboa-rsi.service"
 BASE_DIR="/home/billt/jboa-1/src"
 WORK_DIR="/home/billt/jboa-1/OLDLOGS"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-LOG_DIR="${WORK_DIR}/logs"
+LOG_DIR="${BASE_DIR}/logs"
 BACKUP_DIR="${WORK_DIR}/logs_backup.${TIMESTAMP}"
 
 echo "==> Stopping ${STOP_SERVICE}..."
