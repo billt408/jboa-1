@@ -15337,9 +15337,29 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 ? 'px-2.5 py-1 rounded-md bg-slate-700 text-white font-semibold'
                 : 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white';
 
+            const buyerFiles = Array.isArray(payload.buyer_log_files)
+                ? payload.buyer_log_files
+                : (payload.buyer_log_file ? [payload.buyer_log_file] : []);
+            const sellerFiles = Array.isArray(payload.seller_log_files)
+                ? payload.seller_log_files
+                : (payload.seller_log_file ? [payload.seller_log_file] : []);
             const fileInfoParts = [];
-            if (payload.buyer_log_file) fileInfoParts.push(`Buyer: ${payload.buyer_log_file}`);
-            if (payload.seller_log_file) fileInfoParts.push(`Seller: ${payload.seller_log_file}`);
+            const titleInfoParts = [];
+            if (payload.provider) fileInfoParts.push(`Provider: ${payload.provider}`);
+            if (buyerFiles.length > 1) {
+                fileInfoParts.push(`Buyer: ${buyerFiles.length} files (latest: ${buyerFiles[0]})`);
+                titleInfoParts.push(`Buyer (${buyerFiles.length}):\n${buyerFiles.join('\n')}`);
+            } else if (buyerFiles.length === 1) {
+                fileInfoParts.push(`Buyer: ${buyerFiles[0]}`);
+                titleInfoParts.push(`Buyer: ${buyerFiles[0]}`);
+            }
+            if (sellerFiles.length > 1) {
+                fileInfoParts.push(`Seller: ${sellerFiles.length} files (latest: ${sellerFiles[0]})`);
+                titleInfoParts.push(`Seller (${sellerFiles.length}):\n${sellerFiles.join('\n')}`);
+            } else if (sellerFiles.length === 1) {
+                fileInfoParts.push(`Seller: ${sellerFiles[0]}`);
+                titleInfoParts.push(`Seller: ${sellerFiles[0]}`);
+            }
 
             const rowBadge = document.getElementById('optLogsRowBadge');
             if (rowBadge) {
@@ -15351,7 +15371,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (fileSubtitle) {
                 const subTxt = fileInfoParts.join(' · ') || 'No option_buyer / option_seller log files found yet';
                 fileSubtitle.textContent = subTxt;
-                fileSubtitle.title = subTxt;
+                fileSubtitle.title = titleInfoParts.join('\n\n') || subTxt;
             }
 
             logsEl.innerHTML = `
@@ -15954,6 +15974,28 @@ def _resolve_latest_option_log_file(subdir: str, preferred_name: str):
     return candidates[0][3]
 
 
+def _list_provider_option_log_files(subdir: str, prefix: str):
+    """Return all non-empty *.log files in LOG_ROOT/subdir matching prefix (newest first)."""
+    directory = LOG_ROOT / subdir
+    if not directory.exists() or not directory.is_dir():
+        return []
+    prefix_upper = str(prefix or "").upper()
+    candidates = []
+    for p in directory.glob("*.log"):
+        try:
+            if not p.is_file():
+                continue
+            if prefix_upper and not p.name.upper().startswith(prefix_upper):
+                continue
+            st = p.stat()
+            if st.st_size > 0:
+                candidates.append((st.st_mtime, p.name, p))
+        except OSError:
+            continue
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in candidates]
+
+
 _OPTION_LOG_HEADER_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:,\d+)?)\s+"
     r"(INFO|WARNING|ERROR|DEBUG|CRITICAL)\s+(\S+)(?:\s+(.*))?$"
@@ -15982,6 +16024,7 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
 
     ts_full = m.group(1)
     ts_short = ts_full[5:19] if len(ts_full) >= 19 else ts_full
+    sort_ts = ts_full if "," in ts_full else f"{ts_full},000"
     level = m.group(2)
     event = m.group(3)
     rest = (m.group(4) or "").strip()
@@ -16014,7 +16057,7 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         "decision": event,
         "reason": rest,
         "raw_message": rest,
-        "_sort_key": (ts_full, seq),
+        "_sort_key": (sort_ts, seq),
     }
 
     if event == "OPTION_BUY_ANALYSIS":
@@ -16152,35 +16195,32 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     return rec
 
 
-def read_option_analysis_logs(limit_per_file: int = 500):
-    """Read and parse recent Option Buyer & Option Seller log lines (newest first)."""
+def read_option_analysis_logs(limit_per_file: int = 500, max_total_entries: int = 5000):
+    """Read, merge, and sort all Option Buyer & Option Seller log files for the configured trading provider (newest first)."""
     from collections import deque
 
     tx_tag = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().upper() or "ALPACA"
-    buyer_path = _resolve_latest_option_log_file(
-        "option_buyer", f"{tx_tag}-OPTION_BUYER-{RUN_ID}.log"
-    )
-    seller_path = _resolve_latest_option_log_file(
-        "option_seller", f"{tx_tag}-OPTION_SELLER-{RUN_ID}.log"
-    )
+    buyer_files = _list_provider_option_log_files("option_buyer", f"{tx_tag}-OPTION_BUYER-")
+    seller_files = _list_provider_option_log_files("option_seller", f"{tx_tag}-OPTION_SELLER-")
 
     entries = []
     seq = 0
-    for stream, path in (("BUY", buyer_path), ("SELL", seller_path)):
-        if path is None:
-            continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                tail_lines = deque(f, maxlen=limit_per_file)
-            for raw in tail_lines:
-                seq += 1
-                parsed = _parse_option_log_line(raw, stream=stream, seq=seq)
-                if parsed is not None:
-                    entries.append(parsed)
-        except OSError:
-            continue
+    for stream, paths in (("BUY", buyer_files), ("SELL", seller_files)):
+        for path in reversed(paths):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    tail_lines = deque(f, maxlen=limit_per_file)
+                for raw in tail_lines:
+                    seq += 1
+                    parsed = _parse_option_log_line(raw, stream=stream, seq=seq)
+                    if parsed is not None:
+                        entries.append(parsed)
+            except OSError:
+                continue
 
     entries.sort(key=lambda r: r["_sort_key"], reverse=True)
+    if max_total_entries and len(entries) > max_total_entries:
+        del entries[max_total_entries:]
 
     buy_count = 0
     sell_count = 0
@@ -16211,8 +16251,11 @@ def read_option_analysis_logs(limit_per_file: int = 500):
             rejected_count += 1
 
     return {
-        "buyer_log_file": buyer_path.name if buyer_path else None,
-        "seller_log_file": seller_path.name if seller_path else None,
+        "provider": tx_tag,
+        "buyer_log_file": buyer_files[0].name if buyer_files else None,
+        "seller_log_file": seller_files[0].name if seller_files else None,
+        "buyer_log_files": [p.name for p in buyer_files],
+        "seller_log_files": [p.name for p in seller_files],
         "counts": {
             "total": len(entries),
             "buy": buy_count,
