@@ -10,3 +10,6 @@ src/logs/*
 !src/logs/.gitkeep
 src/logs_backup*/*
 src/logs_backup*/.gitkeep
+OLDLOGS/*
+src/certs/*
+
