@@ -110,3 +110,11 @@ sudo dnf install -y python3-devel patchelf podman
 sudo dnf install ccache
 pip install -r requirements.txt
 pip install cryptography nuitka ordered-set zstandard
+
+podman save -o /home/billt/jboa-1/dist/multistream-rsi-9.8.tar localhost/multistream-rsi:9.8
+
+
+sudo groupadd --gid 1001 jboa
+sudo useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
+
+

@@ -15,5 +15,6 @@ src/certs/*
 src/ngrok/ngrok.yml
 src/.build_venv/*
 .build_venv/*
+dist/multistream-rsi-9.8.tar
 
 
