@@ -17942,7 +17942,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             _updateCxToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
 
-            const W = 640, H = 246, padL = 44, padR = 26;
+            const W = 640, padL = 44, padR = 26;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => padL + (i / Math.max(1, n)) * plotW;
@@ -17984,10 +17984,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const gridInterval = n <= 30 ? 1 : (n <= 90 ? 5 : (n <= 240 ? 15 : 30));
             let minuteGrid = '';
             let lastLabelX = -999;
-            let lastDateMarkerX = padL + 75;
+            let lastDateMarkerX = padL + 14;
+            let hasRolloverLabel = false;
             const latestBarX = xAt(n - 1);
             const firstWindowTs = points[0]?.timestamp || points[0]?.minute_utc || '';
-            const lastWindowTs = points[n - 1]?.timestamp || points[n - 1]?.minute_utc || '';
             let prevDayKey = _localDateKey(firstWindowTs);
 
             for (let i = 0; i < n; i++) {
@@ -18020,6 +18020,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (isDayRollover && xNum > lastDateMarkerX && (W - padR - xNum) > 22) {
                     minuteGrid += `<text x="${x}" y="239" text-anchor="middle" fill="#7dd3fc" font-size="8.2" font-weight="bold" font-family="monospace">${escSvg(fmtShortDateOnly(ptTs))}</text>`;
                     lastDateMarkerX = xNum + 58;
+                    hasRolloverLabel = true;
                 }
 
                 const fitsSpacing = (xNum - lastLabelX >= 42) && (isLatest || (latestBarX - xNum >= 42));
@@ -18030,15 +18031,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     lastLabelX = xNum;
                 }
             }
-            const windowDateBanner = fmtDateRangeSpan(firstWindowTs, lastWindowTs);
-            if (windowDateBanner && windowDateBanner !== '--') {
-                minuteGrid += `<text x="${padL}" y="239" text-anchor="start" fill="#38bdf8" font-size="8.8" font-weight="bold" font-family="monospace">${escSvg(windowDateBanner)}</text>`;
-            }
             if (effProjectedNext !== null) {
                 const px = xAt(n).toFixed(1);
                 minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
                 minuteGrid += `<text x="${px}" y="224" text-anchor="middle" fill="#22d3ee" fill-opacity="0.90" font-size="8.5" font-family="monospace">+1m</text>`;
             }
+            const H = hasRolloverLabel ? 246 : 232;
 
             const crossMarkers = points.map((p, i) => {
                 if (p.crossover_signal === 'leading_bearish' || p.crossover_signal === 'leading_bullish') {
@@ -19388,7 +19386,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             _updateOptToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
 
-            const W = 740, H = 318, padL = 56, padR = 62;
+            const W = 740, padL = 56, padR = 62;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => n === 1 ? (padL + plotW * 0.5) : (padL + (i / Math.max(1, n - 1)) * plotW);
@@ -19435,14 +19433,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const qHalf = (qBot - qTop) / 2;
             const yPnl = (dVal) => qMid - (dVal / maxAbsD) * qHalf;
 
-            // Time grid ticks + day rollover markers + visible session date footer
+            // Time grid ticks + day rollover markers
             let gridHtml = '';
             const maxTicks = 7;
             const step = Math.max(1, Math.ceil(n / maxTicks));
             const optFirstIso = points[0]?.timestamp || points[0]?.minute_utc || '';
-            const optLastIso = points[n - 1]?.timestamp || points[n - 1]?.minute_utc || '';
             let prevOptDay = _localDateKey(optFirstIso);
-            let lastOptDateX = padL + 85;
+            let lastOptDateX = padL + 14;
+            let hasOptRolloverLabel = false;
             for (let i = 0; i < n; i++) {
                 const ptIso = points[i]?.timestamp || points[i]?.minute_utc || '';
                 const curDay = _localDateKey(ptIso);
@@ -19456,6 +19454,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     if (xNum > lastOptDateX && (W - padR - xNum) > 26) {
                         gridHtml += `<text x="${x}" y="307" text-anchor="middle" fill="#67e8f9" font-size="8.8" font-weight="bold" font-family="monospace">${escSvg(fmtShortDateOnly(ptIso))}</text>`;
                         lastOptDateX = xNum + 64;
+                        hasOptRolloverLabel = true;
                     }
                 }
                 if (i === 0 || i === n - 1 || i % step === 0) {
@@ -19466,10 +19465,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     gridHtml += `<text x="${x}" y="289" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
                 }
             }
-            const optWindowDateBanner = fmtDateRangeSpan(optFirstIso, optLastIso);
-            if (optWindowDateBanner && optWindowDateBanner !== '--') {
-                gridHtml += `<text x="${padL}" y="307" text-anchor="start" fill="#22d3ee" font-size="9.2" font-weight="bold" font-family="monospace">${escSvg(optWindowDateBanner)}</text>`;
-            }
+            const H = hasOptRolloverLabel ? 318 : 300;
 
             // Option price path & area
             const pricePathD = _buildGapAwarePath(pricesRaw, xAt, yPrice);
