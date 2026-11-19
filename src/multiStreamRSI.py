@@ -1999,6 +1999,7 @@ class OptionContractHistoryTracker:
         self.backfill_status = "idle"
         self.backfill_last_utc = None
         self.backfill_error = None
+        self._started_at = datetime.now(UTC)
         self._credentials = {}
         self._coordinator = None
         self._trading_client = None
@@ -3993,6 +3994,100 @@ class OptionContractHistoryTracker:
             )
             return {"open": 0, "closed": 0, "error": str(exc)}
 
+    def _run_start_dt(self):
+        coord = getattr(self, "_coordinator", None)
+        started = getattr(coord, "started_at", None) if coord is not None else None
+        return as_utc(started or getattr(self, "_started_at", None) or datetime.now(UTC))
+
+    def _compute_overall_order_counts(self):
+        """Return deduplicated total executed buy/sell order counts across history + live session."""
+        buy_keys, buy_cm = set(), set()
+        sell_keys, sell_cm = set(), set()
+
+        def _add(keys, cm_set, oid, contract, ts_raw):
+            oid_s = str(oid).strip() if oid else ""
+            con_s = str(contract or "").strip().upper()
+            ts_dt = _opt_parse_utc(ts_raw)
+            min_s = (
+                minute_utc(ts_dt).isoformat()
+                if ts_dt is not None
+                else str(ts_raw or "")[:16]
+            )
+            if oid_s:
+                keys.add(f"id:{oid_s}")
+                if con_s and min_s:
+                    cm_set.add((con_s, min_s))
+            elif con_s or min_s:
+                cm = (con_s, min_s)
+                if cm not in cm_set:
+                    cm_set.add(cm)
+                    keys.add(f"cm:{con_s}:{min_s}")
+
+        for fo in self.filled_orders_history:
+            if not isinstance(fo, dict) or fo.get("dry_run"):
+                continue
+            side = str(fo.get("side") or "").lower()
+            ts_raw = fo.get("minute_utc") or fo.get("executed_at_utc")
+            if side == "buy":
+                _add(buy_keys, buy_cm, fo.get("order_id"), fo.get("contract"), ts_raw)
+            elif side == "sell":
+                _add(sell_keys, sell_cm, fo.get("order_id"), fo.get("contract"), ts_raw)
+
+        for c in self.open_contracts.values():
+            if not isinstance(c, dict) or c.get("dry_run"):
+                continue
+            _add(
+                buy_keys,
+                buy_cm,
+                c.get("order_id"),
+                c.get("contract"),
+                c.get("purchased_minute_utc") or c.get("purchased_at_utc"),
+            )
+
+        for c in self.closed_contracts:
+            if not isinstance(c, dict) or c.get("dry_run"):
+                continue
+            if c.get("buy_order_id") or c.get("purchased_at_utc"):
+                _add(
+                    buy_keys,
+                    buy_cm,
+                    c.get("buy_order_id"),
+                    c.get("contract"),
+                    c.get("purchased_at_utc"),
+                )
+            _add(
+                sell_keys,
+                sell_cm,
+                c.get("sell_order_id"),
+                c.get("contract"),
+                c.get("sold_at_utc"),
+            )
+
+        coord = getattr(self, "_coordinator", None)
+        if coord is not None:
+            for ev_list in (getattr(coord, "option_buy_events", {}) or {}).values():
+                for ev in ev_list or ():
+                    if isinstance(ev, dict) and not ev.get("dry_run"):
+                        _add(
+                            buy_keys,
+                            buy_cm,
+                            ev.get("order_id"),
+                            ev.get("contract"),
+                            ev.get("minute_utc") or ev.get("executed_at_utc"),
+                        )
+            for ev_list in (getattr(coord, "option_sell_events", {}) or {}).values():
+                for ev in ev_list or ():
+                    if isinstance(ev, dict) and not ev.get("dry_run"):
+                        _add(
+                            sell_keys,
+                            sell_cm,
+                            ev.get("order_id"),
+                            ev.get("contract"),
+                            ev.get("minute_utc") or ev.get("executed_at_utc"),
+                        )
+
+        return len(buy_keys), len(sell_keys)
+
     def get_buyer_summary(self):
         with self._lock:
             items = list(self.open_contracts.values())
@@ -4009,8 +4104,27 @@ class OptionContractHistoryTracker:
             total_pct = (
                 round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
             )
+            overall_buys, _ = self._compute_overall_order_counts()
+            run_start = self._run_start_dt()
+            live_buy_contracts = set()
+            coord = getattr(self, "_coordinator", None)
+            if coord is not None:
+                for ev_list in (getattr(coord, "option_buy_events", {}) or {}).values():
+                    for ev in ev_list or ():
+                        if isinstance(ev, dict) and not ev.get("dry_run") and ev.get("contract"):
+                            ev_dt = _opt_parse_utc(ev.get("executed_at_utc") or ev.get("minute_utc"))
+                            if ev_dt is not None and ev_dt >= run_start:
+                                live_buy_contracts.add(str(ev.get("contract")).strip().upper())
+            run_open = 0
+            for c in items:
+                con_sym = str(c.get("contract") or "").strip().upper()
+                p_dt = _opt_parse_utc(c.get("purchased_at_utc"))
+                if (p_dt is not None and p_dt >= run_start) or (con_sym and con_sym in live_buy_contracts):
+                    run_open += 1
             return {
                 "open_count": len(items),
+                "run_open_count": run_open,
+                "overall_buy_orders": max(len(items), overall_buys),
                 "total_cost_basis": total_cost,
                 "total_market_value": total_val,
                 "total_pnl_dollars": total_pnl,
@@ -4048,8 +4162,17 @@ class OptionContractHistoryTracker:
                 for c in items
                 if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) < 0
             )
+            _, overall_sells = self._compute_overall_order_counts()
+            run_start = self._run_start_dt()
+            run_closed = 0
+            for c in items:
+                s_dt = _opt_parse_utc(c.get("sold_at_utc"))
+                if s_dt is not None and s_dt >= run_start:
+                    run_closed += 1
             return {
                 "closed_count": len(items),
+                "run_closed_count": run_closed,
+                "overall_sell_orders": max(len(items), overall_sells),
                 "win_count": wins,
                 "loss_count": losses,
                 "total_cost_basis": total_cost,
@@ -16107,6 +16230,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <span id="optionBuyerContractsCount" class="text-slate-400">0 open contracts</span>
                                 <span id="optionBuyerValueDelta" class="text-slate-400">--</span>
                             </div>
+                            <div class="pt-1 mt-0.5 border-t border-slate-800/70 space-y-0.5 text-[10px] mono">
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-500">Overall</span>
+                                    <span id="optionBuyerOverallCounts" class="text-slate-300">0 open · 0 buys</span>
+                                </div>
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-500">This Run</span>
+                                    <span id="optionBuyerRunCounts" class="text-cyan-300/90">0 open · 0 buys · 0 dry</span>
+                                </div>
+                            </div>
                         </div>
 
                         <div id="optionBuyerErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
@@ -16127,6 +16260,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <div class="flex justify-between items-center text-[10px] mono">
                                 <span id="optionSellerContractsCount" class="text-slate-400">0 closed contracts</span>
                                 <span id="optionSellerValueDelta" class="text-slate-400">--</span>
+                            </div>
+                            <div class="pt-1 mt-0.5 border-t border-slate-800/70 space-y-0.5 text-[10px] mono">
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-500">Overall</span>
+                                    <span id="optionSellerOverallCounts" class="text-slate-300">0 closed · 0 sells</span>
+                                </div>
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-500">This Run</span>
+                                    <span id="optionSellerRunCounts" class="text-amber-300/90">0 closed · 0 sells · 0 dry</span>
+                                </div>
                             </div>
                         </div>
 
@@ -16852,9 +16995,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (m.option_buyer) {
                 const ob = m.option_buyer;
                 const obEl = document.getElementById('optionBuyerStatus');
-                const obStatusText = `${ob.status || 'not_loaded'} (${ob.orders_submitted ?? 0}/${ob.dry_run_orders ?? 0})`;
-                obEl.textContent = obStatusText;
-                obEl.title = ob.last_error_detail ? `${obStatusText} — ${ob.last_error_detail}` : obStatusText;
+                const obStatusLabel = ob.status || 'not_loaded';
+                const obRunBuys = ob.orders_submitted ?? 0;
+                const obRunDry = ob.dry_run_orders ?? 0;
+                obEl.textContent = obStatusLabel;
                 obEl.className = `mono font-semibold truncate text-right min-w-0 ${
                     String(ob.status || '').includes('error')
                         ? 'text-rose-400'
@@ -16872,14 +17016,28 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 document.getElementById('optionBuyerLast').textContent = ob.last_order_contract || '--';
                 const obSum = ob.history_summary || {};
+                const cnt = obSum.open_count ?? 0;
+                const overallBuys = obSum.overall_buy_orders ?? cnt;
+                const runOpen = obSum.run_open_count ?? 0;
+                obEl.title = ob.last_error_detail
+                    ? `${obStatusLabel} — ${ob.last_error_detail}`
+                    : `${obStatusLabel} · Overall: ${cnt} open, ${overallBuys} buys · This Run: ${runOpen} open, ${obRunBuys} buys (${obRunDry} dry)`;
                 const obCountEl = document.getElementById('optionBuyerContractsCount');
                 const obDeltaEl = document.getElementById('optionBuyerValueDelta');
+                const obOverallEl = document.getElementById('optionBuyerOverallCounts');
+                const obRunEl = document.getElementById('optionBuyerRunCounts');
                 if (obCountEl) {
-                    const cnt = obSum.open_count ?? 0;
                     obCountEl.textContent = `${cnt} open contract${cnt === 1 ? '' : 's'}`;
                 }
+                if (obOverallEl) {
+                    obOverallEl.textContent = `${cnt} open · ${overallBuys} ${overallBuys === 1 ? 'buy' : 'buys'}`;
+                    obOverallEl.title = 'Total currently open contracts and total filled buy orders across broker history + this run';
+                }
+                if (obRunEl) {
+                    obRunEl.textContent = `${runOpen} open · ${obRunBuys} ${obRunBuys === 1 ? 'buy' : 'buys'} · ${obRunDry} dry`;
+                    obRunEl.title = 'Open contracts purchased and buy orders (live / dry-run) executed since this server run started';
+                }
                 if (obDeltaEl) {
-                    const cnt = obSum.open_count ?? 0;
                     const pnlD = safeNum(obSum.total_pnl_dollars);
                     const pnlP = safeNum(obSum.total_pnl_pct);
                     if (cnt > 0 && pnlD !== null) {
@@ -16896,9 +17054,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (m.option_seller) {
                 const os = m.option_seller;
                 const osEl = document.getElementById('optionSellerStatus');
-                const osStatusText = `${os.status || 'not_loaded'} (${os.orders_submitted ?? 0}/${os.dry_run_orders ?? 0})`;
-                osEl.textContent = osStatusText;
-                osEl.title = os.last_error_detail ? `${osStatusText} — ${os.last_error_detail}` : osStatusText;
+                const osStatusLabel = os.status || 'not_loaded';
+                const osRunSells = os.orders_submitted ?? 0;
+                const osRunDry = os.dry_run_orders ?? 0;
+                osEl.textContent = osStatusLabel;
                 osEl.className = `mono font-semibold truncate text-right min-w-0 ${
                     String(os.status || '').includes('error')
                         ? 'text-rose-400'
@@ -16916,14 +17075,28 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 document.getElementById('optionSellerLast').textContent = os.last_order_contract || '--';
                 const osSum = os.history_summary || {};
+                const cnt = osSum.closed_count ?? 0;
+                const overallSells = osSum.overall_sell_orders ?? cnt;
+                const runClosed = osSum.run_closed_count ?? 0;
+                osEl.title = os.last_error_detail
+                    ? `${osStatusLabel} — ${os.last_error_detail}`
+                    : `${osStatusLabel} · Overall: ${cnt} closed, ${overallSells} sells · This Run: ${runClosed} closed, ${osRunSells} sells (${osRunDry} dry)`;
                 const osCountEl = document.getElementById('optionSellerContractsCount');
                 const osDeltaEl = document.getElementById('optionSellerValueDelta');
+                const osOverallEl = document.getElementById('optionSellerOverallCounts');
+                const osRunEl = document.getElementById('optionSellerRunCounts');
                 if (osCountEl) {
-                    const cnt = osSum.closed_count ?? 0;
                     osCountEl.textContent = `${cnt} closed contract${cnt === 1 ? '' : 's'}`;
                 }
+                if (osOverallEl) {
+                    osOverallEl.textContent = `${cnt} closed · ${overallSells} ${overallSells === 1 ? 'sell' : 'sells'}`;
+                    osOverallEl.title = 'Total closed contracts and total filled sell orders across broker history + this run';
+                }
+                if (osRunEl) {
+                    osRunEl.textContent = `${runClosed} closed · ${osRunSells} ${osRunSells === 1 ? 'sell' : 'sells'} · ${osRunDry} dry`;
+                    osRunEl.title = 'Closed contracts and sell orders (live / dry-run) executed since this server run started';
+                }
                 if (osDeltaEl) {
-                    const cnt = osSum.closed_count ?? 0;
                     const pnlD = safeNum(osSum.total_pnl_dollars);
                     const pnlP = safeNum(osSum.total_pnl_pct);
                     if (cnt > 0 && pnlD !== null) {
