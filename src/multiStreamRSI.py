@@ -330,6 +330,13 @@ KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
 KINEMATICS_HISTORY_MAX_BARS = max(
     60, int(os.getenv("KINEMATICS_HISTORY_MAX_BARS", "2400"))
 )
+OPTION_HISTORY_MAX_BARS = max(
+    60,
+    int(os.getenv("OPTION_HISTORY_MAX_BARS", str(KINEMATICS_HISTORY_MAX_BARS))),
+)
+OPTION_HISTORY_PRE_ENTRY_MINUTES = max(
+    0, int(os.getenv("OPTION_HISTORY_PRE_ENTRY_MINUTES", "390"))
+)
 
 
 def compute_wma(values, period):
@@ -1988,13 +1995,35 @@ class OptionContractHistoryTracker:
         self.open_contracts = {}
         self.closed_contracts = []
         self._closed_ids = set()
+        self.filled_orders_history = []
         self.backfill_status = "idle"
         self.backfill_last_utc = None
         self.backfill_error = None
         self._credentials = {}
+        self._coordinator = None
         self._trading_client = None
         self._option_data_client = None
         self._stock_data_client = None
+
+    @classmethod
+    def _history_cap(cls):
+        try:
+            cfg_max = int(globals().get("OPTION_HISTORY_MAX_BARS", cls.MAX_HISTORY_POINTS) or cls.MAX_HISTORY_POINTS)
+        except (TypeError, ValueError):
+            cfg_max = cls.MAX_HISTORY_POINTS
+        return max(60, cfg_max)
+
+    @classmethod
+    def _pre_entry_cap(cls):
+        try:
+            pre_m = int(globals().get("OPTION_HISTORY_PRE_ENTRY_MINUTES", 390) or 0)
+        except (TypeError, ValueError):
+            pre_m = 390
+        return max(0, min(cls._history_cap(), pre_m))
+
+    def attach_coordinator(self, coordinator):
+        with self._lock:
+            self._coordinator = coordinator
 
     def attach_clients(
         self,
@@ -2013,6 +2042,55 @@ class OptionContractHistoryTracker:
             if stock_data_client is not None:
                 self._stock_data_client = stock_data_client
 
+    def _lookup_live_stock_price(self, underlying, at_dt=None):
+        """Look up underlying stock close price from MinuteCoordinator kinematics/pending state."""
+        und = str(underlying or "").strip().upper()
+        if not und or self._coordinator is None:
+            return None
+        coord = self._coordinator
+        target_min = minute_utc(as_utc(at_dt)) if at_dt is not None else None
+        best_exact = None
+        best_latest = None
+        best_latest_ts = None
+
+        kin_map = getattr(coord, "kinematics_history", None) or {}
+        for prov in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+            hist = kin_map.get((prov, und))
+            if not hist:
+                continue
+            if target_min is not None:
+                for h in reversed(hist[-60:]):
+                    hm = _hist_minute_utc(h)
+                    hc = _opt_safe_float(h.get("close"), None)
+                    if hc is not None and hc > 0 and hm == target_min:
+                        best_exact = hc
+                        break
+                if best_exact is not None:
+                    return round(best_exact, 4)
+            for h in reversed(hist[-10:]):
+                hc = _opt_safe_float(h.get("close"), None)
+                hts = _hist_minute_utc(h)
+                if hc is not None and hc > 0:
+                    if best_latest is None or (hts and (best_latest_ts is None or hts > best_latest_ts)):
+                        best_latest = hc
+                        best_latest_ts = hts
+                    break
+
+        pending = getattr(coord, "pending", None) or {}
+        for (p_prov, p_sym, p_min), p_cand in list(pending.items()):
+            if str(p_sym or "").strip().upper() != und:
+                continue
+            pc = _opt_safe_float(getattr(p_cand, "close", None), None)
+            if pc is None or pc <= 0:
+                continue
+            if target_min is not None and minute_utc(as_utc(p_min)) == target_min:
+                return round(pc, 4)
+            if best_latest is None or (best_latest_ts is None or p_min > best_latest_ts):
+                best_latest = pc
+                best_latest_ts = p_min
+
+        return round(best_latest, 4) if best_latest is not None and best_latest > 0 else None
+
     @staticmethod
     def _build_point(
         ts_dt,
@@ -2022,13 +2100,33 @@ class OptionContractHistoryTracker:
         multiplier,
         source="live_poll",
         minute_key_override=None,
+        stock_price=None,
+        pre_entry=False,
     ):
         ts_utc = as_utc(ts_dt)
         min_dt = minute_utc(ts_utc)
-        p = max(0.0, float(price))
-        ep = max(0.0, float(entry_price))
-        q = max(0.0, float(qty))
+        p_raw = _opt_safe_float(price, None)
+        ep = max(0.0, float(_opt_safe_float(entry_price, 0.0) or 0.0))
+        q = max(0.0, float(_opt_safe_float(qty, 1.0) or 1.0))
         mult = float(multiplier)
+        stk_p = _opt_safe_float(stock_price, None)
+        stk_clean = round(float(stk_p), 4) if (stk_p is not None and stk_p > 0) else None
+        if pre_entry:
+            p_clean = round(max(0.0, float(p_raw)), 4) if (p_raw is not None and p_raw >= 0) else None
+            return {
+                "minute_utc": minute_key_override or min_dt.isoformat(),
+                "timestamp": ts_utc.isoformat(),
+                "price": p_clean,
+                "price_change_dollars": None,
+                "market_value": None,
+                "cost_basis": None,
+                "pnl_dollars": None,
+                "pnl_pct": None,
+                "stock_price": stk_clean,
+                "pre_entry": True,
+                "source": source,
+            }
+        p = max(0.0, float(p_raw if p_raw is not None else ep))
         cost_basis = round(ep * q * mult, 2)
         market_value = round(p * q * mult, 2)
         pnl_dollars = round(market_value - cost_basis, 2)
@@ -2042,6 +2140,7 @@ class OptionContractHistoryTracker:
             "cost_basis": cost_basis,
             "pnl_dollars": pnl_dollars,
             "pnl_pct": pnl_pct,
+            "stock_price": stk_clean,
             "source": source,
         }
 
@@ -2061,15 +2160,20 @@ class OptionContractHistoryTracker:
         for idx, existing in enumerate(history):
             if existing.get("minute_utc") == key:
                 old_prio = priority.get(existing.get("source"), 1)
+                if point.get("stock_price") is None and existing.get("stock_price") is not None:
+                    point = {**point, "stock_price": existing.get("stock_price")}
                 if new_prio >= old_prio:
                     history[idx] = point
+                elif existing.get("stock_price") is None and point.get("stock_price") is not None:
+                    existing["stock_price"] = point.get("stock_price")
                 return
         history.append(point)
         history.sort(
             key=lambda pt: str(pt.get("timestamp") or pt.get("minute_utc") or "")
         )
-        if len(history) > cls.MAX_HISTORY_POINTS:
-            del history[: -cls.MAX_HISTORY_POINTS]
+        cap = cls._history_cap()
+        if len(history) > cap:
+            del history[:-cap]
 
     @classmethod
     def _fill_minute_gaps(
@@ -2082,6 +2186,7 @@ class OptionContractHistoryTracker:
         qty,
         multiplier,
         bar_prices_by_min=None,
+        stock_prices_by_min=None,
         is_closed=False,
     ):
         start_utc = as_utc(start_dt)
@@ -2089,6 +2194,7 @@ class OptionContractHistoryTracker:
         start_min = minute_utc(start_utc)
         end_min = minute_utc(end_utc)
         bar_map = dict(bar_prices_by_min or {})
+        stk_map = dict(stock_prices_by_min or {})
 
         preserved_by_min = {}
         for pt in existing_history or []:
@@ -2106,6 +2212,7 @@ class OptionContractHistoryTracker:
                     or cur == end_min
                     or regular_session(cur)
                     or cur in bar_map
+                    or cur in stk_map
                     or cur.isoformat() in preserved_by_min
                 ):
                     candidate_mins.append(cur)
@@ -2126,21 +2233,46 @@ class OptionContractHistoryTracker:
             for bm in bar_map.keys():
                 if start_min <= bm <= end_min:
                     candidate_mins.append(bm)
+            for sm in stk_map.keys():
+                if start_min <= sm <= end_min:
+                    candidate_mins.append(sm)
             candidate_mins.extend([start_min, end_min])
             candidate_mins = sorted(set(candidate_mins))
 
-        if len(candidate_mins) > cls.MAX_HISTORY_POINTS:
-            candidate_mins = [candidate_mins[0]] + candidate_mins[
-                -(cls.MAX_HISTORY_POINTS - 1) :
-            ]
+        cap = cls._history_cap()
+        if len(candidate_mins) > cap:
+            candidate_mins = [candidate_mins[0]] + candidate_mins[-(cap - 1) :]
+
+        last_known_stock = None
+        for sm in sorted(stk_map.keys()):
+            val = _opt_safe_float(stk_map.get(sm), None)
+            if val is not None and val > 0 and sm <= start_min:
+                last_known_stock = val
+        if last_known_stock is None:
+            for pt in existing_history or []:
+                ps = _opt_safe_float(pt.get("stock_price"), None)
+                if ps is not None and ps > 0:
+                    last_known_stock = ps
+                    break
 
         out = []
         last_known_price = float(entry_price)
         for m_dt in candidate_mins:
             m_iso = m_dt.isoformat()
+            raw_stk = _opt_safe_float(stk_map.get(m_dt), None)
+            if raw_stk is not None and raw_stk > 0:
+                last_known_stock = raw_stk
+
             if m_iso in preserved_by_min:
                 pt = dict(preserved_by_min[m_iso])
                 pt_price = _opt_safe_float(pt.get("price"), last_known_price)
+                pt_stk = (
+                    raw_stk
+                    if (raw_stk is not None and raw_stk > 0)
+                    else (_opt_safe_float(pt.get("stock_price"), None) or last_known_stock)
+                )
+                if pt_stk is not None and pt_stk > 0:
+                    last_known_stock = pt_stk
                 pt = cls._build_point(
                     _opt_parse_utc(pt.get("timestamp")) or m_dt,
                     pt_price,
@@ -2149,6 +2281,7 @@ class OptionContractHistoryTracker:
                     multiplier,
                     source=pt.get("source") or "live_poll",
                     minute_key_override=m_iso,
+                    stock_price=pt_stk,
                 )
                 last_known_price = pt["price"]
                 out.append(pt)
@@ -2163,6 +2296,7 @@ class OptionContractHistoryTracker:
                     multiplier,
                     source="order_fill",
                     minute_key_override=m_iso,
+                    stock_price=last_known_stock,
                 )
                 last_known_price = entry_price
                 out.append(pt)
@@ -2189,12 +2323,15 @@ class OptionContractHistoryTracker:
                     multiplier,
                     source=src,
                     minute_key_override=m_iso,
+                    stock_price=last_known_stock,
                 )
             )
 
         if end_price is not None and end_price > 0:
             final_src = "order_fill" if is_closed else "live_poll"
+            end_stk = _opt_safe_float(stk_map.get(end_min), None) or last_known_stock
             if start_min == end_min and is_closed:
+                start_stk = _opt_safe_float(stk_map.get(start_min), None) or end_stk
                 buy_pt = cls._build_point(
                     start_utc,
                     entry_price,
@@ -2203,6 +2340,7 @@ class OptionContractHistoryTracker:
                     multiplier,
                     source="order_fill",
                     minute_key_override=start_utc.isoformat(),
+                    stock_price=start_stk,
                 )
                 sell_pt = cls._build_point(
                     end_utc,
@@ -2212,6 +2350,7 @@ class OptionContractHistoryTracker:
                     multiplier,
                     source="order_fill",
                     minute_key_override=end_utc.isoformat(),
+                    stock_price=end_stk,
                 )
                 return [buy_pt, sell_pt]
             final_pt = cls._build_point(
@@ -2222,6 +2361,7 @@ class OptionContractHistoryTracker:
                 multiplier,
                 source=final_src,
                 minute_key_override=end_min.isoformat(),
+                stock_price=end_stk,
             )
             cls._upsert_point(out, final_pt)
         return out
@@ -2255,6 +2395,7 @@ class OptionContractHistoryTracker:
         cost_basis = round(eff_price * eff_qty * mult, 2)
 
         with self._lock:
+            stk_p = self._lookup_live_stock_price(eff_und, exec_dt)
             existing = self.open_contracts.get(sym)
             if existing:
                 old_qty = _opt_safe_float(existing.get("qty"), 0.0) or 0.0
@@ -2297,6 +2438,7 @@ class OptionContractHistoryTracker:
                         new_qty,
                         mult,
                         source="order_fill",
+                        stock_price=stk_p,
                     )
                     self._upsert_point(existing["history"], pt)
                 return existing
@@ -2311,6 +2453,7 @@ class OptionContractHistoryTracker:
                         eff_qty,
                         mult,
                         source="order_fill",
+                        stock_price=stk_p,
                     )
                 )
             entry = {
@@ -2339,6 +2482,7 @@ class OptionContractHistoryTracker:
                 "pnl_pct": 0.0,
                 "last_updated_utc": exec_dt.isoformat(),
                 "history_source": "live",
+                "pre_entry_history": [],
                 "history": history,
             }
             self.open_contracts[sym] = entry
@@ -2388,6 +2532,9 @@ class OptionContractHistoryTracker:
                     if pt.get("source") == "order_fill"
                     else (_opt_safe_float(pt.get("price"), cur_p) or cur_p)
                 )
+                pt_stk = pt.get("stock_price")
+                if pt_stk is None:
+                    pt_stk = self._lookup_live_stock_price(entry.get("underlying"), pt_dt)
                 rebuilt.append(
                     self._build_point(
                         pt_dt,
@@ -2397,6 +2544,7 @@ class OptionContractHistoryTracker:
                         mult,
                         source=pt.get("source") or "live_poll",
                         minute_key_override=pt.get("minute_utc"),
+                        stock_price=pt_stk,
                     )
                 )
             entry["history"] = rebuilt
@@ -2542,6 +2690,7 @@ class OptionContractHistoryTracker:
                     if abs(raw_qty - round(raw_qty)) < 1e-6
                     else round(raw_qty, 4)
                 )
+                stk_p = self._lookup_live_stock_price(und, now_dt)
                 existing = self.open_contracts.get(sym)
                 if existing is None:
                     existing = {
@@ -2566,6 +2715,7 @@ class OptionContractHistoryTracker:
                         "pnl_pct": pnl_pct,
                         "last_updated_utc": now_dt.isoformat(),
                         "history_source": "live",
+                        "pre_entry_history": [],
                         "history": [],
                     }
                     if avg_entry > 0:
@@ -2577,6 +2727,7 @@ class OptionContractHistoryTracker:
                                 raw_qty,
                                 mult,
                                 source="order_fill",
+                                stock_price=stk_p,
                             )
                         )
                     self.open_contracts[sym] = existing
@@ -2596,7 +2747,13 @@ class OptionContractHistoryTracker:
 
                 if cur_price > 0 and avg_entry > 0:
                     pt = self._build_point(
-                        now_dt, cur_price, avg_entry, raw_qty, mult, source="live_poll"
+                        now_dt,
+                        cur_price,
+                        avg_entry,
+                        raw_qty,
+                        mult,
+                        source="live_poll",
+                        stock_price=stk_p,
                     )
                     pt["market_value"] = round(mkt_val, 2)
                     pt["cost_basis"] = round(cost_b, 2)
@@ -2769,6 +2926,9 @@ class OptionContractHistoryTracker:
 
             trade_id = str(order_id) if order_id else f"{sym}@{sold_dt.isoformat()}"
             base_history = list(open_entry.get("history") or []) if open_entry else []
+            pre_hist = list(open_entry.get("pre_entry_history") or []) if open_entry else []
+            live_stk = self._lookup_live_stock_price(eff_und, sold_dt)
+            stk_by_min = {minute_utc(sold_dt): live_stk} if live_stk is not None else {}
             rebuilt_hist = self._fill_minute_gaps(
                 base_history,
                 eff_purchased_dt,
@@ -2778,6 +2938,7 @@ class OptionContractHistoryTracker:
                 eff_qty,
                 mult,
                 bar_prices_by_min={},
+                stock_prices_by_min=stk_by_min,
                 is_closed=True,
             )
 
@@ -2813,6 +2974,7 @@ class OptionContractHistoryTracker:
                     if open_entry and open_entry.get("history_source")
                     else "live+sell"
                 ),
+                "pre_entry_history": pre_hist,
                 "history": rebuilt_hist,
             }
 
@@ -2896,6 +3058,11 @@ class OptionContractHistoryTracker:
                             hist[-1].get("minute_utc")
                             or minute_utc(last_dt).isoformat()
                         )
+                        last_stk = hist[-1].get("stock_price")
+                        if last_stk is None:
+                            last_stk = self._lookup_live_stock_price(
+                                item.get("underlying"), last_dt
+                            )
                         hist[-1] = self._build_point(
                             last_dt,
                             fp,
@@ -2904,6 +3071,7 @@ class OptionContractHistoryTracker:
                             mult,
                             source="order_fill",
                             minute_key_override=last_mk,
+                            stock_price=last_stk,
                         )
                     return True
         return False
@@ -3057,6 +3225,177 @@ class OptionContractHistoryTracker:
                     except Exception:
                         continue
         return result
+
+    def _fetch_stock_bars_map(self, symbol_ranges):
+        """Fetch 1-minute underlying stock closes for {und: (start_dt, end_dt)} -> {und: {min_dt: close}}."""
+        result = {}
+        if not symbol_ranges:
+            return result
+
+        # 1) Seed from in-memory MinuteCoordinator kinematics_history first
+        coord = self._coordinator
+        if coord is not None:
+            kin_map = getattr(coord, "kinematics_history", None) or {}
+            for und, (s_dt, e_dt) in symbol_ranges.items():
+                s_min = minute_utc(as_utc(s_dt))
+                e_min = minute_utc(as_utc(e_dt))
+                per_min = result.setdefault(und, {})
+                for prov in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+                    for h in kin_map.get((prov, und), []) or []:
+                        hm = _hist_minute_utc(h)
+                        hc = _opt_safe_float(h.get("close"), None)
+                        if hm is not None and hc is not None and hc > 0 and s_min <= hm <= e_min:
+                            per_min.setdefault(hm, float(hc))
+
+        # 2) Query Alpaca StockHistoricalDataClient for any gaps/earlier backfill ranges
+        missing_ranges = {}
+        for und, (s_dt, e_dt) in symbol_ranges.items():
+            cur_map = result.get(und, {})
+            if len(cur_map) < max(5, int((as_utc(e_dt) - as_utc(s_dt)).total_seconds() // 180)):
+                missing_ranges[und] = (s_dt, e_dt)
+
+        if missing_ranges and not isinstance(self._trading_client, TastytradeClient):
+            client = self._stock_data_client
+            if client is None:
+                key = self._credentials.get("alpaca_key")
+                secret = self._credentials.get("alpaca_secret")
+                if key and secret:
+                    try:
+                        client = StockHistoricalDataClient(key, secret)
+                        self._stock_data_client = client
+                    except Exception:
+                        client = None
+            if client is not None:
+                try:
+                    from alpaca.data.requests import StockBarsRequest
+                except Exception:
+                    StockBarsRequest = None
+                if StockBarsRequest is not None:
+                    for und, (s_dt, e_dt) in missing_ranges.items():
+                        try:
+                            req = StockBarsRequest(
+                                symbol_or_symbols=und,
+                                timeframe=TimeFrame.Minute,
+                                start=minute_utc(as_utc(s_dt)),
+                                end=as_utc(e_dt) + MINUTE,
+                                feed=FEED,
+                            )
+                            resp = client.get_stock_bars(req)
+                            raw = getattr(resp, "data", resp)
+                            bars = (
+                                raw.get(und)
+                                if isinstance(raw, dict)
+                                else (next(iter(raw.values()), []) if hasattr(raw, "values") else [])
+                            )
+                            per_min = result.setdefault(und, {})
+                            for b in bars or []:
+                                ts = _opt_parse_utc(
+                                    b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None)
+                                )
+                                cp = _opt_safe_float(
+                                    b.get("close") if isinstance(b, dict) else getattr(b, "close", None),
+                                    None,
+                                )
+                                if ts is not None and cp is not None and cp > 0:
+                                    per_min[minute_utc(ts)] = float(cp)
+                        except Exception:
+                            continue
+
+        # 3) Fallback to yfinance for any still-empty symbols (e.g. Tastytrade / sandbox)
+        for und, (s_dt, e_dt) in symbol_ranges.items():
+            if result.get(und):
+                continue
+            try:
+                if (as_utc(e_dt) - as_utc(s_dt)).total_seconds() > 7 * 86400:
+                    continue
+                df = yf.download(
+                    tickers=und,
+                    start=as_utc(s_dt) - timedelta(minutes=5),
+                    end=as_utc(e_dt) + timedelta(minutes=2),
+                    interval="1m",
+                    progress=False,
+                    auto_adjust=False,
+                    prepost=(RSI_SESSION_MODE == "extended"),
+                )
+                if df is None or df.empty:
+                    continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    close_cols = [
+                        c for c in df.columns if any(str(p).strip().lower() == "close" for p in c)
+                    ]
+                else:
+                    close_cols = [c for c in df.columns if str(c).strip().lower() == "close"]
+                if len(close_cols) != 1:
+                    continue
+                closes = df[close_cols[0]]
+                per_min = result.setdefault(und, {})
+                for ts, raw_close in closes.items():
+                    if pd.isna(raw_close):
+                        continue
+                    t_dt = pd.Timestamp(ts).to_pydatetime()
+                    if t_dt.tzinfo is None:
+                        continue
+                    cp = _opt_safe_float(raw_close, None)
+                    if cp is not None and cp > 0:
+                        per_min[minute_utc(as_utc(t_dt))] = float(cp)
+            except Exception:
+                continue
+
+        return result
+
+    @classmethod
+    def _build_pre_entry_history(
+        cls,
+        purchased_dt,
+        entry_price,
+        qty,
+        multiplier,
+        opt_bars_by_min=None,
+        stk_bars_by_min=None,
+    ):
+        """Build chronological pre-entry context bars immediately before purchased_at_utc."""
+        pre_cap = cls._pre_entry_cap()
+        if pre_cap <= 0:
+            return []
+        purchase_min = minute_utc(as_utc(purchased_dt))
+        opt_map = {
+            m: p
+            for m, p in (opt_bars_by_min or {}).items()
+            if m < purchase_min and p is not None and p > 0
+        }
+        stk_map = {
+            m: p
+            for m, p in (stk_bars_by_min or {}).items()
+            if m < purchase_min and p is not None and p > 0
+        }
+        all_mins = sorted(set(opt_map.keys()) | set(stk_map.keys()))
+        if not all_mins:
+            return []
+        if len(all_mins) > pre_cap:
+            all_mins = all_mins[-pre_cap:]
+
+        last_opt = None
+        last_stk = None
+        out = []
+        for m_dt in all_mins:
+            if m_dt in opt_map:
+                last_opt = float(opt_map[m_dt])
+            if m_dt in stk_map:
+                last_stk = float(stk_map[m_dt])
+            out.append(
+                cls._build_point(
+                    m_dt,
+                    last_opt,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source="pre_entry_bar" if (m_dt in opt_map or m_dt in stk_map) else "carry_forward",
+                    minute_key_override=m_dt.isoformat(),
+                    stock_price=last_stk,
+                    pre_entry=True,
+                )
+            )
+        return out
 
     def startup_backfill(
         self, trading_client=None, option_data_client=None, stock_data_client=None
@@ -3227,6 +3566,26 @@ class OptionContractHistoryTracker:
 
             filled_orders.sort(key=lambda item: item["filled_at"])
 
+            with self._lock:
+                self.filled_orders_history = [
+                    {
+                        "order_id": fo.get("order_id"),
+                        "symbol": _parse_occ_contract(fo["symbol"])[1] or fo["symbol"],
+                        "contract": fo["symbol"],
+                        "side": fo["side"],
+                        "qty": (
+                            int(round(fo["qty"]))
+                            if abs(fo["qty"] - round(fo["qty"])) < 1e-6
+                            else round(fo["qty"], 4)
+                        ),
+                        "price": round(fo["price"], 4),
+                        "executed_at_utc": fo["filled_at"].isoformat(),
+                        "minute_utc": minute_utc(fo["filled_at"]).isoformat(),
+                        "dry_run": False,
+                    }
+                    for fo in filled_orders
+                ]
+
             lots_by_sym = {}
             latest_buy_by_sym = {}
             closed_matches = []
@@ -3279,7 +3638,14 @@ class OptionContractHistoryTracker:
             closed_matches.sort(key=lambda c: c["sold_at"], reverse=True)
             closed_matches = closed_matches[: self.MAX_CLOSED_TRADES]
 
+            pre_cap = self._pre_entry_cap()
+            pre_buf = (
+                timedelta(days=max(2, int(pre_cap // 240) + 2))
+                if pre_cap > 0
+                else timedelta(0)
+            )
             bar_ranges = {}
+            stock_ranges = {}
             open_specs = {}
             for sym, pos in open_pos_by_sym.items():
                 rem_lots = [l for l in lots_by_sym.get(sym, []) if l["qty"] > 1e-6]
@@ -3293,22 +3659,42 @@ class OptionContractHistoryTracker:
                     purchased_dt = now_dt
                     buy_oid = None
                 open_specs[sym] = (pos, purchased_dt, buy_oid)
-                s_min = bar_ranges[sym][0] if sym in bar_ranges else purchased_dt
+                fetch_s = purchased_dt - pre_buf
+                s_min = bar_ranges[sym][0] if sym in bar_ranges else fetch_s
                 e_max = bar_ranges[sym][1] if sym in bar_ranges else now_dt
-                bar_ranges[sym] = (min(s_min, purchased_dt), max(e_max, now_dt))
+                bar_ranges[sym] = (min(s_min, fetch_s), max(e_max, now_dt))
+
+                _, parsed_und, _, _, _ = _parse_occ_contract(sym)
+                raw_und = (
+                    pos.get("underlying_symbol")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "underlying_symbol", None)
+                )
+                und = str(raw_und or parsed_und or sym).strip().upper()
+                if und:
+                    us0 = stock_ranges[und][0] if und in stock_ranges else fetch_s
+                    us1 = stock_ranges[und][1] if und in stock_ranges else now_dt
+                    stock_ranges[und] = (min(us0, fetch_s), max(us1, now_dt))
 
             for cm in closed_matches[:25]:
                 sym = cm["contract"]
+                fetch_s = cm["purchased_at"] - pre_buf
                 if sym in bar_ranges:
                     s_min, e_max = bar_ranges[sym]
                     bar_ranges[sym] = (
-                        min(s_min, cm["purchased_at"]),
+                        min(s_min, fetch_s),
                         max(e_max, cm["sold_at"]),
                     )
                 else:
-                    bar_ranges[sym] = (cm["purchased_at"], cm["sold_at"])
+                    bar_ranges[sym] = (fetch_s, cm["sold_at"])
+                _, und, _, _, _ = _parse_occ_contract(sym)
+                if und:
+                    us0 = stock_ranges[und][0] if und in stock_ranges else fetch_s
+                    us1 = stock_ranges[und][1] if und in stock_ranges else cm["sold_at"]
+                    stock_ranges[und] = (min(us0, fetch_s), max(us1, cm["sold_at"]))
 
             bars_by_sym = self._fetch_option_bars_map(bar_ranges)
+            stock_bars_by_und = self._fetch_stock_bars_map(stock_ranges)
 
             with self._lock:
                 for cm in closed_matches:
@@ -3336,6 +3722,8 @@ class OptionContractHistoryTracker:
                     existing_hist = (
                         existing_closed.get("history") if existing_closed else []
                     )
+                    opt_map = bars_by_sym.get(sym, {})
+                    stk_map = stock_bars_by_und.get(und, {})
                     hist = self._fill_minute_gaps(
                         existing_hist,
                         p_dt,
@@ -3344,9 +3732,18 @@ class OptionContractHistoryTracker:
                         xp,
                         q,
                         mult,
-                        bar_prices_by_min=bars_by_sym.get(sym, {}),
+                        bar_prices_by_min=opt_map,
+                        stock_prices_by_min=stk_map,
                         is_closed=True,
                     )
+                    pre_hist = self._build_pre_entry_history(
+                        p_dt,
+                        ep,
+                        q,
+                        mult,
+                        opt_bars_by_min=opt_map,
+                        stk_bars_by_min=stk_map,
+                    ) or list((existing_closed or {}).get("pre_entry_history") or [])
                     cost_b = round(ep * q * mult, 2)
                     proceeds = round(xp * q * mult, 2)
                     pnl_d = round(proceeds - cost_b, 2)
@@ -3388,6 +3785,7 @@ class OptionContractHistoryTracker:
                         "history_source": (
                             "backfilled" if bars_by_sym.get(sym) else "order_fills"
                         ),
+                        "pre_entry_history": pre_hist,
                         "history": hist,
                     }
                     if existing_closed is not None:
@@ -3510,6 +3908,8 @@ class OptionContractHistoryTracker:
                     existing_hist = (
                         list(prev_entry.get("history") or []) if prev_entry else []
                     )
+                    opt_map = bars_by_sym.get(sym, {})
+                    stk_map = stock_bars_by_und.get(und, {})
                     hist = self._fill_minute_gaps(
                         existing_hist,
                         purchased_dt,
@@ -3518,9 +3918,18 @@ class OptionContractHistoryTracker:
                         cur_price,
                         raw_qty,
                         mult,
-                        bar_prices_by_min=bars_by_sym.get(sym, {}),
+                        bar_prices_by_min=opt_map,
+                        stock_prices_by_min=stk_map,
                         is_closed=False,
                     )
+                    pre_hist = self._build_pre_entry_history(
+                        purchased_dt,
+                        avg_entry,
+                        raw_qty,
+                        mult,
+                        opt_bars_by_min=opt_map,
+                        stk_bars_by_min=stk_map,
+                    ) or list((prev_entry or {}).get("pre_entry_history") or [])
                     self.open_contracts[sym] = {
                         "contract": sym,
                         "underlying": und,
@@ -3552,6 +3961,7 @@ class OptionContractHistoryTracker:
                         "history_source": (
                             "backfilled+live" if bars_by_sym.get(sym) else "live"
                         ),
+                        "pre_entry_history": pre_hist,
                         "history": hist,
                     }
 
@@ -3565,10 +3975,11 @@ class OptionContractHistoryTracker:
                 closed_cnt = len(self.closed_contracts)
 
             logging.info(
-                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d",
+                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d stock_symbols=%d",
                 open_cnt,
                 closed_cnt,
                 len(bars_by_sym),
+                len(stock_bars_by_und),
             )
             return {"open": open_cnt, "closed": closed_cnt}
         except Exception as exc:
@@ -3652,7 +4063,11 @@ class OptionContractHistoryTracker:
     def get_snapshot(self):
         with self._lock:
             open_list = [
-                {**c, "history": list(c.get("history") or [])}
+                {
+                    **c,
+                    "history": list(c.get("history") or []),
+                    "pre_entry_history": list(c.get("pre_entry_history") or []),
+                }
                 for c in sorted(
                     self.open_contracts.values(),
                     key=lambda x: str(x.get("purchased_at_utc") or ""),
@@ -3660,13 +4075,19 @@ class OptionContractHistoryTracker:
                 )
             ]
             closed_list = [
-                {**c, "history": list(c.get("history") or [])}
+                {
+                    **c,
+                    "history": list(c.get("history") or []),
+                    "pre_entry_history": list(c.get("pre_entry_history") or []),
+                }
                 for c in self.closed_contracts
             ]
             return {
                 "backfill_status": self.backfill_status,
                 "backfill_last_utc": self.backfill_last_utc,
                 "backfill_error": self.backfill_error,
+                "history_max_bars": self._history_cap(),
+                "pre_entry_minutes": self._pre_entry_cap(),
                 "open_summary": self.get_buyer_summary(),
                 "open_contracts": open_list,
                 "closed_summary": self.get_seller_summary(),
@@ -3716,6 +4137,7 @@ class MinuteCoordinator:
         self.option_buy_events = {}
         self.option_sell_events = {}
         self.option_history = OptionContractHistoryTracker()
+        self.option_history.attach_coordinator(self)
         self.event_loop = None
         self.minute_finalized_event = None
         self.minute_finalized_listeners = []
@@ -3845,9 +4267,29 @@ class MinuteCoordinator:
             "dry_run": bool(dry_run),
         }
         events = self.option_buy_events.setdefault(sym, [])
-        events.append(event)
-        if len(events) > 100:
-            del events[:-100]
+        oid = event.get("order_id")
+        replaced = False
+        for idx, existing in enumerate(events):
+            if oid and existing.get("order_id") == oid:
+                events[idx] = event
+                replaced = True
+                break
+            if (
+                not oid
+                and not existing.get("order_id")
+                and existing.get("minute_utc") == event.get("minute_utc")
+                and existing.get("contract") == event.get("contract")
+            ):
+                events[idx] = event
+                replaced = True
+                break
+        if not replaced:
+            events.append(event)
+            events.sort(
+                key=lambda e: str(e.get("executed_at_utc") or e.get("minute_utc") or "")
+            )
+        if len(events) > 2000:
+            del events[:-2000]
         return event
 
     def record_option_sell_event(
@@ -3906,9 +4348,29 @@ class MinuteCoordinator:
             "dry_run": bool(dry_run),
         }
         events = self.option_sell_events.setdefault(sym, [])
-        events.append(event)
-        if len(events) > 100:
-            del events[:-100]
+        oid = event.get("order_id")
+        replaced = False
+        for idx, existing in enumerate(events):
+            if oid and existing.get("order_id") == oid:
+                events[idx] = event
+                replaced = True
+                break
+            if (
+                not oid
+                and not existing.get("order_id")
+                and existing.get("minute_utc") == event.get("minute_utc")
+                and existing.get("contract") == event.get("contract")
+            ):
+                events[idx] = event
+                replaced = True
+                break
+        if not replaced:
+            events.append(event)
+            events.sort(
+                key=lambda e: str(e.get("executed_at_utc") or e.get("minute_utc") or "")
+            )
+        if len(events) > 2000:
+            del events[:-2000]
         return event
 
     def latest_option_contract(self, symbol, max_age_seconds=None):
@@ -6434,6 +6896,7 @@ def _apply_ini_feature_settings(cfg):
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
     global KINEMATICS_HISTORY_MAX_BARS
+    global OPTION_HISTORY_MAX_BARS, OPTION_HISTORY_PRE_ENTRY_MINUTES
     global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
     global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
@@ -6573,6 +7036,22 @@ def _apply_ini_feature_settings(cfg):
         "KINEMATICS_HISTORY_MAX_BARS",
         2400,
         minimum=60,
+    )
+    OPTION_HISTORY_MAX_BARS = _ini_int(
+        cfg,
+        "option_history",
+        "history_max_bars",
+        "OPTION_HISTORY_MAX_BARS",
+        KINEMATICS_HISTORY_MAX_BARS,
+        minimum=60,
+    )
+    OPTION_HISTORY_PRE_ENTRY_MINUTES = _ini_int(
+        cfg,
+        "option_history",
+        "pre_entry_lookback_minutes",
+        "OPTION_HISTORY_PRE_ENTRY_MINUTES",
+        390,
+        minimum=0,
     )
     RSI_WARMUP_SESSIONS = _ini_int(
         cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
@@ -7058,7 +7537,7 @@ def _apply_ini_feature_settings(cfg):
     logging.info(
         "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s "
-        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d "
+        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
@@ -7078,6 +7557,8 @@ def _apply_ini_feature_settings(cfg):
         KINEMATICS_RSI_OVERBOUGHT,
         KINEMATICS_RSI_OVERSOLD,
         KINEMATICS_HISTORY_MAX_BARS,
+        OPTION_HISTORY_MAX_BARS,
+        OPTION_HISTORY_PRE_ENTRY_MINUTES,
         OPTION_BUY_ENABLED,
         OPTION_BUY_DRY_RUN,
         OPTION_SELL_ENABLED,
@@ -12240,6 +12721,299 @@ def _hist_minute_utc(hist_entry):
     return None
 
 
+_TRADE_LOG_EVENTS_LOCK = threading.Lock()
+_TRADE_LOG_EVENTS_CACHE = {"sig": None, "buy": {}, "sell": {}}
+
+
+def _read_logged_submitted_trade_events():
+    """Scan all option_buyer and option_seller logs for submitted non-dry-run trades (stat-cached)."""
+    all_files = []
+    for subdir in ("option_buyer", "option_seller"):
+        stream = "BUY" if subdir == "option_buyer" else "SELL"
+        d = LOG_ROOT / subdir
+        if not d.exists() or not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.log")):
+            try:
+                if not p.is_file():
+                    continue
+                st = p.stat()
+                all_files.append((stream, p, (str(p), int(st.st_mtime_ns), int(st.st_size))))
+            except OSError:
+                continue
+
+    sig = tuple(item[2] for item in all_files)
+    with _TRADE_LOG_EVENTS_LOCK:
+        if _TRADE_LOG_EVENTS_CACHE["sig"] == sig:
+            return (
+                {k: list(v) for k, v in _TRADE_LOG_EVENTS_CACHE["buy"].items()},
+                {k: list(v) for k, v in _TRADE_LOG_EVENTS_CACHE["sell"].items()},
+            )
+
+    buy_by_sym = {}
+    sell_by_sym = {}
+    seq = 0
+    for stream, path, _ in all_files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                raw_lines = f.readlines()
+        except OSError:
+            continue
+
+        file_recs = []
+        utc_votes = 0
+        disp_votes = 0
+        last_trig_by_contract = {}
+        for raw in raw_lines:
+            seq += 1
+            line = (raw or "").strip()
+            if not line:
+                continue
+            if (
+                "OPTION_BUY_SUBMITTED" not in line
+                and "OPTION_SELL_SUBMITTED" not in line
+                and "QUALIFIED_SUBMITTED" not in line
+            ):
+                continue
+            if "DRY_RUN" in line:
+                continue
+            rec = _parse_option_log_line(line, stream=stream, seq=seq)
+            if rec is None:
+                continue
+            hint = _normalize_option_log_record_tz(rec)
+            if hint == "utc":
+                utc_votes += 1
+            elif hint == "display":
+                disp_votes += 1
+            file_recs.append((rec, hint, line))
+
+        file_is_utc = utc_votes > 0 and utc_votes > disp_votes
+        for rec, hint, line in file_recs:
+            if hint is None and file_is_utc:
+                _normalize_option_log_record_tz(rec, force_utc_source=True)
+            epoch = rec.get("_sort_key", (0.0, 0))[0]
+            if not epoch or epoch <= 0:
+                continue
+            exec_dt = datetime.fromtimestamp(float(epoch), tz=UTC)
+            min_dt = minute_utc(exec_dt)
+
+            sym = str(rec.get("symbol") or "").strip().upper()
+            contract = str(rec.get("contract") or "").strip().upper()
+            if contract in {"", "N/A", "NONE"}:
+                contract = sym
+            if (not sym or sym == "NONE") and contract:
+                _, parsed_und, _, _, _ = _parse_occ_contract(contract)
+                sym = parsed_und or contract
+            if not sym or sym == "NONE":
+                continue
+
+            ev_name = str(rec.get("event") or "")
+            trig_iso = None
+            raw_min = rec.get("minute")
+            if raw_min and raw_min not in {"n/a", "none", "None"}:
+                p_min = _opt_parse_utc(raw_min)
+                if p_min is not None:
+                    trig_iso = minute_utc(p_min).isoformat()
+
+            if ev_name in {"OPTION_BUY_ANALYSIS", "OPTION_SELL_ANALYSIS"}:
+                if trig_iso and contract:
+                    last_trig_by_contract[(stream, contract)] = (epoch, trig_iso)
+                continue
+
+            # OPTION_BUY_SUBMITTED / OPTION_SELL_SUBMITTED
+            kv_m = list(_OPTION_KV_KEY_RE.finditer(line))
+            kv = {}
+            for idx, km in enumerate(kv_m):
+                k = km.group(1)
+                v_start = km.end()
+                v_end = kv_m[idx + 1].start() if idx + 1 < len(kv_m) else len(line)
+                kv[k] = line[v_start:v_end].strip()
+
+            oid = kv.get("order_id")
+            if oid in {"", "None", "none"}:
+                oid = None
+            qty_val = _opt_safe_float(kv.get("qty"), 1.0) or 1.0
+            clean_qty = int(round(qty_val)) if abs(qty_val - round(qty_val)) < 1e-6 else round(qty_val, 4)
+            rsi_val = _opt_safe_float(kv.get("rsi"), None)
+            reason = kv.get("trigger") or kv.get("kind") or rec.get("reason")
+            if not trig_iso and (stream, contract) in last_trig_by_contract:
+                t_ep, t_iso = last_trig_by_contract[(stream, contract)]
+                if abs(epoch - t_ep) <= 180.0:
+                    trig_iso = t_iso
+
+            ev_obj = {
+                "symbol": sym,
+                "minute_utc": min_dt.isoformat(),
+                "executed_at_utc": exec_dt.isoformat(),
+                "trigger_minute_utc": trig_iso,
+                "contract": contract or None,
+                "qty": clean_qty,
+                "order_id": oid,
+                "reason": reason,
+                "rsi": round(float(rsi_val), 2) if rsi_val is not None else None,
+                "dry_run": False,
+            }
+            target_map = buy_by_sym if stream == "BUY" else sell_by_sym
+            target_map.setdefault(sym, []).append(ev_obj)
+
+    for sym_map in (buy_by_sym, sell_by_sym):
+        for s_k, evs in sym_map.items():
+            evs.sort(key=lambda e: str(e.get("executed_at_utc") or e.get("minute_utc") or ""))
+
+    with _TRADE_LOG_EVENTS_LOCK:
+        _TRADE_LOG_EVENTS_CACHE["sig"] = sig
+        _TRADE_LOG_EVENTS_CACHE["buy"] = {k: list(v) for k, v in buy_by_sym.items()}
+        _TRADE_LOG_EVENTS_CACHE["sell"] = {k: list(v) for k, v in sell_by_sym.items()}
+
+    return buy_by_sym, sell_by_sym
+
+
+def _gather_symbol_trade_events(coordinator, symbol):
+    """Merge live coordinator events, broker-backfilled option_history, and log events chronologically."""
+    target_sym = str(symbol or "").strip().upper()
+    if not target_sym:
+        return [], []
+
+    log_buys, log_sells = _read_logged_submitted_trade_events()
+    opt_hist = getattr(coordinator, "option_history", None)
+
+    hist_buys = []
+    hist_sells = []
+    if opt_hist is not None:
+        with opt_hist._lock:
+            for fo in getattr(opt_hist, "filled_orders_history", []) or []:
+                fo_sym = str(fo.get("symbol") or "").strip().upper()
+                fo_con = str(fo.get("contract") or "").strip().upper()
+                if fo_sym != target_sym and _parse_occ_contract(fo_con)[1] != target_sym:
+                    continue
+                ev_item = {
+                    "symbol": target_sym,
+                    "minute_utc": fo.get("minute_utc"),
+                    "executed_at_utc": fo.get("executed_at_utc") or fo.get("minute_utc"),
+                    "trigger_minute_utc": None,
+                    "contract": fo_con or None,
+                    "qty": fo.get("qty") or 1,
+                    "order_id": fo.get("order_id"),
+                    "reason": f"filled_{fo.get('side')}",
+                    "rsi": None,
+                    "dry_run": False,
+                }
+                if fo.get("side") == "buy":
+                    hist_buys.append(ev_item)
+                elif fo.get("side") == "sell":
+                    hist_sells.append(ev_item)
+
+            for c in list(opt_hist.open_contracts.values()) + list(opt_hist.closed_contracts):
+                if c.get("dry_run"):
+                    continue
+                c_und = str(c.get("underlying") or "").strip().upper()
+                c_con = str(c.get("contract") or "").strip().upper()
+                if c_und != target_sym and _parse_occ_contract(c_con)[1] != target_sym and c_con != target_sym:
+                    continue
+                p_dt = _opt_parse_utc(c.get("purchased_at_utc"))
+                if p_dt is not None:
+                    hist_buys.append(
+                        {
+                            "symbol": target_sym,
+                            "minute_utc": minute_utc(p_dt).isoformat(),
+                            "executed_at_utc": p_dt.isoformat(),
+                            "trigger_minute_utc": None,
+                            "contract": c_con or None,
+                            "qty": c.get("qty") or 1,
+                            "order_id": c.get("buy_order_id") or c.get("order_id"),
+                            "reason": c.get("buy_reason") or "position_entry",
+                            "rsi": None,
+                            "dry_run": False,
+                        }
+                    )
+                s_dt = _opt_parse_utc(c.get("sold_at_utc"))
+                if s_dt is not None:
+                    hist_sells.append(
+                        {
+                            "symbol": target_sym,
+                            "minute_utc": minute_utc(s_dt).isoformat(),
+                            "executed_at_utc": s_dt.isoformat(),
+                            "trigger_minute_utc": None,
+                            "contract": c_con or None,
+                            "qty": c.get("qty") or 1,
+                            "order_id": c.get("sell_order_id") or c.get("trade_id"),
+                            "reason": c.get("reason") or "position_exit",
+                            "rsi": None,
+                            "dry_run": False,
+                        }
+                    )
+
+    live_buys = [
+        dict(e)
+        for e in (getattr(coordinator, "option_buy_events", {}) or {}).get(target_sym, [])
+        if isinstance(e, dict) and not e.get("dry_run")
+    ]
+    live_sells = [
+        dict(e)
+        for e in (getattr(coordinator, "option_sell_events", {}) or {}).get(target_sym, [])
+        if isinstance(e, dict) and not e.get("dry_run")
+    ]
+
+    def _merge_stream(sources_low_to_high):
+        merged = []
+        by_oid = {}
+        for src_list in sources_low_to_high:
+            for ev in src_list:
+                if not isinstance(ev, dict) or ev.get("dry_run"):
+                    continue
+                oid = str(ev.get("order_id") or "").strip() or None
+                con = str(ev.get("contract") or "").strip().upper() or None
+                ev_dt = _opt_parse_utc(ev.get("executed_at_utc") or ev.get("minute_utc"))
+                if ev_dt is None:
+                    continue
+                norm_ev = {
+                    "symbol": target_sym,
+                    "minute_utc": ev.get("minute_utc") or minute_utc(ev_dt).isoformat(),
+                    "executed_at_utc": ev_dt.isoformat(),
+                    "trigger_minute_utc": ev.get("trigger_minute_utc"),
+                    "contract": con,
+                    "qty": ev.get("qty") or 1,
+                    "order_id": oid,
+                    "reason": ev.get("reason"),
+                    "rsi": ev.get("rsi"),
+                    "dry_run": False,
+                }
+                match_idx = None
+                if oid and oid in by_oid:
+                    match_idx = by_oid[oid]
+                else:
+                    for idx, cur in enumerate(merged):
+                        cur_con = cur.get("contract")
+                        cur_dt = _opt_parse_utc(cur.get("executed_at_utc") or cur.get("minute_utc"))
+                        if cur_dt is None:
+                            continue
+                        same_con = (con == cur_con) or (not con) or (not cur_con)
+                        same_oid_compat = (not oid) or (not cur.get("order_id")) or (oid == cur.get("order_id"))
+                        if same_con and same_oid_compat and abs((ev_dt - cur_dt).total_seconds()) <= 90.0:
+                            match_idx = idx
+                            break
+                if match_idx is None:
+                    new_idx = len(merged)
+                    merged.append(norm_ev)
+                    if oid:
+                        by_oid[oid] = new_idx
+                else:
+                    cur = merged[match_idx]
+                    for k, v in norm_ev.items():
+                        if v is not None and (k in {"executed_at_utc", "minute_utc", "reason", "order_id"} or cur.get(k) is None):
+                            cur[k] = v
+                    if oid:
+                        by_oid[oid] = match_idx
+        merged.sort(
+            key=lambda e: str(e.get("executed_at_utc") or e.get("minute_utc") or "")
+        )
+        return merged
+
+    buys = _merge_stream([log_buys.get(target_sym, []), hist_buys, live_buys])
+    sells = _merge_stream([log_sells.get(target_sym, []), hist_sells, live_sells])
+    return buys, sells
+
+
 def build_kinematics_snapshot_data(coordinator, history_limit=20):
     """Build unified per-symbol and per-provider kinematics snapshot for both UI and PNG capture."""
     latest = {}
@@ -12491,6 +13265,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 }
             )
 
+        merged_buys, merged_sells = _gather_symbol_trade_events(coordinator, sym)
         latest_ts = max(g["latest_timestamps"]) if g["latest_timestamps"] else None
         consolidated_symbols.append(
             {
@@ -12523,16 +13298,8 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "regime": c_regime,
                 "history_window": g["best_history"],
                 "history_total_bars": g["best_history_total_bars"],
-                "buy_events": [
-                    e
-                    for e in coordinator.option_buy_events.get(sym, [])
-                    if not e.get("dry_run")
-                ],
-                "sell_events": [
-                    e
-                    for e in coordinator.option_sell_events.get(sym, [])
-                    if not e.get("dry_run")
-                ],
+                "buy_events": merged_buys,
+                "sell_events": merged_sells,
                 "provider_entries": sorted(
                     all_provider_entries,
                     key=lambda item: str(item.get("provider") or ""),
@@ -12683,6 +13450,7 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
         }
         for h in sliced
     ]
+    merged_buys, merged_sells = _gather_symbol_trade_events(coordinator, target_sym)
     return {
         "symbol": target_sym,
         "provider": best_provider,
@@ -12690,16 +13458,8 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
         "returned_bars": len(history_payload),
         "max_history_bars": KINEMATICS_HISTORY_MAX_BARS,
         "history": history_payload,
-        "buy_events": [
-            e
-            for e in coordinator.option_buy_events.get(target_sym, [])
-            if not e.get("dry_run")
-        ],
-        "sell_events": [
-            e
-            for e in coordinator.option_sell_events.get(target_sym, [])
-            if not e.get("dry_run")
-        ],
+        "buy_events": merged_buys,
+        "sell_events": merged_sells,
     }
 
 
@@ -13725,39 +14485,81 @@ def render_kinematics_chart_png(
                     next_x, ny_pt, 4.5, C_CYAN, border_color=C_CARD, border_width=1.4
                 )
 
-        # Executed option buy/sell markers pinned to bar minutes
+        # Executed option buy/sell markers pinned accurately to bar minutes
+        first_bar_min_idx = next((m for m in bar_min_indices if m is not None), None)
         last_bar_min_idx = bar_min_indices[-1] if bar_min_indices else None
 
-        def _draw_trade_events(events, star_color, label_prefix):
+        def _resolve_event_bar(ev):
+            _, ev_min = _parse_bar_label_utc(
+                ev.get("minute_utc") or ev.get("executed_at_utc"), 0
+            )
+            _, trig_min = _parse_bar_label_utc(ev.get("trigger_minute_utc"), 0)
+            for cand in (ev_min, trig_min):
+                if cand is not None and cand in bar_min_indices:
+                    return bar_min_indices.index(cand), False
+            if (
+                proj_price is not None
+                and last_bar_min_idx is not None
+                and (ev_min == last_bar_min_idx + 1 or trig_min == last_bar_min_idx + 1)
+            ):
+                return len(points), True
+            if first_bar_min_idx is not None and last_bar_min_idx is not None:
+                for cand in (ev_min, trig_min):
+                    if cand is None or cand < first_bar_min_idx or cand > last_bar_min_idx:
+                        continue
+                    best_i = None
+                    best_d = 999
+                    for idx, bm in enumerate(bar_min_indices):
+                        if bm is None:
+                            continue
+                        d = abs(bm - cand)
+                        if d <= 2 and d < best_d:
+                            best_d = d
+                            best_i = idx
+                    if best_i is not None:
+                        return best_i, False
+            return None, False
+
+        buy_placed_cols = set()
+        for ev in buy_events:
+            if isinstance(ev, dict) and not ev.get("dry_run"):
+                ci, _ = _resolve_event_bar(ev)
+                if ci is not None:
+                    buy_placed_cols.add(ci)
+
+        sell_placed_cols = set()
+        for ev in sell_events:
+            if isinstance(ev, dict) and not ev.get("dry_run"):
+                ci, _ = _resolve_event_bar(ev)
+                if ci is not None:
+                    sell_placed_cols.add(ci)
+
+        def _draw_trade_events(events, star_color, label_prefix, is_sell=False):
             for ev in events:
                 if not isinstance(ev, dict) or ev.get("dry_run"):
                     continue
-                _, ev_min = _parse_bar_label_utc(
-                    ev.get("minute_utc") or ev.get("executed_at_utc"), 0
-                )
-                if ev_min is None:
+                b_idx, is_proj_col = _resolve_event_bar(ev)
+                if b_idx is None:
                     continue
-                bx = None
-                by = None
-                if ev_min in bar_min_indices:
-                    b_idx = bar_min_indices.index(ev_min)
-                    bx = x_at(b_idx)
-                    bp = closes[b_idx] if closes[b_idx] is not None else c_close
-                    by = y_price(bp) if bp is not None else (p1_top + p1_bot) * 0.5
-                elif (
-                    last_bar_min_idx is not None
-                    and ev_min == last_bar_min_idx + 1
-                    and proj_price is not None
-                ):
+                if is_proj_col:
                     bx = next_x
                     by = y_price(proj_price)
                 else:
-                    continue
+                    bx = x_at(b_idx)
+                    bp = closes[b_idx] if closes[b_idx] is not None else c_close
+                    by = y_price(bp) if bp is not None else (p1_top + p1_bot) * 0.5
+
+                both_same_col = b_idx in buy_placed_cols and b_idx in sell_placed_cols
+                x_shift = (2.0 if is_sell else -2.0) if both_same_col else 0.0
+                y_shift = (6.0 if is_sell else -6.0) if both_same_col else 0.0
+                draw_bx = bx + x_shift
+                draw_by = max(p1_top + 9, min(p1_bot - 9, by + y_shift))
+
                 for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
                     canvas.draw_dashed_line(
-                        bx,
+                        draw_bx,
                         py0 + 2,
-                        bx,
+                        draw_bx,
                         py1 - 2,
                         star_color,
                         width=1.2,
@@ -13765,10 +14567,17 @@ def render_kinematics_chart_png(
                         gap=3,
                         alpha=0.55,
                     )
-                canvas.draw_star(bx, by, 7.5, 3.2, star_color, border_color=(2, 6, 23))
+                canvas.draw_star(
+                    draw_bx, draw_by, 7.5, 3.2, star_color, border_color=(2, 6, 23)
+                )
+                lbl_y = (
+                    min(p1_bot - 10, draw_by + 11)
+                    if is_sell and both_same_col
+                    else max(p1_top + 4, draw_by - 16)
+                )
                 canvas.draw_text(
-                    bx,
-                    max(p1_top + 4, by - 16),
+                    draw_bx,
+                    lbl_y,
                     label_prefix,
                     star_color,
                     scale=1,
@@ -13777,8 +14586,8 @@ def render_kinematics_chart_png(
                     bold=True,
                 )
 
-        _draw_trade_events(buy_events, C_RED, "BUY")
-        _draw_trade_events(sell_events, C_AMBER, "SELL")
+        _draw_trade_events(buy_events, C_RED, "BUY", is_sell=False)
+        _draw_trade_events(sell_events, C_AMBER, "SELL", is_sell=True)
 
         # --------------------------------------------------------------
         # PANEL 2: VELOCITY (v) / ACCELERATION (a)
@@ -15161,6 +15970,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                             <svg viewBox="0 0 16 16" class="w-3 h-3 inline-block"><polygon points="8,1 10.1,5.6 15,6.2 11.4,9.6 12.3,14.5 8,12.1 3.7,14.5 4.6,9.6 1,6.2 5.9,5.6" fill="#ef4444" stroke="#020617" stroke-width="0.8"/></svg>
                                             Executed Buy
                                         </span>
+                                        <span class="inline-flex items-center gap-1 text-amber-400">
+                                            <svg viewBox="0 0 16 16" class="w-3 h-3 inline-block"><polygon points="8,1 10.1,5.6 15,6.2 11.4,9.6 12.3,14.5 8,12.1 3.7,14.5 4.6,9.6 1,6.2 5.9,5.6" fill="#f59e0b" stroke="#020617" stroke-width="0.8"/></svg>
+                                            Executed Sell
+                                        </span>
                                     </span>
                                 </div>
                             </div>
@@ -15980,13 +16793,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const contractsOpen = contractsModal && !contractsModal.classList.contains('hidden');
                 const logsModal = document.getElementById('optionLogsModal');
                 const logsOpen = logsModal && !logsModal.classList.contains('hidden');
+                const logsFetchSeq = logsOpen ? ++_optionLogsReqSeq : 0;
                 if (contractsOpen) {
                     jobs.push(fetch('/api/option-history').then(r => r.json()).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
                 if (logsOpen) {
-                    jobs.push(fetch(`/api/option-logs?limit=40000&_ts=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null));
+                    jobs.push(fetch(buildOptionLogsQueryUrl(40000), { cache: 'no-store' }).then(r => r.json()).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
@@ -16007,7 +16821,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     latestOptionHistory = optRes;
                     renderOptionDrilldown();
                 }
-                if (logsOpen && optLogsRes && optLogsRes.status === 'ok') {
+                if (logsOpen && optLogsRes && optLogsRes.status === 'ok' && logsFetchSeq === _optionLogsReqSeq) {
                     latestOptionLogs = optLogsRes;
                     renderOptionLogsPanel();
                 }
@@ -16757,9 +17571,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     ? `<span class="text-amber-300 font-semibold">[${escSvg(col.crossover.replace('_', ' '))}]</span>`
                     : '';
                 const buyPart = col.buyNote
-                    ? `<span class="text-rose-400 font-semibold">&#9733; ${escSvg(col.buyNote)}</span>`
+                    ? `<span class="text-rose-400 font-semibold">&#9733; BUY: ${escSvg(col.buyNote)}</span>`
                     : '';
-                hud.innerHTML = `<div class="flex flex-wrap items-center gap-x-3 gap-y-0.5">${timeBadge}${closePart}${smoothPart}${vaPart}${rsiPart}${sigPart}${buyPart}</div>`;
+                const sellPart = col.sellNote
+                    ? `<span class="text-amber-300 font-semibold">&#9733; SELL: ${escSvg(col.sellNote)}</span>`
+                    : '';
+                hud.innerHTML = `<div class="flex flex-wrap items-center gap-x-3 gap-y-0.5">${timeBadge}${closePart}${smoothPart}${vaPart}${rsiPart}${sigPart}${buyPart}${sellPart}</div>`;
             }
         }
 
@@ -16810,6 +17627,44 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return merged;
         }
 
+        function _mergeCxTradeEvents(cachedEvents, liveEvents) {
+            const out = [];
+            const seenOid = new Map();
+            const addEv = (ev) => {
+                if (!ev || ev.dry_run) return;
+                const oid = ev.order_id ? String(ev.order_id).trim() : null;
+                const execIso = String(ev.executed_at_utc || ev.minute_utc || '');
+                const ms = Date.parse(execIso);
+                if (Number.isNaN(ms)) return;
+                const con = ev.contract ? String(ev.contract).trim().toUpperCase() : null;
+                if (oid && seenOid.has(oid)) {
+                    const idx = seenOid.get(oid);
+                    out[idx] = { ...out[idx], ...ev };
+                    return;
+                }
+                const matchIdx = out.findIndex(cur => {
+                    const curOid = cur.order_id ? String(cur.order_id).trim() : null;
+                    if (oid && curOid && oid !== curOid) return false;
+                    const curCon = cur.contract ? String(cur.contract).trim().toUpperCase() : null;
+                    if (con && curCon && con !== curCon) return false;
+                    const curMs = Date.parse(String(cur.executed_at_utc || cur.minute_utc || ''));
+                    return !Number.isNaN(curMs) && Math.abs(ms - curMs) <= 90000;
+                });
+                if (matchIdx >= 0) {
+                    out[matchIdx] = { ...out[matchIdx], ...ev };
+                    if (oid) seenOid.set(oid, matchIdx);
+                } else {
+                    const idx = out.length;
+                    out.push({ ...ev });
+                    if (oid) seenOid.set(oid, idx);
+                }
+            };
+            (Array.isArray(cachedEvents) ? cachedEvents : []).forEach(addEv);
+            (Array.isArray(liveEvents) ? liveEvents : []).forEach(addEv);
+            out.sort((a, b) => Date.parse(a.executed_at_utc || a.minute_utc || 0) - Date.parse(b.executed_at_utc || b.minute_utc || 0));
+            return out;
+        }
+
         async function ensureDeepHistoryForSymbol(sym, totalHint = 0) {
             if (!sym) return;
             const cache = window._cxHistoryCache[sym];
@@ -16830,6 +17685,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (!data || data.status !== 'ok') return;
                 window._cxHistoryCache[sym] = {
                     points: Array.isArray(data.history) ? data.history : [],
+                    buyEvents: Array.isArray(data.buy_events) ? data.buy_events : [],
+                    sellEvents: Array.isArray(data.sell_events) ? data.sell_events : [],
                     totalBars: Number(data.total_bars || 0),
                     provider: data.provider || null,
                     fetchedAtMs: Date.now(),
@@ -16933,7 +17790,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         function _rerenderActiveCxChart() {
             const p = window._cxActiveRenderParams;
             if (!p || !p.container) return;
-            renderCrossoverChart(p.container, p.allPoints, p.projectedNext, p.buyEvents, true);
+            renderCrossoverChart(p.container, p.allPoints, p.projectedNext, p.buyEvents, p.sellEvents, true);
         }
 
         function setCxWindowBars(bars) {
@@ -17028,9 +17885,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             window.addEventListener('pointercancel', finishDrag);
         })();
 
-        function renderCrossoverChart(container, allPoints, projectedNext, buyEvents = [], fromInteraction = false) {
+        function renderCrossoverChart(container, allPoints, projectedNext, buyEvents = [], sellEvents = [], fromInteraction = false) {
             if (!container) return;
-            window._cxActiveRenderParams = { container, allPoints, projectedNext, buyEvents };
+            window._cxActiveRenderParams = { container, allPoints, projectedNext, buyEvents, sellEvents };
             if (!fromInteraction && ((window._cxDragState && window._cxDragState.active) || window._cxRangeDragging)) {
                 return;
             }
@@ -17155,47 +18012,95 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return '';
             }).join('');
 
-            // Executed option buy markers: red 5-point star pinned to exact UTC minute column
+            // Executed option buy & sell star markers aligned accurately across all visible history bars
             const toMinIdx = (raw) => {
                 if (!raw) return null;
                 const ms = Date.parse(raw);
                 return Number.isNaN(ms) ? null : Math.floor(ms / 60000);
             };
             const barMinIndices = points.map(p => toMinIdx(p.timestamp || p.minute));
-            const lastBarMinIdx = barMinIndices[n - 1];
-            const buyNoteByCol = {};
-            const buyMarkers = (Array.isArray(buyEvents) ? buyEvents : [])
-                .filter(ev => ev && !ev.dry_run)
-                .map(ev => {
-                    const evMin = toMinIdx(ev.minute_utc || ev.executed_at_utc);
-                    if (evMin === null) return '';
-                    let bx = null;
-                    let by = null;
-                    const barIdx = barMinIndices.indexOf(evMin);
-                    let colIdx = null;
-                    if (barIdx >= 0) {
-                        bx = xAt(barIdx);
-                        colIdx = barIdx;
-                        const bp = safeNum(points[barIdx].close);
-                        by = bp !== null ? yP(bp) : lastY;
-                    } else if (effProjectedNext !== null && lastBarMinIdx !== null && evMin === lastBarMinIdx + 1) {
-                        bx = nextX;
-                        by = nextY;
-                        colIdx = n;
-                    } else {
-                        return '';
+            const firstBarMinIdx = barMinIndices.find(m => m !== null) ?? null;
+            const lastBarMinIdx = barMinIndices[n - 1] ?? null;
+
+            const resolveEventPlacement = (ev) => {
+                const evMin = toMinIdx(ev.minute_utc || ev.executed_at_utc);
+                const trigMin = toMinIdx(ev.trigger_minute_utc);
+                for (const cand of [evMin, trigMin]) {
+                    if (cand !== null) {
+                        const exactIdx = barMinIndices.indexOf(cand);
+                        if (exactIdx >= 0) {
+                            const bp = safeNum(points[exactIdx].close);
+                            return { colIdx: exactIdx, bx: xAt(exactIdx), by: bp !== null ? yP(bp) : lastY };
+                        }
                     }
+                }
+                if (effProjectedNext !== null && lastBarMinIdx !== null && (evMin === lastBarMinIdx + 1 || trigMin === lastBarMinIdx + 1)) {
+                    return { colIdx: n, bx: nextX, by: nextY };
+                }
+                if (firstBarMinIdx !== null && lastBarMinIdx !== null) {
+                    for (const cand of [evMin, trigMin]) {
+                        if (cand === null || cand < firstBarMinIdx || cand > lastBarMinIdx) continue;
+                        let bestIdx = null;
+                        let bestDist = Infinity;
+                        for (let i = 0; i < barMinIndices.length; i++) {
+                            const bm = barMinIndices[i];
+                            if (bm === null) continue;
+                            const dist = Math.abs(bm - cand);
+                            if (dist <= 2 && dist < bestDist) {
+                                bestDist = dist;
+                                bestIdx = i;
+                            }
+                        }
+                        if (bestIdx !== null) {
+                            const bp = safeNum(points[bestIdx].close);
+                            return { colIdx: bestIdx, bx: xAt(bestIdx), by: bp !== null ? yP(bp) : lastY };
+                        }
+                    }
+                }
+                return null;
+            };
+
+            const buyNoteByCol = {};
+            const sellNoteByCol = {};
+            const placedBuys = [];
+            const buyCols = new Set();
+            (Array.isArray(buyEvents) ? buyEvents : []).forEach(ev => {
+                if (!ev || ev.dry_run) return;
+                const pl = resolveEventPlacement(ev);
+                if (!pl) return;
+                buyCols.add(pl.colIdx);
+                placedBuys.push({ ev, ...pl });
+            });
+            const placedSells = [];
+            const sellCols = new Set();
+            (Array.isArray(sellEvents) ? sellEvents : []).forEach(ev => {
+                if (!ev || ev.dry_run) return;
+                const pl = resolveEventPlacement(ev);
+                if (!pl) return;
+                sellCols.add(pl.colIdx);
+                placedSells.push({ ev, ...pl });
+            });
+
+            const buildTradeStarSvg = (placedList, colorHex, sideLabel, noteMap, isSell) => {
+                return placedList.map(({ ev, colIdx, bx, by }) => {
                     const execDate = ev.executed_at_utc ? new Date(ev.executed_at_utc) : null;
                     const execLabel = (execDate && !Number.isNaN(execDate.getTime()))
                         ? `${fmtTzClock(execDate, { hour: '2-digit', minute: '2-digit', second: '2-digit' })} ${displayTzAbbr}`
                         : (ev.minute_utc || '');
-                    const buySummary = `${ev.contract || ev.symbol || ''} x${ev.qty || 1} @ ${execLabel}`;
-                    if (colIdx !== null) buyNoteByCol[colIdx] = buySummary;
-                    const tip = `BUY EXECUTED: ${buySummary}${ev.order_id ? ' · Order ' + ev.order_id : ''}`;
-                    const starPts = svgStarPoints(bx, by, 6.5, 2.8);
-                    return `<g><line x1="${bx.toFixed(1)}" y1="10" x2="${bx.toFixed(1)}" y2="212" stroke="#ef4444" stroke-opacity="0.40" stroke-dasharray="2,2" stroke-width="1.2" /><polygon points="${starPts}" fill="#ef4444" stroke="#020617" stroke-width="1"><title>${escSvg(tip)}</title></polygon></g>`;
-                })
-                .join('');
+                    const reasonTag = ev.reason ? ` (${String(ev.reason).slice(0, 32)})` : '';
+                    const summary = `${ev.contract || ev.symbol || ''} x${ev.qty || 1} @ ${execLabel}${reasonTag}`;
+                    noteMap[colIdx] = noteMap[colIdx] ? `${noteMap[colIdx]} | ${summary}` : summary;
+                    const tip = `${sideLabel} EXECUTED: ${summary}${ev.order_id ? ' · Order ' + ev.order_id : ''}`;
+                    const sharesCol = buyCols.has(colIdx) && sellCols.has(colIdx);
+                    const drawX = sharesCol ? bx + (isSell ? 1.8 : -1.8) : bx;
+                    const drawY = Math.max(12, Math.min(64, sharesCol ? by + (isSell ? 4.5 : -4.5) : by));
+                    const starPts = svgStarPoints(drawX, drawY, 6.5, 2.8);
+                    return `<g><line x1="${drawX.toFixed(1)}" y1="10" x2="${drawX.toFixed(1)}" y2="212" stroke="${colorHex}" stroke-opacity="0.42" stroke-dasharray="2,2" stroke-width="1.2" /><polygon points="${starPts}" fill="${colorHex}" stroke="#020617" stroke-width="1"><title>${escSvg(tip)}</title></polygon></g>`;
+                }).join('');
+            };
+
+            const buyMarkers = buildTradeStarSvg(placedBuys, '#ef4444', 'BUY', buyNoteByCol, false);
+            const sellMarkers = buildTradeStarSvg(placedSells, '#f59e0b', 'SELL', sellNoteByCol, true);
 
             const cols = points.map((p, i) => {
                 const cVal = safeNum(p.close);
@@ -17219,6 +18124,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     yRsi: rVal !== null ? yR(rVal) : null,
                     crossover: p.crossover_signal || 'none',
                     buyNote: buyNoteByCol[i] || null,
+                    sellNote: sellNoteByCol[i] || null,
                 };
             });
             if (effProjectedNext !== null) {
@@ -17238,6 +18144,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     yRsi: null,
                     crossover: 'projection',
                     buyNote: buyNoteByCol[n] || null,
+                    sellNote: sellNoteByCol[n] || null,
                 });
             }
             const canPan = maxOffset > 0;
@@ -17279,6 +18186,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                     ${rsiCoords.length >= 2 ? `<polyline fill="none" stroke="#c084fc" stroke-width="1.6" points="${rsiPts}" /><circle cx="${rsiCoords[rsiCoords.length - 1].x.toFixed(1)}" cy="${rsiCoords[rsiCoords.length - 1].y.toFixed(1)}" r="2.6" fill="#c084fc" stroke="#0f172a" stroke-width="0.9" />` : (rsiCoords.length === 1 ? `<circle cx="${rsiCoords[0].x.toFixed(1)}" cy="${rsiCoords[0].y.toFixed(1)}" r="3.0" fill="#c084fc" stroke="#0f172a" stroke-width="1" />` : '')}
                     ${buyMarkers}
+                    ${sellMarkers}
 
                     <g id="cxHoverGroup" style="display:none; pointer-events:none;">
                         <line id="cxHoverLine" x1="0" y1="8" x2="0" y2="214" stroke="#f8fafc" stroke-opacity="0.80" stroke-width="1.25" stroke-dasharray="3,2" />
@@ -17406,12 +18314,21 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 deepCached ? deepCached.points : [],
                 symbolData.history_window || []
             );
+            const mergedBuyEvents = _mergeCxTradeEvents(
+                deepCached ? deepCached.buyEvents : [],
+                symbolData.buy_events || []
+            );
+            const mergedSellEvents = _mergeCxTradeEvents(
+                deepCached ? deepCached.sellEvents : [],
+                symbolData.sell_events || []
+            );
 
             renderCrossoverChart(
                 document.getElementById('detailCrossoverChart'),
                 mergedHistory,
                 safeNum(symbolData.projected_price_next),
-                symbolData.buy_events || []
+                mergedBuyEvents,
+                mergedSellEvents
             );
 
             // Diagnosis sentence
@@ -17592,7 +18509,21 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let optionLogStreamFilter = 'all'; // 'all' | 'BUY' | 'SELL'
         let optionLogDecisionFilter = 'all'; // 'all' | 'QUALIFIED' | 'REJECTED'
         let optionLogSearchFilter = '';
+        let _optionLogsAbortCtrl = null;
+        let _optionLogsReqSeq = 0;
+        let _optionLogSearchDebounce = null;
         let activeOptionHistoryPoints = [];
+        window._optPanState = {
+            windowBars: 60, // 20 | 60 | 120 | 240 | 390 | 0 (All)
+            panOffset: 0,
+            anchorTs: null,
+            dragState: { active: false, startX: 0, lastX: 0, accumPx: 0 },
+            rangeDragging: false,
+            activeContractKey: null,
+            hoverIdx: null,
+        };
+        window._optChartState = null;
+        window._optActiveRenderParams = null;
 
         function fmtSignedDollars(v) {
             const n = safeNum(v);
@@ -17630,30 +18561,67 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return fmtTzClock(iso, { hour: '2-digit', minute: '2-digit' });
         }
 
+        function resetOptPanView(newContractKey = null) {
+            window._optPanState.panOffset = 0;
+            window._optPanState.anchorTs = null;
+            window._optPanState.hoverIdx = null;
+            window._optPanState.dragState.active = false;
+            window._optPanState.rangeDragging = false;
+            if (newContractKey !== null) {
+                window._optPanState.activeContractKey = newContractKey;
+            }
+        }
+
         async function openOptionDrilldown(mode = 'buyer') {
-            optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            const nextMode = mode === 'seller' ? 'seller' : 'buyer';
+            if (optionDrilldownMode !== nextMode) {
+                resetOptPanView();
+            }
+            optionDrilldownMode = nextMode;
             const modal = document.getElementById('optionDrilldownModal');
             if (modal) modal.classList.remove('hidden');
             await fetchOptionHistory();
         }
 
         function closeOptionDrilldown() {
+            window._optPanState.dragState.active = false;
+            window._optPanState.rangeDragging = false;
             const modal = document.getElementById('optionDrilldownModal');
             if (modal) modal.classList.add('hidden');
         }
 
         function switchOptionDrilldownMode(mode) {
-            optionDrilldownMode = mode === 'seller' ? 'seller' : 'buyer';
+            const nextMode = mode === 'seller' ? 'seller' : 'buyer';
+            if (optionDrilldownMode !== nextMode) {
+                resetOptPanView();
+            }
+            optionDrilldownMode = nextMode;
             renderOptionDrilldown();
         }
 
         function selectOptionContractItem(key) {
             if (optionDrilldownMode === 'buyer') {
+                if (selectedBuyerContract !== key) resetOptPanView(`buyer:${key}`);
                 selectedBuyerContract = key;
             } else {
+                if (selectedSellerTradeId !== key) resetOptPanView(`seller:${key}`);
                 selectedSellerTradeId = key;
             }
             renderOptionDrilldown();
+        }
+
+        function buildOptionLogsQueryUrl(limit = 40000) {
+            const params = new URLSearchParams();
+            params.set('limit', String(limit));
+            params.set('limit_per_file', '50000');
+            params.set('stream', optionLogStreamFilter || 'all');
+            params.set('decision', optionLogDecisionFilter || 'all');
+            const q = (optionLogSearchFilter || '').trim();
+            if (q) {
+                params.set('q', q);
+            }
+            params.set('_ts', String(Date.now()));
+            return `/api/option-logs?${params.toString()}`;
         }
 
         async function openOptionLogsPanel(symbolFilter = '') {
@@ -17671,6 +18639,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function closeOptionLogsModal() {
+            if (_optionLogSearchDebounce) {
+                clearTimeout(_optionLogSearchDebounce);
+                _optionLogSearchDebounce = null;
+            }
             const modal = document.getElementById('optionLogsModal');
             if (modal) modal.classList.add('hidden');
         }
@@ -17680,9 +18652,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (logsEl && !latestOptionLogs) {
                 logsEl.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Retrieving buy &amp; sell analysis logs...</div>`;
             }
+            if (_optionLogsAbortCtrl) {
+                try { _optionLogsAbortCtrl.abort(); } catch (_) {}
+            }
+            _optionLogsAbortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const reqSeq = ++_optionLogsReqSeq;
             try {
-                const res = await fetch(`/api/option-logs?limit=40000&_ts=${Date.now()}`, { cache: 'no-store' });
+                const fetchOpts = { cache: 'no-store' };
+                if (_optionLogsAbortCtrl) fetchOpts.signal = _optionLogsAbortCtrl.signal;
+                const res = await fetch(buildOptionLogsQueryUrl(40000), fetchOpts);
                 const data = await res.json();
+                if (reqSeq !== _optionLogsReqSeq) return;
                 if (res.ok && data && data.status === 'ok') {
                     latestOptionLogs = data;
                     renderOptionLogsPanel(false, !!resetScroll);
@@ -17690,6 +18670,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     logsEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-10">Failed to load logs: ${escSvg((data && data.message) || 'Unknown error')}</div>`;
                 }
             } catch (err) {
+                if (err && err.name === 'AbortError') return;
                 if (logsEl) {
                     logsEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-10">Error loading logs: ${escSvg(err.message)}</div>`;
                 }
@@ -17699,16 +18680,30 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         function setOptionLogStreamFilter(val) {
             optionLogStreamFilter = val || 'all';
             renderOptionLogsPanel(false, true);
+            fetchOptionLogs(true);
         }
 
         function setOptionLogDecisionFilter(val) {
             optionLogDecisionFilter = val || 'all';
             renderOptionLogsPanel(false, true);
+            fetchOptionLogs(true);
         }
 
         function setOptionLogSearchFilter(val) {
             optionLogSearchFilter = String(val || '').trim().toUpperCase();
             renderOptionLogsPanel(true, true);
+            if (_optionLogSearchDebounce) {
+                clearTimeout(_optionLogSearchDebounce);
+                _optionLogSearchDebounce = null;
+            }
+            if (!optionLogSearchFilter) {
+                fetchOptionLogs(true);
+            } else {
+                _optionLogSearchDebounce = setTimeout(() => {
+                    _optionLogSearchDebounce = null;
+                    fetchOptionLogs(true);
+                }, 180);
+            }
         }
 
         function renderOptionLogsPanel(preserveInputFocus = false, resetScroll = false) {
@@ -17720,7 +18715,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const selStart = wasSearchFocused ? activeEl.selectionStart : null;
             const selEnd = wasSearchFocused ? activeEl.selectionEnd : null;
             const shouldFocusSearch = preserveInputFocus || wasSearchFocused;
-            const payload = latestOptionLogs || { entries: [], buyer_log_file: null, seller_log_file: null, counts: {} };
+            const payload = latestOptionLogs || { entries: [], buyer_log_file: null, seller_log_file: null, counts: {}, filters: {} };
             const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
             const q = optionLogSearchFilter.trim().toUpperCase();
 
@@ -17760,15 +18755,22 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const sidePool = optionLogDecisionFilter === 'all'
                 ? searchMatched
                 : searchMatched.filter(e => matchesDecisionFilter(e, optionLogDecisionFilter));
-            const countAllSide = sidePool.length;
-            const countBuySide = sidePool.filter(e => e.stream === 'BUY').length;
-            const countSellSide = sidePool.filter(e => e.stream === 'SELL').length;
-
             const decPool = optionLogStreamFilter === 'all'
                 ? searchMatched
                 : searchMatched.filter(e => e.stream === optionLogStreamFilter);
-            const countQualified = decPool.filter(isEntryQualified).length;
-            const countRejected = decPool.filter(isEntryRejected).length;
+
+            const srvFilters = payload.filters || {};
+            const srvCounts = payload.counts || {};
+            const hasServerCounts = typeof srvCounts.total === 'number'
+                && String(srvFilters.q || '').trim().toUpperCase() === q
+                && String(srvFilters.stream || 'all').toUpperCase() === String(optionLogStreamFilter || 'all').toUpperCase()
+                && String(srvFilters.decision || 'all').toUpperCase() === String(optionLogDecisionFilter || 'all').toUpperCase();
+
+            const countAllSide = hasServerCounts ? Number(srvCounts.total || 0) : sidePool.length;
+            const countBuySide = hasServerCounts ? Number(srvCounts.buy || 0) : sidePool.filter(e => e.stream === 'BUY').length;
+            const countSellSide = hasServerCounts ? Number(srvCounts.sell || 0) : sidePool.filter(e => e.stream === 'SELL').length;
+            const countQualified = hasServerCounts ? Number(srvCounts.qualified || 0) : decPool.filter(isEntryQualified).length;
+            const countRejected = hasServerCounts ? Number(srvCounts.rejected || 0) : decPool.filter(isEntryRejected).length;
 
             const filtered = searchMatched.filter(e => {
                 if (optionLogStreamFilter !== 'all' && e.stream !== optionLogStreamFilter) return false;
@@ -17856,11 +18858,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 titleInfoParts.push(`Seller: ${sellerFiles[0]}`);
             }
 
+            const totalMatched = hasServerCounts ? Number(srvCounts.matched ?? filtered.length) : searchMatched.length;
             const rowBadge = document.getElementById('optLogsRowBadge');
             if (rowBadge) {
-                rowBadge.textContent = filtered.length === searchMatched.length
+                rowBadge.textContent = filtered.length === totalMatched
                     ? `${filtered.length} ${filtered.length === 1 ? 'row' : 'rows'}`
-                    : `${filtered.length} / ${searchMatched.length} rows`;
+                    : `${filtered.length} / ${totalMatched} rows`;
             }
             const fileSubtitle = document.getElementById('optLogsFileSubtitle');
             if (fileSubtitle) {
@@ -17986,32 +18989,323 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return `<svg viewBox="0 0 ${w} ${h}" class="w-[68px] h-[20px] shrink-0"><polyline fill="none" stroke="${stroke}" stroke-width="1.6" points="${pts}" /></svg>`;
         }
 
-        function buildOptionHistoryChartSvg(points, contract, isClosed) {
-            if (!Array.isArray(points) || points.length === 0) {
+        function _mergeOptionContractPoints(item) {
+            if (!item) return [];
+            const byMin = new Map();
+            const addArr = (arr, forcePre) => {
+                if (!Array.isArray(arr)) return;
+                for (const pt of arr) {
+                    if (!pt) continue;
+                    const key = String(pt.minute_utc || pt.timestamp || '');
+                    if (!key) continue;
+                    const prev = byMin.get(key);
+                    if (prev && !prev.pre_entry && forcePre) continue;
+                    const nextPt = {
+                        ...pt,
+                        pre_entry: forcePre ? true : !!pt.pre_entry,
+                    };
+                    if (nextPt.stock_price == null && prev && prev.stock_price != null) {
+                        nextPt.stock_price = prev.stock_price;
+                    }
+                    byMin.set(key, nextPt);
+                }
+            };
+            addArr(item.pre_entry_history, true);
+            addArr(item.history, false);
+            const merged = Array.from(byMin.values());
+            merged.sort((a, b) => Date.parse(a.minute_utc || a.timestamp || 0) - Date.parse(b.minute_utc || b.timestamp || 0));
+            return merged;
+        }
+
+        function _optWinLabel(w) {
+            if (w === 0) return 'All';
+            if (w === 20) return '20m';
+            if (w === 60) return '1h';
+            if (w === 120) return '2h';
+            if (w === 240) return '4h';
+            if (w === 390) return '6.5h';
+            return `${w}m`;
+        }
+
+        function setOptWindowBars(bars) {
+            const val = Number(bars);
+            const nextWin = val === 0 ? 0 : Math.max(10, Math.min(2400, val || 60));
+            if (window._optPanState.windowBars === nextWin) return;
+            window._optPanState.windowBars = nextWin;
+            window._optPanState.hoverIdx = null;
+            _rerenderActiveOptChart();
+        }
+
+        function stepOptPan(dir) {
+            const p = window._optActiveRenderParams;
+            if (!p || !Array.isArray(p.allPoints) || p.allPoints.length === 0) return;
+            const total = p.allPoints.length;
+            const winBars = window._optPanState.windowBars;
+            const winSize = winBars === 0 ? total : Math.min(total, Math.max(2, winBars));
+            const maxOffset = Math.max(0, total - winSize);
+            const step = Math.max(1, Math.round(winSize / 2));
+            if (dir === 'oldest') {
+                window._optPanState.panOffset = maxOffset;
+            } else if (dir === 'back') {
+                window._optPanState.panOffset = Math.min(maxOffset, (window._optPanState.panOffset || 0) + step);
+            } else if (dir === 'forward') {
+                window._optPanState.panOffset = Math.max(0, (window._optPanState.panOffset || 0) - step);
+            }
+            window._optPanState.hoverIdx = null;
+            _rerenderActiveOptChart();
+        }
+
+        function snapOptToLive() {
+            window._optPanState.panOffset = 0;
+            window._optPanState.anchorTs = null;
+            window._optPanState.hoverIdx = null;
+            _rerenderActiveOptChart();
+        }
+
+        function onOptRangeInput(rangeEl) {
+            if (!rangeEl) return;
+            const maxOff = Number(rangeEl.max) || 0;
+            const sliderVal = Number(rangeEl.value) || 0;
+            window._optPanState.panOffset = Math.max(0, Math.min(maxOff, maxOff - sliderVal));
+            window._optPanState.hoverIdx = null;
+            _rerenderActiveOptChart();
+        }
+
+        function _updateOptToolbarControls(totalBars, visibleCount, maxOffset, offsetFromRight, startPt, endPt) {
+            document.querySelectorAll('.opt-win-btn').forEach(btn => {
+                const w = Number(btn.getAttribute('data-opt-win'));
+                if (w === window._optPanState.windowBars) {
+                    btn.className = 'opt-win-btn px-1.5 py-0.5 rounded bg-cyan-600 text-white font-semibold transition';
+                } else {
+                    btn.className = 'opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition';
+                }
+            });
+
+            const modeBadge = document.getElementById('optModeBadge');
+            if (modeBadge) {
+                if (offsetFromRight > 0) {
+                    modeBadge.textContent = `HISTORY -${offsetFromRight}m`;
+                    modeBadge.className = 'text-[9.5px] mono px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/35 font-semibold';
+                } else {
+                    modeBadge.textContent = 'LIVE';
+                    modeBadge.className = 'text-[9.5px] mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold';
+                }
+            }
+
+            const bar = document.getElementById('optTimelineBar');
+            if (!bar) return;
+            if (totalBars < 2) {
+                bar.classList.add('hidden');
+                return;
+            }
+            bar.classList.remove('hidden');
+
+            const rangeEl = document.getElementById('optPanRange');
+            if (rangeEl) {
+                rangeEl.max = String(maxOffset);
+                const sliderVal = Math.max(0, maxOffset - offsetFromRight);
+                if (!window._optPanState.rangeDragging) {
+                    rangeEl.value = String(sliderVal);
+                }
+                rangeEl.disabled = maxOffset <= 0;
+            }
+
+            const btnOldest = document.getElementById('btnOptOldest');
+            const btnBack = document.getElementById('btnOptBack');
+            const btnFwd = document.getElementById('btnOptForward');
+            const btnLive = document.getElementById('btnOptLive');
+            if (btnOldest) btnOldest.disabled = offsetFromRight >= maxOffset;
+            if (btnBack) btnBack.disabled = offsetFromRight >= maxOffset;
+            if (btnFwd) btnFwd.disabled = offsetFromRight <= 0;
+            if (btnLive) {
+                if (offsetFromRight > 0) {
+                    btnLive.className = 'px-2 py-0.5 rounded border font-semibold transition bg-cyan-500/20 hover:bg-cyan-500/35 text-cyan-200 border-cyan-500/50 cursor-pointer';
+                    btnLive.disabled = false;
+                } else {
+                    btnLive.className = 'px-2 py-0.5 rounded border font-semibold transition bg-slate-900 text-emerald-400 border-emerald-500/30';
+                    btnLive.disabled = true;
+                }
+            }
+
+            const summaryEl = document.getElementById('optRangeSummary');
+            if (summaryEl) {
+                const startTxt = startPt ? fmtShortLocalTs(startPt.timestamp || startPt.minute_utc) : '--';
+                const endTxt = endPt ? fmtShortLocalTs(endPt.timestamp || endPt.minute_utc) : '--';
+                summaryEl.textContent = `${startTxt} – ${endTxt} · ${visibleCount}/${totalBars}m`
+                    + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+            }
+        }
+
+        function _rerenderActiveOptChart() {
+            const p = window._optActiveRenderParams;
+            const host = document.getElementById('optChartHost');
+            if (!p || !host) return;
+            host.innerHTML = buildOptionHistoryChartSvg(p.allPoints, p.contract, p.isClosed, true);
+            mountOptionChartInteractions();
+        }
+
+        (function initOptPanListeners() {
+            window.addEventListener('pointermove', (ev) => {
+                const ds = window._optPanState && window._optPanState.dragState;
+                if (!ds || !ds.active) return;
+                const st = window._optChartState;
+                const svg = document.getElementById('optHistorySvg');
+                if (!st || !svg) return;
+                const dx = ev.clientX - ds.lastX;
+                ds.lastX = ev.clientX;
+                ds.accumPx += dx;
+
+                const rect = svg.getBoundingClientRect();
+                const plotPxW = rect && rect.width > 0 ? rect.width * ((st.plotW || 620) / (st.W || 740)) : 560;
+                const pxPerBar = Math.max(2, plotPxW / Math.max(1, (st.n || 20) - 1));
+                const barShift = Math.trunc(ds.accumPx / pxPerBar);
+                if (barShift !== 0) {
+                    ds.accumPx -= barShift * pxPerBar;
+                    const p = window._optActiveRenderParams;
+                    const total = p && Array.isArray(p.allPoints) ? p.allPoints.length : (st.n || 0);
+                    const winBars = window._optPanState.windowBars;
+                    const winSize = winBars === 0 ? total : Math.min(total, Math.max(2, winBars));
+                    const maxOff = Math.max(0, total - winSize);
+                    const nextOff = Math.max(0, Math.min(maxOff, (window._optPanState.panOffset || 0) + barShift));
+                    if (nextOff !== window._optPanState.panOffset) {
+                        window._optPanState.panOffset = nextOff;
+                        window._optPanState.hoverIdx = null;
+                        _rerenderActiveOptChart();
+                    }
+                }
+            });
+
+            const finishOptDrag = () => {
+                const ds = window._optPanState && window._optPanState.dragState;
+                if (ds && ds.active) {
+                    ds.active = false;
+                    const overlay = document.getElementById('optHoverOverlay');
+                    if (overlay) {
+                        overlay.style.cursor = (window._optChartState && window._optChartState.canPan) ? 'grab' : 'crosshair';
+                    }
+                }
+                if (window._optPanState) {
+                    window._optPanState.rangeDragging = false;
+                }
+            };
+            window.addEventListener('pointerup', finishOptDrag);
+            window.addEventListener('pointercancel', finishOptDrag);
+        })();
+
+        function _buildGapAwarePath(values, xFn, yFn) {
+            let d = '';
+            let inSeg = false;
+            for (let i = 0; i < values.length; i++) {
+                const v = values[i];
+                if (v === null || v === undefined || Number.isNaN(v)) {
+                    inSeg = false;
+                    continue;
+                }
+                const x = xFn(i).toFixed(1);
+                const y = yFn(v).toFixed(1);
+                d += inSeg ? ` L ${x} ${y}` : ` M ${x} ${y}`;
+                inSeg = true;
+            }
+            return d.trim();
+        }
+
+        function _buildOptionAreaPaths(values, xFn, yFn, baselineY) {
+            let paths = '';
+            let seg = [];
+            const flush = () => {
+                if (seg.length >= 2) {
+                    const first = seg[0], last = seg[seg.length - 1];
+                    const pts = `${first.x},${baselineY} ` + seg.map(s => `${s.x},${s.y}`).join(' ') + ` ${last.x},${baselineY}`;
+                    paths += `<polygon points="${pts}" fill="url(#optPriceGrad)" />`;
+                }
+                seg = [];
+            };
+            for (let i = 0; i < values.length; i++) {
+                const v = values[i];
+                if (v === null || v === undefined || Number.isNaN(v)) {
+                    flush();
+                    continue;
+                }
+                seg.push({ x: xFn(i).toFixed(1), y: yFn(v).toFixed(1) });
+            }
+            flush();
+            return paths;
+        }
+
+        function buildOptionHistoryChartSvg(allPoints, contract, isClosed, fromInteraction = false) {
+            window._optActiveRenderParams = { allPoints, contract, isClosed };
+            if (!Array.isArray(allPoints) || allPoints.length === 0) {
+                window._optChartState = null;
+                _updateOptToolbarControls(0, 0, 0, 0, null, null);
                 return `<div class="text-xs text-slate-500 py-10 text-center">No minute-by-minute points recorded yet for this contract.</div>`;
             }
-            const W = 720, H = 290, padL = 54, padR = 54;
+
+            const total = allPoints.length;
+            const reqWin = window._optPanState.windowBars;
+            const winSize = reqWin === 0 ? total : Math.min(total, Math.max(2, reqWin || 60));
+            const maxOffset = Math.max(0, total - winSize);
+
+            if (!fromInteraction && window._optPanState.panOffset > 0 && window._optPanState.anchorTs) {
+                const anchorIdx = allPoints.findIndex(pt => pt && (pt.minute_utc || pt.timestamp) === window._optPanState.anchorTs);
+                if (anchorIdx >= 0) {
+                    window._optPanState.panOffset = Math.max(0, (total - 1) - anchorIdx);
+                }
+            }
+            window._optPanState.panOffset = Math.max(0, Math.min(maxOffset, window._optPanState.panOffset || 0));
+            const offset = window._optPanState.panOffset;
+            const endIdx = total - offset;
+            const startIdx = Math.max(0, endIdx - winSize);
+            const points = allPoints.slice(startIdx, endIdx);
+            window._optPanState.anchorTs = offset > 0
+                ? (points[points.length - 1]?.minute_utc || points[points.length - 1]?.timestamp || null)
+                : null;
+
+            _updateOptToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
+
+            const W = 740, H = 305, padL = 56, padR = 62;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => n === 1 ? (padL + plotW * 0.5) : (padL + (i / Math.max(1, n - 1)) * plotW);
 
-            const entryPrice = safeNum(contract.entry_price) ?? safeNum(points[0].price) ?? 0;
-            const prices = points.map(p => safeNum(p.price) ?? entryPrice);
-            const allPrices = [...prices, entryPrice];
-            const rawMinP = Math.min(...allPrices);
-            const rawMaxP = Math.max(...allPrices);
-            const padP = Math.max(0.01, (rawMaxP - rawMinP) * 0.14);
+            const entryPrice = safeNum(contract.entry_price) ?? safeNum(points.find(p => !p.pre_entry && p.price != null)?.price) ?? 0;
+            const pricesRaw = points.map(p => safeNum(p.price));
+            const validPrices = pricesRaw.filter(v => v !== null && v >= 0);
+            const allPriceVals = validPrices.length ? [...validPrices, entryPrice] : [entryPrice];
+            const rawMinP = Math.min(...allPriceVals);
+            const rawMaxP = Math.max(...allPriceVals);
+            const padP = Math.max(0.02, (rawMaxP - rawMinP) * 0.14);
             const loP = Math.max(0, rawMinP - padP);
             const hiP = rawMaxP + padP;
             const spanP = Math.max(0.01, hiP - loP);
-            const pTop = 24, pBot = 132;
+            const pTop = 26, pBot = 142;
             const yPrice = (v) => pTop + (1 - (v - loP) / spanP) * (pBot - pTop);
 
-            const pnlDollars = points.map(p => safeNum(p.pnl_dollars) ?? 0);
-            const pnlPcts = points.map(p => safeNum(p.pnl_pct) ?? 0);
-            const maxAbsD = Math.max(1.0, ...pnlDollars.map(Math.abs));
-            const maxAbsPct = Math.max(1.0, ...pnlPcts.map(Math.abs));
-            const qTop = 166, qBot = 260, qMid = (qTop + qBot) / 2;
+            // Underlying Stock Price series (right Y-axis)
+            const stockRaw = points.map(p => {
+                const sv = safeNum(p.stock_price);
+                return (sv !== null && sv > 0) ? sv : null;
+            });
+            const validStocks = stockRaw.filter(v => v !== null);
+            const hasStock = validStocks.length > 0;
+            let loS = 0, hiS = 1, spanS = 1;
+            if (hasStock) {
+                const rawMinS = Math.min(...validStocks);
+                const rawMaxS = Math.max(...validStocks);
+                const padS = Math.max(0.05, (rawMaxS - rawMinS) * 0.15);
+                loS = Math.max(0, rawMinS - padS);
+                hiS = rawMaxS + padS;
+                spanS = Math.max(0.01, hiS - loS);
+            }
+            const yStock = (v) => pTop + (1 - (v - loS) / spanS) * (pBot - pTop);
+
+            // P/L series (only for post-entry bars where pnl_dollars !== null)
+            const pnlDollarsRaw = points.map(p => p.pre_entry ? null : safeNum(p.pnl_dollars));
+            const pnlPctsRaw = points.map(p => p.pre_entry ? null : safeNum(p.pnl_pct));
+            const validPnlD = pnlDollarsRaw.filter(v => v !== null);
+            const validPnlPct = pnlPctsRaw.filter(v => v !== null);
+            const maxAbsD = Math.max(1.0, ...(validPnlD.length ? validPnlD.map(Math.abs) : [1.0]));
+            const maxAbsPct = Math.max(1.0, ...(validPnlPct.length ? validPnlPct.map(Math.abs) : [1.0]));
+            const qTop = 176, qBot = 272, qMid = (qTop + qBot) / 2;
             const qHalf = (qBot - qTop) / 2;
             const yPnl = (dVal) => qMid - (dVal / maxAbsD) * qHalf;
 
@@ -18024,47 +19318,98 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const x = xAt(i).toFixed(1);
                     const lbl = fmtClockShort(points[i].timestamp || points[i].minute_utc);
                     gridHtml += `<line x1="${x}" y1="${pTop}" x2="${x}" y2="${qBot}" stroke="#334155" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
-                    gridHtml += `<text x="${x}" y="279" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
+                    gridHtml += `<text x="${x}" y="290" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
                 }
             }
 
-            // Top panel: Price polyline & area
-            const priceCoords = prices.map((v, i) => `${xAt(i).toFixed(1)},${yPrice(v).toFixed(1)}`);
-            const pricePoly = priceCoords.join(' ');
-            const priceArea = `${xAt(0).toFixed(1)},${pBot} ${pricePoly} ${xAt(n - 1).toFixed(1)},${pBot}`;
+            // Option price path & area
+            const pricePathD = _buildGapAwarePath(pricesRaw, xAt, yPrice);
+            const priceAreas = _buildOptionAreaPaths(pricesRaw, xAt, yPrice, pBot);
             const entryY = yPrice(entryPrice).toFixed(1);
 
-            // Bottom panel: P/L zero-baseline & colored segments
+            // Stock price path (purple dashed/solid overlay on secondary Y-axis)
+            const stockPathD = hasStock ? _buildGapAwarePath(stockRaw, xAt, yStock) : '';
+
+            // Buy Entry vertical boundary when pre_entry bars transition into post-entry hold
+            const hasPreEntry = points.some(p => p.pre_entry);
+            const firstPostIdx = points.findIndex(p => !p.pre_entry);
+            let entryDividerHtml = '';
+            if (hasPreEntry && firstPostIdx >= 0) {
+                const ex = xAt(firstPostIdx).toFixed(1);
+                entryDividerHtml = `
+                    <line x1="${ex}" y1="${pTop}" x2="${ex}" y2="${qBot}" stroke="#10b981" stroke-opacity="0.78" stroke-dasharray="3,2" stroke-width="1.4" />
+                    <rect x="${Math.min(W - padR - 58, Math.max(padL + 2, xAt(firstPostIdx) - 27)).toFixed(1)}" y="${pTop + 2}" width="54" height="12" rx="3" fill="#064e3b" fill-opacity="0.9" stroke="#10b981" stroke-width="0.7" />
+                    <text x="${Math.min(W - padR - 31, Math.max(padL + 29, xAt(firstPostIdx))).toFixed(1)}" y="${pTop + 10.5}" text-anchor="middle" fill="#6ee7b7" font-size="7.5" font-weight="bold" font-family="monospace">BUY ENTRY</text>
+                `;
+            }
+
+            // Bottom panel: P/L segments (post-entry only)
             let pnlSegments = '';
-            for (let i = 1; i < n; i++) {
-                const x1 = xAt(i - 1).toFixed(1), y1 = yPnl(pnlDollars[i - 1]).toFixed(1);
-                const x2 = xAt(i).toFixed(1), y2 = yPnl(pnlDollars[i]).toFixed(1);
-                const col = pnlDollars[i] >= 0 ? '#10b981' : '#f43f5e';
-                pnlSegments += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-width="2" />`;
-            }
-            const lastPnlD = pnlDollars[n - 1] ?? 0;
-            const lastPnlColor = lastPnlD >= 0 ? '#10b981' : '#f43f5e';
-            const pnlAreaPts = `${xAt(0).toFixed(1)},${qMid.toFixed(1)} ` +
-                pnlDollars.map((d, i) => `${xAt(i).toFixed(1)},${yPnl(d).toFixed(1)}`).join(' ') +
-                ` ${xAt(n - 1).toFixed(1)},${qMid.toFixed(1)}`;
-
-            // Start & End markers
-            const startX = xAt(0).toFixed(1), startY = yPrice(prices[0]).toFixed(1);
-            const endX = xAt(n - 1).toFixed(1), endY = yPrice(prices[n - 1]).toFixed(1);
-            const endPnlY = yPnl(lastPnlD).toFixed(1);
-
-            // Interactive hit columns for hover tooltip
-            const colWidth = n === 1 ? plotW : Math.max(4, plotW / n);
-            let hoverZones = '';
+            let lastValidPnlIdx = -1;
+            let firstValidPnlIdx = -1;
             for (let i = 0; i < n; i++) {
-                const cx = xAt(i);
-                const rx = (n === 1 ? padL : Math.max(padL, cx - colWidth / 2)).toFixed(1);
-                const rw = (n === 1 ? plotW : colWidth).toFixed(1);
-                hoverZones += `<rect x="${rx}" y="${pTop}" width="${rw}" height="${qBot - pTop}" fill="transparent" class="cursor-crosshair" onmouseenter="highlightOptionChartPoint(${i}, ${cx.toFixed(1)}, ${yPrice(prices[i]).toFixed(1)}, ${yPnl(pnlDollars[i]).toFixed(1)})" />`;
+                if (pnlDollarsRaw[i] !== null) {
+                    if (firstValidPnlIdx < 0) firstValidPnlIdx = i;
+                    if (lastValidPnlIdx >= 0 && lastValidPnlIdx === i - 1) {
+                        const x1 = xAt(i - 1).toFixed(1), y1 = yPnl(pnlDollarsRaw[i - 1]).toFixed(1);
+                        const x2 = xAt(i).toFixed(1), y2 = yPnl(pnlDollarsRaw[i]).toFixed(1);
+                        const col = pnlDollarsRaw[i] >= 0 ? '#10b981' : '#f43f5e';
+                        pnlSegments += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-width="2" />`;
+                    }
+                    lastValidPnlIdx = i;
+                }
             }
+
+            const lastPnlD = lastValidPnlIdx >= 0 ? pnlDollarsRaw[lastValidPnlIdx] : 0;
+            const lastPnlPct = lastValidPnlIdx >= 0 ? (pnlPctsRaw[lastValidPnlIdx] ?? 0) : 0;
+            const lastPnlColor = lastPnlD >= 0 ? '#10b981' : '#f43f5e';
+
+            let pnlAreaSvg = '';
+            if (firstValidPnlIdx >= 0 && lastValidPnlIdx > firstValidPnlIdx) {
+                const postPts = [];
+                for (let i = firstValidPnlIdx; i <= lastValidPnlIdx; i++) {
+                    if (pnlDollarsRaw[i] !== null) {
+                        postPts.push(`${xAt(i).toFixed(1)},${yPnl(pnlDollarsRaw[i]).toFixed(1)}`);
+                    }
+                }
+                if (postPts.length >= 2) {
+                    const areaStr = `${xAt(firstValidPnlIdx).toFixed(1)},${qMid.toFixed(1)} ${postPts.join(' ')} ${xAt(lastValidPnlIdx).toFixed(1)},${qMid.toFixed(1)}`;
+                    pnlAreaSvg = `<polygon points="${areaStr}" fill="${lastPnlColor}" fill-opacity="0.08" />`;
+                }
+            }
+
+            // Start & End markers for option & stock
+            const buyMarkerIdx = firstPostIdx >= 0 ? firstPostIdx : 0;
+            const buyPriceVal = pricesRaw[buyMarkerIdx];
+            const lastOptIdx = (() => { for (let i = n - 1; i >= 0; i--) if (pricesRaw[i] !== null) return i; return -1; })();
+            const lastStkIdx = (() => { for (let i = n - 1; i >= 0; i--) if (stockRaw[i] !== null) return i; return -1; })();
+
+            const lowPVal = validPrices.length ? Math.min(...validPrices) : entryPrice;
+            const highPVal = validPrices.length ? Math.max(...validPrices) : entryPrice;
+            const undSym = contract.underlying || 'STOCK';
+            const stockHeaderTxt = hasStock
+                ? `${undSym}: $${Math.min(...validStocks).toFixed(2)}–$${Math.max(...validStocks).toFixed(2)}`
+                : `${undSym}: N/A`;
+
+            // Precompute hover columns for interactive scrub/hover overlay
+            const cols = points.map((pt, i) => {
+                const pv = pricesRaw[i];
+                const sv = stockRaw[i];
+                const qd = pnlDollarsRaw[i];
+                return {
+                    x: xAt(i),
+                    yPrice: pv !== null ? yPrice(pv) : null,
+                    yStock: sv !== null ? yStock(sv) : null,
+                    yPnl: qd !== null ? yPnl(qd) : null,
+                    pt,
+                };
+            });
+            const canPan = maxOffset > 0;
+            window._optChartState = { W, H, padL, padR, plotW, pTop, pBot, qTop, qBot, n, cols, canPan };
+            const cursorStyle = (window._optPanState.dragState.active) ? 'grabbing' : (canPan ? 'grab' : 'crosshair');
 
             return `
-                <svg id="optHistorySvg" viewBox="0 0 ${W} ${H}" class="w-full h-auto select-none" onmouseleave="clearOptionChartHighlight()">
+                <svg id="optHistorySvg" viewBox="0 0 ${W} ${H}" class="w-full h-auto select-none">
                     <defs>
                         <linearGradient id="optPriceGrad" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.22" />
@@ -18074,29 +19419,43 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                     ${gridHtml}
 
-                    <!-- Top Panel: Contract Price -->
-                    <text x="${padL}" y="14" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">CONTRACT PRICE ($ / SHARE) — MINUTE BY MINUTE</text>
-                    <text x="${W - padR}" y="14" text-anchor="end" fill="#94a3b8" font-size="9" font-family="monospace">Entry: $${entryPrice.toFixed(2)} · Low: $${Math.min(...prices).toFixed(2)} · High: $${Math.max(...prices).toFixed(2)}</text>
+                    <!-- Top Panel Header -->
+                    <text x="${padL}" y="14" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">OPTION PRICE ($ · LEFT) &amp; ${escSvg(undSym)} STOCK ($ · RIGHT)</text>
+                    <text x="${W - padR}" y="14" text-anchor="end" fill="#94a3b8" font-size="8.8" font-family="monospace">Entry: $${entryPrice.toFixed(2)} · Opt: $${lowPVal.toFixed(2)}–$${highPVal.toFixed(2)} · <tspan fill="#d8b4fe">${escSvg(stockHeaderTxt)}</tspan></text>
 
                     <rect x="${padL}" y="${pTop}" width="${plotW}" height="${pBot - pTop}" fill="#020617" fill-opacity="0.45" stroke="#1e293b" stroke-width="1" rx="4" />
                     <line x1="${padL}" y1="${entryY}" x2="${W - padR}" y2="${entryY}" stroke="#eab308" stroke-opacity="0.7" stroke-dasharray="4,3" stroke-width="1.1" />
-                    <text x="${padL - 6}" y="${pTop + 8}" text-anchor="end" fill="#94a3b8" font-size="8.5" font-family="monospace">$${hiP.toFixed(2)}</text>
-                    <text x="${padL - 6}" y="${entryY}" text-anchor="end" fill="#facc15" font-size="8.5" font-family="monospace">$${entryPrice.toFixed(2)}</text>
-                    <text x="${padL - 6}" y="${pBot - 2}" text-anchor="end" fill="#94a3b8" font-size="8.5" font-family="monospace">$${loP.toFixed(2)}</text>
 
-                    ${n > 1 ? `<polygon points="${priceArea}" fill="url(#optPriceGrad)" />` : ''}
-                    ${n > 1 ? `<polyline fill="none" stroke="#22d3ee" stroke-width="2" points="${pricePoly}" />` : ''}
-                    <circle cx="${startX}" cy="${startY}" r="4" fill="#38bdf8" stroke="#020617" stroke-width="1.2"><title>Buy @ $${prices[0].toFixed(2)}</title></circle>
-                    <circle cx="${endX}" cy="${endY}" r="4.5" fill="${isClosed ? '#f59e0b' : '#22d3ee'}" stroke="#020617" stroke-width="1.2"><title>${isClosed ? 'Sold' : 'Current'} @ $${prices[n - 1].toFixed(2)}</title></circle>
+                    <!-- Left Y-axis: Option ($) -->
+                    <text x="${padL - 6}" y="${pTop + 8}" text-anchor="end" fill="#22d3ee" font-size="8.5" font-family="monospace">$${hiP.toFixed(2)}</text>
+                    <text x="${padL - 6}" y="${entryY}" text-anchor="end" fill="#facc15" font-size="8.5" font-family="monospace">$${entryPrice.toFixed(2)}</text>
+                    <text x="${padL - 6}" y="${pBot - 2}" text-anchor="end" fill="#22d3ee" font-size="8.5" font-family="monospace">$${loP.toFixed(2)}</text>
+
+                    <!-- Right Y-axis: Underlying Stock ($) -->
+                    ${hasStock ? `
+                        <text x="${W - padR + 6}" y="${pTop + 8}" text-anchor="start" fill="#c084fc" font-size="8.5" font-family="monospace">$${hiS.toFixed(2)}</text>
+                        <text x="${W - padR + 6}" y="${((pTop + pBot) / 2 + 3).toFixed(1)}" text-anchor="start" fill="#a855f7" font-size="8.5" font-family="monospace">$${((hiS + loS) / 2).toFixed(2)}</text>
+                        <text x="${W - padR + 6}" y="${pBot - 2}" text-anchor="start" fill="#c084fc" font-size="8.5" font-family="monospace">$${loS.toFixed(2)}</text>
+                    ` : `
+                        <text x="${W - padR + 6}" y="${((pTop + pBot) / 2 + 3).toFixed(1)}" text-anchor="start" fill="#64748b" font-size="8" font-family="monospace">Stock N/A</text>
+                    `}
+
+                    ${priceAreas}
+                    ${pricePathD ? `<path d="${pricePathD}" fill="none" stroke="#22d3ee" stroke-width="2" />` : ''}
+                    ${stockPathD ? `<path d="${stockPathD}" fill="none" stroke="#c084fc" stroke-width="1.75" stroke-opacity="0.9" />` : ''}
+                    ${entryDividerHtml}
+
+                    ${buyPriceVal !== null && buyPriceVal !== undefined ? `<circle cx="${xAt(buyMarkerIdx).toFixed(1)}" cy="${yPrice(buyPriceVal).toFixed(1)}" r="4" fill="#38bdf8" stroke="#020617" stroke-width="1.2"><title>Buy @ $${buyPriceVal.toFixed(2)}</title></circle>` : ''}
+                    ${lastOptIdx >= 0 ? `<circle cx="${xAt(lastOptIdx).toFixed(1)}" cy="${yPrice(pricesRaw[lastOptIdx]).toFixed(1)}" r="4.5" fill="${isClosed ? '#f59e0b' : '#22d3ee'}" stroke="#020617" stroke-width="1.2"><title>${isClosed ? 'Sold' : 'Current'} @ $${pricesRaw[lastOptIdx].toFixed(2)}</title></circle>` : ''}
+                    ${lastStkIdx >= 0 ? `<circle cx="${xAt(lastStkIdx).toFixed(1)}" cy="${yStock(stockRaw[lastStkIdx]).toFixed(1)}" r="3.4" fill="#c084fc" stroke="#020617" stroke-width="1.1"><title>${escSvg(undSym)} @ $${stockRaw[lastStkIdx].toFixed(2)}</title></circle>` : ''}
 
                     <!-- Bottom Panel: P/L ($ and %) -->
-                    <text x="${padL}" y="156" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">PROFIT / LOSS ($ &amp; %) — MINUTE BY MINUTE</text>
-                    <text x="${W - padR}" y="156" text-anchor="end" fill="${lastPnlColor}" font-size="9.5" font-weight="bold" font-family="monospace">${isClosed ? 'Total Realized:' : 'Current P/L:'} ${fmtSignedDollars(lastPnlD)} (${(pnlPcts[n - 1] ?? 0) >= 0 ? '+' : ''}${(pnlPcts[n - 1] ?? 0).toFixed(2)}%)</text>
+                    <text x="${padL}" y="166" fill="#cbd5e1" font-size="9.5" font-weight="bold" font-family="monospace">PROFIT / LOSS ($ &amp; %) — MINUTE BY MINUTE</text>
+                    <text x="${W - padR}" y="166" text-anchor="end" fill="${lastValidPnlIdx >= 0 ? lastPnlColor : '#94a3b8'}" font-size="9.5" font-weight="bold" font-family="monospace">${lastValidPnlIdx >= 0 ? `${isClosed ? 'Realized:' : 'Current P/L:'} ${fmtSignedDollars(lastPnlD)} (${lastPnlPct >= 0 ? '+' : ''}${lastPnlPct.toFixed(2)}%)` : 'PRE-ENTRY STOCK CONTEXT'}</text>
 
                     <rect x="${padL}" y="${qTop}" width="${plotW}" height="${qBot - qTop}" fill="#020617" fill-opacity="0.45" stroke="#1e293b" stroke-width="1" rx="4" />
                     <line x1="${padL}" y1="${qMid.toFixed(1)}" x2="${W - padR}" y2="${qMid.toFixed(1)}" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" />
 
-                    <!-- Left Y-axis ($) & Right Y-axis (%) -->
                     <text x="${padL - 6}" y="${qTop + 8}" text-anchor="end" fill="#34d399" font-size="8.5" font-family="monospace">+$${maxAbsD.toFixed(0)}</text>
                     <text x="${padL - 6}" y="${(qMid + 3).toFixed(1)}" text-anchor="end" fill="#64748b" font-size="8.5" font-family="monospace">$0</text>
                     <text x="${padL - 6}" y="${qBot - 2}" text-anchor="end" fill="#fb7185" font-size="8.5" font-family="monospace">-$${maxAbsD.toFixed(0)}</text>
@@ -18105,56 +19464,172 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <text x="${W - padR + 6}" y="${(qMid + 3).toFixed(1)}" text-anchor="start" fill="#64748b" font-size="8.5" font-family="monospace">0%</text>
                     <text x="${W - padR + 6}" y="${qBot - 2}" text-anchor="start" fill="#fb7185" font-size="8.5" font-family="monospace">-${maxAbsPct.toFixed(1)}%</text>
 
-                    ${n > 1 ? `<polygon points="${pnlAreaPts}" fill="${lastPnlColor}" fill-opacity="0.08" />` : ''}
+                    ${pnlAreaSvg}
                     ${pnlSegments}
-                    <circle cx="${endX}" cy="${endPnlY}" r="4" fill="${lastPnlColor}" stroke="#020617" stroke-width="1.2" />
+                    ${lastValidPnlIdx >= 0 ? `<circle cx="${xAt(lastValidPnlIdx).toFixed(1)}" cy="${yPnl(lastPnlD).toFixed(1)}" r="4" fill="${lastPnlColor}" stroke="#020617" stroke-width="1.2" />` : ''}
 
-                    <!-- Crosshair elements (updated on hover) -->
+                    <!-- Interactive Crosshair Layer -->
                     <line id="optHoverLine" x1="0" y1="${pTop}" x2="0" y2="${qBot}" stroke="#e2e8f0" stroke-opacity="0.45" stroke-dasharray="2,2" stroke-width="1" class="hidden" />
                     <circle id="optHoverDotP" cx="0" cy="0" r="4" fill="#22d3ee" stroke="#020617" stroke-width="1.5" class="hidden" />
+                    <circle id="optHoverDotStk" cx="0" cy="0" r="3.8" fill="#c084fc" stroke="#020617" stroke-width="1.5" class="hidden" />
                     <circle id="optHoverDotPnl" cx="0" cy="0" r="4" fill="#f8fafc" stroke="#020617" stroke-width="1.5" class="hidden" />
 
-                    ${hoverZones}
+                    <rect id="optHoverOverlay" x="${padL}" y="${pTop}" width="${plotW}" height="${qBot - pTop}" fill="transparent" style="cursor: ${cursorStyle};" />
                 </svg>
             `;
         }
 
-        function highlightOptionChartPoint(idx, cx, cyP, cyPnl) {
-            const pt = activeOptionHistoryPoints[idx];
-            if (!pt) return;
+        function mountOptionChartInteractions() {
+            const overlay = document.getElementById('optHoverOverlay');
+            if (!overlay) return;
+            overlay.addEventListener('mousemove', onOptChartMouseMove);
+            overlay.addEventListener('mouseleave', () => {
+                if (window._optPanState.dragState.active) return;
+                window._optPanState.hoverIdx = null;
+                clearOptionChartHighlight();
+            });
+            overlay.addEventListener('pointerdown', (ev) => {
+                if (ev.button !== undefined && ev.button !== 0) return;
+                if (!window._optChartState || !window._optChartState.canPan) return;
+                ev.preventDefault();
+                window._optPanState.dragState = {
+                    active: true,
+                    startX: ev.clientX,
+                    lastX: ev.clientX,
+                    accumPx: 0,
+                };
+                overlay.style.cursor = 'grabbing';
+            });
+            overlay.addEventListener('wheel', (ev) => {
+                const p = window._optActiveRenderParams;
+                if (!p || !Array.isArray(p.allPoints) || p.allPoints.length < 2) return;
+                const isHorizontal = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) || ev.shiftKey;
+                if (!isHorizontal) return;
+                ev.preventDefault();
+                const rawDelta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+                const stepBars = Math.round(-rawDelta / 16) || (rawDelta < 0 ? 1 : -1);
+                const totalLen = p.allPoints.length;
+                const winBars = window._optPanState.windowBars;
+                const wSize = winBars === 0 ? totalLen : Math.min(totalLen, Math.max(2, winBars));
+                const maxOff = Math.max(0, totalLen - wSize);
+                const nextOff = Math.max(0, Math.min(maxOff, (window._optPanState.panOffset || 0) + stepBars));
+                if (nextOff !== window._optPanState.panOffset) {
+                    window._optPanState.panOffset = nextOff;
+                    window._optPanState.hoverIdx = null;
+                    _rerenderActiveOptChart();
+                }
+            }, { passive: false });
+
+            if (window._optPanState.hoverIdx !== null && window._optChartState && Array.isArray(window._optChartState.cols) && window._optChartState.cols.length > 0) {
+                const clamped = Math.min(window._optChartState.cols.length - 1, Math.max(0, window._optPanState.hoverIdx));
+                applyOptChartHover(clamped);
+            }
+        }
+
+        function onOptChartMouseMove(ev) {
+            if (window._optPanState.dragState.active) return;
+            const st = window._optChartState;
+            const svg = document.getElementById('optHistorySvg');
+            if (!st || !svg || !Array.isArray(st.cols) || st.cols.length === 0) return;
+            const rect = svg.getBoundingClientRect();
+            if (!rect || rect.width <= 0) return;
+            const svgX = ((ev.clientX - rect.left) / rect.width) * (st.W || 740);
+            let bestIdx = 0;
+            let bestDist = Infinity;
+            for (let i = 0; i < st.cols.length; i++) {
+                const d = Math.abs(st.cols[i].x - svgX);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestIdx = i;
+                }
+            }
+            window._optPanState.hoverIdx = bestIdx;
+            applyOptChartHover(bestIdx);
+        }
+
+        function applyOptChartHover(idx) {
+            const st = window._optChartState;
+            if (!st || !Array.isArray(st.cols) || idx === null || idx === undefined) {
+                clearOptionChartHighlight();
+                return;
+            }
+            const col = st.cols[idx];
+            if (!col || !col.pt) return;
+            const pt = col.pt;
+            const cx = col.x.toFixed(1);
+
             const line = document.getElementById('optHoverLine');
             const dotP = document.getElementById('optHoverDotP');
+            const dotS = document.getElementById('optHoverDotStk');
             const dotQ = document.getElementById('optHoverDotPnl');
             const readout = document.getElementById('optChartHoverReadout');
+
             if (line) { line.setAttribute('x1', cx); line.setAttribute('x2', cx); line.classList.remove('hidden'); }
-            if (dotP) { dotP.setAttribute('cx', cx); dotP.setAttribute('cy', cyP); dotP.classList.remove('hidden'); }
-            if (dotQ) {
-                dotQ.setAttribute('cx', cx);
-                dotQ.setAttribute('cy', cyPnl);
-                dotQ.setAttribute('fill', (pt.pnl_dollars ?? 0) >= 0 ? '#10b981' : '#f43f5e');
-                dotQ.classList.remove('hidden');
+            if (dotP) {
+                if (col.yPrice !== null) {
+                    dotP.setAttribute('cx', cx);
+                    dotP.setAttribute('cy', col.yPrice.toFixed(1));
+                    dotP.classList.remove('hidden');
+                } else {
+                    dotP.classList.add('hidden');
+                }
             }
+            if (dotS) {
+                if (col.yStock !== null) {
+                    dotS.setAttribute('cx', cx);
+                    dotS.setAttribute('cy', col.yStock.toFixed(1));
+                    dotS.classList.remove('hidden');
+                } else {
+                    dotS.classList.add('hidden');
+                }
+            }
+            if (dotQ) {
+                if (col.yPnl !== null) {
+                    dotQ.setAttribute('cx', cx);
+                    dotQ.setAttribute('cy', col.yPnl.toFixed(1));
+                    dotQ.setAttribute('fill', (pt.pnl_dollars ?? 0) >= 0 ? '#10b981' : '#f43f5e');
+                    dotQ.classList.remove('hidden');
+                } else {
+                    dotQ.classList.add('hidden');
+                }
+            }
+
             if (readout) {
-                const dPnl = safeNum(pt.pnl_dollars) ?? 0;
-                const pPnl = safeNum(pt.pnl_pct) ?? 0;
-                const pDiff = safeNum(pt.price_change_dollars) ?? 0;
-                const cls = dPnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
-                readout.innerHTML = `<span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span> · Price <strong class="text-cyan-300">$${Number(pt.price).toFixed(2)}</strong> (${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)}) · Value <strong class="text-slate-100">$${Number(pt.market_value).toFixed(2)}</strong> · P/L <strong class="${cls}">${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%)</strong> <span class="text-slate-500">[${escSvg(pt.source || 'poll')}]</span>`;
+                const stkVal = safeNum(pt.stock_price);
+                const stkPart = stkVal !== null ? ` · Stock <strong class="text-purple-300">$${stkVal.toFixed(2)}</strong>` : '';
+                const optVal = safeNum(pt.price);
+                const optPart = optVal !== null ? ` · Opt <strong class="text-cyan-300">$${optVal.toFixed(2)}</strong>` : ' · Opt <span class="text-slate-500">--</span>';
+                if (pt.pre_entry) {
+                    readout.innerHTML = `<span class="px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/60 text-[9px] font-bold mr-1">PRE-ENTRY</span><span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span>${stkPart}${optPart} <span class="text-slate-500">[${escSvg(pt.source || 'pre_entry_bar')}]</span>`;
+                } else {
+                    const dPnl = safeNum(pt.pnl_dollars) ?? 0;
+                    const pPnl = safeNum(pt.pnl_pct) ?? 0;
+                    const pDiff = safeNum(pt.price_change_dollars) ?? 0;
+                    const cls = dPnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
+                    const diffTxt = optVal !== null ? ` (${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)})` : '';
+                    const mvTxt = pt.market_value != null ? ` · Value <strong class="text-slate-100">$${Number(pt.market_value).toFixed(2)}</strong>` : '';
+                    readout.innerHTML = `<span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span>${optPart}${diffTxt}${stkPart}${mvTxt} · P/L <strong class="${cls}">${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%)</strong> <span class="text-slate-500">[${escSvg(pt.source || 'poll')}]</span>`;
+                }
             }
         }
 
         function clearOptionChartHighlight() {
             const line = document.getElementById('optHoverLine');
             const dotP = document.getElementById('optHoverDotP');
+            const dotS = document.getElementById('optHoverDotStk');
             const dotQ = document.getElementById('optHoverDotPnl');
             const readout = document.getElementById('optChartHoverReadout');
             if (line) line.classList.add('hidden');
             if (dotP) dotP.classList.add('hidden');
+            if (dotS) dotS.classList.add('hidden');
             if (dotQ) dotQ.classList.add('hidden');
-            if (readout) readout.innerHTML = `<span class="text-slate-500">Hover over any minute on the chart to inspect exact contract price and P/L ($ and %).</span>`;
+            if (readout) readout.innerHTML = `<span class="text-slate-500">Hover over any minute on the chart to inspect exact option price, underlying stock price, and P/L ($ and %).</span>`;
         }
 
         function renderOptionDrilldown() {
+            if (window._optPanState && (window._optPanState.dragState.active || window._optPanState.rangeDragging)) {
+                return;
+            }
             const data = latestOptionHistory || { open_contracts: [], closed_contracts: [], open_summary: {}, closed_summary: {} };
             const openList = data.open_contracts || [];
             const closedList = data.closed_contracts || [];
@@ -18231,6 +19706,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>`;
                 detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session.</div>`;
                 activeOptionHistoryPoints = [];
+                window._optChartState = null;
+                window._optActiveRenderParams = null;
                 return;
             }
 
@@ -18240,6 +19717,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             activeKey = getKey(selectedItem);
             if (isBuyer) selectedBuyerContract = activeKey;
             else selectedSellerTradeId = activeKey;
+
+            const scopedKey = `${optionDrilldownMode}:${activeKey}`;
+            if (window._optPanState.activeContractKey !== scopedKey) {
+                resetOptPanView(scopedKey);
+            }
 
             listEl.innerHTML = items.map(c => {
                 const k = getKey(c);
@@ -18279,7 +19761,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             // Render Right Detail Pane for selectedItem
             const pts = selectedItem.history || [];
-            activeOptionHistoryPoints = pts;
+            const prePts = selectedItem.pre_entry_history || [];
+            const allChartPts = _mergeOptionContractPoints(selectedItem);
+            activeOptionHistoryPoints = allChartPts;
+
             const entryP = safeNum(selectedItem.entry_price) ?? 0;
             const endP = safeNum(isBuyer ? selectedItem.current_price : selectedItem.exit_price) ?? 0;
             const costB = safeNum(selectedItem.cost_basis) ?? 0;
@@ -18298,19 +19783,27 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 ? (selectedItem.purchased_at_utc ? Math.max(0, (Date.now() - Date.parse(selectedItem.purchased_at_utc)) / 60000) : pts.length)
                 : (safeNum(selectedItem.hold_minutes) ?? pts.length);
 
-            const ledgerRows = [...pts].reverse().map(pt => {
-                const dPnl = safeNum(pt.pnl_dollars) ?? 0;
-                const pPnl = safeNum(pt.pnl_pct) ?? 0;
-                const pDiff = safeNum(pt.price_change_dollars) ?? 0;
-                const pCls = dPnl >= 0 ? 'text-emerald-400' : 'text-rose-400';
+            const ledgerRows = [...allChartPts].reverse().map(pt => {
+                const stkP = safeNum(pt.stock_price);
+                const optP = safeNum(pt.price);
+                const isPre = !!pt.pre_entry;
+                const dPnl = isPre ? null : safeNum(pt.pnl_dollars);
+                const pPnl = isPre ? null : safeNum(pt.pnl_pct);
+                const pDiff = isPre ? null : safeNum(pt.price_change_dollars);
+                const pCls = (dPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400';
+                const rowBg = isPre ? 'bg-slate-900/35 hover:bg-slate-900/60' : 'hover:bg-slate-900/60';
                 return `
-                    <tr class="hover:bg-slate-900/60">
-                        <td class="px-3 py-1.5 text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</td>
-                        <td class="px-3 py-1.5 text-right text-cyan-300 font-semibold">$${Number(pt.price).toFixed(2)}</td>
-                        <td class="px-3 py-1.5 text-right ${pDiff >= 0 ? 'text-emerald-300' : 'text-rose-300'}">${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)}</td>
-                        <td class="px-3 py-1.5 text-right text-slate-200">$${Number(pt.market_value).toFixed(2)}</td>
-                        <td class="px-3 py-1.5 text-right font-bold ${pCls}">${fmtSignedDollars(dPnl)}</td>
-                        <td class="px-3 py-1.5 text-right font-bold ${pCls}">${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%</td>
+                    <tr class="${rowBg}">
+                        <td class="px-3 py-1.5 text-slate-300 whitespace-nowrap">
+                            ${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}
+                            ${isPre ? `<span class="ml-1 px-1 py-0.2 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/50 text-[9px] font-bold">PRE</span>` : ''}
+                        </td>
+                        <td class="px-3 py-1.5 text-right text-cyan-300 font-semibold">${optP !== null ? `$${optP.toFixed(2)}` : '--'}</td>
+                        <td class="px-3 py-1.5 text-right text-purple-300 font-semibold">${stkP !== null ? `$${stkP.toFixed(2)}` : '--'}</td>
+                        <td class="px-3 py-1.5 text-right ${pDiff === null ? 'text-slate-500' : (pDiff >= 0 ? 'text-emerald-300' : 'text-rose-300')}">${pDiff === null ? '--' : `${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)}`}</td>
+                        <td class="px-3 py-1.5 text-right text-slate-200">${(!isPre && pt.market_value != null) ? `$${Number(pt.market_value).toFixed(2)}` : '--'}</td>
+                        <td class="px-3 py-1.5 text-right font-bold ${dPnl === null ? 'text-slate-500' : pCls}">${dPnl === null ? '--' : fmtSignedDollars(dPnl)}</td>
+                        <td class="px-3 py-1.5 text-right font-bold ${pPnl === null ? 'text-slate-500' : pCls}">${pPnl === null ? '--' : `${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%`}</td>
                         <td class="px-3 py-1.5 text-center text-slate-500">${escSvg(pt.source || '')}</td>
                     </tr>
                 `;
@@ -18319,6 +19812,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const detailHeaderMeta = selectedItem.strike
                 ? `${selectedItem.underlying} $${Number(selectedItem.strike).toFixed(selectedItem.strike % 1 === 0 ? 0 : 2)} ${selectedItem.right} · Exp ${selectedItem.expiry || '--'} · Qty ${selectedItem.qty}`
                 : `${selectedItem.underlying} · Qty ${selectedItem.qty}`;
+
+            const chartSvgHtml = buildOptionHistoryChartSvg(allChartPts, selectedItem, !isBuyer, false);
+            const timelineHint = prePts.length > 0
+                ? `${allChartPts.length}m (${prePts.length}m pre + ${pts.length}m hold)`
+                : `${pts.length}m hold`;
 
             detailEl.innerHTML = `
                 <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
@@ -18333,7 +19831,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </div>
                     </div>
                     <div class="text-right mono text-[10px] text-slate-400">
-                        <div>Source: <span class="text-slate-200">${escSvg(selectedItem.history_source || 'live')}</span></div>
+                        <div>Source: <span class="text-slate-200">${escSvg(selectedItem.history_source || 'live')}</span> · <span class="text-cyan-300">${escSvg(timelineHint)}</span></div>
                         ${(isBuyer ? selectedItem.buy_reason : selectedItem.reason) ? `<div class="max-w-[240px] truncate" title="${escSvg(isBuyer ? selectedItem.buy_reason : selectedItem.reason)}">Trigger: <span class="text-slate-300">${escSvg(isBuyer ? selectedItem.buy_reason : selectedItem.reason)}</span></div>` : ''}
                     </div>
                 </div>
@@ -18362,20 +19860,51 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- 2-Panel Chart + Hover Bar -->
+                <!-- 2-Panel Chart + Pan Toolbar + Hover Bar -->
                 <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3.5 space-y-2">
-                    <div id="optChartHoverReadout" class="text-[11px] mono bg-slate-900/90 border border-slate-800 rounded-lg px-3 py-1.5 min-h-[28px] flex items-center">
-                        <span class="text-slate-500">Hover over any minute on the chart to inspect exact contract price and P/L ($ and %).</span>
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <span id="optModeBadge" class="text-[9.5px] mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">LIVE</span>
+                            <div id="optWindowButtons" class="inline-flex items-center rounded-lg bg-slate-900/90 border border-slate-800 p-0.5 text-[10px] mono">
+                                <button type="button" data-opt-win="20" onclick="setOptWindowBars(20)" class="opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">20m</button>
+                                <button type="button" data-opt-win="60" onclick="setOptWindowBars(60)" class="opt-win-btn px-1.5 py-0.5 rounded bg-cyan-600 text-white font-semibold transition">1h</button>
+                                <button type="button" data-opt-win="120" onclick="setOptWindowBars(120)" class="opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">2h</button>
+                                <button type="button" data-opt-win="240" onclick="setOptWindowBars(240)" class="opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">4h</button>
+                                <button type="button" data-opt-win="390" onclick="setOptWindowBars(390)" class="opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">6.5h</button>
+                                <button type="button" data-opt-win="0" onclick="setOptWindowBars(0)" class="opt-win-btn px-1.5 py-0.5 rounded text-slate-400 hover:text-white transition">All</button>
+                            </div>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2.5 text-[10px] mono text-slate-400">
+                            <span class="hidden sm:inline">Drag chart to slide history</span>
+                            <span class="inline-flex items-center gap-1 text-cyan-300"><span class="w-2.5 h-0.5 bg-cyan-400 inline-block"></span>Option ($)</span>
+                            <span class="inline-flex items-center gap-1 text-purple-300"><span class="w-2.5 h-0.5 bg-purple-400 inline-block"></span>${escSvg(selectedItem.underlying || 'Stock')} ($)</span>
+                            <span class="inline-flex items-center gap-1 text-yellow-300"><span class="w-2.5 h-0.5 bg-yellow-400 inline-block border-t border-dashed"></span>Entry</span>
+                        </div>
                     </div>
-                    <div>
-                        ${buildOptionHistoryChartSvg(pts, selectedItem, !isBuyer)}
+                    <div id="optChartHoverReadout" class="text-[11px] mono bg-slate-900/90 border border-slate-800 rounded-lg px-3 py-1.5 min-h-[28px] flex items-center">
+                        <span class="text-slate-500">Hover over any minute on the chart to inspect exact option price, underlying stock price, and P/L ($ and %).</span>
+                    </div>
+                    <div id="optChartHost">
+                        ${chartSvgHtml}
+                    </div>
+                    <div id="optTimelineBar" class="pt-1.5 border-t border-slate-800/70 flex flex-wrap items-center gap-2 text-[10px] mono text-slate-400">
+                        <div class="flex items-center gap-1 shrink-0">
+                            <button type="button" id="btnOptOldest" onclick="stepOptPan('oldest')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Jump to earliest bar">|&lt;</button>
+                            <button type="button" id="btnOptBack" onclick="stepOptPan('back')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide older">&lt;</button>
+                        </div>
+                        <input id="optPanRange" type="range" min="0" max="0" value="0" step="1" onpointerdown="window._optPanState.rangeDragging=true" oninput="onOptRangeInput(this)" onpointerup="window._optPanState.rangeDragging=false" onchange="window._optPanState.rangeDragging=false" class="flex-1 min-w-[120px] h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400" title="Slide through pre-entry and contract history" />
+                        <div class="flex items-center gap-1 shrink-0">
+                            <button type="button" id="btnOptForward" onclick="stepOptPan('forward')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide newer">&gt;</button>
+                            <button type="button" id="btnOptLive" onclick="snapOptToLive()" class="px-2 py-0.5 rounded border font-semibold transition bg-slate-900 text-slate-400 border-slate-800" title="Snap back to live edge">Live</button>
+                        </div>
+                        <span id="optRangeSummary" class="text-[10px] text-slate-400 ml-auto truncate max-w-full"></span>
                     </div>
                 </div>
 
                 <!-- Minute-by-Minute History Table -->
                 <div class="rounded-xl border border-slate-800/80 bg-slate-950/50 overflow-hidden">
                     <div class="px-3.5 py-2 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                        <span>Minute-by-Minute History (${pts.length} bars)</span>
+                        <span>Minute-by-Minute History (${allChartPts.length} bars · ${pts.length}m hold${prePts.length ? ` · ${prePts.length}m pre-entry` : ''})</span>
                         <span class="font-normal text-slate-500">Newest First</span>
                     </div>
                     <div class="max-h-52 overflow-y-auto">
@@ -18383,8 +19912,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <thead class="sticky top-0 bg-slate-950 text-slate-400 border-b border-slate-800">
                                 <tr>
                                     <th class="px-3 py-1.5">Minute</th>
-                                    <th class="px-3 py-1.5 text-right">Price</th>
-                                    <th class="px-3 py-1.5 text-right">Price &Delta;</th>
+                                    <th class="px-3 py-1.5 text-right">Option</th>
+                                    <th class="px-3 py-1.5 text-right text-purple-300">Stock</th>
+                                    <th class="px-3 py-1.5 text-right">Opt &Delta;</th>
                                     <th class="px-3 py-1.5 text-right">Total Value</th>
                                     <th class="px-3 py-1.5 text-right">P/L ($)</th>
                                     <th class="px-3 py-1.5 text-right">P/L (%)</th>
@@ -18392,12 +19922,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-slate-800/50">
-                                ${ledgerRows || `<tr><td colspan="7" class="px-3 py-4 text-center text-slate-500">No minute bars yet.</td></tr>`}
+                                ${ledgerRows || `<tr><td colspan="8" class="px-3 py-4 text-center text-slate-500">No minute bars yet.</td></tr>`}
                             </tbody>
                         </table>
                     </div>
                 </div>
             `;
+
+            // Sync pan bar state & mount interactive hover/drag/wheel overlay
+            (() => {
+                const tot = allChartPts.length;
+                const reqW = window._optPanState.windowBars;
+                const wSz = reqW === 0 ? tot : Math.min(tot, Math.max(2, reqW || 60));
+                const maxOff = Math.max(0, tot - wSz);
+                const off = Math.max(0, Math.min(maxOff, window._optPanState.panOffset || 0));
+                const eIdx = tot - off;
+                const sIdx = Math.max(0, eIdx - wSz);
+                const vis = allChartPts.slice(sIdx, eIdx);
+                _updateOptToolbarControls(tot, vis.length, maxOff, off, vis[0], vis[vis.length - 1]);
+                mountOptionChartInteractions();
+            })();
         }
 
         document.addEventListener('keydown', (e) => {
@@ -19439,13 +20983,53 @@ class AdminCliProvider:
         def get_option_logs():
             try:
                 raw_limit = request.args.get("limit", "40000")
-                limit = max(20, min(5000, int(raw_limit)))
+                parsed_limit = int(raw_limit)
+                limit = (
+                    0 if parsed_limit <= 0 else max(20, min(100000, parsed_limit))
+                )
             except (TypeError, ValueError):
-                limit = 2000
-            payload = read_option_analysis_logs(
-                limit_per_file=5000, max_total_entries=limit
+                limit = 40000
+            try:
+                raw_per_file = request.args.get("limit_per_file", "50000")
+                limit_per_file = max(1000, min(200000, int(raw_per_file)))
+            except (TypeError, ValueError):
+                limit_per_file = 50000
+
+            stream_filter = (
+                request.args.get("stream")
+                or request.args.get("side")
+                or "all"
             )
-            return jsonify(status="ok", run_id=RUN_ID, **payload), 200
+            decision_filter = request.args.get("decision") or "all"
+            search_query = (
+                request.args.get("q")
+                or request.args.get("search")
+                or request.args.get("symbol")
+                or ""
+            )
+
+            payload = read_option_analysis_logs(
+                limit_per_file=limit_per_file,
+                max_total_entries=limit,
+                stream_filter=stream_filter,
+                decision_filter=decision_filter,
+                search_query=search_query,
+            )
+            return (
+                jsonify(
+                    status="ok",
+                    run_id=RUN_ID,
+                    filters={
+                        "stream": str(stream_filter).strip() or "all",
+                        "decision": str(decision_filter).strip() or "all",
+                        "q": str(search_query).strip(),
+                        "limit": limit,
+                        "limit_per_file": limit_per_file,
+                    },
+                    **payload,
+                ),
+                200,
+            )
 
         @app.post("/api/option-history/refresh")
         def refresh_option_history():
