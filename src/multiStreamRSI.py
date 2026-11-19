@@ -15985,6 +15985,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     <button type="button" id="btnCxOldest" onclick="stepCxPan('oldest')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Jump to earliest cached bar">|&lt;</button>
                                     <button type="button" id="btnCxBack" onclick="stepCxPan('back')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide older">&lt;</button>
                                 </div>
+                                <span id="cxActiveDateBadge" class="px-2 py-0.5 rounded bg-slate-900 border border-slate-700/80 text-cyan-300 font-bold whitespace-nowrap shrink-0" title="Visible chart date range">--</span>
                                 <input id="cxPanRange" type="range" min="0" max="0" value="0" step="1" class="flex-1 min-w-[120px] h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400" title="Slide through intraday and multi-session bar history" />
                                 <div class="flex items-center gap-1 shrink-0">
                                     <button type="button" id="btnCxForward" onclick="stepCxPan('forward')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide newer">&gt;</button>
@@ -17465,8 +17466,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         ? `Hover to inspect · Grab &amp; slide chart to view history (${escSvg(displayTzAbbr)})`
                         : `Flyover cursor over chart to inspect values (${escSvg(displayTzAbbr)})`;
                     const edgeLbl = isHist ? 'Window End' : 'Latest';
+                    const edgeDatePrefix = (lastCol && lastCol.dateLabel && lastCol.dateLabel !== '--') ? `${lastCol.dateLabel}, ` : '';
                     hud.innerHTML = `<span class="text-slate-400">${hint}</span>`
-                        + (lastCol ? `<span class="text-slate-300">${edgeLbl} <strong class="text-white">${escSvg(lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}</span>` : '');
+                        + (lastCol ? `<span class="text-slate-300">${edgeLbl} <strong class="text-white">${escSvg(edgeDatePrefix + lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}</span>` : '');
                 }
                 return;
             }
@@ -17485,8 +17487,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 const tBg = document.getElementById('cxHoverTimeBg');
                 const tTxt = document.getElementById('cxHoverTimeText');
-                const lbl = col.isProj ? '+1m' : col.tick;
-                const pillW = Math.max(34, lbl.length * 6.2 + 8);
+                const lbl = col.isProj ? '+1m' : `${col.shortDate ? col.shortDate + ' ' : ''}${col.tick}`;
+                const pillW = Math.max(38, lbl.length * 5.6 + 10);
                 const pillX = Math.max(2, Math.min(W - pillW - 2, x - pillW / 2));
                 if (tBg) {
                     tBg.setAttribute('x', pillX.toFixed(1));
@@ -17552,9 +17554,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             if (hud) {
+                const hoverDatePrefix = (!col.isProj && col.dateLabel && col.dateLabel !== '--') ? `${col.dateLabel}, ` : '';
                 const timeBadge = col.isProj
                     ? `<span class="text-cyan-300 font-bold">+1m Projection</span>`
-                    : `<span class="text-white font-bold">${escSvg(col.tick)} ${escSvg(displayTzAbbr)}</span>`;
+                    : `<span class="text-white font-bold">${escSvg(hoverDatePrefix + col.tick)} ${escSvg(displayTzAbbr)}</span>`;
                 const closePart = col.isProj
                     ? `<span>P̂: <strong class="text-cyan-300">${fmtPrice(col.close)}</strong></span>`
                     : `<span>Close: <strong class="text-slate-100">${fmtPrice(col.close)}</strong></span>`;
@@ -17707,15 +17710,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (Number.isNaN(d.getTime())) return formatMinuteTick(pt, 0);
             try {
                 if (displayTzIana) {
-                    const parts = new Intl.DateTimeFormat('en-US', {
+                    return new Intl.DateTimeFormat('en-US', {
                         timeZone: displayTzIana,
                         month: 'short',
                         day: 'numeric',
+                        year: 'numeric',
                         hour: '2-digit',
                         minute: '2-digit',
                         hour12: false,
                     }).format(d);
-                    return parts;
                 }
             } catch (_) {}
             return formatMinuteTick(pt, 0);
@@ -17750,6 +17753,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
             bar.classList.remove('hidden');
 
+            const dateBadge = document.getElementById('cxActiveDateBadge');
+            if (dateBadge) {
+                const sIso = startPt && (startPt.timestamp || startPt.minute_utc);
+                const eIso = endPt && (endPt.timestamp || endPt.minute_utc);
+                dateBadge.textContent = fmtDateRangeSpan(sIso, eIso);
+            }
+
             const rangeEl = document.getElementById('cxPanRange');
             if (rangeEl) {
                 rangeEl.max = String(maxOffset);
@@ -17780,10 +17790,19 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const summaryEl = document.getElementById('cxRangeSummary');
             if (summaryEl) {
-                const startTxt = _fmtCxRangeStamp(startPt);
-                const endTxt = _fmtCxRangeStamp(endPt);
-                summaryEl.textContent = `${startTxt} – ${endTxt} ${displayTzAbbr} · ${visibleCount}/${totalBars}m`
-                    + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                const sIso = startPt && (startPt.timestamp || startPt.minute_utc);
+                const eIso = endPt && (endPt.timestamp || endPt.minute_utc);
+                const sameDay = sIso && eIso && _localDateKey(sIso) === _localDateKey(eIso);
+                if (sameDay) {
+                    const dStr = fmtDateWithYear(sIso);
+                    summaryEl.textContent = `${dStr} · ${fmtClockShort(sIso)}–${fmtClockShort(eIso)} ${displayTzAbbr} · ${visibleCount}/${totalBars}m`
+                        + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                } else {
+                    const startTxt = _fmtCxRangeStamp(startPt);
+                    const endTxt = _fmtCxRangeStamp(endPt);
+                    summaryEl.textContent = `${startTxt} – ${endTxt} ${displayTzAbbr} · ${visibleCount}/${totalBars}m`
+                        + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                }
             }
         }
 
@@ -17923,7 +17942,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             _updateCxToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
 
-            const W = 640, H = 232, padL = 44, padR = 26;
+            const W = 640, H = 246, padL = 44, padR = 26;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => padL + (i / Math.max(1, n)) * plotW;
@@ -17960,46 +17979,65 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const nextX = xAt(n);
             const nextY = effProjectedNext !== null ? yP(effProjectedNext) : lastY;
 
-            // Adaptive vertical time gridlines + legible axis ticks across 20m..390m viewports
+            // Adaptive vertical time gridlines + legible axis ticks + date markers across 20m..390m viewports
             const labelStep = n <= 8 ? 1 : (n <= 24 ? 4 : (n <= 90 ? 15 : 30));
             const gridInterval = n <= 30 ? 1 : (n <= 90 ? 5 : (n <= 240 ? 15 : 30));
             let minuteGrid = '';
             let lastLabelX = -999;
+            let lastDateMarkerX = padL + 75;
             const latestBarX = xAt(n - 1);
+            const firstWindowTs = points[0]?.timestamp || points[0]?.minute_utc || '';
+            const lastWindowTs = points[n - 1]?.timestamp || points[n - 1]?.minute_utc || '';
+            let prevDayKey = _localDateKey(firstWindowTs);
+
             for (let i = 0; i < n; i++) {
                 const xNum = xAt(i);
                 const x = xNum.toFixed(1);
+                const ptTs = points[i]?.timestamp || points[i]?.minute_utc || '';
+                const curDayKey = _localDateKey(ptTs);
                 const tickStr = formatMinuteTick(points[i], i);
                 const minNum = parseInt((tickStr.split(':')[1] || ''), 10);
                 const isMajor5m = !Number.isNaN(minNum) && minNum % 5 === 0;
                 const isMajor15m = !Number.isNaN(minNum) && minNum % 15 === 0;
                 const isMajor30m = !Number.isNaN(minNum) && minNum % 30 === 0;
                 const isLatest = i === n - 1;
-                const showGridLine = i === 0 || isLatest || (gridInterval === 1)
+                const isDayRollover = i > 0 && curDayKey && prevDayKey && curDayKey !== prevDayKey;
+                if (curDayKey) prevDayKey = curDayKey;
+
+                const showGridLine = i === 0 || isLatest || isDayRollover || (gridInterval === 1)
                     || (gridInterval === 5 && isMajor5m)
                     || (gridInterval === 15 && isMajor15m)
                     || (gridInterval === 30 && isMajor30m);
 
                 if (showGridLine) {
-                    const isMajor = (gridInterval === 1) ? isMajor5m : (gridInterval <= 15 ? isMajor15m : isMajor30m);
-                    const strokeColor = isMajor ? '#64748b' : '#475569';
-                    const strokeOpacity = isMajor ? '0.75' : '0.45';
-                    const dash = isMajor ? '3,2' : '2,3';
+                    const isMajor = isDayRollover || (gridInterval === 1 ? isMajor5m : (gridInterval <= 15 ? isMajor15m : isMajor30m));
+                    const strokeColor = isDayRollover ? '#38bdf8' : (isMajor ? '#64748b' : '#475569');
+                    const strokeOpacity = isDayRollover ? '0.60' : (isMajor ? '0.75' : '0.45');
+                    const dash = isDayRollover ? '4,2' : (isMajor ? '3,2' : '2,3');
                     minuteGrid += `<line x1="${x}" y1="10" x2="${x}" y2="212" stroke="${strokeColor}" stroke-opacity="${strokeOpacity}" stroke-dasharray="${dash}" stroke-width="1"><title>Bar ${tickStr} ${escSvg(displayTzAbbr)}</title></line>`;
+                }
+
+                if (isDayRollover && xNum > lastDateMarkerX && (W - padR - xNum) > 22) {
+                    minuteGrid += `<text x="${x}" y="239" text-anchor="middle" fill="#7dd3fc" font-size="8.2" font-weight="bold" font-family="monospace">${escSvg(fmtShortDateOnly(ptTs))}</text>`;
+                    lastDateMarkerX = xNum + 58;
                 }
 
                 const fitsSpacing = (xNum - lastLabelX >= 42) && (isLatest || (latestBarX - xNum >= 42));
                 const isCandidate = i === 0 || (n <= 30 ? isMajor5m : (n <= 90 ? isMajor15m : isMajor30m)) || (i % labelStep === 0) || isLatest;
                 if (isCandidate && fitsSpacing) {
                     const textColor = isLatest ? '#cbd5e1' : '#94a3b8';
-                    minuteGrid += `<text x="${x}" y="225" text-anchor="middle" fill="${textColor}" font-size="8.5" font-family="monospace">${tickStr}</text>`;
+                    minuteGrid += `<text x="${x}" y="224" text-anchor="middle" fill="${textColor}" font-size="8.5" font-family="monospace">${tickStr}</text>`;
                     lastLabelX = xNum;
                 }
+            }
+            const windowDateBanner = fmtDateRangeSpan(firstWindowTs, lastWindowTs);
+            if (windowDateBanner && windowDateBanner !== '--') {
+                minuteGrid += `<text x="${padL}" y="239" text-anchor="start" fill="#38bdf8" font-size="8.8" font-weight="bold" font-family="monospace">${escSvg(windowDateBanner)}</text>`;
             }
             if (effProjectedNext !== null) {
                 const px = xAt(n).toFixed(1);
                 minuteGrid += `<line x1="${px}" y1="10" x2="${px}" y2="212" stroke="#22d3ee" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
-                minuteGrid += `<text x="${px}" y="225" text-anchor="middle" fill="#22d3ee" fill-opacity="0.90" font-size="8.5" font-family="monospace">+1m</text>`;
+                minuteGrid += `<text x="${px}" y="224" text-anchor="middle" fill="#22d3ee" fill-opacity="0.90" font-size="8.5" font-family="monospace">+1m</text>`;
             }
 
             const crossMarkers = points.map((p, i) => {
@@ -18108,9 +18146,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const vVal = safeNum(p.smoothed_velocity ?? p.price_velocity);
                 const aVal = safeNum(p.smoothed_acceleration ?? p.price_acceleration);
                 const rVal = safeNum(p.rsi);
+                const ptTs = p.timestamp || p.minute_utc || '';
                 return {
                     x: xAt(i),
                     tick: formatMinuteTick(p, i),
+                    dateLabel: ptTs ? fmtDateWithYear(ptTs) : '--',
+                    shortDate: ptTs ? fmtShortDateOnly(ptTs) : '',
                     isProj: false,
                     close: cVal,
                     smooth: sVal,
@@ -18131,6 +18172,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 cols.push({
                     x: nextX,
                     tick: '+1m',
+                    dateLabel: '',
+                    shortDate: '',
                     isProj: true,
                     close: effProjectedNext,
                     smooth: null,
@@ -18553,6 +18596,76 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             } catch (_) {
                 // fallback below
             }
+            return d.toLocaleString([], opts);
+        }
+
+        function _localDateKey(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return '';
+            try {
+                if (displayTzIana) {
+                    return new Intl.DateTimeFormat('en-CA', {
+                        timeZone: displayTzIana,
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                    }).format(d);
+                }
+            } catch (_) {}
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        function fmtDateWithYear(iso) {
+            if (!iso) return '--';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return '--';
+            const opts = { month: 'short', day: 'numeric', year: 'numeric' };
+            try {
+                if (displayTzIana) {
+                    return new Intl.DateTimeFormat('en-US', { ...opts, timeZone: displayTzIana }).format(d);
+                }
+            } catch (_) {}
+            return d.toLocaleDateString('en-US', opts);
+        }
+
+        function fmtShortDateOnly(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return '';
+            const opts = { month: 'short', day: 'numeric' };
+            try {
+                if (displayTzIana) {
+                    return new Intl.DateTimeFormat('en-US', { ...opts, timeZone: displayTzIana }).format(d);
+                }
+            } catch (_) {}
+            return d.toLocaleDateString('en-US', opts);
+        }
+
+        function fmtDateRangeSpan(startIso, endIso) {
+            const sDate = fmtDateWithYear(startIso);
+            const eDate = fmtDateWithYear(endIso);
+            if (sDate === '--') return eDate;
+            if (eDate === '--' || _localDateKey(startIso) === _localDateKey(endIso)) return sDate;
+            const sShort = fmtShortDateOnly(startIso);
+            const sYear = (sDate.split(',').pop() || '').trim();
+            const eYear = (eDate.split(',').pop() || '').trim();
+            if (sYear && eYear && sYear === eYear && sShort) {
+                return `${sShort} – ${eDate}`;
+            }
+            return `${sDate} – ${eDate}`;
+        }
+
+        function fmtShortLocalTsWithYear(iso) {
+            if (!iso) return '--';
+            const d = new Date(iso);
+            if (Number.isNaN(d.getTime())) return String(iso);
+            const opts = { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false };
+            try {
+                if (displayTzIana) {
+                    return `${new Intl.DateTimeFormat('en-US', { ...opts, timeZone: displayTzIana }).format(d)} ${displayTzAbbr}`;
+                }
+            } catch (_) {}
             return d.toLocaleString([], opts);
         }
 
@@ -19100,6 +19213,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
             bar.classList.remove('hidden');
 
+            const startIso = startPt ? (startPt.timestamp || startPt.minute_utc) : '';
+            const endIso = endPt ? (endPt.timestamp || endPt.minute_utc) : '';
+            const optDateBadge = document.getElementById('optActiveDateBadge');
+            if (optDateBadge) {
+                optDateBadge.textContent = fmtDateRangeSpan(startIso, endIso);
+            }
+
             const rangeEl = document.getElementById('optPanRange');
             if (rangeEl) {
                 rangeEl.max = String(maxOffset);
@@ -19129,10 +19249,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const summaryEl = document.getElementById('optRangeSummary');
             if (summaryEl) {
-                const startTxt = startPt ? fmtShortLocalTs(startPt.timestamp || startPt.minute_utc) : '--';
-                const endTxt = endPt ? fmtShortLocalTs(endPt.timestamp || endPt.minute_utc) : '--';
-                summaryEl.textContent = `${startTxt} – ${endTxt} · ${visibleCount}/${totalBars}m`
-                    + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                const sameDay = startIso && endIso && _localDateKey(startIso) === _localDateKey(endIso);
+                if (sameDay) {
+                    summaryEl.textContent = `${fmtDateWithYear(startIso)} · ${fmtClockShort(startIso)}–${fmtClockShort(endIso)} ${displayTzAbbr} · ${visibleCount}/${totalBars}m`
+                        + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                } else {
+                    const startTxt = startIso ? fmtShortLocalTsWithYear(startIso) : '--';
+                    const endTxt = endIso ? fmtShortLocalTsWithYear(endIso) : '--';
+                    summaryEl.textContent = `${startTxt} – ${endTxt} · ${visibleCount}/${totalBars}m`
+                        + (offsetFromRight > 0 ? ` · -${offsetFromRight}m` : '');
+                }
             }
         }
 
@@ -19262,7 +19388,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             _updateOptToolbarControls(total, points.length, maxOffset, offset, points[0], points[points.length - 1]);
 
-            const W = 740, H = 305, padL = 56, padR = 62;
+            const W = 740, H = 318, padL = 56, padR = 62;
             const plotW = W - padL - padR;
             const n = points.length;
             const xAt = (i) => n === 1 ? (padL + plotW * 0.5) : (padL + (i / Math.max(1, n - 1)) * plotW);
@@ -19309,17 +19435,40 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const qHalf = (qBot - qTop) / 2;
             const yPnl = (dVal) => qMid - (dVal / maxAbsD) * qHalf;
 
-            // Time grid ticks
+            // Time grid ticks + day rollover markers + visible session date footer
             let gridHtml = '';
             const maxTicks = 7;
             const step = Math.max(1, Math.ceil(n / maxTicks));
+            const optFirstIso = points[0]?.timestamp || points[0]?.minute_utc || '';
+            const optLastIso = points[n - 1]?.timestamp || points[n - 1]?.minute_utc || '';
+            let prevOptDay = _localDateKey(optFirstIso);
+            let lastOptDateX = padL + 85;
             for (let i = 0; i < n; i++) {
-                if (i === 0 || i === n - 1 || i % step === 0) {
-                    const x = xAt(i).toFixed(1);
-                    const lbl = fmtClockShort(points[i].timestamp || points[i].minute_utc);
-                    gridHtml += `<line x1="${x}" y1="${pTop}" x2="${x}" y2="${qBot}" stroke="#334155" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
-                    gridHtml += `<text x="${x}" y="290" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
+                const ptIso = points[i]?.timestamp || points[i]?.minute_utc || '';
+                const curDay = _localDateKey(ptIso);
+                const isDayRoll = i > 0 && curDay && prevOptDay && curDay !== prevOptDay;
+                if (curDay) prevOptDay = curDay;
+                const xNum = xAt(i);
+                const x = xNum.toFixed(1);
+
+                if (isDayRoll) {
+                    gridHtml += `<line x1="${x}" y1="${pTop}" x2="${x}" y2="${qBot}" stroke="#22d3ee" stroke-opacity="0.55" stroke-dasharray="4,2" stroke-width="1.1" />`;
+                    if (xNum > lastOptDateX && (W - padR - xNum) > 26) {
+                        gridHtml += `<text x="${x}" y="307" text-anchor="middle" fill="#67e8f9" font-size="8.8" font-weight="bold" font-family="monospace">${escSvg(fmtShortDateOnly(ptIso))}</text>`;
+                        lastOptDateX = xNum + 64;
+                    }
                 }
+                if (i === 0 || i === n - 1 || i % step === 0) {
+                    const lbl = fmtClockShort(ptIso);
+                    if (!isDayRoll) {
+                        gridHtml += `<line x1="${x}" y1="${pTop}" x2="${x}" y2="${qBot}" stroke="#334155" stroke-opacity="0.45" stroke-dasharray="2,3" stroke-width="1" />`;
+                    }
+                    gridHtml += `<text x="${x}" y="289" text-anchor="middle" fill="#94a3b8" font-size="9" font-family="monospace">${escSvg(lbl)}</text>`;
+                }
+            }
+            const optWindowDateBanner = fmtDateRangeSpan(optFirstIso, optLastIso);
+            if (optWindowDateBanner && optWindowDateBanner !== '--') {
+                gridHtml += `<text x="${padL}" y="307" text-anchor="start" fill="#22d3ee" font-size="9.2" font-weight="bold" font-family="monospace">${escSvg(optWindowDateBanner)}</text>`;
             }
 
             // Option price path & area
@@ -19599,8 +19748,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const stkPart = stkVal !== null ? ` · Stock <strong class="text-purple-300">$${stkVal.toFixed(2)}</strong>` : '';
                 const optVal = safeNum(pt.price);
                 const optPart = optVal !== null ? ` · Opt <strong class="text-cyan-300">$${optVal.toFixed(2)}</strong>` : ' · Opt <span class="text-slate-500">--</span>';
+                const hoverTsFull = fmtShortLocalTsWithYear(pt.timestamp || pt.minute_utc);
                 if (pt.pre_entry) {
-                    readout.innerHTML = `<span class="px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/60 text-[9px] font-bold mr-1">PRE-ENTRY</span><span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span>${stkPart}${optPart} <span class="text-slate-500">[${escSvg(pt.source || 'pre_entry_bar')}]</span>`;
+                    readout.innerHTML = `<span class="px-1.5 py-0.5 rounded bg-emerald-950/70 text-emerald-300 border border-emerald-700/60 text-[9px] font-bold mr-1">PRE-ENTRY</span><span class="text-slate-200 font-semibold">${escSvg(hoverTsFull)}</span>${stkPart}${optPart} <span class="text-slate-500">[${escSvg(pt.source || 'pre_entry_bar')}]</span>`;
                 } else {
                     const dPnl = safeNum(pt.pnl_dollars) ?? 0;
                     const pPnl = safeNum(pt.pnl_pct) ?? 0;
@@ -19608,7 +19758,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const cls = dPnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
                     const diffTxt = optVal !== null ? ` (${pDiff >= 0 ? '+' : '-'}$${Math.abs(pDiff).toFixed(2)})` : '';
                     const mvTxt = pt.market_value != null ? ` · Value <strong class="text-slate-100">$${Number(pt.market_value).toFixed(2)}</strong>` : '';
-                    readout.innerHTML = `<span class="text-slate-300">${escSvg(fmtShortLocalTs(pt.timestamp || pt.minute_utc))}</span>${optPart}${diffTxt}${stkPart}${mvTxt} · P/L <strong class="${cls}">${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%)</strong> <span class="text-slate-500">[${escSvg(pt.source || 'poll')}]</span>`;
+                    readout.innerHTML = `<span class="text-slate-200 font-semibold">${escSvg(hoverTsFull)}</span>${optPart}${diffTxt}${stkPart}${mvTxt} · P/L <strong class="${cls}">${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(2)}%)</strong> <span class="text-slate-500">[${escSvg(pt.source || 'poll')}]</span>`;
                 }
             }
         }
@@ -19892,6 +20042,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <button type="button" id="btnOptOldest" onclick="stepOptPan('oldest')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Jump to earliest bar">|&lt;</button>
                             <button type="button" id="btnOptBack" onclick="stepOptPan('back')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide older">&lt;</button>
                         </div>
+                        <span id="optActiveDateBadge" class="px-2 py-0.5 rounded bg-slate-900 border border-slate-700/80 text-cyan-300 font-bold whitespace-nowrap shrink-0" title="Visible chart date range">--</span>
                         <input id="optPanRange" type="range" min="0" max="0" value="0" step="1" onpointerdown="window._optPanState.rangeDragging=true" oninput="onOptRangeInput(this)" onpointerup="window._optPanState.rangeDragging=false" onchange="window._optPanState.rangeDragging=false" class="flex-1 min-w-[120px] h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400" title="Slide through pre-entry and contract history" />
                         <div class="flex items-center gap-1 shrink-0">
                             <button type="button" id="btnOptForward" onclick="stepOptPan('forward')" class="px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition disabled:opacity-35" title="Slide newer">&gt;</button>
