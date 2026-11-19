@@ -92,14 +92,20 @@ RSI_PERIOD = 14
 # extended hours when rsi_session=extended) so the Wilder averages are
 # converged at the 09:30 ET open, matching TradingView's continuous RSI.
 RSI_WARMUP_SESSIONS = int(os.getenv("RSI_WARMUP_SESSIONS", "5"))
-RSI_SESSION_MODE = os.getenv("RSI_SESSION_MODE", "extended").strip().lower() or "extended"
+RSI_SESSION_MODE = (
+    os.getenv("RSI_SESSION_MODE", "extended").strip().lower() or "extended"
+)
 if RSI_SESSION_MODE in {"eth", "ext", "all"}:
     RSI_SESSION_MODE = "extended"
 elif RSI_SESSION_MODE in {"rth", "reg"}:
     RSI_SESSION_MODE = "regular"
 if RSI_SESSION_MODE not in {"extended", "regular"}:
     RSI_SESSION_MODE = "extended"
-FEED = DataFeed.SIP if os.getenv("ALPACA_FEED", "iex").strip().lower() == "sip" else DataFeed.IEX
+FEED = (
+    DataFeed.SIP
+    if os.getenv("ALPACA_FEED", "iex").strip().lower() == "sip"
+    else DataFeed.IEX
+)
 # Populated by load_settings(); provider startup is controlled only by parms.ini.
 selected: list[str] = []
 required: dict[str, list[str]] = {}
@@ -167,7 +173,9 @@ def _resolve_display_timezone(spec):
         tz = ZoneInfo(canonical)
         return tz, canonical
     except Exception:
-        logging.warning("Invalid timezone %r; falling back to America/Los_Angeles (PST)", raw)
+        logging.warning(
+            "Invalid timezone %r; falling back to America/Los_Angeles (PST)", raw
+        )
         return ZoneInfo("America/Los_Angeles"), "America/Los_Angeles"
 
 
@@ -179,7 +187,9 @@ def as_display_tz(value=None):
         dt = datetime.now(timezone.utc)
     elif isinstance(value, str):
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        dt = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        dt = (
+            parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        )
     elif isinstance(value, datetime):
         dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     else:
@@ -312,7 +322,9 @@ class Bar:
 KINEMATICS_SMOOTH_METHOD = os.getenv("KINEMATICS_SMOOTH_METHOD", "hma").strip().lower()
 if KINEMATICS_SMOOTH_METHOD not in {"hma", "ema", "none"}:
     KINEMATICS_SMOOTH_METHOD = "hma"
-KINEMATICS_SMOOTH_PERIOD = max(2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD))))
+KINEMATICS_SMOOTH_PERIOD = max(
+    2, int(os.getenv("KINEMATICS_SMOOTH_PERIOD", str(RSI_PERIOD)))
+)
 KINEMATICS_RSI_OVERBOUGHT = float(os.getenv("KINEMATICS_RSI_OVERBOUGHT", "70.0"))
 KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
 KINEMATICS_HISTORY_MAX_BARS = max(
@@ -413,8 +425,17 @@ def compute_kinematic_forecast(
     projected_delta = None
     projected_delta_pct = None
 
-    if close is not None and math.isfinite(close) and velocity is not None and math.isfinite(velocity):
-        acc = float(acceleration) if (acceleration is not None and math.isfinite(acceleration)) else 0.0
+    if (
+        close is not None
+        and math.isfinite(close)
+        and velocity is not None
+        and math.isfinite(velocity)
+    ):
+        acc = (
+            float(acceleration)
+            if (acceleration is not None and math.isfinite(acceleration))
+            else 0.0
+        )
         delta = float(velocity) + 0.5 * acc
         projected_delta = round(delta, 4)
         projected_price = round(float(close) + delta, 4)
@@ -427,10 +448,22 @@ def compute_kinematic_forecast(
             crossover_signal = "confirmed_bearish"
         elif prev_velocity <= 0 and velocity > 0:
             crossover_signal = "confirmed_bullish"
-    if crossover_signal == "none" and acceleration is not None and prev_acceleration is not None:
-        if prev_acceleration >= 0 and acceleration < 0 and (velocity is None or velocity > 0):
+    if (
+        crossover_signal == "none"
+        and acceleration is not None
+        and prev_acceleration is not None
+    ):
+        if (
+            prev_acceleration >= 0
+            and acceleration < 0
+            and (velocity is None or velocity > 0)
+        ):
             crossover_signal = "leading_bearish"
-        elif prev_acceleration <= 0 and acceleration > 0 and (velocity is None or velocity < 0):
+        elif (
+            prev_acceleration <= 0
+            and acceleration > 0
+            and (velocity is None or velocity < 0)
+        ):
             crossover_signal = "leading_bullish"
 
     rsi_zone = classify_rsi_zone(rsi, overbought=overbought, oversold=oversold)
@@ -887,7 +920,9 @@ def make_summary_logger():
     return logger
 
 
-OPTION_CONTRACT_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$")
+OPTION_CONTRACT_SYMBOL_RE = re.compile(
+    r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$"
+)
 
 
 def _opt_safe_float(val, default=None):
@@ -961,6 +996,7 @@ def _three_fridays_away(start_date=None):
     base = start_date or datetime.now(MARKET_TZ).date()
     try:
         from lib.utils import get_three_fridays_away as _lib_three_fridays_away
+
         if callable(_lib_three_fridays_away):
             return _lib_three_fridays_away(start_date=base)
     except Exception:
@@ -1005,7 +1041,9 @@ class TastytradeClient:
             )
         self.transaction_env = env_norm
         self.prod_base_url = (prod_base_url or TASTYTRADE_PROD_BASE_URL).rstrip("/")
-        self.sandbox_base_url = (sandbox_base_url or TASTYTRADE_SANDBOX_BASE_URL).rstrip("/")
+        self.sandbox_base_url = (
+            sandbox_base_url or TASTYTRADE_SANDBOX_BASE_URL
+        ).rstrip("/")
         self._creds = {
             "prod": {
                 "client_id": str(prod_client_id or "").strip(),
@@ -1161,7 +1199,9 @@ class TastytradeClient:
         if isinstance(data, dict):
             if isinstance(data.get("items"), list):
                 return data["items"]
-            if data and ("symbol" in data or "account-number" in data or "account" in data):
+            if data and (
+                "symbol" in data or "account-number" in data or "account" in data
+            ):
                 return [data]
         elif isinstance(data, list):
             return data
@@ -1174,24 +1214,46 @@ class TastytradeClient:
         raw_sym = str(item.get("symbol") or "").strip()
         sym = _from_tastytrade_occ(raw_sym).upper() if raw_sym else ""
         bid = _opt_safe_float(
-            item.get("bid")
-            if item.get("bid") is not None
-            else (item.get("bid-price") if item.get("bid-price") is not None else item.get("bid_price")),
+            (
+                item.get("bid")
+                if item.get("bid") is not None
+                else (
+                    item.get("bid-price")
+                    if item.get("bid-price") is not None
+                    else item.get("bid_price")
+                )
+            ),
             None,
         )
         ask = _opt_safe_float(
-            item.get("ask")
-            if item.get("ask") is not None
-            else (item.get("ask-price") if item.get("ask-price") is not None else item.get("ask_price")),
+            (
+                item.get("ask")
+                if item.get("ask") is not None
+                else (
+                    item.get("ask-price")
+                    if item.get("ask-price") is not None
+                    else item.get("ask_price")
+                )
+            ),
             None,
         )
         mid = _opt_safe_float(item.get("mid"), None)
         mark = _opt_safe_float(item.get("mark"), None)
         last = _opt_safe_float(
-            item.get("last") if item.get("last") is not None else item.get("last-price"),
+            (
+                item.get("last")
+                if item.get("last") is not None
+                else item.get("last-price")
+            ),
             None,
         )
-        if mid is None and bid is not None and ask is not None and bid > 0 and ask >= bid:
+        if (
+            mid is None
+            and bid is not None
+            and ask is not None
+            and bid > 0
+            and ask >= bid
+        ):
             mid = round((bid + ask) / 2.0, 4)
         return SimpleNamespace(
             symbol=sym,
@@ -1209,14 +1271,20 @@ class TastytradeClient:
     def get_quotes_batch(self, symbols, is_option=None):
         """Fetch live quotes from Tastytrade Prod `/market-data/by-type` (always Prod)."""
         results = {}
-        clean_syms = [str(s or "").strip().upper() for s in (symbols or []) if str(s or "").strip()]
+        clean_syms = [
+            str(s or "").strip().upper()
+            for s in (symbols or [])
+            if str(s or "").strip()
+        ]
         if not clean_syms:
             return results
 
         opt_syms = []
         eq_syms = []
         for s in dict.fromkeys(clean_syms):
-            is_opt = _is_option_contract_symbol(s) if is_option is None else bool(is_option)
+            is_opt = (
+                _is_option_contract_symbol(s) if is_option is None else bool(is_option)
+            )
             if is_opt:
                 opt_syms.append(_to_tastytrade_occ(s))
             else:
@@ -1249,10 +1317,7 @@ class TastytradeClient:
         raw = getattr(req_or_symbol, "symbol_or_symbols", req_or_symbol)
         syms = list(raw) if isinstance(raw, (list, tuple, set)) else [raw]
         quotes = self.get_quotes_batch(syms, is_option=False)
-        return {
-            s: SimpleNamespace(latest_quote=q)
-            for s, q in quotes.items()
-        }
+        return {s: SimpleNamespace(latest_quote=q) for s, q in quotes.items()}
 
     def get_option_chain_nested(self, underlying):
         """Fetch nested option chain for underlying from Tastytrade Prod."""
@@ -1277,7 +1342,11 @@ class TastytradeClient:
             items = self._extract_items(resp)
             chosen = None
             for item in items:
-                acct = item.get("account") if isinstance(item.get("account"), dict) else item
+                acct = (
+                    item.get("account")
+                    if isinstance(item.get("account"), dict)
+                    else item
+                )
                 if not isinstance(acct, dict):
                     continue
                 acct_num = str(acct.get("account-number") or "").strip()
@@ -1289,7 +1358,11 @@ class TastytradeClient:
                 break
             if not chosen and items:
                 first = items[0]
-                acct = first.get("account") if isinstance(first.get("account"), dict) else first
+                acct = (
+                    first.get("account")
+                    if isinstance(first.get("account"), dict)
+                    else first
+                )
                 chosen = str((acct or {}).get("account-number") or "").strip()
             if not chosen:
                 raise RuntimeError(
@@ -1307,31 +1380,51 @@ class TastytradeClient:
         data = resp.get("data", resp) if isinstance(resp, dict) else {}
         if not isinstance(data, dict):
             data = {}
-        equity = _opt_safe_float(
-            data.get("net-liquidating-value")
-            if data.get("net-liquidating-value") is not None
-            else data.get("equity-offering-margin-requirements"),
-            0.0,
-        ) or 0.0
+        equity = (
+            _opt_safe_float(
+                (
+                    data.get("net-liquidating-value")
+                    if data.get("net-liquidating-value") is not None
+                    else data.get("equity-offering-margin-requirements")
+                ),
+                0.0,
+            )
+            or 0.0
+        )
         cash = _opt_safe_float(data.get("cash-balance"), 0.0) or 0.0
-        buying_power = _opt_safe_float(
-            data.get("derivative-buying-power")
-            if data.get("derivative-buying-power") is not None
-            else data.get("equity-buying-power"),
-            0.0,
-        ) or 0.0
-        long_mv = _opt_safe_float(
-            data.get("long-derivative-value")
-            if data.get("long-derivative-value") is not None
-            else data.get("long-equity-value"),
-            0.0,
-        ) or 0.0
-        short_mv = _opt_safe_float(
-            data.get("short-derivative-value")
-            if data.get("short-derivative-value") is not None
-            else data.get("short-equity-value"),
-            0.0,
-        ) or 0.0
+        buying_power = (
+            _opt_safe_float(
+                (
+                    data.get("derivative-buying-power")
+                    if data.get("derivative-buying-power") is not None
+                    else data.get("equity-buying-power")
+                ),
+                0.0,
+            )
+            or 0.0
+        )
+        long_mv = (
+            _opt_safe_float(
+                (
+                    data.get("long-derivative-value")
+                    if data.get("long-derivative-value") is not None
+                    else data.get("long-equity-value")
+                ),
+                0.0,
+            )
+            or 0.0
+        )
+        short_mv = (
+            _opt_safe_float(
+                (
+                    data.get("short-derivative-value")
+                    if data.get("short-derivative-value") is not None
+                    else data.get("short-equity-value")
+                ),
+                0.0,
+            )
+            or 0.0
+        )
         return SimpleNamespace(
             account_number=acct,
             equity=equity,
@@ -1364,10 +1457,19 @@ class TastytradeClient:
             is_opt = ("option" in inst_type) or _is_option_contract_symbol(sym)
             raw_qty = abs(_opt_safe_float(item.get("quantity"), 0.0) or 0.0)
             qdir = str(item.get("quantity-direction") or "Long").strip().lower()
-            side = "short" if ("short" in qdir or (_opt_safe_float(item.get("quantity"), 0.0) or 0.0) < 0) else "long"
+            side = (
+                "short"
+                if (
+                    "short" in qdir
+                    or (_opt_safe_float(item.get("quantity"), 0.0) or 0.0) < 0
+                )
+                else "long"
+            )
             avg_open = _opt_safe_float(item.get("average-open-price"), 0.0) or 0.0
             close_p = _opt_safe_float(item.get("close-price"), None)
-            mult = _opt_safe_float(item.get("multiplier"), 100.0 if is_opt else 1.0) or (100.0 if is_opt else 1.0)
+            mult = _opt_safe_float(
+                item.get("multiplier"), 100.0 if is_opt else 1.0
+            ) or (100.0 if is_opt else 1.0)
             und = str(item.get("underlying-symbol") or "").strip().upper()
             if not und and is_opt:
                 _, parsed_und, _, _, _ = _parse_occ_contract(sym)
@@ -1376,19 +1478,21 @@ class TastytradeClient:
                 opt_syms.append(sym)
             else:
                 eq_syms.append(sym)
-            parsed_positions.append({
-                "symbol": sym,
-                "underlying_symbol": und or sym,
-                "is_option": is_opt,
-                "asset_class": "us_option" if is_opt else "us_equity",
-                "side": side,
-                "qty": raw_qty,
-                "qty_available": raw_qty,
-                "avg_entry_price": avg_open,
-                "close_price": close_p,
-                "multiplier": mult,
-                "raw": item,
-            })
+            parsed_positions.append(
+                {
+                    "symbol": sym,
+                    "underlying_symbol": und or sym,
+                    "is_option": is_opt,
+                    "asset_class": "us_option" if is_opt else "us_equity",
+                    "side": side,
+                    "qty": raw_qty,
+                    "qty_available": raw_qty,
+                    "avg_entry_price": avg_open,
+                    "close_price": close_p,
+                    "multiplier": mult,
+                    "raw": item,
+                }
+            )
 
         # Enrich with Prod live quotes when Prod credentials are available so
         # Sandbox positions reflect live Prod pricing & P/L.
@@ -1416,7 +1520,11 @@ class TastytradeClient:
                     or q.ask_price
                 )
             if cur_price is None or cur_price <= 0:
-                cur_price = entry["close_price"] if (entry["close_price"] and entry["close_price"] > 0) else entry["avg_entry_price"]
+                cur_price = (
+                    entry["close_price"]
+                    if (entry["close_price"] and entry["close_price"] > 0)
+                    else entry["avg_entry_price"]
+                )
             avg_e = entry["avg_entry_price"]
             qty_f = entry["qty"]
             mult = entry["multiplier"]
@@ -1424,7 +1532,11 @@ class TastytradeClient:
             mkt_val = round((cur_price or 0.0) * qty_f * mult, 2)
             sign = -1.0 if entry["side"] == "short" else 1.0
             upl = round((mkt_val - cost_basis) * sign, 2) if cost_basis > 0 else 0.0
-            upl_pc = ((cur_price - avg_e) / avg_e) * sign if (avg_e > 0 and cur_price is not None) else 0.0
+            upl_pc = (
+                ((cur_price - avg_e) / avg_e) * sign
+                if (avg_e > 0 and cur_price is not None)
+                else 0.0
+            )
             out.append(
                 SimpleNamespace(
                     symbol=sym,
@@ -1496,7 +1608,11 @@ class TastytradeClient:
         sym_upper = _from_tastytrade_occ(symbol).upper()
         if not sym_upper:
             raise ValueError("Order symbol is required")
-        opt = _is_option_contract_symbol(sym_upper) if is_option is None else bool(is_option)
+        opt = (
+            _is_option_contract_symbol(sym_upper)
+            if is_option is None
+            else bool(is_option)
+        )
         q_val = _opt_safe_float(qty, 0.0) or 0.0
         if q_val <= 0:
             raise ValueError(f"Order qty must be positive; got {qty!r}")
@@ -1513,7 +1629,15 @@ class TastytradeClient:
         eff_type = str(order_type or "limit").strip().lower()
         payload = {
             "time-in-force": time_in_force or "Day",
-            "order-type": "Limit" if (eff_type == "limit" and limit_price is not None and float(limit_price) > 0) else "Market",
+            "order-type": (
+                "Limit"
+                if (
+                    eff_type == "limit"
+                    and limit_price is not None
+                    and float(limit_price) > 0
+                )
+                else "Market"
+            ),
             "legs": [
                 {
                     "instrument-type": "Equity Option" if opt else "Equity",
@@ -1531,8 +1655,20 @@ class TastytradeClient:
 
     def _normalize_order(self, raw_order):
         if not isinstance(raw_order, dict):
-            return SimpleNamespace(id=None, status="unknown", symbol="", side="", qty=0, filled_qty=0, filled_avg_price=None)
-        order_obj = raw_order.get("order") if isinstance(raw_order.get("order"), dict) else raw_order
+            return SimpleNamespace(
+                id=None,
+                status="unknown",
+                symbol="",
+                side="",
+                qty=0,
+                filled_qty=0,
+                filled_avg_price=None,
+            )
+        order_obj = (
+            raw_order.get("order")
+            if isinstance(raw_order.get("order"), dict)
+            else raw_order
+        )
         legs = order_obj.get("legs") or []
         leg0 = legs[0] if legs and isinstance(legs[0], dict) else {}
         sym = _from_tastytrade_occ(leg0.get("symbol") or "").upper()
@@ -1558,7 +1694,15 @@ class TastytradeClient:
             status_low = str(order_obj.get("status") or "").lower()
             if "fill" in status_low:
                 filled_qty = max(0.0, qty - rem_qty)
-        avg_fill = (filled_cost / filled_qty) if (filled_qty > 0 and filled_cost > 0) else _opt_safe_float(order_obj.get("price"), None) if "fill" in str(order_obj.get("status") or "").lower() else None
+        avg_fill = (
+            (filled_cost / filled_qty)
+            if (filled_qty > 0 and filled_cost > 0)
+            else (
+                _opt_safe_float(order_obj.get("price"), None)
+                if "fill" in str(order_obj.get("status") or "").lower()
+                else None
+            )
+        )
         return SimpleNamespace(
             id=str(order_obj.get("id") or "") or None,
             status=str(order_obj.get("status") or "submitted"),
@@ -1568,7 +1712,9 @@ class TastytradeClient:
             qty=qty,
             filled_qty=filled_qty,
             filled_avg_price=avg_fill,
-            filled_at=filled_at or order_obj.get("terminal-at") or order_obj.get("updated-at"),
+            filled_at=filled_at
+            or order_obj.get("terminal-at")
+            or order_obj.get("updated-at"),
             submitted_at=order_obj.get("received-at") or order_obj.get("created-at"),
             created_at=order_obj.get("created-at"),
             updated_at=order_obj.get("updated-at"),
@@ -1628,7 +1774,9 @@ class TastytradeClient:
         if symbols and len(symbols) == 1:
             one_sym = str(symbols[0]).strip().upper()
             query["underlying-symbol"] = (
-                _parse_occ_contract(one_sym)[1] if _is_option_contract_symbol(one_sym) else one_sym
+                _parse_occ_contract(one_sym)[1]
+                if _is_option_contract_symbol(one_sym)
+                else one_sym
             )
         resp = self._request_json(
             "GET",
@@ -1643,16 +1791,28 @@ class TastytradeClient:
         if status and str(status).lower() not in {"all", "any"}:
             st_l = str(status).lower()
             if st_l == "closed":
-                orders = [o for o in orders if str(o.status).lower() in {"filled", "cancelled", "canceled", "expired", "rejected"}]
+                orders = [
+                    o
+                    for o in orders
+                    if str(o.status).lower()
+                    in {"filled", "cancelled", "canceled", "expired", "rejected"}
+                ]
             elif st_l == "open":
-                orders = [o for o in orders if str(o.status).lower() in {"live", "received", "routed", "in-flight"}]
+                orders = [
+                    o
+                    for o in orders
+                    if str(o.status).lower()
+                    in {"live", "received", "routed", "in-flight"}
+                ]
         return orders[: int(limit or 50)]
 
 
 def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL"):
     """Fetch option chain from Tastytrade Prod matching getOptionsContracts semantics."""
     if not underlying_ticker or tt_client is None:
-        return None, json.dumps({"error": "missing_ticker_or_tastytrade_client"}, indent=2)
+        return None, json.dumps(
+            {"error": "missing_ticker_or_tastytrade_client"}, indent=2
+        )
     ticker = str(underlying_ticker).split(",")[0].strip().upper()
     target_right = str(right or "CALL").strip().upper()
     if target_right not in {"CALL", "PUT"}:
@@ -1665,7 +1825,9 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
     expirations = (nested or {}).get("expirations") or []
     if not expirations:
         return None, json.dumps(
-            {"error": f"No option expirations returned from Tastytrade Prod for {ticker}"},
+            {
+                "error": f"No option expirations returned from Tastytrade Prod for {ticker}"
+            },
             indent=2,
         )
 
@@ -1694,12 +1856,16 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
         if future_matches:
             chosen_exp = future_matches[0][1]
         else:
-            chosen_exp = min(dated, key=lambda pair: abs((pair[0] - target_friday).days))[1]
+            chosen_exp = min(
+                dated, key=lambda pair: abs((pair[0] - target_friday).days)
+            )[1]
 
     strikes_list = chosen_exp.get("strikes") or []
     if not strikes_list:
         return None, json.dumps(
-            {"error": f"No strikes found for {ticker} exp={chosen_exp.get('expiration-date')}"},
+            {
+                "error": f"No strikes found for {ticker} exp={chosen_exp.get('expiration-date')}"
+            },
             indent=2,
         )
 
@@ -1717,7 +1883,9 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
 
     if not strike_entries:
         return None, json.dumps(
-            {"error": f"No {target_right} contracts returned from Tastytrade for {ticker}"},
+            {
+                "error": f"No {target_right} contracts returned from Tastytrade for {ticker}"
+            },
             indent=2,
         )
 
@@ -1734,7 +1902,9 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
             or 0.0
         )
 
-    opt_quotes = tt_client.get_quotes_batch([s for s, _ in strike_entries], is_option=True)
+    opt_quotes = tt_client.get_quotes_batch(
+        [s for s, _ in strike_entries], is_option=True
+    )
 
     parsed_contracts = []
     for compact_sym, strike_price in strike_entries:
@@ -1771,9 +1941,15 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
     selected_contract = None
     if stk_ask_price > 0:
         otm = 0
-        ordered = pruned_chain if target_right == "CALL" else list(reversed(pruned_chain))
+        ordered = (
+            pruned_chain if target_right == "CALL" else list(reversed(pruned_chain))
+        )
         for c in ordered:
-            is_otm = (c["strike"] > stk_ask_price) if target_right == "CALL" else (c["strike"] < stk_ask_price)
+            is_otm = (
+                (c["strike"] > stk_ask_price)
+                if target_right == "CALL"
+                else (c["strike"] < stk_ask_price)
+            )
             if is_otm:
                 otm += 1
                 if otm == 2:
@@ -1784,7 +1960,9 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
         {
             "underlying": ticker,
             "provider": "tastytrade",
-            "expiration_date": str(chosen_exp.get("expiration-date") or expiration_date),
+            "expiration_date": str(
+                chosen_exp.get("expiration-date") or expiration_date
+            ),
             "timestamp": format_display_ts(datetime.now(UTC), "%Y-%m-%d %H:%M:%S %Z"),
             "spot_ask_price": stk_ask_price,
             "chain_snapshot": pruned_chain,
@@ -1836,7 +2014,15 @@ class OptionContractHistoryTracker:
                 self._stock_data_client = stock_data_client
 
     @staticmethod
-    def _build_point(ts_dt, price, entry_price, qty, multiplier, source="live_poll", minute_key_override=None):
+    def _build_point(
+        ts_dt,
+        price,
+        entry_price,
+        qty,
+        multiplier,
+        source="live_poll",
+        minute_key_override=None,
+    ):
         ts_utc = as_utc(ts_dt)
         min_dt = minute_utc(ts_utc)
         p = max(0.0, float(price))
@@ -1879,9 +2065,11 @@ class OptionContractHistoryTracker:
                     history[idx] = point
                 return
         history.append(point)
-        history.sort(key=lambda pt: str(pt.get("timestamp") or pt.get("minute_utc") or ""))
+        history.sort(
+            key=lambda pt: str(pt.get("timestamp") or pt.get("minute_utc") or "")
+        )
         if len(history) > cls.MAX_HISTORY_POINTS:
-            del history[:-cls.MAX_HISTORY_POINTS]
+            del history[: -cls.MAX_HISTORY_POINTS]
 
     @classmethod
     def _fill_minute_gaps(
@@ -1942,7 +2130,9 @@ class OptionContractHistoryTracker:
             candidate_mins = sorted(set(candidate_mins))
 
         if len(candidate_mins) > cls.MAX_HISTORY_POINTS:
-            candidate_mins = [candidate_mins[0]] + candidate_mins[-(cls.MAX_HISTORY_POINTS - 1):]
+            candidate_mins = [candidate_mins[0]] + candidate_mins[
+                -(cls.MAX_HISTORY_POINTS - 1) :
+            ]
 
         out = []
         last_known_price = float(entry_price)
@@ -2071,29 +2261,57 @@ class OptionContractHistoryTracker:
                 old_cost = _opt_safe_float(existing.get("cost_basis"), 0.0) or 0.0
                 new_qty = old_qty + eff_qty
                 new_cost = round(old_cost + cost_basis, 2)
-                new_entry = round(new_cost / (new_qty * mult), 4) if new_qty > 0 else eff_price
-                existing["qty"] = int(round(new_qty)) if abs(new_qty - round(new_qty)) < 1e-6 else round(new_qty, 4)
+                new_entry = (
+                    round(new_cost / (new_qty * mult), 4) if new_qty > 0 else eff_price
+                )
+                existing["qty"] = (
+                    int(round(new_qty))
+                    if abs(new_qty - round(new_qty)) < 1e-6
+                    else round(new_qty, 4)
+                )
                 existing["entry_price"] = new_entry
                 existing["cost_basis"] = new_cost
-                existing["order_id"] = str(order_id) if order_id else existing.get("order_id")
+                existing["order_id"] = (
+                    str(order_id) if order_id else existing.get("order_id")
+                )
                 existing["buy_reason"] = reason or existing.get("buy_reason")
                 existing["last_updated_utc"] = exec_dt.isoformat()
                 if eff_price > 0:
                     existing["current_price"] = round(eff_price, 4)
                     existing["market_value"] = round(eff_price * new_qty * mult, 2)
-                    existing["pnl_dollars"] = round(existing["market_value"] - new_cost, 2)
+                    existing["pnl_dollars"] = round(
+                        existing["market_value"] - new_cost, 2
+                    )
                     existing["pnl_pct"] = round(
-                        ((existing["pnl_dollars"] / new_cost) * 100.0) if new_cost > 0 else 0.0,
+                        (
+                            ((existing["pnl_dollars"] / new_cost) * 100.0)
+                            if new_cost > 0
+                            else 0.0
+                        ),
                         2,
                     )
-                    pt = self._build_point(exec_dt, eff_price, new_entry, new_qty, mult, source="order_fill")
+                    pt = self._build_point(
+                        exec_dt,
+                        eff_price,
+                        new_entry,
+                        new_qty,
+                        mult,
+                        source="order_fill",
+                    )
                     self._upsert_point(existing["history"], pt)
                 return existing
 
             history = []
             if eff_price > 0:
                 history.append(
-                    self._build_point(exec_dt, eff_price, eff_price, eff_qty, mult, source="order_fill")
+                    self._build_point(
+                        exec_dt,
+                        eff_price,
+                        eff_price,
+                        eff_qty,
+                        mult,
+                        source="order_fill",
+                    )
                 )
             entry = {
                 "contract": sym,
@@ -2102,7 +2320,11 @@ class OptionContractHistoryTracker:
                 "right": right,
                 "strike": strike,
                 "expiry": expiry,
-                "qty": int(round(eff_qty)) if abs(eff_qty - round(eff_qty)) < 1e-6 else round(eff_qty, 4),
+                "qty": (
+                    int(round(eff_qty))
+                    if abs(eff_qty - round(eff_qty)) < 1e-6
+                    else round(eff_qty, 4)
+                ),
                 "multiplier": mult,
                 "entry_price": round(eff_price, 4),
                 "cost_basis": cost_basis,
@@ -2122,7 +2344,9 @@ class OptionContractHistoryTracker:
             self.open_contracts[sym] = entry
             return entry
 
-    def update_buy_fill(self, contract, order_id, filled_price, filled_at=None, filled_qty=None):
+    def update_buy_fill(
+        self, contract, order_id, filled_price, filled_at=None, filled_qty=None
+    ):
         sym = str(contract or "").strip().upper()
         fp = _opt_safe_float(filled_price, None)
         if not sym or fp is None or fp <= 0:
@@ -2133,7 +2357,9 @@ class OptionContractHistoryTracker:
             if not entry:
                 return False
             mult = float(entry.get("multiplier") or 100.0)
-            q = float(_opt_safe_float(filled_qty, entry.get("qty")) or entry.get("qty") or 1.0)
+            q = float(
+                _opt_safe_float(filled_qty, entry.get("qty")) or entry.get("qty") or 1.0
+            )
             entry["entry_price"] = round(fp, 4)
             entry["cost_basis"] = round(fp * q * mult, 2)
             if fdt is not None:
@@ -2145,13 +2371,23 @@ class OptionContractHistoryTracker:
             entry["market_value"] = round(cur_p * q * mult, 2)
             entry["pnl_dollars"] = round(entry["market_value"] - entry["cost_basis"], 2)
             entry["pnl_pct"] = round(
-                (entry["pnl_dollars"] / entry["cost_basis"]) * 100.0 if entry["cost_basis"] > 0 else 0.0,
+                (
+                    (entry["pnl_dollars"] / entry["cost_basis"]) * 100.0
+                    if entry["cost_basis"] > 0
+                    else 0.0
+                ),
                 2,
             )
             rebuilt = []
             for pt in entry.get("history") or []:
-                pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc")) or (fdt or datetime.now(UTC))
-                pt_p = fp if pt.get("source") == "order_fill" else (_opt_safe_float(pt.get("price"), cur_p) or cur_p)
+                pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc")) or (
+                    fdt or datetime.now(UTC)
+                )
+                pt_p = (
+                    fp
+                    if pt.get("source") == "order_fill"
+                    else (_opt_safe_float(pt.get("price"), cur_p) or cur_p)
+                )
                 rebuilt.append(
                     self._build_point(
                         pt_dt,
@@ -2173,56 +2409,116 @@ class OptionContractHistoryTracker:
 
         with self._lock:
             for pos in positions or []:
-                sym = str(
-                    (pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", ""))
-                    or ""
-                ).strip().upper()
+                sym = (
+                    str(
+                        (
+                            pos.get("symbol")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "symbol", "")
+                        )
+                        or ""
+                    )
+                    .strip()
+                    .upper()
+                )
                 if not sym:
                     continue
-                raw_ac = pos.get("asset_class") if isinstance(pos, dict) else getattr(pos, "asset_class", None)
+                raw_ac = (
+                    pos.get("asset_class")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "asset_class", None)
+                )
                 if not _is_option_contract_symbol(sym, raw_ac):
                     continue
-                raw_qty = _opt_safe_float(
-                    pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 0.0
-                ) or 0.0
-                raw_side = pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+                raw_qty = (
+                    _opt_safe_float(
+                        (
+                            pos.get("qty")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "qty", None)
+                        ),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                raw_side = (
+                    pos.get("side")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "side", None)
+                )
                 side = str(getattr(raw_side, "value", raw_side) or "long").lower()
                 if raw_qty <= 0 or side == "short":
                     continue
 
                 seen_symbols.add(sym)
                 _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
-                raw_und = pos.get("underlying_symbol") if isinstance(pos, dict) else getattr(pos, "underlying_symbol", None)
+                raw_und = (
+                    pos.get("underlying_symbol")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "underlying_symbol", None)
+                )
                 und = str(raw_und or parsed_und or sym).strip().upper()
                 mult = 100.0
                 avg_entry = _opt_safe_float(
-                    pos.get("avg_entry_price") if isinstance(pos, dict) else getattr(pos, "avg_entry_price", None),
+                    (
+                        pos.get("avg_entry_price")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "avg_entry_price", None)
+                    ),
                     None,
                 )
                 cur_price = _opt_safe_float(
-                    pos.get("current_price") if isinstance(pos, dict) else getattr(pos, "current_price", None),
+                    (
+                        pos.get("current_price")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "current_price", None)
+                    ),
                     None,
                 )
                 mkt_val = _opt_safe_float(
-                    pos.get("market_value") if isinstance(pos, dict) else getattr(pos, "market_value", None),
+                    (
+                        pos.get("market_value")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "market_value", None)
+                    ),
                     None,
                 )
                 cost_b = _opt_safe_float(
-                    pos.get("cost_basis") if isinstance(pos, dict) else getattr(pos, "cost_basis", None),
+                    (
+                        pos.get("cost_basis")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "cost_basis", None)
+                    ),
                     None,
                 )
                 upl = _opt_safe_float(
-                    pos.get("unrealized_pl") if isinstance(pos, dict) else getattr(pos, "unrealized_pl", None),
+                    (
+                        pos.get("unrealized_pl")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "unrealized_pl", None)
+                    ),
                     None,
                 )
                 uplpc = _opt_safe_float(
-                    pos.get("unrealized_plpc") if isinstance(pos, dict) else getattr(pos, "unrealized_plpc", None),
+                    (
+                        pos.get("unrealized_plpc")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "unrealized_plpc", None)
+                    ),
                     None,
                 )
 
-                if (avg_entry is None or avg_entry <= 0) and cost_b is not None and cost_b > 0:
+                if (
+                    (avg_entry is None or avg_entry <= 0)
+                    and cost_b is not None
+                    and cost_b > 0
+                ):
                     avg_entry = cost_b / (raw_qty * mult)
-                if (cur_price is None or cur_price <= 0) and mkt_val is not None and mkt_val > 0:
+                if (
+                    (cur_price is None or cur_price <= 0)
+                    and mkt_val is not None
+                    and mkt_val > 0
+                ):
                     cur_price = mkt_val / (raw_qty * mult)
                 if avg_entry is None or avg_entry <= 0:
                     avg_entry = cur_price or 0.0
@@ -2241,7 +2537,11 @@ class OptionContractHistoryTracker:
                 else:
                     pnl_pct = 0.0
 
-                clean_qty = int(round(raw_qty)) if abs(raw_qty - round(raw_qty)) < 1e-6 else round(raw_qty, 4)
+                clean_qty = (
+                    int(round(raw_qty))
+                    if abs(raw_qty - round(raw_qty)) < 1e-6
+                    else round(raw_qty, 4)
+                )
                 existing = self.open_contracts.get(sym)
                 if existing is None:
                     existing = {
@@ -2270,7 +2570,14 @@ class OptionContractHistoryTracker:
                     }
                     if avg_entry > 0:
                         existing["history"].append(
-                            self._build_point(now_dt, avg_entry, avg_entry, raw_qty, mult, source="order_fill")
+                            self._build_point(
+                                now_dt,
+                                avg_entry,
+                                avg_entry,
+                                raw_qty,
+                                mult,
+                                source="order_fill",
+                            )
                         )
                     self.open_contracts[sym] = existing
                 else:
@@ -2288,7 +2595,9 @@ class OptionContractHistoryTracker:
                         existing["history_source"] = "backfilled+live"
 
                 if cur_price > 0 and avg_entry > 0:
-                    pt = self._build_point(now_dt, cur_price, avg_entry, raw_qty, mult, source="live_poll")
+                    pt = self._build_point(
+                        now_dt, cur_price, avg_entry, raw_qty, mult, source="live_poll"
+                    )
                     pt["market_value"] = round(mkt_val, 2)
                     pt["cost_basis"] = round(cost_b, 2)
                     pt["pnl_dollars"] = round(upl, 2)
@@ -2320,17 +2629,35 @@ class OptionContractHistoryTracker:
                 from alpaca.trading.requests import GetOrdersRequest
                 from alpaca.trading.enums import QueryOrderStatus
 
-                req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[sym], limit=20)
+                req = GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED, symbols=[sym], limit=20
+                )
                 orders = list(self._trading_client.get_orders(filter=req) or [])
         except Exception:
             return
 
         sell_order = None
         for ord_obj in orders:
-            side_val = str(getattr(getattr(ord_obj, "side", None), "value", getattr(ord_obj, "side", "")) or "").lower()
-            st_val = str(getattr(getattr(ord_obj, "status", None), "value", getattr(ord_obj, "status", "")) or "").lower()
+            side_val = str(
+                getattr(
+                    getattr(ord_obj, "side", None),
+                    "value",
+                    getattr(ord_obj, "side", ""),
+                )
+                or ""
+            ).lower()
+            st_val = str(
+                getattr(
+                    getattr(ord_obj, "status", None),
+                    "value",
+                    getattr(ord_obj, "status", ""),
+                )
+                or ""
+            ).lower()
             f_qty = _opt_safe_float(getattr(ord_obj, "filled_qty", None), 0.0) or 0.0
-            f_price = _opt_safe_float(getattr(ord_obj, "filled_avg_price", None), 0.0) or 0.0
+            f_price = (
+                _opt_safe_float(getattr(ord_obj, "filled_avg_price", None), 0.0) or 0.0
+            )
             if side_val == "sell" and ("fill" in st_val or f_qty > 0) and f_price > 0:
                 sell_order = ord_obj
                 break
@@ -2392,15 +2719,22 @@ class OptionContractHistoryTracker:
 
         with self._lock:
             open_entry = self.open_contracts.get(sym)
-            eff_qty = _opt_safe_float(
-                qty,
-                open_entry.get("qty") if open_entry else 1.0,
-            ) or 1.0
+            eff_qty = (
+                _opt_safe_float(
+                    qty,
+                    open_entry.get("qty") if open_entry else 1.0,
+                )
+                or 1.0
+            )
             eff_entry = _opt_safe_float(
                 entry_price,
                 open_entry.get("entry_price") if open_entry else None,
             )
-            if (eff_entry is None or eff_entry <= 0) and cost_basis is not None and eff_qty > 0:
+            if (
+                (eff_entry is None or eff_entry <= 0)
+                and cost_basis is not None
+                and eff_qty > 0
+            ):
                 eff_entry = float(cost_basis) / (eff_qty * mult)
             eff_exit = _opt_safe_float(
                 exit_price,
@@ -2411,15 +2745,27 @@ class OptionContractHistoryTracker:
 
             eff_purchased_dt = (
                 _opt_parse_utc(purchased_at)
-                or (_opt_parse_utc(open_entry.get("purchased_at_utc")) if open_entry else None)
+                or (
+                    _opt_parse_utc(open_entry.get("purchased_at_utc"))
+                    if open_entry
+                    else None
+                )
                 or sold_dt
             )
-            eff_buy_order_id = buy_order_id or (open_entry.get("order_id") if open_entry else None)
+            eff_buy_order_id = buy_order_id or (
+                open_entry.get("order_id") if open_entry else None
+            )
             eff_cost_basis = round(eff_entry * eff_qty * mult, 2)
             proceeds = round(eff_exit * eff_qty * mult, 2)
             total_pnl_dollars = round(proceeds - eff_cost_basis, 2)
-            total_pnl_pct = round((total_pnl_dollars / eff_cost_basis) * 100.0, 2) if eff_cost_basis > 0 else 0.0
-            hold_minutes = round(max(0.0, (sold_dt - eff_purchased_dt).total_seconds() / 60.0), 2)
+            total_pnl_pct = (
+                round((total_pnl_dollars / eff_cost_basis) * 100.0, 2)
+                if eff_cost_basis > 0
+                else 0.0
+            )
+            hold_minutes = round(
+                max(0.0, (sold_dt - eff_purchased_dt).total_seconds() / 60.0), 2
+            )
 
             trade_id = str(order_id) if order_id else f"{sym}@{sold_dt.isoformat()}"
             base_history = list(open_entry.get("history") or []) if open_entry else []
@@ -2443,7 +2789,11 @@ class OptionContractHistoryTracker:
                 "right": right if eff_opt else "EQUITY",
                 "strike": strike,
                 "expiry": expiry,
-                "qty": int(round(eff_qty)) if abs(eff_qty - round(eff_qty)) < 1e-6 else round(eff_qty, 4),
+                "qty": (
+                    int(round(eff_qty))
+                    if abs(eff_qty - round(eff_qty)) < 1e-6
+                    else round(eff_qty, 4)
+                ),
                 "multiplier": mult,
                 "entry_price": round(eff_entry, 4),
                 "exit_price": round(eff_exit, 4),
@@ -2484,10 +2834,19 @@ class OptionContractHistoryTracker:
                 if rem_qty <= 1e-6:
                     self.open_contracts.pop(sym, None)
                 else:
-                    open_entry["qty"] = int(round(rem_qty)) if abs(rem_qty - round(rem_qty)) < 1e-6 else round(rem_qty, 4)
+                    open_entry["qty"] = (
+                        int(round(rem_qty))
+                        if abs(rem_qty - round(rem_qty)) < 1e-6
+                        else round(rem_qty, 4)
+                    )
                     open_entry["cost_basis"] = round(eff_entry * rem_qty * mult, 2)
-                    open_entry["market_value"] = round((open_entry.get("current_price") or eff_exit) * rem_qty * mult, 2)
-                    open_entry["pnl_dollars"] = round(open_entry["market_value"] - open_entry["cost_basis"], 2)
+                    open_entry["market_value"] = round(
+                        (open_entry.get("current_price") or eff_exit) * rem_qty * mult,
+                        2,
+                    )
+                    open_entry["pnl_dollars"] = round(
+                        open_entry["market_value"] - open_entry["cost_basis"], 2
+                    )
             return closed_record
 
     def update_sell_fill(self, order_id, filled_price, filled_at=None):
@@ -2498,34 +2857,60 @@ class OptionContractHistoryTracker:
         fdt = _opt_parse_utc(filled_at)
         with self._lock:
             for item in self.closed_contracts:
-                if item.get("sell_order_id") == oid_str or item.get("trade_id") == oid_str:
+                if (
+                    item.get("sell_order_id") == oid_str
+                    or item.get("trade_id") == oid_str
+                ):
                     mult = float(item.get("multiplier") or 100.0)
                     q = float(_opt_safe_float(item.get("qty"), 1.0) or 1.0)
                     ep = float(_opt_safe_float(item.get("entry_price"), fp) or fp)
                     item["exit_price"] = round(fp, 4)
                     item["proceeds"] = round(fp * q * mult, 2)
                     item["cost_basis"] = round(ep * q * mult, 2)
-                    item["total_pnl_dollars"] = round(item["proceeds"] - item["cost_basis"], 2)
+                    item["total_pnl_dollars"] = round(
+                        item["proceeds"] - item["cost_basis"], 2
+                    )
                     item["total_pnl_pct"] = round(
-                        (item["total_pnl_dollars"] / item["cost_basis"]) * 100.0 if item["cost_basis"] > 0 else 0.0,
+                        (
+                            (item["total_pnl_dollars"] / item["cost_basis"]) * 100.0
+                            if item["cost_basis"] > 0
+                            else 0.0
+                        ),
                         2,
                     )
                     if fdt is not None:
                         item["sold_at_utc"] = fdt.isoformat()
                         p_dt = _opt_parse_utc(item.get("purchased_at_utc"))
                         if p_dt is not None:
-                            item["hold_minutes"] = round(max(0.0, (fdt - p_dt).total_seconds() / 60.0), 2)
+                            item["hold_minutes"] = round(
+                                max(0.0, (fdt - p_dt).total_seconds() / 60.0), 2
+                            )
                     hist = item.get("history") or []
                     if hist:
-                        last_dt = fdt or _opt_parse_utc(item.get("sold_at_utc")) or datetime.now(UTC)
-                        last_mk = hist[-1].get("minute_utc") or minute_utc(last_dt).isoformat()
+                        last_dt = (
+                            fdt
+                            or _opt_parse_utc(item.get("sold_at_utc"))
+                            or datetime.now(UTC)
+                        )
+                        last_mk = (
+                            hist[-1].get("minute_utc")
+                            or minute_utc(last_dt).isoformat()
+                        )
                         hist[-1] = self._build_point(
-                            last_dt, fp, ep, q, mult, source="order_fill", minute_key_override=last_mk
+                            last_dt,
+                            fp,
+                            ep,
+                            q,
+                            mult,
+                            source="order_fill",
+                            minute_key_override=last_mk,
                         )
                     return True
         return False
 
-    def schedule_order_fill_refresh(self, trading_client, order_id, contract, side="buy"):
+    def schedule_order_fill_refresh(
+        self, trading_client, order_id, contract, side="buy"
+    ):
         if trading_client is None or not order_id:
             return
         oid_str = str(order_id)
@@ -2542,11 +2927,22 @@ class OptionContractHistoryTracker:
                     return
                 fp = _opt_safe_float(getattr(ord_obj, "filled_avg_price", None), None)
                 fq = _opt_safe_float(getattr(ord_obj, "filled_qty", None), None)
-                fat = getattr(ord_obj, "filled_at", None) or getattr(ord_obj, "updated_at", None)
-                st = str(getattr(getattr(ord_obj, "status", None), "value", getattr(ord_obj, "status", "")) or "").lower()
+                fat = getattr(ord_obj, "filled_at", None) or getattr(
+                    ord_obj, "updated_at", None
+                )
+                st = str(
+                    getattr(
+                        getattr(ord_obj, "status", None),
+                        "value",
+                        getattr(ord_obj, "status", ""),
+                    )
+                    or ""
+                ).lower()
                 if fp is not None and fp > 0:
                     if side == "buy":
-                        self.update_buy_fill(sym, oid_str, fp, filled_at=fat, filled_qty=fq)
+                        self.update_buy_fill(
+                            sym, oid_str, fp, filled_at=fat, filled_qty=fq
+                        )
                     else:
                         self.update_sell_fill(oid_str, fp, filled_at=fat)
                     if "fill" in st and "partially" not in st:
@@ -2554,7 +2950,9 @@ class OptionContractHistoryTracker:
                 if st in {"canceled", "cancelled", "expired", "rejected"}:
                     return
 
-        threading.Thread(target=_poll_fill, name=f"OPT-FILL-{oid_str[:8]}", daemon=True).start()
+        threading.Thread(
+            target=_poll_fill, name=f"OPT-FILL-{oid_str[:8]}", daemon=True
+        ).start()
 
     def _fetch_option_bars_map(self, symbol_ranges):
         """Fetch 1-minute option bars for {sym: (start_dt, end_dt)} -> {sym: {min_dt: close}}."""
@@ -2610,8 +3008,19 @@ class OptionContractHistoryTracker:
                     s_upper = str(sym).strip().upper()
                     per_min = result.setdefault(s_upper, {})
                     for b in bars or []:
-                        ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
-                        close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
+                        ts = _opt_parse_utc(
+                            b.get("timestamp")
+                            if isinstance(b, dict)
+                            else getattr(b, "timestamp", None)
+                        )
+                        close_p = _opt_safe_float(
+                            (
+                                b.get("close")
+                                if isinstance(b, dict)
+                                else getattr(b, "close", None)
+                            ),
+                            None,
+                        )
                         if ts is not None and close_p is not None and close_p > 0:
                             per_min[minute_utc(ts)] = close_p
             except Exception:
@@ -2625,18 +3034,33 @@ class OptionContractHistoryTracker:
                         )
                         resp = self._option_data_client.get_option_bars(req)
                         bar_dict = _extract_bars_from_resp(resp)
-                        bars = bar_dict.get(sym) or (next(iter(bar_dict.values()), []) if bar_dict else [])
+                        bars = bar_dict.get(sym) or (
+                            next(iter(bar_dict.values()), []) if bar_dict else []
+                        )
                         per_min = result.setdefault(sym, {})
                         for b in bars or []:
-                            ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
-                            close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
+                            ts = _opt_parse_utc(
+                                b.get("timestamp")
+                                if isinstance(b, dict)
+                                else getattr(b, "timestamp", None)
+                            )
+                            close_p = _opt_safe_float(
+                                (
+                                    b.get("close")
+                                    if isinstance(b, dict)
+                                    else getattr(b, "close", None)
+                                ),
+                                None,
+                            )
                             if ts is not None and close_p is not None and close_p > 0:
                                 per_min[minute_utc(ts)] = close_p
                     except Exception:
                         continue
         return result
 
-    def startup_backfill(self, trading_client=None, option_data_client=None, stock_data_client=None):
+    def startup_backfill(
+        self, trading_client=None, option_data_client=None, stock_data_client=None
+    ):
         """Scan open positions & closed/filled orders in Alpaca and backfill 1m option history."""
         client = trading_client or self._trading_client
         if client is None:
@@ -2659,14 +3083,43 @@ class OptionContractHistoryTracker:
             positions = list(client.get_all_positions() or [])
             open_pos_by_sym = {}
             for pos in positions:
-                sym = str((pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", "")) or "").strip().upper()
+                sym = (
+                    str(
+                        (
+                            pos.get("symbol")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "symbol", "")
+                        )
+                        or ""
+                    )
+                    .strip()
+                    .upper()
+                )
                 if not sym:
                     continue
-                raw_ac = pos.get("asset_class") if isinstance(pos, dict) else getattr(pos, "asset_class", None)
+                raw_ac = (
+                    pos.get("asset_class")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "asset_class", None)
+                )
                 if not _is_option_contract_symbol(sym, raw_ac):
                     continue
-                qty = _opt_safe_float(pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 0.0) or 0.0
-                raw_side = pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
+                qty = (
+                    _opt_safe_float(
+                        (
+                            pos.get("qty")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "qty", None)
+                        ),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                raw_side = (
+                    pos.get("side")
+                    if isinstance(pos, dict)
+                    else getattr(pos, "side", None)
+                )
                 side = str(getattr(raw_side, "value", raw_side) or "long").lower()
                 if qty > 0 and side != "short":
                     open_pos_by_sym[sym] = pos
@@ -2680,7 +3133,9 @@ class OptionContractHistoryTracker:
                     from alpaca.trading.enums import QueryOrderStatus
 
                     try:
-                        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500, direction=Sort.DESC)
+                        req = GetOrdersRequest(
+                            status=QueryOrderStatus.ALL, limit=500, direction=Sort.DESC
+                        )
                     except Exception:
                         req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500)
                     orders = list(client.get_orders(filter=req) or [])
@@ -2688,16 +3143,24 @@ class OptionContractHistoryTracker:
                 logging.warning("OPTION_HISTORY_GET_ORDERS_FAILED detail=%s", exc)
 
             seen_order_syms = {
-                str(getattr(o, "symbol", "") or "").strip().upper()
-                for o in orders
+                str(getattr(o, "symbol", "") or "").strip().upper() for o in orders
             }
-            missing_open_syms = [s for s in open_pos_by_sym.keys() if s not in seen_order_syms]
+            missing_open_syms = [
+                s for s in open_pos_by_sym.keys() if s not in seen_order_syms
+            ]
             if missing_open_syms:
                 try:
                     if isinstance(client, TastytradeClient):
                         for osym in missing_open_syms:
                             try:
-                                orders.extend(list(client.get_orders(status="closed", symbols=[osym], limit=50) or []))
+                                orders.extend(
+                                    list(
+                                        client.get_orders(
+                                            status="closed", symbols=[osym], limit=50
+                                        )
+                                        or []
+                                    )
+                                )
                             except Exception:
                                 continue
                     else:
@@ -2706,8 +3169,14 @@ class OptionContractHistoryTracker:
 
                         for osym in missing_open_syms:
                             try:
-                                treq = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[osym], limit=50)
-                                orders.extend(list(client.get_orders(filter=treq) or []))
+                                treq = GetOrdersRequest(
+                                    status=QueryOrderStatus.CLOSED,
+                                    symbols=[osym],
+                                    limit=50,
+                                )
+                                orders.extend(
+                                    list(client.get_orders(filter=treq) or [])
+                                )
                             except Exception:
                                 continue
                 except Exception:
@@ -2726,7 +3195,9 @@ class OptionContractHistoryTracker:
                 if not sym or not _is_option_contract_symbol(sym, raw_ac):
                     continue
                 f_qty = _opt_safe_float(getattr(o, "filled_qty", None), 0.0) or 0.0
-                f_price = _opt_safe_float(getattr(o, "filled_avg_price", None), 0.0) or 0.0
+                f_price = (
+                    _opt_safe_float(getattr(o, "filled_avg_price", None), 0.0) or 0.0
+                )
                 if f_qty <= 0 or f_price <= 0:
                     continue
                 f_at = (
@@ -2737,17 +3208,22 @@ class OptionContractHistoryTracker:
                 )
                 if f_at is None:
                     continue
-                side_val = str(getattr(getattr(o, "side", None), "value", getattr(o, "side", "")) or "").lower()
+                side_val = str(
+                    getattr(getattr(o, "side", None), "value", getattr(o, "side", ""))
+                    or ""
+                ).lower()
                 if side_val not in {"buy", "sell"}:
                     continue
-                filled_orders.append({
-                    "order_id": oid or None,
-                    "symbol": sym,
-                    "side": side_val,
-                    "qty": f_qty,
-                    "price": f_price,
-                    "filled_at": f_at,
-                })
+                filled_orders.append(
+                    {
+                        "order_id": oid or None,
+                        "symbol": sym,
+                        "side": side_val,
+                        "qty": f_qty,
+                        "price": f_price,
+                        "filled_at": f_at,
+                    }
+                )
 
             filled_orders.sort(key=lambda item: item["filled_at"])
 
@@ -2757,12 +3233,14 @@ class OptionContractHistoryTracker:
             for fo in filled_orders:
                 sym = fo["symbol"]
                 if fo["side"] == "buy":
-                    lots_by_sym.setdefault(sym, []).append({
-                        "qty": fo["qty"],
-                        "price": fo["price"],
-                        "filled_at": fo["filled_at"],
-                        "order_id": fo["order_id"],
-                    })
+                    lots_by_sym.setdefault(sym, []).append(
+                        {
+                            "qty": fo["qty"],
+                            "price": fo["price"],
+                            "filled_at": fo["filled_at"],
+                            "order_id": fo["order_id"],
+                        }
+                    )
                     latest_buy_by_sym[sym] = fo
                 elif fo["side"] == "sell":
                     sym_lots = lots_by_sym.get(sym, [])
@@ -2785,16 +3263,18 @@ class OptionContractHistoryTracker:
                             sym_lots.pop(0)
                     if matched_qty > 0 and earliest_buy_dt is not None:
                         avg_entry = matched_cost / matched_qty
-                        closed_matches.append({
-                            "contract": sym,
-                            "qty": matched_qty,
-                            "entry_price": avg_entry,
-                            "exit_price": fo["price"],
-                            "purchased_at": earliest_buy_dt,
-                            "sold_at": fo["filled_at"],
-                            "buy_order_id": first_buy_oid,
-                            "sell_order_id": fo["order_id"],
-                        })
+                        closed_matches.append(
+                            {
+                                "contract": sym,
+                                "qty": matched_qty,
+                                "entry_price": avg_entry,
+                                "exit_price": fo["price"],
+                                "purchased_at": earliest_buy_dt,
+                                "sold_at": fo["filled_at"],
+                                "buy_order_id": first_buy_oid,
+                                "sell_order_id": fo["order_id"],
+                            }
+                        )
 
             closed_matches.sort(key=lambda c: c["sold_at"], reverse=True)
             closed_matches = closed_matches[: self.MAX_CLOSED_TRADES]
@@ -2821,7 +3301,10 @@ class OptionContractHistoryTracker:
                 sym = cm["contract"]
                 if sym in bar_ranges:
                     s_min, e_max = bar_ranges[sym]
-                    bar_ranges[sym] = (min(s_min, cm["purchased_at"]), max(e_max, cm["sold_at"]))
+                    bar_ranges[sym] = (
+                        min(s_min, cm["purchased_at"]),
+                        max(e_max, cm["sold_at"]),
+                    )
                 else:
                     bar_ranges[sym] = (cm["purchased_at"], cm["sold_at"])
 
@@ -2837,9 +3320,22 @@ class OptionContractHistoryTracker:
                     xp = cm["exit_price"]
                     p_dt = cm["purchased_at"]
                     s_dt = cm["sold_at"]
-                    trade_id = str(cm["sell_order_id"]) if cm["sell_order_id"] else f"{sym}@{s_dt.isoformat()}"
-                    existing_closed = next((x for x in self.closed_contracts if x.get("trade_id") == trade_id), None)
-                    existing_hist = existing_closed.get("history") if existing_closed else []
+                    trade_id = (
+                        str(cm["sell_order_id"])
+                        if cm["sell_order_id"]
+                        else f"{sym}@{s_dt.isoformat()}"
+                    )
+                    existing_closed = next(
+                        (
+                            x
+                            for x in self.closed_contracts
+                            if x.get("trade_id") == trade_id
+                        ),
+                        None,
+                    )
+                    existing_hist = (
+                        existing_closed.get("history") if existing_closed else []
+                    )
                     hist = self._fill_minute_gaps(
                         existing_hist,
                         p_dt,
@@ -2863,7 +3359,9 @@ class OptionContractHistoryTracker:
                         "right": right,
                         "strike": strike,
                         "expiry": expiry,
-                        "qty": int(round(q)) if abs(q - round(q)) < 1e-6 else round(q, 4),
+                        "qty": (
+                            int(round(q)) if abs(q - round(q)) < 1e-6 else round(q, 4)
+                        ),
                         "multiplier": mult,
                         "entry_price": round(ep, 4),
                         "exit_price": round(xp, 4),
@@ -2873,12 +3371,23 @@ class OptionContractHistoryTracker:
                         "total_pnl_pct": pnl_p,
                         "purchased_at_utc": p_dt.isoformat(),
                         "sold_at_utc": s_dt.isoformat(),
-                        "hold_minutes": round(max(0.0, (s_dt - p_dt).total_seconds() / 60.0), 2),
-                        "buy_order_id": str(cm["buy_order_id"]) if cm["buy_order_id"] else None,
-                        "sell_order_id": str(cm["sell_order_id"]) if cm["sell_order_id"] else None,
-                        "reason": (existing_closed.get("reason") if existing_closed else None) or "alpaca_closed_order",
+                        "hold_minutes": round(
+                            max(0.0, (s_dt - p_dt).total_seconds() / 60.0), 2
+                        ),
+                        "buy_order_id": (
+                            str(cm["buy_order_id"]) if cm["buy_order_id"] else None
+                        ),
+                        "sell_order_id": (
+                            str(cm["sell_order_id"]) if cm["sell_order_id"] else None
+                        ),
+                        "reason": (
+                            existing_closed.get("reason") if existing_closed else None
+                        )
+                        or "alpaca_closed_order",
                         "dry_run": False,
-                        "history_source": "backfilled" if bars_by_sym.get(sym) else "order_fills",
+                        "history_source": (
+                            "backfilled" if bars_by_sym.get(sym) else "order_fills"
+                        ),
                         "history": hist,
                     }
                     if existing_closed is not None:
@@ -2888,39 +3397,119 @@ class OptionContractHistoryTracker:
                         self._closed_ids.add(trade_id)
                         self.closed_contracts.append(rec)
 
-                self.closed_contracts.sort(key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True)
+                self.closed_contracts.sort(
+                    key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True
+                )
                 if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
-                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES:]:
+                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES :]:
                         self._closed_ids.discard(dropped.get("trade_id"))
-                    del self.closed_contracts[self.MAX_CLOSED_TRADES:]
+                    del self.closed_contracts[self.MAX_CLOSED_TRADES :]
 
                 for sym, (pos, purchased_dt, buy_oid) in open_specs.items():
                     _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
-                    raw_und = pos.get("underlying_symbol") if isinstance(pos, dict) else getattr(pos, "underlying_symbol", None)
+                    raw_und = (
+                        pos.get("underlying_symbol")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "underlying_symbol", None)
+                    )
                     und = str(raw_und or parsed_und or sym).strip().upper()
                     mult = 100.0
-                    raw_qty = _opt_safe_float(pos.get("qty") if isinstance(pos, dict) else getattr(pos, "qty", None), 1.0) or 1.0
-                    clean_qty = int(round(raw_qty)) if abs(raw_qty - round(raw_qty)) < 1e-6 else round(raw_qty, 4)
-                    avg_entry = _opt_safe_float(pos.get("avg_entry_price") if isinstance(pos, dict) else getattr(pos, "avg_entry_price", None), None)
-                    cur_price = _opt_safe_float(pos.get("current_price") if isinstance(pos, dict) else getattr(pos, "current_price", None), None)
-                    mkt_val = _opt_safe_float(pos.get("market_value") if isinstance(pos, dict) else getattr(pos, "market_value", None), None)
-                    cost_b = _opt_safe_float(pos.get("cost_basis") if isinstance(pos, dict) else getattr(pos, "cost_basis", None), None)
-                    upl = _opt_safe_float(pos.get("unrealized_pl") if isinstance(pos, dict) else getattr(pos, "unrealized_pl", None), None)
-                    uplpc = _opt_safe_float(pos.get("unrealized_plpc") if isinstance(pos, dict) else getattr(pos, "unrealized_plpc", None), None)
+                    raw_qty = (
+                        _opt_safe_float(
+                            (
+                                pos.get("qty")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "qty", None)
+                            ),
+                            1.0,
+                        )
+                        or 1.0
+                    )
+                    clean_qty = (
+                        int(round(raw_qty))
+                        if abs(raw_qty - round(raw_qty)) < 1e-6
+                        else round(raw_qty, 4)
+                    )
+                    avg_entry = _opt_safe_float(
+                        (
+                            pos.get("avg_entry_price")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "avg_entry_price", None)
+                        ),
+                        None,
+                    )
+                    cur_price = _opt_safe_float(
+                        (
+                            pos.get("current_price")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "current_price", None)
+                        ),
+                        None,
+                    )
+                    mkt_val = _opt_safe_float(
+                        (
+                            pos.get("market_value")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "market_value", None)
+                        ),
+                        None,
+                    )
+                    cost_b = _opt_safe_float(
+                        (
+                            pos.get("cost_basis")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "cost_basis", None)
+                        ),
+                        None,
+                    )
+                    upl = _opt_safe_float(
+                        (
+                            pos.get("unrealized_pl")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "unrealized_pl", None)
+                        ),
+                        None,
+                    )
+                    uplpc = _opt_safe_float(
+                        (
+                            pos.get("unrealized_plpc")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "unrealized_plpc", None)
+                        ),
+                        None,
+                    )
 
                     if (avg_entry is None or avg_entry <= 0) and cost_b and raw_qty > 0:
                         avg_entry = cost_b / (raw_qty * mult)
-                    if (cur_price is None or cur_price <= 0) and mkt_val and raw_qty > 0:
+                    if (
+                        (cur_price is None or cur_price <= 0)
+                        and mkt_val
+                        and raw_qty > 0
+                    ):
                         cur_price = mkt_val / (raw_qty * mult)
                     avg_entry = avg_entry or cur_price or 0.0
                     cur_price = cur_price or avg_entry
-                    cost_b = cost_b if (cost_b is not None and cost_b > 0) else round(avg_entry * raw_qty * mult, 2)
-                    mkt_val = mkt_val if (mkt_val is not None and mkt_val > 0) else round(cur_price * raw_qty * mult, 2)
+                    cost_b = (
+                        cost_b
+                        if (cost_b is not None and cost_b > 0)
+                        else round(avg_entry * raw_qty * mult, 2)
+                    )
+                    mkt_val = (
+                        mkt_val
+                        if (mkt_val is not None and mkt_val > 0)
+                        else round(cur_price * raw_qty * mult, 2)
+                    )
                     upl = upl if upl is not None else round(mkt_val - cost_b, 2)
-                    pnl_pct = round(uplpc * 100.0, 2) if uplpc is not None else (round((upl / cost_b) * 100.0, 2) if cost_b > 0 else 0.0)
+                    pnl_pct = (
+                        round(uplpc * 100.0, 2)
+                        if uplpc is not None
+                        else (round((upl / cost_b) * 100.0, 2) if cost_b > 0 else 0.0)
+                    )
 
                     prev_entry = self.open_contracts.get(sym)
-                    existing_hist = list(prev_entry.get("history") or []) if prev_entry else []
+                    existing_hist = (
+                        list(prev_entry.get("history") or []) if prev_entry else []
+                    )
                     hist = self._fill_minute_gaps(
                         existing_hist,
                         purchased_dt,
@@ -2945,15 +3534,24 @@ class OptionContractHistoryTracker:
                         "cost_basis": round(cost_b, 2),
                         "purchased_at_utc": purchased_dt.isoformat(),
                         "purchased_minute_utc": minute_utc(purchased_dt).isoformat(),
-                        "order_id": str(buy_oid) if buy_oid else (prev_entry.get("order_id") if prev_entry else None),
-                        "buy_reason": (prev_entry.get("buy_reason") if prev_entry else None) or "alpaca_open_position",
+                        "order_id": (
+                            str(buy_oid)
+                            if buy_oid
+                            else (prev_entry.get("order_id") if prev_entry else None)
+                        ),
+                        "buy_reason": (
+                            prev_entry.get("buy_reason") if prev_entry else None
+                        )
+                        or "alpaca_open_position",
                         "dry_run": False,
                         "current_price": round(cur_price, 4),
                         "market_value": round(mkt_val, 2),
                         "pnl_dollars": round(upl, 2),
                         "pnl_pct": pnl_pct,
                         "last_updated_utc": now_dt.isoformat(),
-                        "history_source": "backfilled+live" if bars_by_sym.get(sym) else "live",
+                        "history_source": (
+                            "backfilled+live" if bars_by_sym.get(sym) else "live"
+                        ),
                         "history": hist,
                     }
 
@@ -2977,16 +3575,29 @@ class OptionContractHistoryTracker:
             with self._lock:
                 self.backfill_status = "error"
                 self.backfill_error = f"{type(exc).__name__}: {str(exc)[:180]}"
-            logging.warning("OPTION_HISTORY_BACKFILL_FAILED error_type=%s detail=%s", type(exc).__name__, exc)
+            logging.warning(
+                "OPTION_HISTORY_BACKFILL_FAILED error_type=%s detail=%s",
+                type(exc).__name__,
+                exc,
+            )
             return {"open": 0, "closed": 0, "error": str(exc)}
 
     def get_buyer_summary(self):
         with self._lock:
             items = list(self.open_contracts.values())
-            total_cost = round(sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2)
-            total_val = round(sum(_opt_safe_float(c.get("market_value"), 0.0) or 0.0 for c in items), 2)
-            total_pnl = round(sum(_opt_safe_float(c.get("pnl_dollars"), 0.0) or 0.0 for c in items), 2)
-            total_pct = round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+            total_cost = round(
+                sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2
+            )
+            total_val = round(
+                sum(_opt_safe_float(c.get("market_value"), 0.0) or 0.0 for c in items),
+                2,
+            )
+            total_pnl = round(
+                sum(_opt_safe_float(c.get("pnl_dollars"), 0.0) or 0.0 for c in items), 2
+            )
+            total_pct = (
+                round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+            )
             return {
                 "open_count": len(items),
                 "total_cost_basis": total_cost,
@@ -3000,12 +3611,32 @@ class OptionContractHistoryTracker:
     def get_seller_summary(self):
         with self._lock:
             items = list(self.closed_contracts)
-            total_cost = round(sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2)
-            total_proc = round(sum(_opt_safe_float(c.get("proceeds"), 0.0) or 0.0 for c in items), 2)
-            total_pnl = round(sum(_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0 for c in items), 2)
-            total_pct = round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
-            wins = sum(1 for c in items if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) > 0)
-            losses = sum(1 for c in items if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) < 0)
+            total_cost = round(
+                sum(_opt_safe_float(c.get("cost_basis"), 0.0) or 0.0 for c in items), 2
+            )
+            total_proc = round(
+                sum(_opt_safe_float(c.get("proceeds"), 0.0) or 0.0 for c in items), 2
+            )
+            total_pnl = round(
+                sum(
+                    _opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0
+                    for c in items
+                ),
+                2,
+            )
+            total_pct = (
+                round((total_pnl / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+            )
+            wins = sum(
+                1
+                for c in items
+                if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) > 0
+            )
+            losses = sum(
+                1
+                for c in items
+                if (_opt_safe_float(c.get("total_pnl_dollars"), 0.0) or 0.0) < 0
+            )
             return {
                 "closed_count": len(items),
                 "win_count": wins,
@@ -3424,7 +4055,11 @@ class MinuteCoordinator:
                 m = per_bar_metrics.get(b_ts)
                 sc = round(smoothed_seed[idx], 4)
                 sv = round(sc - smoothed_seed[idx - 1], 4) if idx >= 1 else None
-                sa = round(sv - prev_sv, 4) if (sv is not None and prev_sv is not None) else None
+                sa = (
+                    round(sv - prev_sv, 4)
+                    if (sv is not None and prev_sv is not None)
+                    else None
+                )
                 pv = (
                     m["price_velocity"]
                     if (m is not None and m.get("price_velocity") is not None)
@@ -3451,7 +4086,9 @@ class MinuteCoordinator:
                 else:
                     rsi_val = None
                     rsi_changes = None
-                reg = classify_kinematic_regime(rv, ra, sv if sv is not None else pv, sa if sa is not None else pa)
+                reg = classify_kinematic_regime(
+                    rv, ra, sv if sv is not None else pv, sa if sa is not None else pa
+                )
                 fc = compute_kinematic_forecast(
                     b.close,
                     sv if sv is not None else pv,
@@ -3684,7 +4321,9 @@ class MinuteCoordinator:
         smoothed_velocity = None
         smoothed_acceleration = None
         if curr_close is not None:
-            close_series = [e["close"] for e in history[-120:] if e.get("close") is not None] + [curr_close]
+            close_series = [
+                e["close"] for e in history[-120:] if e.get("close") is not None
+            ] + [curr_close]
             smoothed_vals = compute_smoothed_series(close_series)
             if smoothed_vals:
                 smoothed_close = round(smoothed_vals[-1], 4)
@@ -3692,13 +4331,20 @@ class MinuteCoordinator:
                     smoothed_velocity = round(smoothed_vals[-1] - smoothed_vals[-2], 4)
                 if len(smoothed_vals) >= 3:
                     prev_smoothed_vel = smoothed_vals[-2] - smoothed_vals[-3]
-                    smoothed_acceleration = round(smoothed_velocity - prev_smoothed_vel, 4)
+                    smoothed_acceleration = round(
+                        smoothed_velocity - prev_smoothed_vel, 4
+                    )
 
         prev_vel_for_cross = None
         prev_acc_for_cross = None
         if history:
             prev_hist = next(
-                (e for e in reversed(history) if e.get("smoothed_velocity") is not None or e.get("price_velocity") is not None),
+                (
+                    e
+                    for e in reversed(history)
+                    if e.get("smoothed_velocity") is not None
+                    or e.get("price_velocity") is not None
+                ),
                 None,
             )
             if prev_hist is not None:
@@ -3713,8 +4359,14 @@ class MinuteCoordinator:
                     else prev_hist.get("price_acceleration")
                 )
 
-        active_pv = smoothed_velocity if smoothed_velocity is not None else price_velocity
-        active_pa = smoothed_acceleration if smoothed_acceleration is not None else price_acceleration
+        active_pv = (
+            smoothed_velocity if smoothed_velocity is not None else price_velocity
+        )
+        active_pa = (
+            smoothed_acceleration
+            if smoothed_acceleration is not None
+            else price_acceleration
+        )
         forecast = compute_kinematic_forecast(
             curr_close,
             active_pv,
@@ -3763,12 +4415,14 @@ class MinuteCoordinator:
                     "regime": regime,
                     "rsi_changes": (
                         self.trackers[(provider, symbol)].changes
-                        if provider != "TRADINGVIEW" and (provider, symbol) in self.trackers
+                        if provider != "TRADINGVIEW"
+                        and (provider, symbol) in self.trackers
                         else None
                     ),
                     "rsi_period": (
                         self.trackers[(provider, symbol)].period
-                        if provider != "TRADINGVIEW" and (provider, symbol) in self.trackers
+                        if provider != "TRADINGVIEW"
+                        and (provider, symbol) in self.trackers
                         else None
                     ),
                 }
@@ -3921,9 +4575,7 @@ class MinuteCoordinator:
             # Discard pending records already at or before the just-finalized minute.
             next_day = self.next_minute.astimezone(MARKET_TZ).date()
             self.pending = {
-                key: value
-                for key, value in self.pending.items()
-                if key[2] > minute
+                key: value for key, value in self.pending.items() if key[2] > minute
             }
             self.counts = {
                 key: value for key, value in self.counts.items() if key[2] >= next_day
@@ -4223,7 +4875,9 @@ class ProviderRouter:
                 params={
                     "symbol": symbol,
                     "interval": "1min",
-                    "session_filter": ("all" if RSI_SESSION_MODE == "extended" else "open"),
+                    "session_filter": (
+                        "all" if RSI_SESSION_MODE == "extended" else "open"
+                    ),
                     "start": start.strftime("%Y-%m-%d %H:%M"),
                     "end": end.strftime("%Y-%m-%d %H:%M"),
                 },
@@ -4347,7 +5001,9 @@ class ProviderRouter:
 
         now_utc = minute_utc(datetime.now(UTC))
         report_start = getattr(self.coordinator, "report_start", None)
-        seed_end = min(now_utc, as_utc(report_start)) if report_start is not None else now_utc
+        seed_end = (
+            min(now_utc, as_utc(report_start)) if report_start is not None else now_utc
+        )
         if seed_end <= oldest_start:
             seed_end = sessions[-1][1][1]
 
@@ -4422,7 +5078,9 @@ class ProviderRouter:
                 for attempt in range(2):
                     try:
                         async with self.history_lock:
-                            bars = await self.fetch_history(symbol, fetch_start, seed_end)
+                            bars = await self.fetch_history(
+                                symbol, fetch_start, seed_end
+                            )
                         fetched_ok = True
                         break
                     except FatalProviderError:
@@ -4475,7 +5133,11 @@ class ProviderRouter:
             ext = extended_bounds(day)
             session_start = ext[0] if ext is not None else rth_open
             tracker = self.trackers.get(symbol)
-            last_ts = as_utc(tracker.last_timestamp) if (tracker and tracker.last_timestamp) else None
+            last_ts = (
+                as_utc(tracker.last_timestamp)
+                if (tracker and tracker.last_timestamp)
+                else None
+            )
             start = (
                 max(session_start, last_ts + MINUTE)
                 if (last_ts is not None and last_ts.astimezone(MARKET_TZ).date() == day)
@@ -4545,6 +5207,7 @@ class ProviderRouter:
 
             orig_subscribe_all = getattr(self.stream, "_subscribe_all", None)
             if callable(orig_subscribe_all):
+
                 async def _wrapped_subscribe_all(*args, **kwargs):
                     res = await orig_subscribe_all(*args, **kwargs)
                     self.coordinator.set_connected(self.provider, True)
@@ -4792,8 +5455,12 @@ class ProviderRouter:
                 "env": "sandbox",
                 "base_url": TASTYTRADE_SANDBOX_BASE_URL,
                 "client_id": self.credentials.get("tastytrade_sandbox_client_id", ""),
-                "client_secret": self.credentials.get("tastytrade_sandbox_client_secret", ""),
-                "refresh_token": self.credentials.get("tastytrade_sandbox_refresh_token", ""),
+                "client_secret": self.credentials.get(
+                    "tastytrade_sandbox_client_secret", ""
+                ),
+                "refresh_token": self.credentials.get(
+                    "tastytrade_sandbox_refresh_token", ""
+                ),
             }
         return {
             "env": "prod",
@@ -4838,7 +5505,9 @@ class ProviderRouter:
             url = f"{cfg['base_url']}/oauth/token"
             for attempt in range(4):
                 try:
-                    async with self.session.post(url, headers=headers, json=body) as resp:
+                    async with self.session.post(
+                        url, headers=headers, json=body
+                    ) as resp:
                         text = await resp.text()
                         if resp.status in {401, 403}:
                             raise FatalProviderError(
@@ -4846,14 +5515,20 @@ class ProviderRouter:
                             )
                         if resp.status == 400:
                             lower = text.lower()
-                            if "invalid_grant" in lower or "invalid_client" in lower or "unauthorized" in lower:
+                            if (
+                                "invalid_grant" in lower
+                                or "invalid_client" in lower
+                                or "unauthorized" in lower
+                            ):
                                 raise FatalProviderError(
                                     f"Tastytrade {env_key} OAuth rejected (invalid credentials/grant)"
                                 )
                             raise RuntimeError(f"Tastytrade OAuth HTTP 400")
                         if resp.status == 429 or resp.status >= 500:
                             if attempt == 3:
-                                raise RuntimeError(f"Tastytrade OAuth HTTP {resp.status}")
+                                raise RuntimeError(
+                                    f"Tastytrade OAuth HTTP {resp.status}"
+                                )
                             await asyncio.sleep(2**attempt)
                             continue
                         if resp.status >= 400:
@@ -4862,12 +5537,16 @@ class ProviderRouter:
                         break
                 except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
                     if attempt == 3:
-                        raise RuntimeError("Tastytrade OAuth network retries exhausted") from None
+                        raise RuntimeError(
+                            "Tastytrade OAuth network retries exhausted"
+                        ) from None
                     await asyncio.sleep(2**attempt)
 
             token = data.get("access_token") if isinstance(data, dict) else None
             if not isinstance(token, str) or not token.strip():
-                raise FatalProviderError("Tastytrade OAuth response missing access_token")
+                raise FatalProviderError(
+                    "Tastytrade OAuth response missing access_token"
+                )
             expires_in = float(data.get("expires_in", 900) or 900)
             token = token.strip()
             self._tt_access_cache[env_key] = {
@@ -4906,9 +5585,13 @@ class ProviderRouter:
             if not isinstance(data, dict):
                 raise RuntimeError("Tastytrade /api-quote-tokens invalid payload")
             quote_token = str(data.get("token") or "").strip()
-            dxlink_url = str(data.get("dxlink-url") or data.get("dxlink_url") or "").strip()
+            dxlink_url = str(
+                data.get("dxlink-url") or data.get("dxlink_url") or ""
+            ).strip()
             if not quote_token or not dxlink_url:
-                raise RuntimeError("Tastytrade /api-quote-tokens missing dxlink-url or token")
+                raise RuntimeError(
+                    "Tastytrade /api-quote-tokens missing dxlink-url or token"
+                )
             # Tokens last 24h; proactively refresh after 20h.
             self._tt_quote_cache = {
                 "token": quote_token,
@@ -5058,11 +5741,16 @@ class ProviderRouter:
             subscribed = False
 
             while time.monotonic() < deadline:
-                wait_for = min(float(idle_timeout), max(0.05, deadline - time.monotonic()))
+                wait_for = min(
+                    float(idle_timeout), max(0.05, deadline - time.monotonic())
+                )
                 try:
                     msg = await ws.receive(timeout=wait_for)
                 except asyncio.TimeoutError:
-                    if subscribed and (time.monotonic() - last_activity) >= idle_timeout:
+                    if (
+                        subscribed
+                        and (time.monotonic() - last_activity) >= idle_timeout
+                    ):
                         break
                     continue
 
@@ -5129,16 +5817,24 @@ class ProviderRouter:
                     last_activity = time.monotonic()
                 elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
                     ev_fields = frame.get("eventFields") or {}
-                    if isinstance(ev_fields, dict) and isinstance(ev_fields.get("Candle"), list):
+                    if isinstance(ev_fields, dict) and isinstance(
+                        ev_fields.get("Candle"), list
+                    ):
                         field_order = list(ev_fields["Candle"])
                 elif ftype == "ERROR":
                     err_msg = str(frame.get("message") or frame.get("error") or "")
-                    if "token" in err_msg.lower() or "auth" in err_msg.lower() or "unauth" in err_msg.lower():
+                    if (
+                        "token" in err_msg.lower()
+                        or "auth" in err_msg.lower()
+                        or "unauth" in err_msg.lower()
+                    ):
                         self._tt_quote_cache = None
                     raise RuntimeError(f"DXLink history error: {err_msg[:120]}")
                 elif ftype == "FEED_DATA" and frame.get("channel") == 1:
                     last_activity = time.monotonic()
-                    events = self._dxlink_parse_candle_data(frame.get("data"), field_order)
+                    events = self._dxlink_parse_candle_data(
+                        frame.get("data"), field_order
+                    )
                     for raw_sym, raw_time, raw_close, raw_flags in events:
                         base_sym, dt, price, flags = self._dxlink_normalize_candle(
                             raw_sym, raw_time, raw_close, raw_flags
@@ -5191,7 +5887,9 @@ class ProviderRouter:
 
                     async for message in ws:
                         if message.type == aiohttp.WSMsgType.ERROR:
-                            raise ConnectionError("Tastytrade DXLink WebSocket transport failed")
+                            raise ConnectionError(
+                                "Tastytrade DXLink WebSocket transport failed"
+                            )
                         if message.type != aiohttp.WSMsgType.TEXT:
                             continue
 
@@ -5211,7 +5909,11 @@ class ProviderRouter:
                                 state = str(frame.get("state") or "").upper()
                                 if state == "UNAUTHORIZED":
                                     await ws.send_json(
-                                        {"type": "AUTH", "channel": 0, "token": quote_token}
+                                        {
+                                            "type": "AUTH",
+                                            "channel": 0,
+                                            "token": quote_token,
+                                        }
                                     )
                                 elif state == "AUTHORIZED" and not channel_opened:
                                     await ws.send_json(
@@ -5222,16 +5924,21 @@ class ProviderRouter:
                                             "parameters": {"contract": "AUTO"},
                                         }
                                     )
-                            elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                            elif (
+                                ftype == "CHANNEL_OPENED" and frame.get("channel") == 1
+                            ):
                                 channel_opened = True
                                 self.coordinator.set_connected(self.provider, True)
                                 now_utc = datetime.now(UTC)
                                 for symbol in self.symbols:
                                     self.enqueue(symbol, "recover", now_utc)
-                                recent_floor = minute_utc(now_utc) - timedelta(minutes=2)
+                                recent_floor = minute_utc(now_utc) - timedelta(
+                                    minutes=2
+                                )
                                 if self.coordinator.last_finalized is not None:
                                     recent_floor = max(
-                                        recent_floor, self.coordinator.last_finalized + MINUTE
+                                        recent_floor,
+                                        self.coordinator.last_finalized + MINUTE,
                                     )
                                 from_ms = int(recent_floor.timestamp() * 1000)
                                 await ws.send_json(
@@ -5241,7 +5948,12 @@ class ProviderRouter:
                                         "acceptAggregationPeriod": 60.0,
                                         "acceptDataFormat": "COMPACT",
                                         "acceptEventFields": {
-                                            "Candle": ["eventSymbol", "time", "close", "eventFlags"]
+                                            "Candle": [
+                                                "eventSymbol",
+                                                "time",
+                                                "close",
+                                                "eventFlags",
+                                            ]
                                         },
                                     }
                                 )
@@ -5276,8 +5988,10 @@ class ProviderRouter:
                                     frame.get("data"), field_order
                                 )
                                 for raw_sym, raw_time, raw_close, raw_flags in events:
-                                    base_sym, dt, price, _flags = self._dxlink_normalize_candle(
-                                        raw_sym, raw_time, raw_close, raw_flags
+                                    base_sym, dt, price, _flags = (
+                                        self._dxlink_normalize_candle(
+                                            raw_sym, raw_time, raw_close, raw_flags
+                                        )
                                     )
                                     if (
                                         base_sym not in self.symbols
@@ -5296,7 +6010,9 @@ class ProviderRouter:
                                 safe = sanitize_provider_event(
                                     frame, secrets=tuple(self.credentials.values())
                                 )
-                                details = json.dumps(safe, separators=(",", ":"), default=str)
+                                details = json.dumps(
+                                    safe, separators=(",", ":"), default=str
+                                )
                                 self.logger.warning(
                                     "WS_CONTROL provider=%s payload=%s",
                                     self.provider,
@@ -5305,7 +6021,11 @@ class ProviderRouter:
                                 err_lower = str(
                                     frame.get("message") or frame.get("error") or ""
                                 ).lower()
-                                if "token" in err_lower or "auth" in err_lower or "unauth" in err_lower:
+                                if (
+                                    "token" in err_lower
+                                    or "auth" in err_lower
+                                    or "unauth" in err_lower
+                                ):
                                     force_quote_refresh = True
                                     self._tt_quote_cache = None
                                     raise ConnectionError("DXLink quote token rejected")
@@ -5487,7 +6207,10 @@ def _sanitize_parms_for_json_ini(raw_text):
             continue
         if "=" in body:
             key_part, val_part = body.split("=", 1)
-            if current_section in {"alpaca_api", "alpaca"} and key_part.strip().lower() == "feed":
+            if (
+                current_section in {"alpaca_api", "alpaca"}
+                and key_part.strip().lower() == "feed"
+            ):
                 out_lines.append(f"; ini-feature-option{newline}")
                 continue
             cleaned_val = _strip_trailing_json_comment(val_part)
@@ -5511,7 +6234,11 @@ def _read_chart_capture_ini_enabled(ini_path=None):
         cfg = configparser.ConfigParser(interpolation=None)
         cfg.read_string(raw_text)
         if cfg.has_option("chart_capture", "enabled"):
-            raw = str(_strip_ini_value(cfg.get("chart_capture", "enabled", fallback=""))).strip().lower()
+            raw = (
+                str(_strip_ini_value(cfg.get("chart_capture", "enabled", fallback="")))
+                .strip()
+                .lower()
+            )
             if raw in {"1", "true", "yes"}:
                 return True
             if raw in {"0", "false", "no"}:
@@ -5535,10 +6262,14 @@ def update_chart_capture_ini(enabled, ini_path=None):
     cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
     if not cfg_path.is_file():
         if ini_path is None:
-            logging.warning("CHART_CAPTURE_INI_SKIPPED reason=missing_file path=%s", cfg_path)
+            logging.warning(
+                "CHART_CAPTURE_INI_SKIPPED reason=missing_file path=%s", cfg_path
+            )
             return False
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(f"[chart_capture]\nenabled = {target_val}\n", encoding="utf-8")
+        cfg_path.write_text(
+            f"[chart_capture]\nenabled = {target_val}\n", encoding="utf-8"
+        )
         return True
 
     raw_bytes = cfg_path.read_bytes()
@@ -5554,7 +6285,7 @@ def update_chart_capture_ini(enabled, ini_path=None):
 
     for line in lines:
         nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
-        body = line[:-len(nl)] if nl else line
+        body = line[: -len(nl)] if nl else line
         sec_match = _INI_SECTION_RE.match(body)
         if sec_match:
             sec_name = sec_match.group(1).strip().lower()
@@ -5567,12 +6298,18 @@ def update_chart_capture_ini(enabled, ini_path=None):
             out_lines.append(line)
             continue
 
-        if in_chart_capture and "=" in body and not body.lstrip().startswith((";", "#")):
+        if (
+            in_chart_capture
+            and "=" in body
+            and not body.lstrip().startswith((";", "#"))
+        ):
             key_part = body.split("=", 1)[0]
             if key_part.strip().lower() == "enabled":
                 if not updated_option:
                     indent = key_part[: len(key_part) - len(key_part.lstrip())]
-                    out_lines.append(f"{indent}enabled = {target_val}{nl or default_nl}")
+                    out_lines.append(
+                        f"{indent}enabled = {target_val}{nl or default_nl}"
+                    )
                     updated_option = True
                 continue
 
@@ -5657,7 +6394,9 @@ def _ini_str(cfg, section, option, env_name, default):
 
 def _ini_bool(cfg, section, option, env_name, default):
     if cfg.has_option(section, option):
-        raw = str(_strip_ini_value(cfg.get(section, option, fallback=""))).strip().lower()
+        raw = (
+            str(_strip_ini_value(cfg.get(section, option, fallback=""))).strip().lower()
+        )
         if raw in {"1", "true", "yes"}:
             return True
         if raw in {"0", "false", "no"}:
@@ -5726,13 +6465,21 @@ def _apply_ini_feature_settings(cfg):
     global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
     global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES
 
-    tz_setting = _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
+    tz_setting = (
+        _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
+    )
     DISPLAY_TIMEZONE_SETTING = tz_setting
     DISPLAY_TZ, DISPLAY_TZ_IANA = _resolve_display_timezone(tz_setting)
     _reconfigure_logging_timezone()
 
     chain_prov = (
-        _ini_str(cfg, "option_trading", "optionchainprovider", "OPTION_CHAIN_PROVIDER", "alpaca")
+        _ini_str(
+            cfg,
+            "option_trading",
+            "optionchainprovider",
+            "OPTION_CHAIN_PROVIDER",
+            "alpaca",
+        )
         .strip()
         .lower()
     )
@@ -5743,7 +6490,13 @@ def _apply_ini_feature_settings(cfg):
     OPTION_CHAIN_PROVIDER = chain_prov
 
     tx_prov = (
-        _ini_str(cfg, "option_trading", "transactionprovider", "OPTION_TRANSACTION_PROVIDER", "alpaca")
+        _ini_str(
+            cfg,
+            "option_trading",
+            "transactionprovider",
+            "OPTION_TRANSACTION_PROVIDER",
+            "alpaca",
+        )
         .strip()
         .lower()
     )
@@ -5754,7 +6507,13 @@ def _apply_ini_feature_settings(cfg):
     OPTION_TRANSACTION_PROVIDER = tx_prov
 
     tt_env = (
-        _ini_str(cfg, "tastytrade_api", "transaction_env", "TASTYTRADE_TRANSACTION_ENV", "sandbox")
+        _ini_str(
+            cfg,
+            "tastytrade_api",
+            "transaction_env",
+            "TASTYTRADE_TRANSACTION_ENV",
+            "sandbox",
+        )
         .strip()
         .lower()
     )
@@ -5769,10 +6528,18 @@ def _apply_ini_feature_settings(cfg):
         cfg, "tastytrade_api", "account_number", "TASTYTRADE_ACCOUNT_NUMBER", ""
     ).strip()
     TASTYTRADE_PROD_ACCOUNT_NUMBER = _ini_str(
-        cfg, "tastytrade_api", "prod_account_number", "TASTYTRADE_PROD_ACCOUNT_NUMBER", ""
+        cfg,
+        "tastytrade_api",
+        "prod_account_number",
+        "TASTYTRADE_PROD_ACCOUNT_NUMBER",
+        "",
     ).strip()
     TASTYTRADE_SANDBOX_ACCOUNT_NUMBER = _ini_str(
-        cfg, "tastytrade_api", "sandbox_account_number", "TASTYTRADE_SANDBOX_ACCOUNT_NUMBER", ""
+        cfg,
+        "tastytrade_api",
+        "sandbox_account_number",
+        "TASTYTRADE_SANDBOX_ACCOUNT_NUMBER",
+        "",
     ).strip()
 
     smooth_method = (
@@ -5786,7 +6553,12 @@ def _apply_ini_feature_settings(cfg):
         )
     KINEMATICS_SMOOTH_METHOD = smooth_method
     KINEMATICS_SMOOTH_PERIOD = _ini_int(
-        cfg, "kinematics", "smooth_period", "KINEMATICS_SMOOTH_PERIOD", RSI_PERIOD, minimum=2
+        cfg,
+        "kinematics",
+        "smooth_period",
+        "KINEMATICS_SMOOTH_PERIOD",
+        RSI_PERIOD,
+        minimum=2,
     )
     KINEMATICS_RSI_OVERBOUGHT = _ini_float(
         cfg, "kinematics", "rsi_overbought", "KINEMATICS_RSI_OVERBOUGHT", 70.0
@@ -5795,7 +6567,12 @@ def _apply_ini_feature_settings(cfg):
         cfg, "kinematics", "rsi_oversold", "KINEMATICS_RSI_OVERSOLD", 30.0
     )
     KINEMATICS_HISTORY_MAX_BARS = _ini_int(
-        cfg, "kinematics", "history_max_bars", "KINEMATICS_HISTORY_MAX_BARS", 2400, minimum=60
+        cfg,
+        "kinematics",
+        "history_max_bars",
+        "KINEMATICS_HISTORY_MAX_BARS",
+        2400,
+        minimum=60,
     )
     RSI_WARMUP_SESSIONS = _ini_int(
         cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
@@ -5839,7 +6616,11 @@ def _apply_ini_feature_settings(cfg):
     )
     if cfg.has_section("option_seller") and cfg.has_option("option_seller", "rsi_high"):
         OPTION_CHAIN_RSI_HIGH = _ini_float(
-            cfg, "option_seller", "rsi_high", "OPTION_CHAIN_RSI_HIGH", OPTION_CHAIN_RSI_HIGH
+            cfg,
+            "option_seller",
+            "rsi_high",
+            "OPTION_CHAIN_RSI_HIGH",
+            OPTION_CHAIN_RSI_HIGH,
         )
     ALPACA_PAPER = _ini_bool(cfg, "option_buyer", "paper", "ALPACA_PAPER", True)
     OPTION_BUY_ENABLED = _ini_bool(
@@ -6229,7 +7010,12 @@ def _apply_ini_feature_settings(cfg):
         cfg, "dashboard", "password", "DASHBOARD_PASSWORD", ""
     )
     DASHBOARD_SESSION_TTL_HOURS = _ini_int(
-        cfg, "dashboard", "session_ttl_hours", "DASHBOARD_SESSION_TTL_HOURS", 24, minimum=1
+        cfg,
+        "dashboard",
+        "session_ttl_hours",
+        "DASHBOARD_SESSION_TTL_HOURS",
+        24,
+        minimum=1,
     )
     if cfg.has_option("dashboard", "inactivity_timeout_minutes"):
         DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = _ini_int(
@@ -6342,7 +7128,10 @@ def load_settings():
         "ALPACA": ["alpaca_key", "alpaca_secret"],
         "TRADIER": ["tradier_token"],
         "TWELVEDATA": ["twelvedata_key"],
-        "TASTYTRADE": ["tastytrade_prod_client_secret", "tastytrade_prod_refresh_token"],
+        "TASTYTRADE": [
+            "tastytrade_prod_client_secret",
+            "tastytrade_prod_refresh_token",
+        ],
         "YAHOOFINANCE": [],
         "TRADINGVIEW": [],
     }
@@ -6464,17 +7253,47 @@ def load_settings():
             keys["twelvedata_key"] = td_key
 
         tt_ini_map = (
-            ("tastytrade_prod_client_id", "prod_client_id", "TASTYTRADE_PROD_CLIENT_ID"),
-            ("tastytrade_prod_client_secret", "prod_client_secret", "TASTYTRADE_PROD_CLIENT_SECRET"),
-            ("tastytrade_prod_refresh_token", "prod_refresh_token", "TASTYTRADE_PROD_REFRESH_TOKEN"),
-            ("tastytrade_sandbox_client_id", "sandbox_client_id", "TASTYTRADE_SANDBOX_CLIENT_ID"),
-            ("tastytrade_sandbox_client_secret", "sandbox_client_secret", "TASTYTRADE_SANDBOX_CLIENT_SECRET"),
-            ("tastytrade_sandbox_refresh_token", "sandbox_refresh_token", "TASTYTRADE_SANDBOX_REFRESH_TOKEN"),
+            (
+                "tastytrade_prod_client_id",
+                "prod_client_id",
+                "TASTYTRADE_PROD_CLIENT_ID",
+            ),
+            (
+                "tastytrade_prod_client_secret",
+                "prod_client_secret",
+                "TASTYTRADE_PROD_CLIENT_SECRET",
+            ),
+            (
+                "tastytrade_prod_refresh_token",
+                "prod_refresh_token",
+                "TASTYTRADE_PROD_REFRESH_TOKEN",
+            ),
+            (
+                "tastytrade_sandbox_client_id",
+                "sandbox_client_id",
+                "TASTYTRADE_SANDBOX_CLIENT_ID",
+            ),
+            (
+                "tastytrade_sandbox_client_secret",
+                "sandbox_client_secret",
+                "TASTYTRADE_SANDBOX_CLIENT_SECRET",
+            ),
+            (
+                "tastytrade_sandbox_refresh_token",
+                "sandbox_refresh_token",
+                "TASTYTRADE_SANDBOX_REFRESH_TOKEN",
+            ),
         )
         for dest_key, ini_opt, env_opt in tt_ini_map:
-            keys[dest_key] = _ini_str(provider_config, "tastytrade_api", ini_opt, env_opt, "")
+            keys[dest_key] = _ini_str(
+                provider_config, "tastytrade_api", ini_opt, env_opt, ""
+            )
 
-        if "TASTYTRADE" in selected or OPTION_CHAIN_PROVIDER == "tastytrade" or OPTION_TRANSACTION_PROVIDER == "tastytrade":
+        if (
+            "TASTYTRADE" in selected
+            or OPTION_CHAIN_PROVIDER == "tastytrade"
+            or OPTION_TRANSACTION_PROVIDER == "tastytrade"
+        ):
             prod_ready = bool(
                 keys["tastytrade_prod_client_secret"].strip()
                 and keys["tastytrade_prod_refresh_token"].strip()
@@ -6509,7 +7328,10 @@ def load_settings():
             )
 
     if OPTION_CHAIN_PROVIDER == "tastytrade":
-        if not (keys.get("tastytrade_prod_client_secret") and keys.get("tastytrade_prod_refresh_token")):
+        if not (
+            keys.get("tastytrade_prod_client_secret")
+            and keys.get("tastytrade_prod_refresh_token")
+        ):
             raise ValueError(
                 "Missing Tastytrade Prod credentials ([tastytrade_api] prod_client_secret / prod_refresh_token) "
                 "required for [option_trading] optionchainprovider = tastytrade (no fallbacks)"
@@ -6517,18 +7339,27 @@ def load_settings():
 
     if OPTION_TRANSACTION_PROVIDER == "tastytrade":
         if TASTYTRADE_TRANSACTION_ENV == "sandbox":
-            if not (keys.get("tastytrade_sandbox_client_secret") and keys.get("tastytrade_sandbox_refresh_token")):
+            if not (
+                keys.get("tastytrade_sandbox_client_secret")
+                and keys.get("tastytrade_sandbox_refresh_token")
+            ):
                 raise ValueError(
                     "Missing Tastytrade Sandbox credentials ([tastytrade_api] sandbox_client_secret / sandbox_refresh_token) "
                     "required for [option_trading] transactionprovider = tastytrade with transaction_env = sandbox (no fallbacks)"
                 )
-            if not (keys.get("tastytrade_prod_client_secret") and keys.get("tastytrade_prod_refresh_token")):
+            if not (
+                keys.get("tastytrade_prod_client_secret")
+                and keys.get("tastytrade_prod_refresh_token")
+            ):
                 raise ValueError(
                     "Missing Tastytrade Prod credentials ([tastytrade_api] prod_client_secret / prod_refresh_token) "
                     "required for Prod quote pricing when transactionprovider = tastytrade with transaction_env = sandbox (no fallbacks)"
                 )
         else:
-            if not (keys.get("tastytrade_prod_client_secret") and keys.get("tastytrade_prod_refresh_token")):
+            if not (
+                keys.get("tastytrade_prod_client_secret")
+                and keys.get("tastytrade_prod_refresh_token")
+            ):
                 raise ValueError(
                     "Missing Tastytrade Prod credentials ([tastytrade_api] prod_client_secret / prod_refresh_token) "
                     "required for [option_trading] transactionprovider = tastytrade with transaction_env = prod (no fallbacks)"
@@ -6713,13 +7544,21 @@ CHART_CAPTURE_STALE_AFTER_SECONDS = max(
     0, int(os.getenv("CHART_CAPTURE_STALE_AFTER_SECONDS", "180"))
 )
 
-OPTION_CHAIN_PROVIDER = os.getenv("OPTION_CHAIN_PROVIDER", "alpaca").strip().lower() or "alpaca"
-OPTION_TRANSACTION_PROVIDER = os.getenv("OPTION_TRANSACTION_PROVIDER", "alpaca").strip().lower() or "alpaca"
-_raw_tt_tx_env = os.getenv("TASTYTRADE_TRANSACTION_ENV", "sandbox").strip().lower() or "sandbox"
+OPTION_CHAIN_PROVIDER = (
+    os.getenv("OPTION_CHAIN_PROVIDER", "alpaca").strip().lower() or "alpaca"
+)
+OPTION_TRANSACTION_PROVIDER = (
+    os.getenv("OPTION_TRANSACTION_PROVIDER", "alpaca").strip().lower() or "alpaca"
+)
+_raw_tt_tx_env = (
+    os.getenv("TASTYTRADE_TRANSACTION_ENV", "sandbox").strip().lower() or "sandbox"
+)
 TASTYTRADE_TRANSACTION_ENV = "prod" if _raw_tt_tx_env == "live" else _raw_tt_tx_env
 TASTYTRADE_ACCOUNT_NUMBER = os.getenv("TASTYTRADE_ACCOUNT_NUMBER", "").strip()
 TASTYTRADE_PROD_ACCOUNT_NUMBER = os.getenv("TASTYTRADE_PROD_ACCOUNT_NUMBER", "").strip()
-TASTYTRADE_SANDBOX_ACCOUNT_NUMBER = os.getenv("TASTYTRADE_SANDBOX_ACCOUNT_NUMBER", "").strip()
+TASTYTRADE_SANDBOX_ACCOUNT_NUMBER = os.getenv(
+    "TASTYTRADE_SANDBOX_ACCOUNT_NUMBER", ""
+).strip()
 
 DASHBOARD_SSL_ENABLED = os.getenv("DASHBOARD_SSL_ENABLED", "true").strip().lower() in {
     "1",
@@ -6732,7 +7571,9 @@ DASHBOARD_SSL_KEY = os.getenv("DASHBOARD_SSL_KEY", "certs/dashboard.key").strip(
 DASHBOARD_SSL_AUTO_SELF_SIGNED = os.getenv(
     "DASHBOARD_SSL_AUTO_SELF_SIGNED", "true"
 ).strip().lower() in {"1", "true", "yes"}
-DASHBOARD_AUTH_ENABLED = os.getenv("DASHBOARD_AUTH_ENABLED", "true").strip().lower() in {
+DASHBOARD_AUTH_ENABLED = os.getenv(
+    "DASHBOARD_AUTH_ENABLED", "true"
+).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -6820,7 +7661,11 @@ def _validate_tradingview_item(
         if "ticker" in item
         else (item.get("symbol") if "symbol" in item else item.get("sym"))
     )
-    if not isinstance(raw_ticker, str) or not raw_ticker.strip() or len(raw_ticker) > 100:
+    if (
+        not isinstance(raw_ticker, str)
+        or not raw_ticker.strip()
+        or len(raw_ticker) > 100
+    ):
         raise ValueError("ticker must be a nonempty string of at most 100 characters")
     ticker = raw_ticker.strip().upper()
     if ticker in allowed_symbols:
@@ -6870,7 +7715,11 @@ def _validate_tradingview_item(
     raw_time = (
         item.get("bar_start")
         if item.get("bar_start") is not None
-        else (item.get("timestamp") if item.get("timestamp") is not None else item.get("time"))
+        else (
+            item.get("timestamp")
+            if item.get("timestamp") is not None
+            else item.get("time")
+        )
     )
     if raw_time is not None:
         timestamp = _parse_tv_bar_start(raw_time, now)
@@ -6879,7 +7728,9 @@ def _validate_tradingview_item(
     else:
         timestamp = minute_utc(now) - MINUTE
         if not regular_session(timestamp):
-            raise ValueError(f"{symbol}: missing bar_start timestamp outside regular session")
+            raise ValueError(
+                f"{symbol}: missing bar_start timestamp outside regular session"
+            )
 
     return (
         {
@@ -6925,7 +7776,9 @@ def validate_tradingview_payload(payload, allowed_symbols):
             raise ValueError("JSON payload must be a batch or symbol object") from None
 
     if isinstance(payload, dict) and isinstance(payload.get("payload"), dict):
-        if not any(k in payload for k in ("data", "symbols", "items", "ticker", "symbol")):
+        if not any(
+            k in payload for k in ("data", "symbols", "items", "ticker", "symbol")
+        ):
             payload = payload["payload"]
 
     if isinstance(payload, list):
@@ -7017,9 +7870,11 @@ def validate_tradingview_payload(payload, allowed_symbols):
         "events": events,
         "skipped": skipped,
         "errors": errors,
-        "bar_start": default_timestamp.isoformat()
-        if default_timestamp is not None
-        else events[0]["event_time"],
+        "bar_start": (
+            default_timestamp.isoformat()
+            if default_timestamp is not None
+            else events[0]["event_time"]
+        ),
     }
 
 
@@ -7050,11 +7905,15 @@ def build_trading_client(keys, paper=None):
     """Create the configured transaction client (Alpaca TradingClient or TastytradeClient) with zero fallbacks."""
     provider = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
     if provider == "tastytrade":
-        env = str(
-            (keys or {}).get("tastytrade_transaction_env")
-            or TASTYTRADE_TRANSACTION_ENV
-            or "sandbox"
-        ).strip().lower()
+        env = (
+            str(
+                (keys or {}).get("tastytrade_transaction_env")
+                or TASTYTRADE_TRANSACTION_ENV
+                or "sandbox"
+            )
+            .strip()
+            .lower()
+        )
         if env == "live":
             env = "prod"
         if env not in {"sandbox", "prod"}:
@@ -7075,7 +7934,11 @@ def build_trading_client(keys, paper=None):
         acct_num = (
             ((keys or {}).get(prefix + "account_number") or "").strip()
             or ((keys or {}).get("tastytrade_account_number") or "").strip()
-            or (TASTYTRADE_PROD_ACCOUNT_NUMBER if env == "prod" else TASTYTRADE_SANDBOX_ACCOUNT_NUMBER)
+            or (
+                TASTYTRADE_PROD_ACCOUNT_NUMBER
+                if env == "prod"
+                else TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
+            )
             or TASTYTRADE_ACCOUNT_NUMBER
         )
         p_sec = ((keys or {}).get("tastytrade_prod_client_secret") or "").strip()
@@ -7096,12 +7959,20 @@ def build_trading_client(keys, paper=None):
             sandbox_refresh_token=(c_ref if env == "sandbox" else ""),
             transaction_env=env,
             account_number=acct_num,
-            prod_account_number=((keys or {}).get("tastytrade_prod_account_number") or TASTYTRADE_PROD_ACCOUNT_NUMBER),
-            sandbox_account_number=((keys or {}).get("tastytrade_sandbox_account_number") or TASTYTRADE_SANDBOX_ACCOUNT_NUMBER),
+            prod_account_number=(
+                (keys or {}).get("tastytrade_prod_account_number")
+                or TASTYTRADE_PROD_ACCOUNT_NUMBER
+            ),
+            sandbox_account_number=(
+                (keys or {}).get("tastytrade_sandbox_account_number")
+                or TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
+            ),
         )
 
     if provider != "alpaca":
-        raise ValueError(f"Unsupported [option_trading] transactionprovider: {provider!r}")
+        raise ValueError(
+            f"Unsupported [option_trading] transactionprovider: {provider!r}"
+        )
 
     if not keys.get("alpaca_key") or not keys.get("alpaca_secret"):
         logging.warning(
@@ -7128,7 +7999,9 @@ def build_option_chain_client(keys):
         return client
 
     if provider != "alpaca":
-        raise ValueError(f"Unsupported [option_trading] optionchainprovider: {provider!r}")
+        raise ValueError(
+            f"Unsupported [option_trading] optionchainprovider: {provider!r}"
+        )
 
     if not keys.get("alpaca_key") or not keys.get("alpaca_secret"):
         logging.warning(
@@ -7168,7 +8041,14 @@ def _extract_option_chain_error_message(contract, clean_payload=None):
             return None
         visited.add(node_id)
         if isinstance(node, dict):
-            for key in ("error", "message", "detail", "reason", "status_message", "msg"):
+            for key in (
+                "error",
+                "message",
+                "detail",
+                "reason",
+                "status_message",
+                "msg",
+            ):
                 val = node.get(key)
                 if isinstance(val, str) and val.strip():
                     text = " ".join(val.split()).strip()
@@ -7195,7 +8075,9 @@ def _looks_like_single_option_contract(obj):
     if isinstance(obj, str):
         return _is_valid_occ_symbol(obj)
     if isinstance(obj, dict):
-        if any(k in obj for k in ("call", "put", "contracts", "chain", "clean_payload")):
+        if any(
+            k in obj for k in ("call", "put", "contracts", "chain", "clean_payload")
+        ):
             return False
         return any(
             _is_valid_occ_symbol(obj.get(k))
@@ -7229,7 +8111,11 @@ def _unpack_pruned_option_chain_result(res):
             c = res.get("contract")
             p = _maybe_parse_json_str(res.get("clean_payload"))
             if isinstance(c, str) and c.strip() and not _is_valid_occ_symbol(c):
-                err_payload = p if isinstance(p, dict) else {"error": c.strip(), "clean_payload": p}
+                err_payload = (
+                    p
+                    if isinstance(p, dict)
+                    else {"error": c.strip(), "clean_payload": p}
+                )
                 return None, err_payload
             return c, p
         return res, res
@@ -7242,7 +8128,9 @@ def _unpack_pruned_option_chain_result(res):
                 return None, (p if p is not None else {"error": c.strip()})
             return c, p
         if all(isinstance(el, str) and not _is_valid_occ_symbol(el) for el in res):
-            return None, {"error": "; ".join(el.strip() for el in res if el.strip())[:240]}
+            return None, {
+                "error": "; ".join(el.strip() for el in res if el.strip())[:240]
+            }
         return res, res
     if isinstance(res, tuple):
         if not res:
@@ -7256,24 +8144,36 @@ def _unpack_pruned_option_chain_result(res):
                     merged = dict(p)
                     merged.setdefault("error", c.strip())
                     return None, merged
-                return None, ({"error": c.strip(), "detail": p} if p is not None else {"error": c.strip()})
+                return None, (
+                    {"error": c.strip(), "detail": p}
+                    if p is not None
+                    else {"error": c.strip()}
+                )
             return c, p
         # 3+ tuple: handle both (contract, clean_payload, extra...) and (call_contract, put_contract, clean_payload, ...)
-        if _looks_like_single_option_contract(res[0]) and _looks_like_single_option_contract(res[1]):
+        if _looks_like_single_option_contract(
+            res[0]
+        ) and _looks_like_single_option_contract(res[1]):
             pair = {}
             for item in res[:2]:
                 sym = ""
                 if isinstance(item, str):
                     sym = item.strip().upper()
                 elif isinstance(item, dict):
-                    sym = str(
-                        item.get("symbol")
-                        or item.get("contract_symbol")
-                        or item.get("option_symbol")
-                        or item.get("contract")
-                        or ""
-                    ).strip().upper()
-                    rtype = str(item.get("type") or item.get("right") or "").strip().lower()
+                    sym = (
+                        str(
+                            item.get("symbol")
+                            or item.get("contract_symbol")
+                            or item.get("option_symbol")
+                            or item.get("contract")
+                            or ""
+                        )
+                        .strip()
+                        .upper()
+                    )
+                    rtype = (
+                        str(item.get("type") or item.get("right") or "").strip().lower()
+                    )
                     if rtype in {"call", "put"} and rtype not in pair:
                         pair[rtype] = item
                         continue
@@ -7289,7 +8189,11 @@ def _unpack_pruned_option_chain_result(res):
                     pair["call"] = item
                 elif "put" not in pair:
                     pair["put"] = item
-            payload = res[2] if isinstance(res[2], (dict, list)) else {"contracts": list(res[:2]), "extra": list(res[2:])}
+            payload = (
+                res[2]
+                if isinstance(res[2], (dict, list))
+                else {"contracts": list(res[:2]), "extra": list(res[2:])}
+            )
             return pair, payload
         first = res[0]
         second = res[1] if res[1] is not None else res[2]
@@ -7357,7 +8261,11 @@ def _kinematics_entry_rank(provider, entry):
     has_vel = _has_finite_field(entry, "smoothed_velocity", "price_velocity")
     has_close = _has_finite_field(entry, "close")
     changes = entry.get("rsi_changes")
-    changes_val = int(changes) if isinstance(changes, (int, float)) and not isinstance(changes, bool) else -1
+    changes_val = (
+        int(changes)
+        if isinstance(changes, (int, float)) and not isinstance(changes, bool)
+        else -1
+    )
     ts = str(entry.get("timestamp") or "")
     if is_tv and has_complete:
         tier = 4
@@ -7589,7 +8497,9 @@ class TradingviewProvider:
                 errors = parsed.get("errors") or []
 
                 if not events:
-                    self._record_stat_error("Batch payload yielded no valid symbol events")
+                    self._record_stat_error(
+                        "Batch payload yielded no valid symbol events"
+                    )
                     return (
                         jsonify(
                             status="error",
@@ -7607,7 +8517,9 @@ class TradingviewProvider:
                     self.stats["events_queued"] += len(queued_symbols)
                     self.stats["last_received_symbols"] = list(queued_symbols[:50])
                     if skipped:
-                        self.stats["last_skipped_symbols"] = list(dict.fromkeys(skipped))[:30]
+                        self.stats["last_skipped_symbols"] = list(
+                            dict.fromkeys(skipped)
+                        )[:30]
                     self.stats["last_error"] = "; ".join(errors[:3]) if errors else None
 
                 if skipped:
@@ -7805,7 +8717,9 @@ class TradingviewProvider:
                         self.credentials["alpaca_secret"],
                         self.option_client,
                     )
-                contract, clean_payload = _unpack_pruned_option_chain_result(raw_chain_res)
+                contract, clean_payload = _unpack_pruned_option_chain_result(
+                    raw_chain_res
+                )
             except Exception as exc:
                 self.logger.error(
                     "OPTION_CHAIN_FAILED provider=%s signal=%s symbol=%s rsi=%.4f error_type=%s detail=%s",
@@ -7835,9 +8749,10 @@ class TradingviewProvider:
                 contract, clean_payload
             )
             if contract is None or not parsed_sym:
-                err_detail = _extract_option_chain_error_message(
-                    contract, clean_payload
-                ) or "empty_chain"
+                err_detail = (
+                    _extract_option_chain_error_message(contract, clean_payload)
+                    or "empty_chain"
+                )
                 self.logger.warning(
                     "OPTION_CHAIN_NO_CONTRACT provider=%s chain_provider=%s signal=%s symbol=%s rsi=%.4f detail=%s file=%s",
                     self.provider,
@@ -7976,7 +8891,9 @@ class AlpacaPositionMonitor:
         self.provider = "POSITIONS"
         self.credentials = dict(keys or {})
         self.coordinator = coordinator
-        self.transaction_provider = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+        self.transaction_provider = (
+            str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+        )
         self.logger = make_logger("POSITIONS", self.transaction_provider.upper())
         self.client = build_trading_client(self.credentials)
         # --- NEW: Status Tracking State Variables ---
@@ -8159,7 +9076,12 @@ def _fmt_log_price(val):
 
 
 def _compute_order_total(unit_price, qty, is_option=True):
-    if unit_price is None or qty is None or isinstance(unit_price, bool) or isinstance(qty, bool):
+    if (
+        unit_price is None
+        or qty is None
+        or isinstance(unit_price, bool)
+        or isinstance(qty, bool)
+    ):
         return None
     try:
         p = float(unit_price)
@@ -8240,8 +9162,12 @@ class AlpacaOptionBuyer:
         self.provider = "OPTION_BUYER"
         self.credentials = dict(keys or {})
         self.coordinator = coordinator
-        self.transaction_provider = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
-        self.option_chain_provider = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+        self.transaction_provider = (
+            str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+        )
+        self.option_chain_provider = (
+            str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+        )
         self.logger = make_logger("OPTION_BUYER", self.transaction_provider.upper())
         self.client = (
             client if client is not None else build_trading_client(self.credentials)
@@ -8296,7 +9222,9 @@ class AlpacaOptionBuyer:
         return m.group(1) if m else None
 
     @classmethod
-    def _extract_contract_details(cls, contract, clean_payload=None, desired_right=None):
+    def _extract_contract_details(
+        cls, contract, clean_payload=None, desired_right=None
+    ):
         """Extract (contract_symbol, limit_price, inferred_right) strictly from the
         `contract` returned by get_pruned_option_chain / collect_option_chain."""
         if contract is None:
@@ -8344,12 +9272,23 @@ class AlpacaOptionBuyer:
                     if sym:
                         extracted = (sym, lp, right)
                 if extracted is None:
-                    for key in ("symbol", "contract_symbol", "option_symbol", "contract"):
+                    for key in (
+                        "symbol",
+                        "contract_symbol",
+                        "option_symbol",
+                        "contract",
+                    ):
                         raw_sym = cand.get(key)
                         if isinstance(raw_sym, str) and _is_valid_occ_symbol(raw_sym):
                             sym = raw_sym.strip().upper()
                             lp = None
-                            for pk in ("limit_price", "ask_price", "ask", "close_price", "last_price"):
+                            for pk in (
+                                "limit_price",
+                                "ask_price",
+                                "ask",
+                                "close_price",
+                                "last_price",
+                            ):
                                 try:
                                     pv = cand.get(pk)
                                     if pv is not None and not isinstance(pv, bool):
@@ -8417,9 +9356,15 @@ class AlpacaOptionBuyer:
             nonlocal bid, ask
             if item is None:
                 return
-            if isinstance(item, dict) and right_key and isinstance(item.get(right_key), (dict, object)):
+            if (
+                isinstance(item, dict)
+                and right_key
+                and isinstance(item.get(right_key), (dict, object))
+            ):
                 nested = item.get(right_key)
-                if nested is not None and not isinstance(nested, (str, int, float, bool)):
+                if nested is not None and not isinstance(
+                    nested, (str, int, float, bool)
+                ):
                     _scan_item(nested)
             b = cls._first_pos_float(item, bid_keys)
             a = cls._first_pos_float(item, ask_keys)
@@ -8427,11 +9372,16 @@ class AlpacaOptionBuyer:
                 bid = b
             if ask is None and a is not None:
                 ask = a
-            if isinstance(item, dict) and isinstance(item.get("latest_quote"), (dict, object)):
+            if isinstance(item, dict) and isinstance(
+                item.get("latest_quote"), (dict, object)
+            ):
                 lq = item.get("latest_quote")
                 if lq is not None and not isinstance(lq, (str, int, float, bool)):
                     _scan_item(lq)
-            elif hasattr(item, "latest_quote") and getattr(item, "latest_quote", None) is not None:
+            elif (
+                hasattr(item, "latest_quote")
+                and getattr(item, "latest_quote", None) is not None
+            ):
                 _scan_item(getattr(item, "latest_quote"))
 
         _scan_item(contract)
@@ -8467,7 +9417,9 @@ class AlpacaOptionBuyer:
 
     def _fetch_option_quote(self, contract_symbol):
         """Fetch live (bid, ask) for an OCC option contract via configured transaction provider (Prod quotes for Tastytrade)."""
-        if self.transaction_provider == "tastytrade" or isinstance(self.client, TastytradeClient):
+        if self.transaction_provider == "tastytrade" or isinstance(
+            self.client, TastytradeClient
+        ):
             try:
                 tt_client = (
                     self.client
@@ -8611,20 +9563,35 @@ class AlpacaOptionBuyer:
                 else "oversold_decel_bottom"
             )
             reason = f"rsi={rsi:.2f}<=low&{tag}(v={vel:+.4f},a={acc:+.4f})"
-        elif crossover in {"leading_bullish", "confirmed_bullish"} and acc >= 0 and (
-            not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0
+        elif (
+            crossover in {"leading_bullish", "confirmed_bullish"}
+            and acc >= 0
+            and (not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0)
         ):
             reason = f"rsi={rsi:.2f}<=low&crossover={crossover}"
-        elif forecast in OPTION_BUY_ALLOWED_FORECASTS and acc > 0 and (
-            not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0
+        elif (
+            forecast in OPTION_BUY_ALLOWED_FORECASTS
+            and acc > 0
+            and (not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0)
         ):
             reason = f"rsi={rsi:.2f}<=low&forecast={forecast}"
 
         if reason is None:
+            details = []
+            if vel <= 0:
+                details.append(f"v={vel:+.4f}<=0")
+            if acc <= 0:
+                details.append(f"a={acc:+.4f}<=0(no_upward_accel)")
+            if crossover not in {"leading_bullish", "confirmed_bullish"}:
+                details.append(f"cross={crossover}")
+            if forecast not in OPTION_BUY_ALLOWED_FORECASTS:
+                details.append(f"forecast={forecast or 'none'}")
+
+            why = ",".join(details) if details else "no_buy_trigger"
             return (
                 False,
                 None,
-                f"kinematics_unfavorable(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f},cross={crossover})",
+                f"kinematics_unfavorable[{why}](rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f})",
             )
 
         if OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT and proj_delta is not None:
@@ -8671,18 +9638,24 @@ class AlpacaOptionBuyer:
             contract_symbol or "n/a",
         )
 
-    def _submit_option_order(self, contract_symbol, qty, limit_price=None, force_limit=False):
+    def _submit_option_order(
+        self, contract_symbol, qty, limit_price=None, force_limit=False
+    ):
         """Place the option BUY order on configured TradingClient / TastytradeClient (blocking)."""
         use_limit = (OPTION_BUY_ORDER_TYPE == "limit" or force_limit) and (
             limit_price is not None and limit_price > 0
         )
-        if self.transaction_provider == "tastytrade" or isinstance(self.client, TastytradeClient):
+        if self.transaction_provider == "tastytrade" or isinstance(
+            self.client, TastytradeClient
+        ):
             return self.client.submit_order(
                 symbol=contract_symbol,
                 qty=qty,
                 side="buy",
                 order_type="limit" if use_limit else "market",
-                limit_price=(round(max(0.01, float(limit_price)), 2) if use_limit else None),
+                limit_price=(
+                    round(max(0.01, float(limit_price)), 2) if use_limit else None
+                ),
                 time_in_force="Day",
                 is_option=True,
                 underlying_symbol=self._infer_occ_underlying(contract_symbol),
@@ -8755,7 +9728,9 @@ class AlpacaOptionBuyer:
             nonlocal positions_loaded, open_contracts, open_underlyings, open_option_count
             if positions_loaded:
                 return
-            positions = list(await asyncio.to_thread(self.client.get_all_positions) or [])
+            positions = list(
+                await asyncio.to_thread(self.client.get_all_positions) or []
+            )
             for pos in positions:
                 if AlpacaPositionMonitor._is_option(pos):
                     open_option_count += 1
@@ -8774,7 +9749,10 @@ class AlpacaOptionBuyer:
 
         cap_logged = False
         for symbol in self.coordinator.symbols:
-            if OPTION_BUY_MAX_BUYS_PER_MINUTE > 0 and buys_this_cycle >= OPTION_BUY_MAX_BUYS_PER_MINUTE:
+            if (
+                OPTION_BUY_MAX_BUYS_PER_MINUTE > 0
+                and buys_this_cycle >= OPTION_BUY_MAX_BUYS_PER_MINUTE
+            ):
                 if not cap_logged:
                     self.logger.info(
                         "OPTION_BUY_CYCLE_CAP_REACHED count=%d limit=%d minute=%s",
@@ -8914,7 +9892,9 @@ class AlpacaOptionBuyer:
                             self.credentials["alpaca_secret"],
                             self.option_chain_client,
                         )
-                    contract, clean_payload = _unpack_pruned_option_chain_result(raw_chain_res)
+                    contract, clean_payload = _unpack_pruned_option_chain_result(
+                        raw_chain_res
+                    )
                     signal_label = "buy" if desired_right == "CALL" else "sell"
                     parsed_sym, _, _ = self._extract_contract_details(
                         contract, clean_payload, desired_right=desired_right
@@ -8979,8 +9959,10 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
-            contract_symbol, limit_price, inferred_right = self._extract_contract_details(
-                contract, clean_payload, desired_right=desired_right
+            contract_symbol, limit_price, inferred_right = (
+                self._extract_contract_details(
+                    contract, clean_payload, desired_right=desired_right
+                )
             )
             if not contract_symbol:
                 chain_err = _extract_option_chain_error_message(contract, clean_payload)
@@ -9127,7 +10109,10 @@ class AlpacaOptionBuyer:
                     if mid_quote > 0
                     else 0.0
                 )
-                if OPTION_BUY_MAX_SPREAD_PCT > 0 and spread_pct > OPTION_BUY_MAX_SPREAD_PCT:
+                if (
+                    OPTION_BUY_MAX_SPREAD_PCT > 0
+                    and spread_pct > OPTION_BUY_MAX_SPREAD_PCT
+                ):
                     self._log_buy_analysis(
                         minute_key,
                         symbol,
@@ -9155,18 +10140,29 @@ class AlpacaOptionBuyer:
                     and contract_ask is not None
                     and contract_ask >= contract_bid
                 ):
-                    raw_lp = contract_bid + (contract_ask - contract_bid) * OPTION_BUY_LIMIT_AGGRESSION
+                    raw_lp = (
+                        contract_bid
+                        + (contract_ask - contract_bid) * OPTION_BUY_LIMIT_AGGRESSION
+                    )
                     limit_price = round(
                         max(0.01, min(contract_ask, max(contract_bid, raw_lp))), 2
                     )
-                elif (limit_price is None or limit_price <= 0) and contract_ask is not None:
+                elif (
+                    limit_price is None or limit_price <= 0
+                ) and contract_ask is not None:
                     limit_price = round(max(0.01, contract_ask), 2)
-                elif (limit_price is None or limit_price <= 0) and contract_bid is not None:
+                elif (
+                    limit_price is None or limit_price <= 0
+                ) and contract_bid is not None:
                     limit_price = round(max(0.01, contract_bid), 2)
 
             est_unit_price = (
                 limit_price
-                if (OPTION_BUY_ORDER_TYPE == "limit" and limit_price is not None and limit_price > 0)
+                if (
+                    OPTION_BUY_ORDER_TYPE == "limit"
+                    and limit_price is not None
+                    and limit_price > 0
+                )
                 else (
                     contract_ask
                     if contract_ask is not None
@@ -9230,7 +10226,11 @@ class AlpacaOptionBuyer:
                     OPTION_BUY_ORDER_TYPE,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
-                    _fmt_log_price(limit_price) if OPTION_BUY_ORDER_TYPE == "limit" else "n/a",
+                    (
+                        _fmt_log_price(limit_price)
+                        if OPTION_BUY_ORDER_TYPE == "limit"
+                        else "n/a"
+                    ),
                     _fmt_log_total(total_purchase),
                     inferred_right or desired_right,
                     contract_source,
@@ -9266,15 +10266,25 @@ class AlpacaOptionBuyer:
                         False,
                     )
                 except Exception as submit_exc:
-                    if eff_buy_order_type != "limit" and _is_no_quote_market_rejection(submit_exc):
+                    if eff_buy_order_type != "limit" and _is_no_quote_market_rejection(
+                        submit_exc
+                    ):
                         fallback_candidates = [
                             eff_buy_limit,
                             contract_ask,
                             contract_bid,
-                            self._first_pos_float(contract, ("close_price", "mark_price", "last_price")),
+                            self._first_pos_float(
+                                contract, ("close_price", "mark_price", "last_price")
+                            ),
                         ]
                         fallback_lp = next(
-                            (round(max(0.01, float(p)), 2) for p in fallback_candidates if p is not None and math.isfinite(float(p)) and float(p) > 0),
+                            (
+                                round(max(0.01, float(p)), 2)
+                                for p in fallback_candidates
+                                if p is not None
+                                and math.isfinite(float(p))
+                                and float(p) > 0
+                            ),
                             None,
                         )
                         if fallback_lp is None:
@@ -9305,7 +10315,9 @@ class AlpacaOptionBuyer:
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
                 filled_avg = self._first_pos_float(order, ("filled_avg_price",))
-                actual_unit_price = filled_avg if filled_avg is not None else est_unit_price
+                actual_unit_price = (
+                    filled_avg if filled_avg is not None else est_unit_price
+                )
                 actual_total_purchase = _compute_order_total(
                     actual_unit_price, OPTION_BUY_QTY, is_option=True
                 )
@@ -9313,7 +10325,10 @@ class AlpacaOptionBuyer:
                 raw_submitted = getattr(order, "submitted_at", None) or getattr(
                     order, "created_at", None
                 )
-                if isinstance(raw_submitted, datetime) and raw_submitted.tzinfo is not None:
+                if (
+                    isinstance(raw_submitted, datetime)
+                    and raw_submitted.tzinfo is not None
+                ):
                     exec_at = as_utc(raw_submitted)
                 elif isinstance(raw_submitted, str) and raw_submitted.strip():
                     try:
@@ -9390,7 +10405,11 @@ class AlpacaOptionBuyer:
                     eff_buy_order_type,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
-                    _fmt_log_price(eff_buy_limit) if eff_buy_order_type == "limit" else "n/a",
+                    (
+                        _fmt_log_price(eff_buy_limit)
+                        if eff_buy_order_type == "limit"
+                        else "n/a"
+                    ),
                     _fmt_log_total(actual_total_purchase),
                     inferred_right or desired_right,
                     contract_source,
@@ -9413,7 +10432,9 @@ class AlpacaOptionBuyer:
                 )
             except Exception as exc:
                 self.last_status = f"order_error: {type(exc).__name__}"
-                self.last_error_detail = f"{symbol} ({contract_symbol}): {str(exc)[:140]}"
+                self.last_error_detail = (
+                    f"{symbol} ({contract_symbol}): {str(exc)[:140]}"
+                )
                 self._log_buy_analysis(
                     minute_key,
                     symbol,
@@ -9433,7 +10454,9 @@ class AlpacaOptionBuyer:
                 )
 
         if not str(self.last_status).startswith("order_error"):
-            self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
+            self.last_status = (
+                "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
+            )
 
     async def run(self):
         self.coordinator.attach_event_loop(asyncio.get_running_loop())
@@ -9515,7 +10538,9 @@ class AlpacaOptionSeller:
         self.provider = "OPTION_SELLER"
         self.credentials = dict(keys or {})
         self.coordinator = coordinator
-        self.transaction_provider = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+        self.transaction_provider = (
+            str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+        )
         self.logger = make_logger("OPTION_SELLER", self.transaction_provider.upper())
         self.client = (
             client
@@ -9650,9 +10675,28 @@ class AlpacaOptionSeller:
             reason = f"rsi={rsi:.2f}>=high&forecast={forecast}"
 
         if reason is None:
+            details = []
+            if vel > 0 and acc >= 0:
+                details.append(f"still_accelerating_up(v={vel:+.4f}>0,a={acc:+.4f}>=0)")
+            elif vel < 0 and acc > 0:
+                details.append(f"downside_decelerating(v={vel:+.4f}<0,a={acc:+.4f}>0)")
+            elif vel == 0 and acc >= 0:
+                details.append(f"flat_or_rising_accel(v=0,a={acc:+.4f}>=0)")
+            else:
+                if vel >= 0:
+                    details.append(f"v={vel:+.4f}>=0")
+                if acc >= 0:
+                    details.append(f"a={acc:+.4f}>=0")
+
+            if crossover not in {"leading_bearish", "confirmed_bearish"}:
+                details.append(f"cross={crossover}")
+            if forecast not in OPTION_SELL_ALLOWED_FORECASTS:
+                details.append(f"forecast={forecast or 'none'}")
+
+            why = ",".join(details) if details else "no_sell_trigger"
             return (
                 False,
-                f"kinematics_unfavorable(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f},cross={crossover})",
+                f"kinematics_unfavorable[{why}](rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f})",
             )
 
         if OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT and proj_delta is not None:
@@ -9737,12 +10781,22 @@ class AlpacaOptionSeller:
         if vel < 0 and acc <= 0:
             return True, f"downward_pressure(v={vel:+.4f},a={acc:+.4f})"
         if vel < 0 and eff_proj < 0:
-            return True, f"downward_bleed(v={vel:+.4f},a={acc:+.4f},p_delta={eff_proj:+.4f})"
-        if vel <= 0 and acc < 0 and (
-            crossover in {"leading_bearish", "confirmed_bearish"}
-            or forecast in OPTION_SELL_ALLOWED_FORECASTS
+            return (
+                True,
+                f"downward_bleed(v={vel:+.4f},a={acc:+.4f},p_delta={eff_proj:+.4f})",
+            )
+        if (
+            vel <= 0
+            and acc < 0
+            and (
+                crossover in {"leading_bearish", "confirmed_bearish"}
+                or forecast in OPTION_SELL_ALLOWED_FORECASTS
+            )
         ):
-            return True, f"bearish_rollover(v={vel:+.4f},a={acc:+.4f},cross={crossover})"
+            return (
+                True,
+                f"bearish_rollover(v={vel:+.4f},a={acc:+.4f},cross={crossover})",
+            )
 
         return (
             False,
@@ -9889,17 +10943,21 @@ class AlpacaOptionSeller:
 
     def _fetch_live_quote(self, pos_sym, is_option):
         """Fetch latest live (bid, ask) prices for an option contract or equity symbol via configured transaction provider (Prod quotes for Tastytrade)."""
-        if self.transaction_provider == "tastytrade" or isinstance(self.client, TastytradeClient):
+        if self.transaction_provider == "tastytrade" or isinstance(
+            self.client, TastytradeClient
+        ):
             try:
                 tt_client = (
                     self.client
                     if isinstance(self.client, TastytradeClient)
                     else (
                         self.option_data_client
-                        if is_option and isinstance(self.option_data_client, TastytradeClient)
+                        if is_option
+                        and isinstance(self.option_data_client, TastytradeClient)
                         else (
                             self.stock_data_client
-                            if (not is_option) and isinstance(self.stock_data_client, TastytradeClient)
+                            if (not is_option)
+                            and isinstance(self.stock_data_client, TastytradeClient)
                             else _build_tastytrade_quote_client(self.credentials)
                         )
                     )
@@ -9913,8 +10971,16 @@ class AlpacaOptionSeller:
                 ask = AlpacaPositionMonitor._num(q, "ask_price", None)
                 if ask is None:
                     ask = AlpacaPositionMonitor._num(q, "ask", None)
-                valid_bid = bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
-                valid_ask = ask if (ask is not None and math.isfinite(ask) and ask > 0) else None
+                valid_bid = (
+                    bid
+                    if (bid is not None and math.isfinite(bid) and bid > 0)
+                    else None
+                )
+                valid_ask = (
+                    ask
+                    if (ask is not None and math.isfinite(ask) and ask > 0)
+                    else None
+                )
                 return valid_bid, valid_ask
             except Exception as exc:
                 self.logger.warning(
@@ -9934,7 +11000,9 @@ class AlpacaOptionSeller:
                     if not key or not secret:
                         return None, None
                     try:
-                        from alpaca.data.historical.option import OptionHistoricalDataClient
+                        from alpaca.data.historical.option import (
+                            OptionHistoricalDataClient,
+                        )
                     except ImportError:
                         from alpaca.data.historical import OptionHistoricalDataClient
                     self.option_data_client = OptionHistoricalDataClient(key, secret)
@@ -9976,8 +11044,12 @@ class AlpacaOptionSeller:
         ask = AlpacaPositionMonitor._num(quote, "ask_price", None)
         if ask is None:
             ask = AlpacaPositionMonitor._num(quote, "ask", None)
-        valid_bid = bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
-        valid_ask = ask if (ask is not None and math.isfinite(ask) and ask > 0) else None
+        valid_bid = (
+            bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
+        )
+        valid_ask = (
+            ask if (ask is not None and math.isfinite(ask) and ask > 0) else None
+        )
         return valid_bid, valid_ask
 
     def _fetch_live_bid(self, pos_sym, is_option):
@@ -10032,7 +11104,9 @@ class AlpacaOptionSeller:
             limit_price = round(max(0.01, ref_price - 0.01), 2)
         return limit_price
 
-    async def _resolve_sell_order_params(self, pos_sym, cur_price, is_option, trigger_kind):
+    async def _resolve_sell_order_params(
+        self, pos_sym, cur_price, is_option, trigger_kind
+    ):
         """Compute (order_type, live_bid, live_ask, limit_price) for SELL orders.
 
         Profit/kinematic exits price from Mid (floored at Bid) so they don't
@@ -10047,7 +11121,11 @@ class AlpacaOptionSeller:
         if trigger_kind == "stop_loss" and OPTION_SELL_STOP_LOSS_FORCE_MARKET:
             return "market", live_bid, live_ask, None
 
-        cur_val = cur_price if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0) else None
+        cur_val = (
+            cur_price
+            if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0)
+            else None
+        )
         if (
             trigger_kind != "stop_loss"
             and live_bid is not None
@@ -10067,11 +11145,15 @@ class AlpacaOptionSeller:
         limit_price = self._compute_discounted_limit_price(ref_price, trigger_kind)
         return "limit", live_bid, live_ask, limit_price
 
-    def _submit_sell_order(self, contract_or_symbol, qty, limit_price=None, order_type=None):
+    def _submit_sell_order(
+        self, contract_or_symbol, qty, limit_price=None, order_type=None
+    ):
         """Place a SELL order on configured TradingClient / TastytradeClient (blocking)."""
         eff_type = (order_type or OPTION_SELL_ORDER_TYPE).strip().lower()
         use_limit = eff_type == "limit" and limit_price is not None and limit_price > 0
-        if self.transaction_provider == "tastytrade" or isinstance(self.client, TastytradeClient):
+        if self.transaction_provider == "tastytrade" or isinstance(
+            self.client, TastytradeClient
+        ):
             is_opt = AlpacaPositionMonitor._is_option({"symbol": contract_or_symbol})
             return self.client.submit_order(
                 symbol=contract_or_symbol,
@@ -10081,7 +11163,11 @@ class AlpacaOptionSeller:
                 limit_price=limit_price if use_limit else None,
                 time_in_force="Day",
                 is_option=is_opt,
-                underlying_symbol=AlpacaOptionBuyer._infer_occ_underlying(contract_or_symbol) if is_opt else contract_or_symbol,
+                underlying_symbol=(
+                    AlpacaOptionBuyer._infer_occ_underlying(contract_or_symbol)
+                    if is_opt
+                    else contract_or_symbol
+                ),
             )
 
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -10135,7 +11221,9 @@ class AlpacaOptionSeller:
             self.attempted_minutes.clear()
 
         try:
-            positions = list(await asyncio.to_thread(self.client.get_all_positions) or [])
+            positions = list(
+                await asyncio.to_thread(self.client.get_all_positions) or []
+            )
         except Exception as exc:
             self.last_status = f"positions_error: {type(exc).__name__}"
             self.logger.warning(
@@ -10146,7 +11234,9 @@ class AlpacaOptionSeller:
             return
 
         if hasattr(self.coordinator, "option_history"):
-            self.coordinator.option_history.record_positions_snapshot(positions, timestamp=now)
+            self.coordinator.option_history.record_positions_snapshot(
+                positions, timestamp=now
+            )
 
         self.last_positions_checked = len(positions)
         if not positions:
@@ -10162,15 +11252,25 @@ class AlpacaOptionSeller:
                 "SKIPPED",
                 "no_open_positions",
             )
-            self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+            self.last_status = (
+                "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+            )
             return
 
         seen_long_symbols = set()
         for pos in positions:
-            pos_sym = str(
-                (pos.get("symbol") if isinstance(pos, dict) else getattr(pos, "symbol", ""))
-                or ""
-            ).strip().upper()
+            pos_sym = (
+                str(
+                    (
+                        pos.get("symbol")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "symbol", "")
+                    )
+                    or ""
+                )
+                .strip()
+                .upper()
+            )
             if not pos_sym:
                 continue
 
@@ -10211,18 +11311,30 @@ class AlpacaOptionSeller:
             seen_long_symbols.add(pos_sym)
             if pos_sym not in self.first_seen_at_by_symbol:
                 inferred_entry_dt = now
-                for buy_evt in reversed(self.coordinator.option_buy_events.get(underlying, []) or []):
-                    buy_ts = buy_evt.get("executed_at_utc") or buy_evt.get("executed_at")
-                    if str(buy_evt.get("contract") or "").strip().upper() == pos_sym and buy_ts:
+                for buy_evt in reversed(
+                    self.coordinator.option_buy_events.get(underlying, []) or []
+                ):
+                    buy_ts = buy_evt.get("executed_at_utc") or buy_evt.get(
+                        "executed_at"
+                    )
+                    if (
+                        str(buy_evt.get("contract") or "").strip().upper() == pos_sym
+                        and buy_ts
+                    ):
                         try:
-                            parsed_buy = datetime.fromisoformat(str(buy_ts).replace("Z", "+00:00"))
+                            parsed_buy = datetime.fromisoformat(
+                                str(buy_ts).replace("Z", "+00:00")
+                            )
                             if parsed_buy.tzinfo is not None:
                                 inferred_entry_dt = as_utc(parsed_buy)
                                 break
                         except Exception:
                             pass
                 self.first_seen_at_by_symbol[pos_sym] = inferred_entry_dt
-            hold_minutes = max(0.0, (now - self.first_seen_at_by_symbol[pos_sym]).total_seconds() / 60.0)
+            hold_minutes = max(
+                0.0,
+                (now - self.first_seen_at_by_symbol[pos_sym]).total_seconds() / 60.0,
+            )
             pnl_pct = self._position_pnl_pct(pos)
             peak_pnl, drawdown_pct = self._update_peak_profit_state(
                 pos_sym, pnl_pct, now.isoformat()
@@ -10320,7 +11432,9 @@ class AlpacaOptionSeller:
                     and drawdown_pct > OPTION_SELL_TRAILING_DRAWDOWN_PCT
                 ):
                     if OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY:
-                        ts_vel_ok, _, ts_vel_reason = self._evaluate_trailing_stop_velocity(entry)
+                        ts_vel_ok, _, ts_vel_reason = (
+                            self._evaluate_trailing_stop_velocity(entry)
+                        )
                     else:
                         ts_vel_ok, _, ts_vel_reason = True, None, "velocity_bypassed"
 
@@ -10408,7 +11522,9 @@ class AlpacaOptionSeller:
                         )
                     else:
                         if OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS:
-                            sl_kin_ok, sl_kin_reason = self._evaluate_stop_loss_kinematics(entry)
+                            sl_kin_ok, sl_kin_reason = (
+                                self._evaluate_stop_loss_kinematics(entry)
+                            )
                         else:
                             sl_kin_ok, sl_kin_reason = True, "kinematics_bypassed"
 
@@ -10459,7 +11575,11 @@ class AlpacaOptionSeller:
                     entry,
                     pnl_pct,
                     "REJECTED",
-                    "; ".join(rejection_notes) if rejection_notes else "no_sell_trigger",
+                    (
+                        "; ".join(rejection_notes)
+                        if rejection_notes
+                        else "no_sell_trigger"
+                    ),
                 )
                 continue
 
@@ -10469,7 +11589,8 @@ class AlpacaOptionSeller:
             if (
                 last_sell is not None
                 and OPTION_SELL_COOLDOWN_MINUTES > 0
-                and (now - last_sell).total_seconds() < OPTION_SELL_COOLDOWN_MINUTES * 60
+                and (now - last_sell).total_seconds()
+                < OPTION_SELL_COOLDOWN_MINUTES * 60
             ):
                 self._log_sell_analysis(
                     minute_key,
@@ -10489,8 +11610,10 @@ class AlpacaOptionSeller:
                 )
                 continue
 
-            target_qty = raw_qty if OPTION_SELL_CLOSE_FULL_POSITION else min(
-                float(OPTION_SELL_QTY), raw_qty
+            target_qty = (
+                raw_qty
+                if OPTION_SELL_CLOSE_FULL_POSITION
+                else min(float(OPTION_SELL_QTY), raw_qty)
             )
             if target_qty <= 0:
                 self._log_sell_analysis(
@@ -10510,18 +11633,28 @@ class AlpacaOptionSeller:
                 order_qty = round(target_qty, 6)
 
             cur_price = AlpacaPositionMonitor._num(pos, "current_price", 0.0)
-            eff_order_type, live_bid, live_ask, limit_price = await self._resolve_sell_order_params(
-                pos_sym, cur_price, is_option, trigger_kind
+            eff_order_type, live_bid, live_ask, limit_price = (
+                await self._resolve_sell_order_params(
+                    pos_sym, cur_price, is_option, trigger_kind
+                )
             )
             est_sell_unit = (
                 limit_price
-                if (eff_order_type == "limit" and limit_price is not None and limit_price > 0)
+                if (
+                    eff_order_type == "limit"
+                    and limit_price is not None
+                    and limit_price > 0
+                )
                 else (
                     live_bid
                     if live_bid is not None
                     else (
                         cur_price
-                        if (cur_price is not None and math.isfinite(cur_price) and cur_price > 0)
+                        if (
+                            cur_price is not None
+                            and math.isfinite(cur_price)
+                            and cur_price > 0
+                        )
                         else live_ask
                     )
                 )
@@ -10627,7 +11760,9 @@ class AlpacaOptionSeller:
                         eff_order_type,
                     )
                 except Exception as submit_exc:
-                    if eff_order_type != "limit" and _is_no_quote_market_rejection(submit_exc):
+                    if eff_order_type != "limit" and _is_no_quote_market_rejection(
+                        submit_exc
+                    ):
                         fallback_ref = self._extract_position_fallback_price(
                             pos, raw_qty, is_option, live_bid, cur_price
                         )
@@ -10665,7 +11800,11 @@ class AlpacaOptionSeller:
                 filled_avg = AlpacaPositionMonitor._num(order, "filled_avg_price", None)
                 actual_sell_unit = (
                     filled_avg
-                    if (filled_avg is not None and math.isfinite(filled_avg) and filled_avg > 0)
+                    if (
+                        filled_avg is not None
+                        and math.isfinite(filled_avg)
+                        and filled_avg > 0
+                    )
                     else est_sell_unit
                 )
                 actual_total_sale = _compute_order_total(
@@ -10675,7 +11814,10 @@ class AlpacaOptionSeller:
                 raw_submitted = getattr(order, "submitted_at", None) or getattr(
                     order, "created_at", None
                 )
-                if isinstance(raw_submitted, datetime) and raw_submitted.tzinfo is not None:
+                if (
+                    isinstance(raw_submitted, datetime)
+                    and raw_submitted.tzinfo is not None
+                ):
                     exec_at = as_utc(raw_submitted)
                 elif isinstance(raw_submitted, str) and raw_submitted.strip():
                     try:
@@ -10729,7 +11871,9 @@ class AlpacaOptionSeller:
                         sold_at=exec_at,
                         order_id=order_id,
                         reason=reason,
-                        entry_price=AlpacaPositionMonitor._num(pos, "avg_entry_price", None),
+                        entry_price=AlpacaPositionMonitor._num(
+                            pos, "avg_entry_price", None
+                        ),
                         cost_basis=AlpacaPositionMonitor._num(pos, "cost_basis", None),
                         purchased_at=self.first_seen_at_by_symbol.get(pos_sym),
                         dry_run=False,
@@ -10817,7 +11961,9 @@ class AlpacaOptionSeller:
                 self.first_seen_at_by_symbol.pop(stale_sym, None)
 
         if not str(self.last_status).startswith(("order_error", "positions_error")):
-            self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+            self.last_status = (
+                "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+            )
 
     async def run(self):
         self.coordinator.attach_event_loop(asyncio.get_running_loop())
@@ -10833,7 +11979,9 @@ class AlpacaOptionSeller:
             )
             return
 
-        self.last_status = "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+        self.last_status = (
+            "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
+        )
         self.logger.info(
             "OPTION_SELLER_START mode=%s rsi_high>=%.2f qty=%d close_full=%s "
             "options_only=%s cooldown_min=%d min_hold=%dm order_type=%s limit_disc=%.2f%% sl_disc=%.2f%% "
@@ -10992,9 +12140,9 @@ def _preview_pending_candidate_point(provider, hist, p_minute, cand):
     smoothed_velocity = None
     smoothed_acceleration = None
     if curr_close is not None:
-        close_series = [e["close"] for e in hist[-120:] if e.get("close") is not None] + [
-            curr_close
-        ]
+        close_series = [
+            e["close"] for e in hist[-120:] if e.get("close") is not None
+        ] + [curr_close]
         smoothed_vals = compute_smoothed_series(close_series)
         if smoothed_vals:
             smoothed_close = round(smoothed_vals[-1], 4)
@@ -11030,7 +12178,9 @@ def _preview_pending_candidate_point(provider, hist, p_minute, cand):
 
     active_pv = smoothed_velocity if smoothed_velocity is not None else price_velocity
     active_pa = (
-        smoothed_acceleration if smoothed_acceleration is not None else price_acceleration
+        smoothed_acceleration
+        if smoothed_acceleration is not None
+        else price_acceleration
     )
     forecast = compute_kinematic_forecast(
         curr_close,
@@ -11049,9 +12199,7 @@ def _preview_pending_candidate_point(provider, hist, p_minute, cand):
     return {
         "minute": p_minute,
         "timestamp": (
-            p_minute.isoformat()
-            if hasattr(p_minute, "isoformat")
-            else str(p_minute)
+            p_minute.isoformat() if hasattr(p_minute, "isoformat") else str(p_minute)
         ),
         "close": curr_close,
         "smoothed_close": smoothed_close,
@@ -11084,7 +12232,9 @@ def _hist_minute_utc(hist_entry):
     raw = hist_entry.get("timestamp")
     if isinstance(raw, str) and raw.strip():
         try:
-            return minute_utc(as_utc(datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))))
+            return minute_utc(
+                as_utc(datetime.fromisoformat(raw.strip().replace("Z", "+00:00")))
+            )
         except Exception:
             return None
     return None
@@ -11102,12 +12252,18 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
     # Index latest closed/pending candidate per (provider, symbol) so newly received
     # TradingView webhooks appear immediately instead of waiting up to +45s finalization.
     latest_pending = {}
-    for (p_prov, p_sym, p_min), p_cand in list(getattr(coordinator, "pending", {}).items()):
+    for (p_prov, p_sym, p_min), p_cand in list(
+        getattr(coordinator, "pending", {}).items()
+    ):
         existing = latest_pending.get((p_prov, p_sym))
         if existing is None or p_min > existing[0]:
             latest_pending[(p_prov, p_sym)] = (p_min, p_cand)
 
-    tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {}) if "PROVIDER_REGISTRY" in globals() else {}
+    tv_entry = (
+        PROVIDER_REGISTRY.get("TRADINGVIEW", {})
+        if "PROVIDER_REGISTRY" in globals()
+        else {}
+    )
     tv_router = tv_entry.get("router") if isinstance(tv_entry, dict) else None
     tv_latest_map = getattr(tv_router, "latest", {}) if tv_router is not None else {}
 
@@ -11117,7 +12273,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
         )
     )
 
-    for (provider, symbol) in all_stream_keys:
+    for provider, symbol in all_stream_keys:
         hist = list(coordinator.kinematics_history.get((provider, symbol), []) or [])
         pending_pair = latest_pending.get((provider, symbol))
         feed_status = "LIVE"
@@ -11129,7 +12285,9 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             is_newer = last_hist_min is None or p_min > last_hist_min
             should_preview = p_cand.kind != "tick" or not hist
             if is_newer and should_preview:
-                preview_cur = _preview_pending_candidate_point(provider, hist, p_min, p_cand)
+                preview_cur = _preview_pending_candidate_point(
+                    provider, hist, p_min, p_cand
+                )
                 eff_hist = hist + [preview_cur]
                 feed_status = "PENDING"
 
@@ -11174,7 +12332,9 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             sym_group["latest_timestamps"].append(str(entry["timestamp"]))
         window_slice = eff_hist[-hist_cap:]
         window_rsi_count = sum(1 for h in window_slice if h.get("rsi") is not None)
-        window_last_ts = str(window_slice[-1].get("timestamp") or "") if window_slice else ""
+        window_last_ts = (
+            str(window_slice[-1].get("timestamp") or "") if window_slice else ""
+        )
         window_score = (window_rsi_count, len(window_slice), window_last_ts)
         if window_score > sym_group["best_history_score"]:
             sym_group["best_history_score"] = window_score
@@ -11265,7 +12425,11 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 continue
             is_conn = bool(connected_map.get(prov, False))
             tv_latest = tv_latest_map.get(sym) if prov == "TRADINGVIEW" else None
-            if prov == "TRADINGVIEW" and isinstance(tv_latest, dict) and tv_latest.get("accepted_for_summary") is False:
+            if (
+                prov == "TRADINGVIEW"
+                and isinstance(tv_latest, dict)
+                and tv_latest.get("accepted_for_summary") is False
+            ):
                 placeholder_status = "LATE"
                 placeholder_action = "Webhook Arrived Past Deadline"
                 p_close = tv_latest.get("price")
@@ -11278,9 +12442,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 elif prov == "TRADINGVIEW":
                     placeholder_status = "AWAITING_WEBHOOK"
                     if tv_reporting_count > 0:
-                        placeholder_action = (
-                            f"Not Sent by TV ({tv_reporting_count}/{tv_configured_count} active)"
-                        )
+                        placeholder_action = f"Not Sent by TV ({tv_reporting_count}/{tv_configured_count} active)"
                     elif tv_stats.get("last_skipped_symbols"):
                         placeholder_action = (
                             "TV Ticker Unconfigured ("
@@ -11385,7 +12547,9 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             "reporting_count": len(latest.get(prov, {})),
             "configured_count": len(coordinator.symbols),
             "connected": bool(connected_map.get(prov, False)),
-            "late_count": int((getattr(coordinator, "late_counts", {}) or {}).get(prov, 0)),
+            "late_count": int(
+                (getattr(coordinator, "late_counts", {}) or {}).get(prov, 0)
+            ),
         }
         if prov == "TRADINGVIEW" and tv_stats:
             cov.update(
@@ -11399,7 +12563,9 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 }
             )
         provider_coverage[prov] = cov
-    total_late = sum(int(v or 0) for v in (getattr(coordinator, "late_counts", {}) or {}).values())
+    total_late = sum(
+        int(v or 0) for v in (getattr(coordinator, "late_counts", {}) or {}).values()
+    )
 
     return {
         "total_unique_symbols": len(consolidated_symbols),
@@ -11451,7 +12617,9 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
         }
 
     latest_pending = {}
-    for (p_prov, p_sym, p_min), p_cand in list(getattr(coordinator, "pending", {}).items()):
+    for (p_prov, p_sym, p_min), p_cand in list(
+        getattr(coordinator, "pending", {}).items()
+    ):
         if str(p_sym or "").strip().upper() != target_sym:
             continue
         existing = latest_pending.get(p_prov)
@@ -11483,7 +12651,9 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
             is_newer = last_hist_min is None or p_min > last_hist_min
             should_preview = p_cand.kind != "tick" or not hist
             if is_newer and should_preview:
-                preview_cur = _preview_pending_candidate_point(prov, hist, p_min, p_cand)
+                preview_cur = _preview_pending_candidate_point(
+                    prov, hist, p_min, p_cand
+                )
                 eff_hist = hist + [preview_cur]
 
         if not eff_hist:
@@ -11802,18 +12972,24 @@ class _PngCanvas:
             )
             pos = end + gap
 
-    def draw_polyline(self, pts, color, width=1.8, dashed=False, dash=6.0, gap=4.0, alpha=1.0):
+    def draw_polyline(
+        self, pts, color, width=1.8, dashed=False, dash=6.0, gap=4.0, alpha=1.0
+    ):
         if len(pts) < 2:
             return
         for idx in range(len(pts) - 1):
             x0, y0 = pts[idx]
             x1, y1 = pts[idx + 1]
             if dashed:
-                self.draw_dashed_line(x0, y0, x1, y1, color, width=width, dash=dash, gap=gap, alpha=alpha)
+                self.draw_dashed_line(
+                    x0, y0, x1, y1, color, width=width, dash=dash, gap=gap, alpha=alpha
+                )
             else:
                 self.draw_line(x0, y0, x1, y1, color, width=width, alpha=alpha)
 
-    def draw_circle(self, cx, cy, radius, fill_color, border_color=None, border_width=1.2, alpha=1.0):
+    def draw_circle(
+        self, cx, cy, radius, fill_color, border_color=None, border_width=1.2, alpha=1.0
+    ):
         r = float(radius)
         bw = float(border_width) if border_color is not None else 0.0
         outer = r + bw
@@ -11851,7 +13027,11 @@ class _PngCanvas:
                     xi, yi = verts[i]
                     xj, yj = verts[j]
                     if ((yi > py) != (yj > py)) and (
-                        px < (xj - xi) * (py - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-9) + xi
+                        px
+                        < (xj - xi)
+                        * (py - yi)
+                        / ((yj - yi) if (yj - yi) != 0 else 1e-9)
+                        + xi
                     ):
                         inside = not inside
                     j = i
@@ -11869,7 +13049,9 @@ class _PngCanvas:
             return 0
         return len(s) * (5 * scale + spacing) - spacing
 
-    def draw_text(self, x, y, text, color, scale=2, spacing=2, align="left", bold=False, alpha=1.0):
+    def draw_text(
+        self, x, y, text, color, scale=2, spacing=2, align="left", bold=False, alpha=1.0
+    ):
         s = _sanitize_ascii_text(text)
         if not s:
             return
@@ -11893,10 +13075,17 @@ class _PngCanvas:
                 for col_i in range(5):
                     if row_bits & (1 << (4 - col_i)):
                         px = cur_x + col_i * sc
-                        self.fill_rect(px, py, px + sc, py + sc, (cr, cg, cb), alpha=alpha)
+                        self.fill_rect(
+                            px, py, px + sc, py + sc, (cr, cg, cb), alpha=alpha
+                        )
                         if bold:
                             self.fill_rect(
-                                px + 1, py, px + sc + 1, py + sc, (cr, cg, cb), alpha=alpha
+                                px + 1,
+                                py,
+                                px + sc + 1,
+                                py + sc,
+                                (cr, cg, cb),
+                                alpha=alpha,
                             )
             cur_x += step
 
@@ -11908,7 +13097,9 @@ class _PngCanvas:
         for y in range(self.height):
             raw[out_pos] = 0
             in_start = y * row_len
-            raw[out_pos + 1 : out_pos + 1 + row_len] = buf[in_start : in_start + row_len]
+            raw[out_pos + 1 : out_pos + 1 + row_len] = buf[
+                in_start : in_start + row_len
+            ]
             out_pos += 1 + row_len
 
         compressed = zlib.compress(bytes(raw), level=4)
@@ -12014,11 +13205,36 @@ def render_kinematics_chart_png(
     entries = symbol_data.get("provider_entries") or []
 
     REGIME_STYLES = {
-        "accelerating_bullish": ("ACCELERATING BULLISH", (52, 211, 153), (6, 78, 59), "Strong buyer thrust & momentum expansion"),
-        "decelerating_bullish": ("DECELERATING BULLISH", (34, 211, 238), (22, 78, 99), "Upward momentum waning / consolidation"),
-        "accelerating_bearish": ("ACCELERATING BEARISH", (251, 113, 133), (76, 5, 25), "Aggressive selling impulse accelerating"),
-        "decelerating_bearish": ("DECELERATING BEARISH", (251, 191, 36), (69, 26, 3), "Downside absorption / selling deceleration"),
-        "neutral": ("NEUTRAL", (148, 163, 184), (30, 41, 59), "Equilibrium / no directional acceleration"),
+        "accelerating_bullish": (
+            "ACCELERATING BULLISH",
+            (52, 211, 153),
+            (6, 78, 59),
+            "Strong buyer thrust & momentum expansion",
+        ),
+        "decelerating_bullish": (
+            "DECELERATING BULLISH",
+            (34, 211, 238),
+            (22, 78, 99),
+            "Upward momentum waning / consolidation",
+        ),
+        "accelerating_bearish": (
+            "ACCELERATING BEARISH",
+            (251, 113, 133),
+            (76, 5, 25),
+            "Aggressive selling impulse accelerating",
+        ),
+        "decelerating_bearish": (
+            "DECELERATING BEARISH",
+            (251, 191, 36),
+            (69, 26, 3),
+            "Downside absorption / selling deceleration",
+        ),
+        "neutral": (
+            "NEUTRAL",
+            (148, 163, 184),
+            (30, 41, 59),
+            "Equilibrium / no directional acceleration",
+        ),
     }
     r_label, r_fg, r_bg, r_desc = REGIME_STYLES.get(regime, REGIME_STYLES["neutral"])
 
@@ -12058,7 +13274,9 @@ def render_kinematics_chart_png(
 
     title_x = margin + badge_w + 14
     title_str = f"{sym} MULTI-STREAM KINEMATICS ANALYSIS"
-    canvas.draw_text(title_x, 14, title_str, (248, 250, 252), scale=2, spacing=1, bold=True)
+    canvas.draw_text(
+        title_x, 14, title_str, (248, 250, 252), scale=2, spacing=1, bold=True
+    )
 
     title_end_x = title_x + canvas.measure_text(title_str, scale=2, spacing=1) + 14
     pill_w = canvas.measure_text(r_label, scale=1, spacing=1) + 18
@@ -12115,7 +13333,9 @@ def render_kinematics_chart_png(
     canvas.draw_card(left_x0, top_y, left_x1, bot_y, C_CARD, C_BORDER)
     lx = left_x0 + 16
     rx = left_x1 - 16
-    canvas.draw_text(lx, top_y + 14, "NEXT-STEP PROJECTION", C_MUTED, scale=2, spacing=1, bold=True)
+    canvas.draw_text(
+        lx, top_y + 14, "NEXT-STEP PROJECTION", C_MUTED, scale=2, spacing=1, bold=True
+    )
     canvas.draw_text(
         rx,
         top_y + 16,
@@ -12127,7 +13347,9 @@ def render_kinematics_chart_png(
         bold=True,
     )
 
-    canvas.draw_text(lx, top_y + 42, "P(t+1) = P(t) + v(t) + 0.5*a(t)", C_DIM, scale=1, spacing=2)
+    canvas.draw_text(
+        lx, top_y + 42, "P(t+1) = P(t) + v(t) + 0.5*a(t)", C_DIM, scale=1, spacing=2
+    )
     proj_price = _safe_num(symbol_data.get("projected_price_next"))
     proj_delta = _safe_num(symbol_data.get("projected_delta"))
     proj_delta_pct = _safe_num(symbol_data.get("projected_delta_pct"))
@@ -12141,14 +13363,18 @@ def render_kinematics_chart_png(
         spacing=2,
         bold=True,
     )
-    canvas.draw_text(rx, top_y + 56, "Expected Delta", C_MUTED, scale=1, spacing=2, align="right")
+    canvas.draw_text(
+        rx, top_y + 56, "Expected Delta", C_MUTED, scale=1, spacing=2, align="right"
+    )
     if proj_delta is not None and proj_delta_pct is not None:
         d_col = C_EMERALD if proj_delta > 0 else (C_ROSE if proj_delta < 0 else C_TEXT)
         d_str = f"{_fmt_signed(proj_delta, 2)} ({_fmt_signed(proj_delta_pct, 2, '%')})"
     else:
         d_col = C_MUTED
         d_str = "--"
-    canvas.draw_text(rx, top_y + 74, d_str, d_col, scale=2, spacing=1, align="right", bold=True)
+    canvas.draw_text(
+        rx, top_y + 74, d_str, d_col, scale=2, spacing=1, align="right", bold=True
+    )
 
     canvas.fill_rect(lx, top_y + 104, rx, top_y + 105, C_BORDER)
 
@@ -12179,7 +13405,13 @@ def render_kinematics_chart_png(
         (
             "RSI (14):",
             f"{c_rsi:.2f}" if c_rsi is not None else "--",
-            C_ROSE if (c_rsi is not None and c_rsi >= rsi_ob) else (C_EMERALD if (c_rsi is not None and c_rsi <= rsi_os) else C_PURPLE),
+            (
+                C_ROSE
+                if (c_rsi is not None and c_rsi >= rsi_ob)
+                else (
+                    C_EMERALD if (c_rsi is not None and c_rsi <= rsi_os) else C_PURPLE
+                )
+            ),
         ),
         (
             "RSI Vel / Acc:",
@@ -12193,11 +13425,21 @@ def render_kinematics_chart_png(
     cur_ky = top_y + 116
     for k_lbl, k_val, k_col in kv_rows:
         canvas.draw_text(lx, cur_ky, k_lbl, C_MUTED, scale=2, spacing=1)
-        canvas.draw_text(rx, cur_ky, k_val, k_col, scale=2, spacing=1, align="right", bold=True)
+        canvas.draw_text(
+            rx, cur_ky, k_val, k_col, scale=2, spacing=1, align="right", bold=True
+        )
         cur_ky += 26
 
     canvas.fill_rect(lx, top_y + 356, rx, top_y + 357, C_BORDER)
-    canvas.draw_text(lx, top_y + 365, "CHART KEY (ALL 3 PANELS)", C_DIM, scale=1, spacing=2, bold=True)
+    canvas.draw_text(
+        lx,
+        top_y + 365,
+        "CHART KEY (ALL 3 PANELS)",
+        C_DIM,
+        scale=1,
+        spacing=2,
+        bold=True,
+    )
     legend_items = [
         (lx, top_y + 382, (226, 232, 240), "line", "Close Price"),
         (lx + 200, top_y + 382, C_INDIGO, "dash", f"{smooth_method} Smooth"),
@@ -12213,7 +13455,9 @@ def render_kinematics_chart_png(
         if shape == "line":
             canvas.draw_line(item_x, mid_y, item_x + 18, mid_y, col, width=2.2)
         elif shape == "dash":
-            canvas.draw_dashed_line(item_x, mid_y, item_x + 18, mid_y, col, width=2.0, dash=4, gap=3)
+            canvas.draw_dashed_line(
+                item_x, mid_y, item_x + 18, mid_y, col, width=2.0, dash=4, gap=3
+            )
         elif shape == "dot":
             canvas.draw_circle(item_x + 9, mid_y, 4.0, col)
         elif shape == "star":
@@ -12276,7 +13520,11 @@ def render_kinematics_chart_png(
             x_at = lambda i: plot_x0 + 28.0 + i * min(48.0, usable_w * 0.5)
             next_x = plot_x1 - 30.0
         else:
-            x_at = lambda i: plot_x0 + 16.0 + (i / float(max(1, n - 1))) * (usable_w - 28.0)
+            x_at = (
+                lambda i: plot_x0
+                + 16.0
+                + (i / float(max(1, n - 1))) * (usable_w - 28.0)
+            )
             next_x = plot_x1 - 30.0
 
         # Compute Y ranges for all 3 panels
@@ -12299,15 +13547,19 @@ def render_kinematics_chart_png(
             return p1_top + 8 + (1.0 - (val - lo_p) / span_p) * (p1_bot - p1_top - 16)
 
         vels = [
-            _safe_num(p.get("smoothed_velocity"))
-            if _safe_num(p.get("smoothed_velocity")) is not None
-            else (_safe_num(p.get("price_velocity")) or 0.0)
+            (
+                _safe_num(p.get("smoothed_velocity"))
+                if _safe_num(p.get("smoothed_velocity")) is not None
+                else (_safe_num(p.get("price_velocity")) or 0.0)
+            )
             for p in points
         ]
         accs = [
-            _safe_num(p.get("smoothed_acceleration"))
-            if _safe_num(p.get("smoothed_acceleration")) is not None
-            else (_safe_num(p.get("price_acceleration")) or 0.0)
+            (
+                _safe_num(p.get("smoothed_acceleration"))
+                if _safe_num(p.get("smoothed_acceleration")) is not None
+                else (_safe_num(p.get("price_acceleration")) or 0.0)
+            )
             for p in points
         ]
         max_va = max([0.05] + [abs(v) for v in vels] + [abs(a) for a in accs]) * 1.15
@@ -12329,7 +13581,9 @@ def render_kinematics_chart_png(
         lbl_step = 1 if n <= 8 else (3 if n <= 15 else 4)
         for i, pt in enumerate(points):
             bx = x_at(i)
-            lbl, min_idx = _parse_bar_label_utc(pt.get("timestamp") or pt.get("minute"), i)
+            lbl, min_idx = _parse_bar_label_utc(
+                pt.get("timestamp") or pt.get("minute"), i
+            )
             bar_min_indices.append(min_idx)
             min_num = None
             if ":" in lbl:
@@ -12341,19 +13595,34 @@ def render_kinematics_chart_png(
             is_last = i == n - 1
             grid_col = (71, 85, 105) if is_5m else (38, 49, 70)
             for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
-                canvas.draw_dashed_line(bx, py0 + 2, bx, py1 - 2, grid_col, width=1.0, dash=3, gap=3)
+                canvas.draw_dashed_line(
+                    bx, py0 + 2, bx, py1 - 2, grid_col, width=1.0, dash=3, gap=3
+                )
 
             fits_prev = bx - last_lbl_x >= 72.0
             fits_latest = is_last or (latest_bar_x - bx >= 72.0)
             fits_next = (next_x - bx >= 60.0) or (proj_price is None)
-            if (i == 0 or is_5m or (i % lbl_step == 0) or is_last) and fits_prev and fits_latest and fits_next:
+            if (
+                (i == 0 or is_5m or (i % lbl_step == 0) or is_last)
+                and fits_prev
+                and fits_latest
+                and fits_next
+            ):
                 tick_labels.append((bx, lbl, C_TEXT if is_last else C_MUTED))
                 last_lbl_x = bx
 
         if proj_price is not None:
             for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
                 canvas.draw_dashed_line(
-                    next_x, py0 + 2, next_x, py1 - 2, C_CYAN, width=1.0, dash=3, gap=3, alpha=0.55
+                    next_x,
+                    py0 + 2,
+                    next_x,
+                    py1 - 2,
+                    C_CYAN,
+                    width=1.0,
+                    dash=3,
+                    gap=3,
+                    alpha=0.55,
                 )
             tick_labels.append((next_x, "+1m", C_CYAN))
 
@@ -12363,31 +13632,98 @@ def render_kinematics_chart_png(
         # --------------------------------------------------------------
         # PANEL 1: PRICE HEADER, LEFT Y-TICKS, GRID, CURVES, +1M, BUY/SELL
         # --------------------------------------------------------------
-        canvas.draw_text(plot_x0, p1_top - 15, "PANEL 1: PRICE ($)", C_TEXT, scale=1, spacing=2, bold=True)
+        canvas.draw_text(
+            plot_x0,
+            p1_top - 15,
+            "PANEL 1: PRICE ($)",
+            C_TEXT,
+            scale=1,
+            spacing=2,
+            bold=True,
+        )
         p1_readout = (
             f"Close:{_fmt_price_val(closes[-1])}  Smooth:{_fmt_price_val(smooths[-1])}  "
             f"Proj+1m:{_fmt_price_val(proj_price)}"
         )
-        canvas.draw_text(plot_x1, p1_top - 15, p1_readout, C_CYAN_SOFT, scale=1, spacing=2, align="right")
+        canvas.draw_text(
+            plot_x1,
+            p1_top - 15,
+            p1_readout,
+            C_CYAN_SOFT,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
 
-        canvas.draw_text(right_x0 + 12, (p1_top + p1_bot) // 2 - 7, "Price", C_INDIGO, scale=2, spacing=1, bold=True)
-        canvas.draw_text(plot_x0 - 8, p1_top + 4, _fmt_price_val(hi_p), C_MUTED, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, (p1_top + p1_bot) // 2 - 3, _fmt_price_val(mid_p), C_DIM, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, p1_bot - 11, _fmt_price_val(lo_p), C_MUTED, scale=1, spacing=2, align="right")
-        canvas.draw_dashed_line(plot_x0 + 2, (p1_top + p1_bot) * 0.5, plot_x1 - 2, (p1_top + p1_bot) * 0.5, (30, 41, 59), width=1.0, dash=4, gap=4)
+        canvas.draw_text(
+            right_x0 + 12,
+            (p1_top + p1_bot) // 2 - 7,
+            "Price",
+            C_INDIGO,
+            scale=2,
+            spacing=1,
+            bold=True,
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            p1_top + 4,
+            _fmt_price_val(hi_p),
+            C_MUTED,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            (p1_top + p1_bot) // 2 - 3,
+            _fmt_price_val(mid_p),
+            C_DIM,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            p1_bot - 11,
+            _fmt_price_val(lo_p),
+            C_MUTED,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_dashed_line(
+            plot_x0 + 2,
+            (p1_top + p1_bot) * 0.5,
+            plot_x1 - 2,
+            (p1_top + p1_bot) * 0.5,
+            (30, 41, 59),
+            width=1.0,
+            dash=4,
+            gap=4,
+        )
 
-        close_pts = [(x_at(i), y_price(v)) for i, v in enumerate(closes) if v is not None]
-        smooth_pts = [(x_at(i), y_price(v)) for i, v in enumerate(smooths) if v is not None]
+        close_pts = [
+            (x_at(i), y_price(v)) for i, v in enumerate(closes) if v is not None
+        ]
+        smooth_pts = [
+            (x_at(i), y_price(v)) for i, v in enumerate(smooths) if v is not None
+        ]
         if smooth_pts:
-            canvas.draw_polyline(smooth_pts, C_INDIGO, width=1.8, dashed=True, dash=5, gap=3)
+            canvas.draw_polyline(
+                smooth_pts, C_INDIGO, width=1.8, dashed=True, dash=5, gap=3
+            )
         if close_pts:
             canvas.draw_polyline(close_pts, (241, 245, 249), width=2.1)
             lx_pt, ly_pt = close_pts[-1]
             canvas.draw_circle(lx_pt, ly_pt, 3.5, (241, 245, 249), border_color=C_CARD)
             if proj_price is not None:
                 ny_pt = y_price(proj_price)
-                canvas.draw_dashed_line(lx_pt, ly_pt, next_x, ny_pt, C_CYAN, width=1.8, dash=4, gap=3)
-                canvas.draw_circle(next_x, ny_pt, 4.5, C_CYAN, border_color=C_CARD, border_width=1.4)
+                canvas.draw_dashed_line(
+                    lx_pt, ly_pt, next_x, ny_pt, C_CYAN, width=1.8, dash=4, gap=3
+                )
+                canvas.draw_circle(
+                    next_x, ny_pt, 4.5, C_CYAN, border_color=C_CARD, border_width=1.4
+                )
 
         # Executed option buy/sell markers pinned to bar minutes
         last_bar_min_idx = bar_min_indices[-1] if bar_min_indices else None
@@ -12408,17 +13744,38 @@ def render_kinematics_chart_png(
                     bx = x_at(b_idx)
                     bp = closes[b_idx] if closes[b_idx] is not None else c_close
                     by = y_price(bp) if bp is not None else (p1_top + p1_bot) * 0.5
-                elif last_bar_min_idx is not None and ev_min == last_bar_min_idx + 1 and proj_price is not None:
+                elif (
+                    last_bar_min_idx is not None
+                    and ev_min == last_bar_min_idx + 1
+                    and proj_price is not None
+                ):
                     bx = next_x
                     by = y_price(proj_price)
                 else:
                     continue
                 for py0, py1 in ((p1_top, p1_bot), (p2_top, p2_bot), (p3_top, p3_bot)):
                     canvas.draw_dashed_line(
-                        bx, py0 + 2, bx, py1 - 2, star_color, width=1.2, dash=3, gap=3, alpha=0.55
+                        bx,
+                        py0 + 2,
+                        bx,
+                        py1 - 2,
+                        star_color,
+                        width=1.2,
+                        dash=3,
+                        gap=3,
+                        alpha=0.55,
                     )
                 canvas.draw_star(bx, by, 7.5, 3.2, star_color, border_color=(2, 6, 23))
-                canvas.draw_text(bx, max(p1_top + 4, by - 16), label_prefix, star_color, scale=1, spacing=1, align="center", bold=True)
+                canvas.draw_text(
+                    bx,
+                    max(p1_top + 4, by - 16),
+                    label_prefix,
+                    star_color,
+                    scale=1,
+                    spacing=1,
+                    align="center",
+                    bold=True,
+                )
 
         _draw_trade_events(buy_events, C_RED, "BUY")
         _draw_trade_events(sell_events, C_AMBER, "SELL")
@@ -12435,15 +13792,60 @@ def render_kinematics_chart_png(
             spacing=2,
             bold=True,
         )
-        p2_readout = f"v:{_fmt_signed(vels[-1], 2, '/m')}   a:{_fmt_signed(accs[-1], 2, '/m2')}"
-        canvas.draw_text(plot_x1, p2_top - 15, p2_readout, C_SKY, scale=1, spacing=2, align="right")
+        p2_readout = (
+            f"v:{_fmt_signed(vels[-1], 2, '/m')}   a:{_fmt_signed(accs[-1], 2, '/m2')}"
+        )
+        canvas.draw_text(
+            plot_x1, p2_top - 15, p2_readout, C_SKY, scale=1, spacing=2, align="right"
+        )
 
-        canvas.draw_text(right_x0 + 12, (p2_top + p2_bot) // 2 - 7, "v / a", C_SKY, scale=2, spacing=1, bold=True)
-        canvas.draw_text(plot_x0 - 8, p2_top + 4, f"+{max_va:.2f}", C_MUTED, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, int(mid_va_y) - 3, "0.00", C_TEXT, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, p2_bot - 11, f"-{max_va:.2f}", C_MUTED, scale=1, spacing=2, align="right")
+        canvas.draw_text(
+            right_x0 + 12,
+            (p2_top + p2_bot) // 2 - 7,
+            "v / a",
+            C_SKY,
+            scale=2,
+            spacing=1,
+            bold=True,
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            p2_top + 4,
+            f"+{max_va:.2f}",
+            C_MUTED,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            int(mid_va_y) - 3,
+            "0.00",
+            C_TEXT,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            p2_bot - 11,
+            f"-{max_va:.2f}",
+            C_MUTED,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
 
-        canvas.draw_dashed_line(plot_x0 + 2, mid_va_y, plot_x1 - 2, mid_va_y, (71, 85, 105), width=1.2, dash=5, gap=4)
+        canvas.draw_dashed_line(
+            plot_x0 + 2,
+            mid_va_y,
+            plot_x1 - 2,
+            mid_va_y,
+            (71, 85, 105),
+            width=1.2,
+            dash=5,
+            gap=4,
+        )
         vel_pts = [(x_at(i), y_va(v)) for i, v in enumerate(vels)]
         acc_pts = [(x_at(i), y_va(a)) for i, a in enumerate(accs)]
         canvas.draw_polyline(vel_pts, C_SKY, width=2.0)
@@ -12452,9 +13854,23 @@ def render_kinematics_chart_png(
         for i, pt in enumerate(points):
             cs = str(pt.get("crossover_signal") or "none")
             if cs in {"leading_bearish", "leading_bullish"}:
-                canvas.draw_circle(x_at(i), y_va(accs[i]), 4.5, C_ORANGE, border_color=(15, 23, 42), border_width=1.3)
+                canvas.draw_circle(
+                    x_at(i),
+                    y_va(accs[i]),
+                    4.5,
+                    C_ORANGE,
+                    border_color=(15, 23, 42),
+                    border_width=1.3,
+                )
             elif cs in {"confirmed_bearish", "confirmed_bullish"}:
-                canvas.draw_circle(x_at(i), y_va(vels[i]), 4.5, C_SKY, border_color=(15, 23, 42), border_width=1.3)
+                canvas.draw_circle(
+                    x_at(i),
+                    y_va(vels[i]),
+                    4.5,
+                    C_SKY,
+                    border_color=(15, 23, 42),
+                    border_width=1.3,
+                )
 
         # --------------------------------------------------------------
         # PANEL 3: RSI(14) WITH OB/OS BANDS & COMPLETE THRESHOLDS
@@ -12472,21 +13888,109 @@ def render_kinematics_chart_png(
         p3_readout = (
             f"RSI:{last_r:.2f} ({rsi_zone_str})" if last_r is not None else "RSI:--"
         )
-        canvas.draw_text(plot_x1, p3_top - 15, p3_readout, C_PURPLE, scale=1, spacing=2, align="right")
+        canvas.draw_text(
+            plot_x1,
+            p3_top - 15,
+            p3_readout,
+            C_PURPLE,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
 
-        canvas.draw_text(right_x0 + 12, (p3_top + p3_bot) // 2 - 7, "RSI", C_PURPLE, scale=2, spacing=1, bold=True)
-        canvas.draw_text(plot_x0 - 8, p3_top + 4, "100", C_DIM, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, int(y_rsi(rsi_ob)) - 3, f"OB {int(rsi_ob)}", C_ROSE, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, int(y_rsi(50.0)) - 3, "50", C_DIM, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, int(y_rsi(rsi_os)) - 3, f"OS {int(rsi_os)}", C_EMERALD, scale=1, spacing=2, align="right")
-        canvas.draw_text(plot_x0 - 8, p3_bot - 11, "0", C_DIM, scale=1, spacing=2, align="right")
+        canvas.draw_text(
+            right_x0 + 12,
+            (p3_top + p3_bot) // 2 - 7,
+            "RSI",
+            C_PURPLE,
+            scale=2,
+            spacing=1,
+            bold=True,
+        )
+        canvas.draw_text(
+            plot_x0 - 8, p3_top + 4, "100", C_DIM, scale=1, spacing=2, align="right"
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            int(y_rsi(rsi_ob)) - 3,
+            f"OB {int(rsi_ob)}",
+            C_ROSE,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            int(y_rsi(50.0)) - 3,
+            "50",
+            C_DIM,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8,
+            int(y_rsi(rsi_os)) - 3,
+            f"OS {int(rsi_os)}",
+            C_EMERALD,
+            scale=1,
+            spacing=2,
+            align="right",
+        )
+        canvas.draw_text(
+            plot_x0 - 8, p3_bot - 11, "0", C_DIM, scale=1, spacing=2, align="right"
+        )
 
         # Overbought / Oversold shaded zones
-        canvas.fill_rect(plot_x0 + 1, y_rsi(100.0), plot_x1 - 1, y_rsi(rsi_ob), (244, 63, 94), alpha=0.11)
-        canvas.fill_rect(plot_x0 + 1, y_rsi(rsi_os), plot_x1 - 1, y_rsi(0.0), (16, 185, 129), alpha=0.11)
-        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(rsi_ob), plot_x1 - 2, y_rsi(rsi_ob), (244, 63, 94), width=1.1, dash=4, gap=3, alpha=0.75)
-        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(50.0), plot_x1 - 2, y_rsi(50.0), (51, 65, 85), width=1.0, dash=3, gap=4, alpha=0.65)
-        canvas.draw_dashed_line(plot_x0 + 2, y_rsi(rsi_os), plot_x1 - 2, y_rsi(rsi_os), (16, 185, 129), width=1.1, dash=4, gap=3, alpha=0.75)
+        canvas.fill_rect(
+            plot_x0 + 1,
+            y_rsi(100.0),
+            plot_x1 - 1,
+            y_rsi(rsi_ob),
+            (244, 63, 94),
+            alpha=0.11,
+        )
+        canvas.fill_rect(
+            plot_x0 + 1,
+            y_rsi(rsi_os),
+            plot_x1 - 1,
+            y_rsi(0.0),
+            (16, 185, 129),
+            alpha=0.11,
+        )
+        canvas.draw_dashed_line(
+            plot_x0 + 2,
+            y_rsi(rsi_ob),
+            plot_x1 - 2,
+            y_rsi(rsi_ob),
+            (244, 63, 94),
+            width=1.1,
+            dash=4,
+            gap=3,
+            alpha=0.75,
+        )
+        canvas.draw_dashed_line(
+            plot_x0 + 2,
+            y_rsi(50.0),
+            plot_x1 - 2,
+            y_rsi(50.0),
+            (51, 65, 85),
+            width=1.0,
+            dash=3,
+            gap=4,
+            alpha=0.65,
+        )
+        canvas.draw_dashed_line(
+            plot_x0 + 2,
+            y_rsi(rsi_os),
+            plot_x1 - 2,
+            y_rsi(rsi_os),
+            (16, 185, 129),
+            width=1.1,
+            dash=4,
+            gap=3,
+            alpha=0.75,
+        )
 
         rsi_pts = [
             (x_at(i), y_rsi(_safe_num(pt.get("rsi"))))
@@ -12495,7 +13999,9 @@ def render_kinematics_chart_png(
         ]
         if rsi_pts:
             canvas.draw_polyline(rsi_pts, C_PURPLE, width=2.1)
-            canvas.draw_circle(rsi_pts[-1][0], rsi_pts[-1][1], 4.0, C_PURPLE, border_color=C_CARD)
+            canvas.draw_circle(
+                rsi_pts[-1][0], rsi_pts[-1][1], 4.0, C_PURPLE, border_color=C_CARD
+            )
 
     # ------------------------------------------------------------------
     # PROVIDER FEEDS TABLE (MIDDLE-BOTTOM ROW)
@@ -12521,7 +14027,16 @@ def render_kinematics_chart_png(
         ("Status", "center"),
     ]
     for idx_h, (htxt, halign) in enumerate(headers):
-        canvas.draw_text(cols[idx_h], tbl_top + 10, htxt, C_MUTED, scale=2, spacing=1, align=halign, bold=True)
+        canvas.draw_text(
+            cols[idx_h],
+            tbl_top + 10,
+            htxt,
+            C_MUTED,
+            scale=2,
+            spacing=1,
+            align=halign,
+            bold=True,
+        )
 
     FORECAST_LABELS = {
         "bearish_reversal": ("Bearish Reversal", C_ROSE, (76, 5, 25)),
@@ -12551,7 +14066,9 @@ def render_kinematics_chart_png(
         for r_idx, e in enumerate(visible_entries):
             ry = tbl_top + 40 + r_idx * 32
             if r_idx > 0:
-                canvas.fill_rect(margin + 12, ry - 4, W - margin - 12, ry - 3, (22, 32, 50))
+                canvas.fill_rect(
+                    margin + 12, ry - 4, W - margin - 12, ry - 3, (22, 32, 50)
+                )
             prov_name = str(e.get("provider") or "--")[:14]
             ec = _safe_num(e.get("close"))
             ep = _safe_num(e.get("projected_price_next"))
@@ -12567,9 +14084,33 @@ def render_kinematics_chart_png(
             fdir = str(e.get("forecast_direction") or "neutral").lower()
             flbl, ffg, fbg = FORECAST_LABELS.get(fdir, FORECAST_LABELS["neutral"])
 
-            canvas.draw_text(cols[0], ry + 4, prov_name, (248, 250, 252), scale=2, spacing=1, bold=True)
-            canvas.draw_text(cols[1], ry + 4, _fmt_price_val(ec), C_TEXT, scale=2, spacing=1, align="right")
-            canvas.draw_text(cols[2], ry + 4, _fmt_price_val(ep), C_CYAN_SOFT, scale=2, spacing=1, align="right")
+            canvas.draw_text(
+                cols[0],
+                ry + 4,
+                prov_name,
+                (248, 250, 252),
+                scale=2,
+                spacing=1,
+                bold=True,
+            )
+            canvas.draw_text(
+                cols[1],
+                ry + 4,
+                _fmt_price_val(ec),
+                C_TEXT,
+                scale=2,
+                spacing=1,
+                align="right",
+            )
+            canvas.draw_text(
+                cols[2],
+                ry + 4,
+                _fmt_price_val(ep),
+                C_CYAN_SOFT,
+                scale=2,
+                spacing=1,
+                align="right",
+            )
             canvas.draw_text(
                 cols[3],
                 ry + 4,
@@ -12579,14 +14120,40 @@ def render_kinematics_chart_png(
                 spacing=1,
                 align="right",
             )
-            canvas.draw_text(cols[4], ry + 4, _fmt_signed(ea, 2), C_TEXT, scale=2, spacing=1, align="right")
-            canvas.draw_text(cols[5], ry + 4, f"{er:.1f}" if er is not None else "--", C_TEXT, scale=2, spacing=1, align="right")
-            canvas.draw_text(cols[6], ry + 4, f"{_fmt_signed(erv, 2)} / {_fmt_signed(era, 2)}", C_MUTED, scale=2, spacing=1, align="right")
+            canvas.draw_text(
+                cols[4],
+                ry + 4,
+                _fmt_signed(ea, 2),
+                C_TEXT,
+                scale=2,
+                spacing=1,
+                align="right",
+            )
+            canvas.draw_text(
+                cols[5],
+                ry + 4,
+                f"{er:.1f}" if er is not None else "--",
+                C_TEXT,
+                scale=2,
+                spacing=1,
+                align="right",
+            )
+            canvas.draw_text(
+                cols[6],
+                ry + 4,
+                f"{_fmt_signed(erv, 2)} / {_fmt_signed(era, 2)}",
+                C_MUTED,
+                scale=2,
+                spacing=1,
+                align="right",
+            )
 
             bw = min(195, canvas.measure_text(flbl, scale=2, spacing=1) + 18)
             bx0 = cols[7] - bw // 2
             canvas.draw_card(bx0, ry, bx0 + bw, ry + 22, fbg, ffg)
-            canvas.draw_text(cols[7], ry + 5, flbl, ffg, scale=2, spacing=1, align="center")
+            canvas.draw_text(
+                cols[7], ry + 5, flbl, ffg, scale=2, spacing=1, align="center"
+            )
             fstatus = str(e.get("feed_status") or "LIVE").upper()
             st_map = {
                 "LIVE": ("LIVE", C_EMERALD),
@@ -12597,7 +14164,16 @@ def render_kinematics_chart_png(
                 "OFFLINE": ("OFFLINE", C_ROSE),
             }
             st_lbl, st_col = st_map.get(fstatus, (fstatus[:8], C_MUTED))
-            canvas.draw_text(cols[8], ry + 4, st_lbl, st_col, scale=2, spacing=1, align="center", bold=True)
+            canvas.draw_text(
+                cols[8],
+                ry + 4,
+                st_lbl,
+                st_col,
+                scale=2,
+                spacing=1,
+                align="center",
+                bold=True,
+            )
 
     # ------------------------------------------------------------------
     # BOTTOM KINEMATIC DIAGNOSIS BANNER
@@ -12608,7 +14184,9 @@ def render_kinematics_chart_png(
 
     diag_parts = [f"{r_desc}."]
     if proj_price is not None:
-        diag_parts.append(f"Projected next close P(t+1) = {_fmt_price_val(proj_price)}.")
+        diag_parts.append(
+            f"Projected next close P(t+1) = {_fmt_price_val(proj_price)}."
+        )
     if c_rv is not None:
         diag_parts.append(f"RSI velocity is {_fmt_signed(c_rv, 2, '/m')}.")
     if c_ra is not None:
@@ -12618,25 +14196,48 @@ def render_kinematics_chart_png(
         )
     diag_full = " ".join(diag_parts)
     diag_title = "Kinematic Diagnosis:"
-    canvas.draw_text(margin + 14, diag_top + 11, diag_title, C_INDIGO, scale=2, spacing=1, bold=True)
+    canvas.draw_text(
+        margin + 14, diag_top + 11, diag_title, C_INDIGO, scale=2, spacing=1, bold=True
+    )
     tag_txt = "1m Auto-Capture"
     tag_w = canvas.measure_text(tag_txt, scale=2, spacing=1) + 22
     tag_x0 = W - margin - 14 - tag_w
-    canvas.draw_card(tag_x0, diag_top + 12, tag_x0 + tag_w, diag_bot - 12, (37, 45, 96), (99, 102, 241))
-    canvas.draw_text(tag_x0 + tag_w // 2, diag_top + 21, tag_txt, (199, 210, 254), scale=2, spacing=1, align="center", bold=True)
+    canvas.draw_card(
+        tag_x0,
+        diag_top + 12,
+        tag_x0 + tag_w,
+        diag_bot - 12,
+        (37, 45, 96),
+        (99, 102, 241),
+    )
+    canvas.draw_text(
+        tag_x0 + tag_w // 2,
+        diag_top + 21,
+        tag_txt,
+        (199, 210, 254),
+        scale=2,
+        spacing=1,
+        align="center",
+        bold=True,
+    )
 
     diag_text_x = margin + 14 + canvas.measure_text(diag_title, scale=2, spacing=1) + 12
     avail_diag_px = max(240, tag_x0 - diag_text_x - 16)
     max_diag_chars = max(40, avail_diag_px // 11)
     diag_lines = _wrap_text_lines(diag_full, max_diag_chars)[:2]
     for li, dline in enumerate(diag_lines):
-        canvas.draw_text(diag_text_x, diag_top + 11 + li * 19, dline, C_TEXT, scale=2, spacing=1)
+        canvas.draw_text(
+            diag_text_x, diag_top + 11 + li * 19, dline, C_TEXT, scale=2, spacing=1
+        )
 
     return canvas.to_png_bytes()
 
 
 def _safe_symbol_folder(symbol):
-    clean = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(symbol or "UNKNOWN").upper())
+    clean = "".join(
+        c if c.isalnum() or c in "-_." else "_"
+        for c in str(symbol or "UNKNOWN").upper()
+    )
     return clean or "UNKNOWN"
 
 
@@ -12700,8 +14301,13 @@ class ChartCaptureManager:
         folder = self.output_dir / _safe_symbol_folder(sym)
         stamp_dt = as_utc(minute_dt) if minute_dt is not None else datetime.now(UTC)
         dt_disp = as_display_tz(stamp_dt)
-        tz_tag = "".join(c for c in str(display_tz_abbr(dt_disp) or "TZ") if c.isalnum()) or "TZ"
-        fname = f"{_safe_symbol_folder(sym)}_{dt_disp.strftime('%Y%m%d_%H%M')}_{tz_tag}.png"
+        tz_tag = (
+            "".join(c for c in str(display_tz_abbr(dt_disp) or "TZ") if c.isalnum())
+            or "TZ"
+        )
+        fname = (
+            f"{_safe_symbol_folder(sym)}_{dt_disp.strftime('%Y%m%d_%H%M')}_{tz_tag}.png"
+        )
         png_bytes = render_kinematics_chart_png(
             sym_data,
             smooth_config=smooth_cfg,
@@ -12777,7 +14383,9 @@ class ChartCaptureManager:
         return saved_count
 
     def _thread_worker(self):
-        logging.info("CHART_CAPTURE_THREAD_STARTED thread=%s", threading.current_thread().name)
+        logging.info(
+            "CHART_CAPTURE_THREAD_STARTED thread=%s", threading.current_thread().name
+        )
         try:
             while not self._stop_event.is_set():
                 try:
@@ -12800,7 +14408,10 @@ class ChartCaptureManager:
                 finally:
                     self._task_queue.task_done()
         finally:
-            logging.info("CHART_CAPTURE_THREAD_STOPPED thread=%s", threading.current_thread().name)
+            logging.info(
+                "CHART_CAPTURE_THREAD_STOPPED thread=%s",
+                threading.current_thread().name,
+            )
 
     def _drain_task_queue_unlocked(self):
         while True:
@@ -12829,7 +14440,9 @@ class ChartCaptureManager:
             self.last_status = "running"
             self._trigger_immediate_capture = True
         self._wake_async_loop()
-        logging.info("CHART_CAPTURE_STARTED persist_ini=%s dir=%s", persist_ini, self.output_dir)
+        logging.info(
+            "CHART_CAPTURE_STARTED persist_ini=%s dir=%s", persist_ini, self.output_dir
+        )
         return self.get_status()
 
     def stop_capture(self, persist_ini=True, ini_path=None, join_timeout=5.0):
@@ -12862,7 +14475,9 @@ class ChartCaptureManager:
 
     def get_status(self):
         with self._state_lock:
-            alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
+            alive = bool(
+                self._worker_thread is not None and self._worker_thread.is_alive()
+            )
             tname = self._worker_thread.name if alive else None
             return {
                 "status": self.last_status,
@@ -12908,7 +14523,9 @@ class ChartCaptureManager:
             self.coordinator, history_limit=self.history_bars
         )
         with self._state_lock:
-            worker_alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
+            worker_alive = bool(
+                self._worker_thread is not None and self._worker_thread.is_alive()
+            )
         if worker_alive:
             return 1 if self.enqueue_snapshot(minute_dt, snapshot) else 0
         return await asyncio.to_thread(self._process_snapshot_sync, minute_dt, snapshot)
@@ -12985,7 +14602,9 @@ class ChartCaptureManager:
                     if force_now:
                         self._trigger_immediate_capture = False
 
-                    if cur_finalized is not None and (cur_finalized != last_processed_minute or force_now):
+                    if cur_finalized is not None and (
+                        cur_finalized != last_processed_minute or force_now
+                    ):
                         await self.capture_minute(cur_finalized)
                         last_processed_minute = cur_finalized
                 except asyncio.CancelledError:
@@ -14367,7 +15986,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     jobs.push(Promise.resolve(null));
                 }
                 if (logsOpen) {
-                    jobs.push(fetch(`/api/option-logs?limit=2000&_ts=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null));
+                    jobs.push(fetch(`/api/option-logs?limit=40000&_ts=${Date.now()}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
@@ -16062,7 +17681,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 logsEl.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Retrieving buy &amp; sell analysis logs...</div>`;
             }
             try {
-                const res = await fetch(`/api/option-logs?limit=2000&_ts=${Date.now()}`, { cache: 'no-store' });
+                const res = await fetch(`/api/option-logs?limit=40000&_ts=${Date.now()}`, { cache: 'no-store' });
                 const data = await res.json();
                 if (res.ok && data && data.status === 'ok') {
                     latestOptionLogs = data;
@@ -16906,7 +18525,9 @@ def _parse_option_log_timestamp(ts_full: str):
         except ValueError:
             ms = 0
     try:
-        naive = datetime.strptime(base, "%Y-%m-%d %H:%M:%S").replace(microsecond=ms * 1000)
+        naive = datetime.strptime(base, "%Y-%m-%d %H:%M:%S").replace(
+            microsecond=ms * 1000
+        )
         return naive, ms
     except ValueError:
         return None, ms
@@ -16934,7 +18555,9 @@ def _normalize_option_log_record_tz(rec: dict, force_utc_source=None):
     minute_raw = rec.get("minute")
     if minute_raw and minute_raw not in {"n/a", "none", "None"}:
         try:
-            parsed_min = datetime.fromisoformat(str(minute_raw).strip().replace("Z", "+00:00"))
+            parsed_min = datetime.fromisoformat(
+                str(minute_raw).strip().replace("Z", "+00:00")
+            )
             if parsed_min.tzinfo is None:
                 parsed_min = parsed_min.replace(tzinfo=timezone.utc)
             diff_utc = abs((dt_utc - parsed_min).total_seconds())
@@ -17058,7 +18681,9 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     for idx, km in enumerate(kv_matches):
         key = km.group(1)
         val_start = km.end()
-        val_end = kv_matches[idx + 1].start() if idx + 1 < len(kv_matches) else len(rest)
+        val_end = (
+            kv_matches[idx + 1].start() if idx + 1 < len(kv_matches) else len(rest)
+        )
         kv[key] = rest[val_start:val_end].strip()
 
     if kv.get("minute"):
@@ -17083,9 +18708,7 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         raw_sym = kv.get("symbol")
         contract_val = kv.get("contract")
         rec["symbol"] = (
-            und
-            if (und and und not in {"n/a", "none", "None"})
-            else (raw_sym or "none")
+            und if (und and und not in {"n/a", "none", "None"}) else (raw_sym or "none")
         )
         if contract_val and contract_val not in {"n/a", "none", "None"}:
             rec["contract"] = contract_val
@@ -17116,7 +18739,9 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         "OPTION_SELLER_DISABLED": "ENGINE_DISABLED",
     }
     if event in {"OPTION_SELL_DRY_RUN", "OPTION_SELL_SUBMITTED"}:
-        base_dec = "DRY_RUN_ORDER" if event == "OPTION_SELL_DRY_RUN" else "ORDER_SUBMITTED"
+        base_dec = (
+            "DRY_RUN_ORDER" if event == "OPTION_SELL_DRY_RUN" else "ORDER_SUBMITTED"
+        )
         kind_val = kv.get("kind")
         rec["decision"] = f"{base_dec}({kind_val})" if kind_val else base_dec
     elif event in decision_map:
@@ -17149,26 +18774,70 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     return rec
 
 
-def read_option_analysis_logs(limit_per_file: int = 2000, max_total_entries: int = 5000):
-    """Read, merge, and interleave all Option Buyer & Option Seller log files for the configured provider (newest first)."""
+def _option_log_is_qualified(rec: dict) -> bool:
+    dec_u = str(rec.get("decision") or "").upper()
+    ev_u = str(rec.get("event") or "").upper()
+    if "FAILED" in dec_u or "FAILED" in ev_u:
+        return False
+    return "QUALIFIED" in dec_u or "SUBMITTED" in ev_u or "DRY_RUN" in ev_u
+
+
+def _option_log_is_rejected(rec: dict) -> bool:
+    dec_u = str(rec.get("decision") or "").upper()
+    ev_u = str(rec.get("event") or "").upper()
+    return (
+        "FAILED" in dec_u
+        or "FAILED" in ev_u
+        or "REJECTED" in dec_u
+        or "SKIPPED" in dec_u
+        or "HOLD" in dec_u
+        or "WATCH" in dec_u
+        or "SKIPPED" in ev_u
+        or "HOLD" in ev_u
+    )
+
+
+def read_option_analysis_logs(
+    limit_per_file: int = 50000,
+    max_total_entries: int = 40000,
+    stream_filter: str = "all",
+    decision_filter: str = "all",
+    search_query: str = "",
+):
+    """Read, filter, merge, and interleave all Option Buyer & Option Seller log files (newest first)."""
     from collections import deque
 
     tx_tag = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().upper() or "ALPACA"
-    buyer_candidates = _list_provider_option_log_files("option_buyer", f"{tx_tag}-OPTION_BUYER-")
-    seller_candidates = _list_provider_option_log_files("option_seller", f"{tx_tag}-OPTION_SELLER-")
+    buyer_candidates = _list_provider_option_log_files(
+        "option_buyer", f"{tx_tag}-OPTION_BUYER-"
+    )
+    seller_candidates = _list_provider_option_log_files(
+        "option_seller", f"{tx_tag}-OPTION_SELLER-"
+    )
 
     try:
-        requested_limit = max(20, int(limit_per_file or 2000))
+        requested_limit = int(max_total_entries or 40000)
     except (TypeError, ValueError):
-        requested_limit = 2000
-    per_file_cap = max(requested_limit, 5000)
-    total_cap = max(20, min(int(max_total_entries or 5000), max(requested_limit, 2000)))
+        requested_limit = 40000
+    per_file_cap = max(int(limit_per_file or 50000), 50000)
+    # Allow 0 for unlimited, otherwise up to 100,000 rows per stream
+    stream_cap = 0 if requested_limit <= 0 else max(20, min(100000, requested_limit))
 
-    entries = []
+    norm_stream = str(stream_filter or "all").strip().upper()
+    if norm_stream not in {"BUY", "SELL"}:
+        norm_stream = "ALL"
+
+    norm_decision = str(decision_filter or "all").strip().upper()
+    if norm_decision not in {"QUALIFIED", "REJECTED"}:
+        norm_decision = "ALL"
+
+    q_upper = str(search_query or "").strip().upper()
+
+    by_stream = {"BUY": [], "SELL": []}
     active_files = {"BUY": [], "SELL": []}
     seq = 0
+
     for stream, paths in (("BUY", buyer_candidates), ("SELL", seller_candidates)):
-        # Collect active file names newest-first while reading oldest-to-newest for clean tie-break seq
         file_has_records = set()
         for path in reversed(paths):
             try:
@@ -17195,51 +18864,67 @@ def read_option_analysis_logs(limit_per_file: int = 2000, max_total_entries: int
                         disp_votes += 1
                     file_records.append((parsed, hint))
 
-            # If this file predominantly logged UTC timestamps, normalize lines without minute= (e.g. executions)
             file_is_utc = utc_votes > 0 and utc_votes > disp_votes
             for parsed, hint in file_records:
                 if hint is None and file_is_utc:
                     _normalize_option_log_record_tz(parsed, force_utc_source=True)
-                entries.append(parsed)
+                if q_upper:
+                    haystack = (
+                        f"{parsed.get('symbol', '')} {parsed.get('contract', '')} "
+                        f"{parsed.get('provider', '')} {parsed.get('reason', '')} "
+                        f"{parsed.get('event', '')}"
+                    ).upper()
+                    if q_upper not in haystack:
+                        continue
+                by_stream[stream].append(parsed)
 
         active_files[stream] = [p for p in paths if p in file_has_records]
 
-    buyer_files = active_files["BUY"]
-    seller_files = active_files["SELL"]
+    all_entries = by_stream["BUY"] + by_stream["SELL"]
 
-    entries.sort(key=lambda r: r["_sort_key"], reverse=True)
-    if total_cap and len(entries) > total_cap:
-        del entries[total_cap:]
+    # Tallies across ALL matching files before slicing
+    side_pool = [
+        r
+        for r in all_entries
+        if norm_decision == "ALL"
+        or (norm_decision == "QUALIFIED" and _option_log_is_qualified(r))
+        or (norm_decision == "REJECTED" and _option_log_is_rejected(r))
+    ]
+    count_all_side = len(side_pool)
+    count_buy_side = sum(1 for r in side_pool if r["stream"] == "BUY")
+    count_sell_side = sum(1 for r in side_pool if r["stream"] == "SELL")
 
-    buy_count = 0
-    sell_count = 0
-    qualified_count = 0
-    rejected_count = 0
-    for r in entries:
+    dec_pool = [
+        r for r in all_entries if norm_stream == "ALL" or r["stream"] == norm_stream
+    ]
+    count_qualified = sum(1 for r in dec_pool if _option_log_is_qualified(r))
+    count_rejected = sum(1 for r in dec_pool if _option_log_is_rejected(r))
+
+    # Apply stream_cap INDEPENDENTLY to BUY and SELL so BUY never starves SELL
+    selected = []
+    for st_name in ("BUY", "SELL"):
+        if norm_stream not in {"ALL", st_name}:
+            continue
+        st_rows = [
+            r
+            for r in by_stream[st_name]
+            if norm_decision == "ALL"
+            or (norm_decision == "QUALIFIED" and _option_log_is_qualified(r))
+            or (norm_decision == "REJECTED" and _option_log_is_rejected(r))
+        ]
+        st_rows.sort(key=lambda r: r["_sort_key"], reverse=True)
+        if stream_cap > 0 and len(st_rows) > stream_cap:
+            st_rows = st_rows[:stream_cap]
+        selected.extend(st_rows)
+
+    selected.sort(key=lambda r: r["_sort_key"], reverse=True)
+
+    for r in selected:
         r.pop("_sort_key", None)
         r.pop("_seq", None)
-        if r["stream"] == "BUY":
-            buy_count += 1
-        else:
-            sell_count += 1
-        dec_u = str(r.get("decision") or "").upper()
-        ev_u = str(r.get("event") or "").upper()
-        is_failed = ("FAILED" in dec_u) or ("FAILED" in ev_u)
-        if (not is_failed) and (
-            "QUALIFIED" in dec_u or "SUBMITTED" in ev_u or "DRY_RUN" in ev_u
-        ):
-            qualified_count += 1
-        elif (
-            is_failed
-            or "REJECTED" in dec_u
-            or "SKIPPED" in dec_u
-            or "HOLD" in dec_u
-            or "WATCH" in dec_u
-            or "SKIPPED" in ev_u
-            or "HOLD" in ev_u
-        ):
-            rejected_count += 1
 
+    buyer_files = active_files["BUY"]
+    seller_files = active_files["SELL"]
     return {
         "provider": tx_tag,
         "buyer_log_file": buyer_files[0].name if buyer_files else None,
@@ -17247,13 +18932,19 @@ def read_option_analysis_logs(limit_per_file: int = 2000, max_total_entries: int
         "buyer_log_files": [p.name for p in buyer_files],
         "seller_log_files": [p.name for p in seller_files],
         "counts": {
-            "total": len(entries),
-            "buy": buy_count,
-            "sell": sell_count,
-            "qualified": qualified_count,
-            "rejected": rejected_count,
+            "total": count_all_side,
+            "buy": count_buy_side,
+            "sell": count_sell_side,
+            "qualified": count_qualified,
+            "rejected": count_rejected,
+            "matched": (
+                count_all_side
+                if norm_stream == "ALL"
+                else (count_buy_side if norm_stream == "BUY" else count_sell_side)
+            ),
+            "returned": len(selected),
         },
-        "entries": entries,
+        "entries": selected,
     }
 
 
@@ -17355,7 +19046,9 @@ class AdminCliProvider:
         try:
             payload_b64, _ = token.split(".", 1)
             padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+            payload = json.loads(
+                base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            )
             sid = str(payload.get("nonce") or "")
             if sid:
                 with self._auth_lock:
@@ -17375,7 +19068,9 @@ class AdminCliProvider:
             if not hmac.compare_digest(sig, expected_sig):
                 return False, "invalid_token"
             padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+            payload = json.loads(
+                base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            )
             now = time.time()
             if float(payload.get("exp", 0)) <= now:
                 return False, "session_expired"
@@ -17422,7 +19117,9 @@ class AdminCliProvider:
             recent = [t for t in self._auth_failures.get(key, []) if t > cutoff]
             self._auth_failures[key] = recent
             if len(recent) >= self._AUTH_MAX_FAILURES:
-                retry_after = max(1, int(math.ceil(recent[0] + self._AUTH_LOCKOUT_SECONDS - now)))
+                retry_after = max(
+                    1, int(math.ceil(recent[0] + self._AUTH_LOCKOUT_SECONDS - now))
+                )
                 return False, retry_after
         return True, 0
 
@@ -17476,7 +19173,9 @@ class AdminCliProvider:
         app = Flask("admin_cli_interface")
         app.config["MAX_CONTENT_LENGTH"] = 16384
 
-        def _render_login_html(next_url="/", error_msg="", notice_msg="", status_code=200):
+        def _render_login_html(
+            next_url="/", error_msg="", notice_msg="", status_code=200
+        ):
             import html as _html
 
             safe_next = self._safe_next_url(next_url)
@@ -17493,7 +19192,9 @@ class AdminCliProvider:
             )
             resp = make_response(page, status_code)
             resp.headers["Content-Type"] = "text/html; charset=utf-8"
-            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Cache-Control"] = (
+                "no-store, no-cache, must-revalidate, max-age=0"
+            )
             return resp
 
         @app.before_request
@@ -17505,10 +19206,16 @@ class AdminCliProvider:
             if request.path == "/favicon.ico":
                 return "", 204
             touch = self._request_counts_as_user_activity(request)
-            ok, reason = self._authenticate_request_detail(request, touch_activity=touch)
+            ok, reason = self._authenticate_request_detail(
+                request, touch_activity=touch
+            )
             if ok:
                 return None
-            if request.path.startswith("/api/") or request.path.startswith("/cli/") or request.path == "/auth/heartbeat":
+            if (
+                request.path.startswith("/api/")
+                or request.path.startswith("/cli/")
+                or request.path == "/auth/heartbeat"
+            ):
                 resp = make_response(
                     jsonify(
                         status="error",
@@ -17540,7 +19247,9 @@ class AdminCliProvider:
         @app.get("/login")
         def login_page():
             safe_next = self._safe_next_url(request.args.get("next", "/"))
-            if not self._is_auth_active() or self._is_request_authenticated(request, touch_activity=False):
+            if not self._is_auth_active() or self._is_request_authenticated(
+                request, touch_activity=False
+            ):
                 return redirect(safe_next, code=302)
             notice_msg = ""
             if str(request.args.get("reason") or "").strip().lower() == "idle":
@@ -17577,7 +19286,9 @@ class AdminCliProvider:
                 msg = f"Too many failed attempts. Try again in {retry_after}s."
                 if wants_json:
                     return jsonify(status="error", message=msg), 429
-                return _render_login_html(next_url=safe_next, error_msg=msg, status_code=429)
+                return _render_login_html(
+                    next_url=safe_next, error_msg=msg, status_code=429
+                )
 
             if not self._verify_password(candidate):
                 self._record_auth_failure(rate_key)
@@ -17585,7 +19296,9 @@ class AdminCliProvider:
                 msg = "Invalid password. Check [dashboard] password in parms.ini."
                 if wants_json:
                     return jsonify(status="error", message=msg), 401
-                return _render_login_html(next_url=safe_next, error_msg=msg, status_code=401)
+                return _render_login_html(
+                    next_url=safe_next, error_msg=msg, status_code=401
+                )
 
             self._clear_auth_failures(rate_key)
             logging.info("DASHBOARD_AUTH_SUCCESS client=%s", rate_key)
@@ -17593,7 +19306,8 @@ class AdminCliProvider:
             ttl_seconds = max(3600, int(DASHBOARD_SESSION_TTL_HOURS or 24) * 3600)
             is_https = bool(
                 request.is_secure
-                or request.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
+                or request.headers.get("X-Forwarded-Proto", "").strip().lower()
+                == "https"
             )
             if wants_json:
                 resp = make_response(jsonify(status="ok", redirect=safe_next), 200)
@@ -17616,7 +19330,9 @@ class AdminCliProvider:
             resp = make_response(
                 jsonify(
                     status="ok",
-                    inactivity_timeout_minutes=int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0),
+                    inactivity_timeout_minutes=int(
+                        DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0
+                    ),
                 ),
                 200,
             )
@@ -17667,7 +19383,9 @@ class AdminCliProvider:
                 hist_limit = max(2, min(KINEMATICS_HISTORY_MAX_BARS, int(raw_limit)))
             except (TypeError, ValueError):
                 hist_limit = 20
-            snap = build_kinematics_snapshot_data(self.coordinator, history_limit=hist_limit)
+            snap = build_kinematics_snapshot_data(
+                self.coordinator, history_limit=hist_limit
+            )
             return jsonify(status="ok", run_id=RUN_ID, **snap), 200
 
         @app.get("/api/kinematics/history")
@@ -17706,31 +19424,52 @@ class AdminCliProvider:
         @app.get("/api/option-history")
         def get_option_history():
             if not hasattr(self.coordinator, "option_history"):
-                return jsonify(status="error", message="Option history tracker unavailable"), 503
-            return jsonify(status="ok", **self.coordinator.option_history.get_snapshot()), 200
+                return (
+                    jsonify(
+                        status="error", message="Option history tracker unavailable"
+                    ),
+                    503,
+                )
+            return (
+                jsonify(status="ok", **self.coordinator.option_history.get_snapshot()),
+                200,
+            )
 
         @app.get("/api/option-logs")
         def get_option_logs():
             try:
-                raw_limit = request.args.get("limit", "2000")
+                raw_limit = request.args.get("limit", "40000")
                 limit = max(20, min(5000, int(raw_limit)))
             except (TypeError, ValueError):
                 limit = 2000
-            payload = read_option_analysis_logs(limit_per_file=5000, max_total_entries=limit)
+            payload = read_option_analysis_logs(
+                limit_per_file=5000, max_total_entries=limit
+            )
             return jsonify(status="ok", run_id=RUN_ID, **payload), 200
 
         @app.post("/api/option-history/refresh")
         def refresh_option_history():
             if not hasattr(self.coordinator, "option_history"):
-                return jsonify(status="error", message="Option history tracker unavailable"), 503
+                return (
+                    jsonify(
+                        status="error", message="Option history tracker unavailable"
+                    ),
+                    503,
+                )
             pm_entry = PROVIDER_REGISTRY.get("POSITIONS_MONITOR", {})
             pm = pm_entry.get("router")
             ob_entry = PROVIDER_REGISTRY.get("OPTION_BUYER", {})
             ob = ob_entry.get("router")
             os_entry = PROVIDER_REGISTRY.get("OPTION_SELLER", {})
             osel = os_entry.get("router")
-            t_client = (pm.client if pm and pm.client else None) or (ob.client if ob and ob.client else None) or (osel.client if osel and osel.client else None)
-            o_client = (ob.option_data_client if ob else None) or (osel.option_data_client if osel else None)
+            t_client = (
+                (pm.client if pm and pm.client else None)
+                or (ob.client if ob and ob.client else None)
+                or (osel.client if osel and osel.client else None)
+            )
+            o_client = (ob.option_data_client if ob else None) or (
+                osel.option_data_client if osel else None
+            )
             s_client = osel.stock_data_client if osel else None
             future = asyncio.run_coroutine_threadsafe(
                 asyncio.to_thread(
@@ -17745,7 +19484,10 @@ class AdminCliProvider:
                 future.result(timeout=20.0)
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
-            return jsonify(status="ok", **self.coordinator.option_history.get_snapshot()), 200
+            return (
+                jsonify(status="ok", **self.coordinator.option_history.get_snapshot()),
+                200,
+            )
 
         @app.route("/cli/status", methods=["GET", "POST"])
         def get_status():
@@ -17771,7 +19513,9 @@ class AdminCliProvider:
                 "last_order_utc": ob.last_order_utc if ob else None,
                 "last_order_contract": ob.last_order_contract if ob else None,
                 "last_order_reason": ob.last_order_reason if ob else None,
-                "last_error_detail": getattr(ob, "last_error_detail", None) if ob else None,
+                "last_error_detail": (
+                    getattr(ob, "last_error_detail", None) if ob else None
+                ),
                 "cached_contracts": len(self.coordinator.option_chain_cache),
                 "history_summary": (
                     self.coordinator.option_history.get_buyer_summary()
@@ -17790,12 +19534,16 @@ class AdminCliProvider:
                 "stop_loss_watches": {
                     sym: {
                         "streak": st.get("streak", 0),
-                        "pnl_pct": round(st["last_pnl_pct"], 2)
-                        if st.get("last_pnl_pct") is not None
-                        else None,
+                        "pnl_pct": (
+                            round(st["last_pnl_pct"], 2)
+                            if st.get("last_pnl_pct") is not None
+                            else None
+                        ),
                         "minute_utc": st.get("last_minute_key"),
                     }
-                    for sym, st in (osel.stop_loss_state_by_symbol if osel else {}).items()
+                    for sym, st in (
+                        osel.stop_loss_state_by_symbol if osel else {}
+                    ).items()
                     if st.get("streak", 0) > 0
                 },
                 "peak_profit_watches": {
@@ -17804,13 +19552,17 @@ class AdminCliProvider:
                         "last_pnl_pct": round(st["last_pnl_pct"], 2),
                         "drawdown_pct": round(st.get("drawdown_pct", 0.0), 2),
                     }
-                    for sym, st in (osel.peak_profit_state_by_symbol if osel else {}).items()
+                    for sym, st in (
+                        osel.peak_profit_state_by_symbol if osel else {}
+                    ).items()
                     if st.get("peak_pnl_pct", 0.0) > 0
                 },
                 "last_order_utc": osel.last_order_utc if osel else None,
                 "last_order_contract": osel.last_order_contract if osel else None,
                 "last_order_reason": osel.last_order_reason if osel else None,
-                "last_error_detail": getattr(osel, "last_error_detail", None) if osel else None,
+                "last_error_detail": (
+                    getattr(osel, "last_error_detail", None) if osel else None
+                ),
                 "positions_checked": osel.last_positions_checked if osel else 0,
                 "history_summary": (
                     self.coordinator.option_history.get_seller_summary()
@@ -17858,16 +19610,16 @@ class AdminCliProvider:
                     "output_dir": str(cc.output_dir) if cc else CHART_CAPTURE_DIR,
                     "captures_total": cc.captures_total if cc else 0,
                     "last_capture_utc": cc.last_capture_utc if cc else None,
-                    "last_capture_symbol_count": cc.last_capture_symbol_count if cc else 0,
+                    "last_capture_symbol_count": (
+                        cc.last_capture_symbol_count if cc else 0
+                    ),
                 }
             )
 
             tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {})
             tv = tv_entry.get("router")
             tv_report = (
-                tv.get_stats()
-                if tv is not None and hasattr(tv, "get_stats")
-                else None
+                tv.get_stats() if tv is not None and hasattr(tv, "get_stats") else None
             )
 
             status_report = {
@@ -17925,7 +19677,9 @@ class AdminCliProvider:
             cc = cc_entry.get("router")
             if cc is None:
                 return (
-                    jsonify(status="error", message="CHART_CAPTURE manager is not loaded"),
+                    jsonify(
+                        status="error", message="CHART_CAPTURE manager is not loaded"
+                    ),
                     503,
                 )
 
@@ -18071,7 +19825,9 @@ class AdminCliProvider:
 
         return app
 
-    def _generate_self_signed_cert(self, cert_path: Path, key_path: Path, lan_ip: str = None):
+    def _generate_self_signed_cert(
+        self, cert_path: Path, key_path: Path, lan_ip: str = None
+    ):
         cert_path.parent.mkdir(parents=True, exist_ok=True)
         key_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -18097,7 +19853,12 @@ class AdminCliProvider:
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             now = datetime.now(UTC)
             subject = issuer = x509.Name(
-                [x509.NameAttribute(NameOID.COMMON_NAME, str(san_ips[-1] if san_ips else "localhost"))]
+                [
+                    x509.NameAttribute(
+                        NameOID.COMMON_NAME,
+                        str(san_ips[-1] if san_ips else "localhost"),
+                    )
+                ]
             )
             alt_names = [x509.DNSName(h) for h in san_hosts if h]
             for ip_s in san_ips:
@@ -18111,7 +19872,9 @@ class AdminCliProvider:
                 .not_valid_before(now - timedelta(days=1))
                 .not_valid_after(now + timedelta(days=825))
                 .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
-                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(
+                    x509.BasicConstraints(ca=False, path_length=None), critical=True
+                )
                 .sign(key, hashes.SHA256())
             )
             key_path.write_bytes(
@@ -18126,7 +19889,9 @@ class AdminCliProvider:
         except ImportError:
             pass
 
-        san_entries = [f"DNS:{h}" for h in san_hosts if h] + [f"IP:{i}" for i in san_ips if i]
+        san_entries = [f"DNS:{h}" for h in san_hosts if h] + [
+            f"IP:{i}" for i in san_ips if i
+        ]
         cn = san_ips[-1] if san_ips else "localhost"
         cmd = [
             "openssl",
@@ -18148,7 +19913,9 @@ class AdminCliProvider:
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode != 0:
-            raise RuntimeError(f"openssl req failed: {(res.stderr or res.stdout or '').strip()}")
+            raise RuntimeError(
+                f"openssl req failed: {(res.stderr or res.stdout or '').strip()}"
+            )
         return True
 
     def _ensure_dashboard_ssl_context(self, lan_ip: str = None):
@@ -18301,7 +20068,11 @@ class AdminCliProvider:
         logging.info(
             "=================================================================="
         )
-        logging.info("RSI & Kinematics Web Dashboard Ready (ssl=%s mode=%s):", self.ssl_active, ssl_mode)
+        logging.info(
+            "RSI & Kinematics Web Dashboard Ready (ssl=%s mode=%s):",
+            self.ssl_active,
+            ssl_mode,
+        )
         if self.ssl_active:
             logging.info("  -> Local Machine (HTTPS): https://127.0.0.1:%d/", self.port)
         if (not self.ssl_active) or ssl_mode != "https":
@@ -18329,7 +20100,9 @@ class AdminCliProvider:
                 )
         else:
             proto = "https" if self.ssl_active else "http"
-            logging.info("  -> Bound Host:      %s://%s:%d/", proto, self.host, self.port)
+            logging.info(
+                "  -> Bound Host:      %s://%s:%d/", proto, self.host, self.port
+            )
         logging.info(
             "=================================================================="
         )
@@ -18463,11 +20236,14 @@ async def main():
     )
     tasks.append(os_task)
 
-    startup_t_client = position_monitor.client or option_buyer.client or option_seller.client
+    startup_t_client = (
+        position_monitor.client or option_buyer.client or option_seller.client
+    )
     coordinator.option_history.attach_clients(
         credentials=keys,
         trading_client=startup_t_client,
-        option_data_client=option_buyer.option_data_client or option_seller.option_data_client,
+        option_data_client=option_buyer.option_data_client
+        or option_seller.option_data_client,
         stock_data_client=option_seller.stock_data_client,
     )
     if startup_t_client is not None:
@@ -18520,8 +20296,11 @@ async def main():
     except Exception:
         is_tty = False
     if is_tty:
+
         def _tty_cli_reader():
-            logging.info("TTY_CLI_READY commands: 'chart-capture start|stop|status', 'status', 'help'")
+            logging.info(
+                "TTY_CLI_READY commands: 'chart-capture start|stop|status', 'status', 'help'"
+            )
             while True:
                 try:
                     line = sys.stdin.readline()
@@ -18538,8 +20317,15 @@ async def main():
                 elif cmd in {"chart-capture stop", "chart_capture stop", "cc stop"}:
                     res = chart_capture.stop_capture(persist_ini=True)
                     print(f"[CLI] Chart capture STOPPED: {json.dumps(res)}", flush=True)
-                elif cmd in {"chart-capture status", "chart_capture status", "cc status"}:
-                    print(f"[CLI] Chart capture STATUS: {json.dumps(chart_capture.get_status())}", flush=True)
+                elif cmd in {
+                    "chart-capture status",
+                    "chart_capture status",
+                    "cc status",
+                }:
+                    print(
+                        f"[CLI] Chart capture STATUS: {json.dumps(chart_capture.get_status())}",
+                        flush=True,
+                    )
                 elif cmd == "status":
                     tv_entry = PROVIDER_REGISTRY.get("TRADINGVIEW", {})
                     tv_r = tv_entry.get("router")
@@ -18548,7 +20334,11 @@ async def main():
                             {
                                 "connected": coordinator.connected,
                                 "chart_capture": chart_capture.get_status(),
-                                "tradingview": tv_r.get_stats() if tv_r and hasattr(tv_r, "get_stats") else None,
+                                "tradingview": (
+                                    tv_r.get_stats()
+                                    if tv_r and hasattr(tv_r, "get_stats")
+                                    else None
+                                ),
                             },
                             indent=2,
                         ),
@@ -18587,7 +20377,9 @@ def _read_dashboard_password_from_ini(ini_path=None):
             raw_text = cfg_path.read_text(encoding="utf-8-sig")
             cfg = configparser.ConfigParser(interpolation=None)
             cfg.read_string(raw_text)
-            auth_on = _ini_bool(cfg, "dashboard", "auth_enabled", "DASHBOARD_AUTH_ENABLED", True)
+            auth_on = _ini_bool(
+                cfg, "dashboard", "auth_enabled", "DASHBOARD_AUTH_ENABLED", True
+            )
             if not auth_on:
                 return ""
             return _ini_str(cfg, "dashboard", "password", "DASHBOARD_PASSWORD", "")
@@ -18598,7 +20390,9 @@ def _read_dashboard_password_from_ini(ini_path=None):
     return os.getenv("DASHBOARD_PASSWORD", DASHBOARD_PASSWORD or "")
 
 
-def _call_running_chart_capture_cli(action, port=DASHBOARD_PORT, timeout=2.0, ini_path=None):
+def _call_running_chart_capture_cli(
+    action, port=DASHBOARD_PORT, timeout=2.0, ini_path=None
+):
     import urllib.error
     import urllib.request
 
@@ -18671,11 +20465,17 @@ def handle_cli_command(argv=None):
         help="Manage the 1-minute PNG chart capture thread & lib/parms.ini setting.",
     )
     cc_parser.add_argument("action", choices=["start", "stop", "status"])
-    cc_parser.add_argument("--ini", dest="sub_ini", default=None, help="Optional path to parms.ini.")
+    cc_parser.add_argument(
+        "--ini", dest="sub_ini", default=None, help="Optional path to parms.ini."
+    )
     cc_parser.add_argument("--port", dest="sub_port", type=int, default=DASHBOARD_PORT)
 
     args = parser.parse_args(raw_args)
-    action = args.action if getattr(args, "subcommand", None) == "chart-capture" else args.chart_capture
+    action = (
+        args.action
+        if getattr(args, "subcommand", None) == "chart-capture"
+        else args.chart_capture
+    )
     if not action:
         return None
 
@@ -18689,7 +20489,9 @@ def handle_cli_command(argv=None):
         out = {
             "status": "ok",
             "action": action,
-            "ini_path": str(Path(ini_path) if ini_path else get_default_parms_ini_path()),
+            "ini_path": str(
+                Path(ini_path) if ini_path else get_default_parms_ini_path()
+            ),
             "ini_updated": ini_updated,
             "chart_capture_enabled": target_enabled,
             "live_engine_updated": bool(live_res and live_res.get("status") == "ok"),
