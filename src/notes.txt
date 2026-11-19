@@ -103,3 +103,10 @@ python cli.py reconnect --provider ALPACA
 
 http://127.0.0.1:5001/cli/status
 http://192.168.0.162:5001/cli/status
+
+to compile to c & package podman
+sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y python3-devel patchelf podman
+sudo dnf install ccache
+pip install -r requirements.txt
+pip install cryptography nuitka ordered-set zstandard

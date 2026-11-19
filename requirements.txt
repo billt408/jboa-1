@@ -36,4 +36,5 @@ yfinance==1.2.0
 aiohttp>=3.12,<4
 Flask>=2.3,<4
 pandas-market-calendars
+cryptography 
 
