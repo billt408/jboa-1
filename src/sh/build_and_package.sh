@@ -126,8 +126,8 @@ RUN microdnf install -y --setopt=install_weak_deps=0 shadow-utils ca-certificate
     microdnf clean all
 
 # Create non-root group and user 'jboa' with home directory /home/jboa
-RUN groupadd --gid 1000 jboa && \
-    useradd --uid 1000 --gid 1000 --create-home --home-dir /home/jboa --shell /bin/bash jboa
+RUN groupadd --gid 1001 jboa && \
+    useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
 # Create /home/jboa/app/src (for parms.ini) and /home/jboa/app/logs (for log output)
 WORKDIR /home/jboa/app
@@ -160,6 +160,6 @@ echo "==========================================================================
 echo "BUILD & PACKAGING COMPLETE"
 echo "  Standalone Binary : ${DIST_DIR}/${BINARY_NAME}"
 echo "  Podman Image      : ${IMAGE_NAME}:${IMAGE_TAG} (RHEL 9.8 UBI)"
-echo "  Container User    : jboa (UID 1000 / GID 1000)"
+echo "  Container User    : jboa (UID 1001 / GID 1001)"
 echo "  Default Entrypoint: /home/jboa/app/multiStreamRSI -c /home/jboa/app/src/parms.ini"
 echo "=============================================================================="
