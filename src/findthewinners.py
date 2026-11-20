@@ -88,7 +88,7 @@ _OPTIONCHAIN_BUY_RE = re.compile(
     r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-BUY-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
 )
 _OPTIONCHAIN_SELL_RE = re.compile(
-    r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-SELL-(.+?)-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
+    r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-SELL-(?:(.+?)-)?rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
 )
 _OPTION_LOG_HEADER_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:,\d+)?)\s+"
@@ -261,7 +261,9 @@ def _strip_ini_value(raw: str) -> str:
     return txt
 
 
-def load_standalone_config(ini_path: Path | None) -> dict:
+def load_standalone_config(
+    ini_path: Path | None, show_input_files: bool = True
+) -> dict:
     """Load display timezone and Alpaca credentials from parms.ini + environment."""
     cfg_out = {
         "ini_path": str(ini_path) if ini_path else None,
@@ -273,8 +275,21 @@ def load_standalone_config(ini_path: Path | None) -> dict:
     }
 
     if ini_path is None or not ini_path.is_file():
+        if show_input_files:
+            if ini_path is not None:
+                print(
+                    f"[INPUT ini] {ini_path} (not found; using environment/defaults)",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[INPUT ini] (none found; using environment/defaults)",
+                    flush=True,
+                )
         return cfg_out
 
+    if show_input_files:
+        print(f"[INPUT ini] {ini_path}", flush=True)
     raw_text = ini_path.read_text(encoding="utf-8-sig", errors="replace")
     parser = configparser.ConfigParser(interpolation=None)
     try:
@@ -432,15 +447,31 @@ def _parse_optionchain_file_meta(path: Path, payload: dict, display_tz: ZoneInfo
     }
 
 
-def _load_minute_summary_kinematics_index(log_root: Path) -> dict:
+def _load_minute_summary_kinematics_index(
+    log_root: Path, show_input_files: bool = True
+) -> dict:
     """Load {(minute_utc_iso, symbol): kinematics_dict} from minute-summary logs."""
     if not log_root.exists() or not log_root.is_dir():
+        if show_input_files:
+            print(
+                f"[INPUT minute_summary] Directory not found: {log_root}",
+                flush=True,
+            )
         return {}
 
     files = sorted(
-        list(log_root.glob("minute-summary-*.jsonl"))
-        + list(log_root.glob("minute-summary-*.json"))
+        p
+        for p in (
+            list(log_root.glob("minute-summary-*.jsonl"))
+            + list(log_root.glob("minute-summary-*.json"))
+        )
+        if p.is_file()
     )
+    if show_input_files:
+        print(
+            f"[INPUT minute_summary] Found {len(files)} file(s) in {log_root}",
+            flush=True,
+        )
     idx: dict[tuple[str, str], dict] = {}
     prov_priority = {
         "TRADINGVIEW": 5,
@@ -450,11 +481,17 @@ def _load_minute_summary_kinematics_index(log_root: Path) -> dict:
         "TASTYTRADE": 1,
     }
 
-    for p in files:
-        if not p.is_file():
-            continue
+    files_read = 0
+    total_files = len(files)
+    for file_idx, p in enumerate(files, 1):
+        if show_input_files:
+            print(
+                f"[INPUT minute_summary ({file_idx}/{total_files})] {p}",
+                flush=True,
+            )
         try:
             with open(p, "r", encoding="utf-8", errors="replace") as f:
+                files_read += 1
                 for raw in f:
                     line = raw.strip()
                     if not line:
@@ -572,9 +609,19 @@ def _load_minute_summary_kinematics_index(log_root: Path) -> dict:
                             )
                             if new_score > old_score:
                                 idx[(min_iso, sym_u)] = new_entry
-        except OSError:
+        except OSError as exc:
+            if show_input_files:
+                print(
+                    f"[INPUT minute_summary ({file_idx}/{total_files})] ERROR reading {p}: {exc}",
+                    flush=True,
+                )
             continue
 
+    if show_input_files:
+        print(
+            f"[INPUT minute_summary] Loaded {len(idx)} (minute, symbol) entries from {files_read}/{total_files} file(s)",
+            flush=True,
+        )
     return idx
 
 
@@ -649,7 +696,10 @@ def _parse_option_log_timestamp(ts_full: str):
 
 
 def _read_logged_trades(
-    log_root: Path, display_tz: ZoneInfo, include_dry_run: bool = False
+    log_root: Path,
+    display_tz: ZoneInfo,
+    include_dry_run: bool = False,
+    show_input_files: bool = True,
 ) -> list[dict]:
     """Reconstruct executed (and optionally dry-run) option trades from logs."""
     buys: list[dict] = []
@@ -658,13 +708,30 @@ def _read_logged_trades(
     for subdir, stream in (("option_buyer", "BUY"), ("option_seller", "SELL")):
         d = log_root / subdir
         if not d.exists() or not d.is_dir():
+            if show_input_files:
+                print(f"[INPUT {subdir}] Directory not found: {d}", flush=True)
             continue
-        for path in sorted(d.glob("*.log")):
-            if not path.is_file():
-                continue
+        log_files = sorted(p for p in d.glob("*.log") if p.is_file())
+        if show_input_files:
+            print(
+                f"[INPUT {subdir}] Found {len(log_files)} file(s) in {d}",
+                flush=True,
+            )
+        total_logs = len(log_files)
+        for file_idx, path in enumerate(log_files, 1):
+            if show_input_files:
+                print(
+                    f"[INPUT {subdir} ({file_idx}/{total_logs})] {path}",
+                    flush=True,
+                )
             try:
                 raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
+            except OSError as exc:
+                if show_input_files:
+                    print(
+                        f"[INPUT {subdir} ({file_idx}/{total_logs})] ERROR reading {path}: {exc}",
+                        flush=True,
+                    )
                 continue
 
             file_recs = []
@@ -682,7 +749,7 @@ def _read_logged_trades(
                     is_target = "OPTION_SELL_SUBMITTED" in line or (
                         include_dry_run and "OPTION_SELL_DRY_RUN" in line
                     )
-                if not is_target:
+                if not is_target and "minute=" not in line:
                     continue
                 m = _OPTION_LOG_HEADER_RE.match(line)
                 if not m:
@@ -722,10 +789,17 @@ def _read_logged_trades(
                             hint = "display"
                             disp_votes += 1
 
-                file_recs.append((event, kv, naive, hint, "DRY_RUN" in event))
+                if is_target:
+                    file_recs.append((event, kv, naive, hint, "DRY_RUN" in event))
 
             file_is_utc = utc_votes > 0 and utc_votes > disp_votes
+            seen_order_ids: set[str] = set()
             for event, kv, naive, hint, is_dry in file_recs:
+                oid = str(kv.get("order_id") or "").strip()
+                if oid and oid.lower() not in {"none", "n/a", "na"}:
+                    if oid in seen_order_ids:
+                        continue
+                    seen_order_ids.add(oid)
                 use_utc = (hint == "utc") or (hint is None and file_is_utc)
                 exec_dt = (
                     naive.replace(tzinfo=UTC)
@@ -844,6 +918,11 @@ def _read_logged_trades(
                     matched_sell.get("reason") if matched_sell else b.get("reason")
                 ),
             }
+        )
+    if show_input_files:
+        print(
+            f"[INPUT option_trades] Parsed {len(buys)} BUY and {len(sells)} SELL log record(s) -> {len(trades)} trade(s)",
+            flush=True,
         )
     return trades
 
@@ -1055,6 +1134,20 @@ def _lookup_bar_near(con_bars: dict, target_min: datetime):
     return None
 
 
+def _lookup_bar_carry_forward(con_bars: dict, buy_min: datetime, target_min: datetime):
+    """Return the latest option close strictly after buy_min and at or before target_min."""
+    if not con_bars:
+        return None
+    latest_bm = None
+    latest_px = None
+    for bm, bval in con_bars.items():
+        if buy_min < bm <= target_min and bval.get("c"):
+            if latest_bm is None or bm > latest_bm:
+                latest_bm = bm
+                latest_px = bval["c"]
+    return latest_px
+
+
 def _lookup_session_end_bar(
     con_bars: dict,
     buy_min: datetime,
@@ -1126,8 +1219,10 @@ def analyze_session_winners(
     date_filter: str = "",
     limit: int | None = None,
     include_dry_run: bool = False,
+    executed_only: bool = False,
     bars_override: dict | None = None,
     now_utc: datetime | None = None,
+    show_input_files: bool = True,
 ) -> dict:
     """Run strike analyzer logic from option buy time to end of session."""
     chain_dir = log_root / "optionchains"
@@ -1135,12 +1230,24 @@ def analyze_session_winners(
     date_q = str(date_filter or "").strip()
     ref_now = as_utc(now_utc or datetime.now(UTC))
 
+    if show_input_files:
+        print(
+            f"[INPUT dir] logs_dir={log_root} | optionchains={chain_dir}",
+            flush=True,
+        )
+
     if not chain_dir.exists() or not chain_dir.is_dir():
+        if show_input_files:
+            print(
+                f"[INPUT optionchains] Directory not found: {chain_dir}",
+                flush=True,
+            )
         return {
             "log_root": str(log_root),
             "chain_dir": str(chain_dir),
             "symbol_filter": sym_q,
             "date_filter": date_q,
+            "executed_only": bool(executed_only),
             "bars_available": False,
             "bars_note": f"Option chain directory not found: {chain_dir}",
             "summary": {
@@ -1155,40 +1262,249 @@ def analyze_session_winners(
             "winners_by_symbol": [],
         }
 
-    kin_index = _load_minute_summary_kinematics_index(log_root)
+    kin_index = _load_minute_summary_kinematics_index(
+        log_root, show_input_files=show_input_files
+    )
     all_trades = _read_logged_trades(
-        log_root, display_tz=display_tz, include_dry_run=include_dry_run
+        log_root,
+        display_tz=display_tz,
+        include_dry_run=include_dry_run,
+        show_input_files=show_input_files,
     )
 
     buy_records = []
     sell_records = []
+    skipped_chains = 0
+    error_chains_by_sym: dict[str, int] = {}
 
-    for path in sorted(chain_dir.glob("*.json")):
-        if not path.is_file():
-            continue
+    chain_files = sorted(p for p in chain_dir.glob("*.json") if p.is_file())
+    total_chains = len(chain_files)
+    if show_input_files:
+        print(
+            f"[INPUT optionchains] Found {total_chains} file(s) in {chain_dir}",
+            flush=True,
+        )
+
+    for chain_idx, path in enumerate(chain_files, 1):
         try:
             payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
+        except Exception as exc:
+            skipped_chains += 1
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED (read/JSON error: {exc})",
+                    flush=True,
+                )
             continue
         if not isinstance(payload, dict) or payload.get("error"):
+            skipped_chains += 1
+            if isinstance(payload, dict):
+                err_meta = _parse_optionchain_file_meta(path, payload, display_tz=display_tz)
+                if err_meta.get("symbol"):
+                    error_chains_by_sym[err_meta["symbol"]] = (
+                        error_chains_by_sym.get(err_meta["symbol"], 0) + 1
+                    )
+            reason = (
+                f"error={payload.get('error')}"
+                if isinstance(payload, dict)
+                else "non-dict JSON"
+            )
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED ({reason})",
+                    flush=True,
+                )
             continue
         meta = _parse_optionchain_file_meta(path, payload, display_tz=display_tz)
         if not meta["symbol"]:
+            skipped_chains += 1
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED (no symbol)",
+                    flush=True,
+                )
             continue
         if sym_q and meta["symbol"] != sym_q:
+            skipped_chains += 1
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED (symbol {meta['symbol']} != {sym_q})",
+                    flush=True,
+                )
             continue
         if date_q:
             local_day_str = meta["dt_utc"].astimezone(MARKET_TZ).date().isoformat()
             disp_day_str = meta["dt_utc"].astimezone(display_tz).date().isoformat()
             if date_q not in {local_day_str, disp_day_str}:
+                skipped_chains += 1
+                if show_input_files:
+                    print(
+                        f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED (date {local_day_str}/{disp_day_str} != {date_q})",
+                        flush=True,
+                    )
                 continue
+        ts_disp = meta["dt_utc"].astimezone(display_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
         if meta["signal"] == "BUY":
             buy_records.append((meta["dt_utc"], path, payload, meta))
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> INCLUDED (BUY | {meta['symbol']} | {ts_disp})",
+                    flush=True,
+                )
         elif meta["signal"] == "SELL":
             sell_records.append((meta["dt_utc"], path, payload, meta))
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> INCLUDED (SELL | {meta['symbol']} | {ts_disp})",
+                    flush=True,
+                )
+        else:
+            skipped_chains += 1
+            if show_input_files:
+                print(
+                    f"[INPUT optionchain ({chain_idx}/{total_chains})] {path} -> SKIPPED (signal={meta['signal']!r})",
+                    flush=True,
+                )
+
+    if show_input_files:
+        print(
+            f"[INPUT optionchains] Scanned {total_chains} file(s): "
+            f"{len(buy_records)} BUY, {len(sell_records)} SELL, {skipped_chains} skipped",
+            flush=True,
+        )
+
+    prematched_by_path: dict[Path, dict] = {}
+    unmatched_details: list[dict] = []
+    if executed_only:
+        raw_buy_count = len(buy_records)
+        filtered_trades = []
+        for tr in all_trades:
+            if sym_q and tr.get("underlying") != sym_q:
+                continue
+            p_dt = tr.get("purchased_dt")
+            if p_dt is None:
+                continue
+            if date_q:
+                local_day_str = p_dt.astimezone(MARKET_TZ).date().isoformat()
+                disp_day_str = p_dt.astimezone(display_tz).date().isoformat()
+                if date_q not in {local_day_str, disp_day_str}:
+                    continue
+            filtered_trades.append(tr)
+
+        # Match each actual executed trade 1-to-1 with its best BUY option-chain snapshot
+        filtered_trades.sort(key=lambda t: t["purchased_dt"], reverse=True)
+        used_paths: set[Path] = set()
+        matched_buy_records = []
+        unmatched_trades = []
+
+        for tr in filtered_trades:
+            p_dt = tr["purchased_dt"]
+            tr_con = str(tr.get("contract") or "").strip().upper()
+            best_rec = None
+            best_score = None
+            for rec in buy_records:
+                signal_dt, rec_path, rec_payload, rec_meta = rec
+                if rec_path in used_paths:
+                    continue
+                if rec_meta["symbol"] != tr["underlying"]:
+                    continue
+                diff = (p_dt - signal_dt).total_seconds()
+                if not (-120.0 <= diff <= 600.0):
+                    continue
+                has_contract = any(
+                    isinstance(c, dict)
+                    and str(c.get("contract") or "").strip().upper() == tr_con
+                    for c in (rec_payload.get("chain_snapshot") or [])
+                )
+                is_opt_buyer_chain = "OPTION_BUYER" in rec_path.name.upper()
+                score = (
+                    1 if has_contract else 0,
+                    1 if is_opt_buyer_chain else 0,
+                    -abs(diff),
+                )
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_rec = rec
+            if best_rec is not None:
+                used_paths.add(best_rec[1])
+                prematched_by_path[best_rec[1]] = tr
+                matched_buy_records.append(best_rec)
+            else:
+                unmatched_trades.append(tr)
+
+        for tr in unmatched_trades:
+            p_dt = tr["purchased_dt"]
+            und = tr.get("underlying") or ""
+            same_sym = [
+                rec for rec in buy_records if rec[3].get("symbol") == und
+            ]
+            nearest_all = min(
+                same_sym,
+                key=lambda r: abs((p_dt - r[0]).total_seconds()),
+                default=None,
+            )
+            nearest_unused = min(
+                [r for r in same_sym if r[1] not in used_paths],
+                key=lambda r: abs((p_dt - r[0]).total_seconds()),
+                default=None,
+            )
+            err_cnt = error_chains_by_sym.get(und, 0)
+            if nearest_all is not None:
+                diff_all = round((p_dt - nearest_all[0]).total_seconds(), 1)
+                snap_ts = nearest_all[0].astimezone(display_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+                claimed_note = (
+                    " [already claimed by another trade]"
+                    if nearest_all[1] in used_paths and nearest_unused is None
+                    else ""
+                )
+                diag = (
+                    f"closest BUY snapshot {snap_ts} (diff={diff_all:+.0f}s, "
+                    f"outside [-120s,+600s]){claimed_note}; {len(same_sym)} valid BUY chain(s)"
+                )
+            else:
+                diag = f"0 valid BUY snapshots for {und}"
+            if err_cnt:
+                diag += f"; {err_cnt} skipped/error chain file(s)"
+            unmatched_details.append(
+                {
+                    "symbol": und,
+                    "contract": tr.get("contract"),
+                    "purchased_dt": p_dt,
+                    "purchased_disp": p_dt.astimezone(display_tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    "entry_price": tr.get("entry_price"),
+                    "reason": tr.get("reason"),
+                    "diag": diag,
+                }
+            )
+
+        buy_records = matched_buy_records
+        if show_input_files:
+            print(
+                f"[INPUT executed_only] Matched {len(buy_records)} executed trade(s) to BUY snapshots "
+                f"(filtered out {raw_buy_count - len(buy_records)} untraded/duplicate BUY snapshot(s))",
+                flush=True,
+            )
+            if unmatched_details:
+                print(
+                    f"[INPUT executed_only] Note: {len(unmatched_details)} executed trade(s) had no matching "
+                    f"optionchain BUY snapshot within [-120s, +600s]:",
+                    flush=True,
+                )
+                for u in unmatched_details:
+                    px_s = f"${u['entry_price']:.2f}" if u["entry_price"] is not None else "--"
+                    print(
+                        f"[INPUT executed_only]   Unmatched: {u['symbol']} | {u['contract']} | "
+                        f"bought {u['purchased_disp']} | entry={px_s} | {u['diag']}",
+                        flush=True,
+                    )
 
     buy_records.sort(key=lambda item: item[0], reverse=True)
     if limit is not None and limit > 0:
+        if show_input_files and len(buy_records) > limit:
+            print(
+                f"[INPUT optionchains] Applying --limit {limit}: keeping {limit} most recent BUY file(s) out of {len(buy_records)}",
+                flush=True,
+            )
         buy_records = buy_records[:limit]
 
     sell_by_sym_exp: dict[tuple[str, str], list] = {}
@@ -1226,19 +1542,20 @@ def analyze_session_winners(
                 right = first_r
 
         # Match executed trade by underlying + purchase time [-120s, +600s]
-        matched_trade = None
-        best_tdiff = None
-        for tr in all_trades:
-            if tr["underlying"] != sym:
-                continue
-            p_dt = tr.get("purchased_dt")
-            if p_dt is None:
-                continue
-            diff = (p_dt - signal_dt).total_seconds()
-            if -120.0 <= diff <= 600.0:
-                if best_tdiff is None or abs(diff) < best_tdiff:
-                    best_tdiff = abs(diff)
-                    matched_trade = tr
+        matched_trade = prematched_by_path.get(path)
+        if matched_trade is None:
+            best_tdiff = None
+            for tr in all_trades:
+                if tr["underlying"] != sym:
+                    continue
+                p_dt = tr.get("purchased_dt")
+                if p_dt is None:
+                    continue
+                diff = (p_dt - signal_dt).total_seconds()
+                if -120.0 <= diff <= 600.0:
+                    if best_tdiff is None or abs(diff) < best_tdiff:
+                        best_tdiff = abs(diff)
+                        matched_trade = tr
 
         # Determine effective option buy time and NYSE session close
         option_buy_dt = (
@@ -1374,6 +1691,7 @@ def analyze_session_winners(
             "spreads": [],
             "deltas": [],
             "ret_15m": [],
+            "ret_30m": [],
             "ret_60m": [],
             "ret_session": [],
             "pnl_session": [],
@@ -1425,15 +1743,24 @@ def analyze_session_winners(
                 else ("chain_mid" if (mid and mid > 0) else "bar_or_last")
             )
 
-            # Intraday checkpoints for hold-duration analysis
+            # Intraday checkpoints for hold-duration analysis (separate exact bars vs carry-forward)
+            session_mins_rem = max(
+                0.0, round((ev["eval_end_dt"] - ev["buy_min"]).total_seconds() / 60.0, 1)
+            )
             horizons = {}
             for h_key, h_mins, _ in HOLD_DURATION_BUCKETS:
                 t_min = ev["buy_min"] + timedelta(minutes=h_mins)
-                px = (
-                    _lookup_bar_near(con_bars, t_min)
-                    if t_min <= ev["eval_end_dt"]
-                    else None
-                )
+                if t_min <= ev["eval_end_dt"]:
+                    exact_px = _lookup_bar_near(con_bars, t_min)
+                    if exact_px is not None:
+                        px = exact_px
+                        is_exact = True
+                    else:
+                        px = _lookup_bar_carry_forward(con_bars, ev["buy_min"], t_min)
+                        is_exact = False
+                else:
+                    px = None
+                    is_exact = False
                 if px is not None and entry_ref and entry_ref > 0:
                     ret_p = round(((px - entry_ref) / entry_ref) * 100.0, 2)
                     pnl_d = round((px - entry_ref) * 100.0, 2)
@@ -1441,8 +1768,9 @@ def analyze_session_winners(
                         "price": round(px, 4),
                         "ret_pct": ret_p,
                         "pnl_dollars": pnl_d,
+                        "is_exact": is_exact,
                     }
-                    if h_key in {"15m", "60m"}:
+                    if is_exact and h_key in {"15m", "30m", "60m"}:
                         rank_stats[rk][f"ret_{h_key}"].append(ret_p)
                 else:
                     horizons[h_key] = None
@@ -1545,6 +1873,7 @@ def analyze_session_winners(
                     "peak_minutes": peak_minutes,
                     "trough_minutes": trough_minutes,
                     "max_drawdown_pct": max_dd_pct,
+                    "session_minutes_remaining": session_mins_rem,
                     "is_current_pick": rk == 2,
                     "is_matched_contract": bool(matched_con and matched_con == con),
                     "horizons": horizons,
@@ -1640,6 +1969,7 @@ def analyze_session_winners(
             "avg_spread_pct": _avg_or_none(st["spreads"], 1),
             "avg_delta": _avg_or_none(st["deltas"], 2),
             "avg_ret_15m": _avg_or_none(st["ret_15m"]),
+            "avg_ret_30m": _avg_or_none(st["ret_30m"]),
             "avg_ret_60m": _avg_or_none(st["ret_60m"]),
             "avg_ret_session": avg_sess,
             "avg_pnl_session": _avg_or_none(st["pnl_session"]),
@@ -1822,6 +2152,8 @@ def analyze_session_winners(
         "chain_dir": str(chain_dir),
         "symbol_filter": sym_q,
         "date_filter": date_q,
+        "executed_only": bool(executed_only),
+        "unmatched_trades": unmatched_details,
         "bars_available": bars_available,
         "bars_note": bars_note,
         "summary": {
@@ -2115,7 +2447,7 @@ def _compute_overall_strategy_summary(
     # --- 2. Hold Duration Sweep ("What is the optimal duration to hold before selling?") ---
     bought_cands = [bc for _, bc, _ in effective_pairs]
 
-    def _horizon_stats(cands: list[dict], h_key: str | None) -> dict:
+    def _horizon_stats(cands: list[dict], h_key: str | None, h_mins: int | None) -> dict:
         exact_rets, exact_pnls = [], []
         capped_rets, capped_pnls = [], []
         for c in cands:
@@ -2131,16 +2463,26 @@ def _compute_overall_strategy_summary(
             else:
                 h_obj = (c.get("horizons") or {}).get(h_key)
                 if h_obj and h_obj.get("ret_pct") is not None:
-                    exact_rets.append(h_obj["ret_pct"])
+                    if h_obj.get("is_exact", True):
+                        exact_rets.append(h_obj["ret_pct"])
+                        if h_obj.get("pnl_dollars") is not None:
+                            exact_pnls.append(h_obj["pnl_dollars"])
                     capped_rets.append(h_obj["ret_pct"])
                     if h_obj.get("pnl_dollars") is not None:
-                        exact_pnls.append(h_obj["pnl_dollars"])
                         capped_pnls.append(h_obj["pnl_dollars"])
-                elif c.get("session_return_pct") is not None:
-                    # If session ends before h_mins, a "hold Xm or EOD" rule exits at EOD
-                    capped_rets.append(c["session_return_pct"])
-                    if c.get("session_pnl_dollars") is not None:
-                        capped_pnls.append(c["session_pnl_dollars"])
+                else:
+                    # Only fall back to EOD when the trading session actually ended before h_mins;
+                    # do not substitute EOD prices for missing/illiquid intraday bars.
+                    rem_m = c.get("session_minutes_remaining")
+                    if (
+                        rem_m is not None
+                        and h_mins is not None
+                        and rem_m < h_mins
+                        and c.get("session_return_pct") is not None
+                    ):
+                        capped_rets.append(c["session_return_pct"])
+                        if c.get("session_pnl_dollars") is not None:
+                            capped_pnls.append(c["session_pnl_dollars"])
 
         exact_wins = sum(1 for r in exact_rets if r > 0)
         cap_wins = sum(1 for r in capped_rets if r > 0)
@@ -2163,9 +2505,10 @@ def _compute_overall_strategy_summary(
     ]
     duration_buckets = []
     for key, mins, label in duration_specs:
-        b_st = _horizon_stats(bought_cands, None if key == "EOD" else key)
-        w_st = _horizon_stats(winner_cands, None if key == "EOD" else key)
-        a_st = _horizon_stats(all_scored_cands, None if key == "EOD" else key)
+        hk = None if key == "EOD" else key
+        b_st = _horizon_stats(bought_cands, hk, mins)
+        w_st = _horizon_stats(winner_cands, hk, mins)
+        a_st = _horizon_stats(all_scored_cands, hk, mins)
         duration_buckets.append(
             {
                 "key": key,
@@ -2185,7 +2528,7 @@ def _compute_overall_strategy_summary(
         ]
         if not valid:
             return None
-        # Prefer highest capped average return (apples-to-apples across all signals),
+        # Prefer highest non-diluted capped average return,
         # tie-breaking on capped win rate, exact sample coverage, and shorter duration.
         best = max(
             valid,
@@ -2240,6 +2583,11 @@ def _compute_overall_strategy_summary(
             if eod_ret_b is not None
             else None
         )
+        exact_note = (
+            f" (exact-bar avg {_fmt_pct(opt_bought['exact_avg_ret'], 2)} on {opt_bought['exact_n']} exact bars)"
+            if (opt_bought.get("exact_avg_ret") is not None and opt_bought["exact_n"] > 0 and opt_bought["key"] != "EOD")
+            else ""
+        )
         if opt_bought["key"] == "EOD":
             duration_rec.append(
                 f"Best hold duration for bought/+2 OTM contracts across all data & symbols is "
@@ -2252,7 +2600,7 @@ def _compute_overall_strategy_summary(
                 f"{opt_bought['minutes']} minutes (or EOD if shorter): "
                 f"{_fmt_pct(opt_bought['capped_avg_ret'], 2)} avg return, "
                 f"{opt_bought['capped_win_rate']:.1f}% win rate, "
-                f"{_fmt_dollars(opt_bought['capped_avg_pnl'], 2)}/ctr"
+                f"{_fmt_dollars(opt_bought['capped_avg_pnl'], 2)}/ctr{exact_note}"
                 + (
                     f" — beating Hold-to-EOD ({_fmt_pct(eod_ret_b, 2)}) by {_fmt_pct(diff_vs_eod, 2)}."
                     if diff_vs_eod is not None
@@ -2301,9 +2649,374 @@ def _compute_overall_strategy_summary(
         "recommendations": duration_rec,
     }
 
+    diagnostics = _compute_entry_diagnostics(
+        events_out=events_out,
+        best_rank_session=best_rank_session,
+        opt_bought=opt_bought,
+    )
+
     return {
         "contract_selection": contract_selection,
         "hold_duration": hold_duration,
+        "diagnostics": diagnostics,
+    }
+
+
+def _cand_return_at_horizon(c: dict | None, h_key: str | None) -> tuple[float | None, float | None]:
+    """Return (ret_pct, pnl_dollars) for candidate c at horizon h_key ('30m', etc.) or EOD if None.
+
+    Uses exact/carry-forward bar at h_key, falling back to EOD ONLY when session ended early.
+    """
+    if c is None:
+        return None, None
+    if h_key is None or h_key == "EOD":
+        return c.get("session_return_pct"), c.get("session_pnl_dollars")
+    h_obj = (c.get("horizons") or {}).get(h_key)
+    if h_obj and h_obj.get("ret_pct") is not None:
+        return h_obj.get("ret_pct"), h_obj.get("pnl_dollars")
+    # Look up minutes for h_key
+    h_mins = next((m for k, m, _ in HOLD_DURATION_BUCKETS if k == h_key), None)
+    rem_m = c.get("session_minutes_remaining")
+    if rem_m is not None and h_mins is not None and rem_m < h_mins:
+        return c.get("session_return_pct"), c.get("session_pnl_dollars")
+    return None, None
+
+
+def _pick_ex_ante_candidate(ev: dict, mode: str) -> dict | None:
+    """Select a candidate contract using ONLY live buy-time information (zero hindsight)."""
+    cands = [c for c in (ev.get("candidates") or []) if c.get("entry_price") and c["entry_price"] > 0]
+    if not cands:
+        return None
+    if mode == "bought":
+        return next(
+            (c for c in cands if c.get("is_matched_contract")),
+            next((c for c in cands if c.get("otm_rank") == 2), None),
+        )
+    if mode == "plus2":
+        return next((c for c in cands if c.get("otm_rank") == 2), None)
+    if mode.startswith("rank:"):
+        rk = int(mode.split(":", 1)[1])
+        return next((c for c in cands if c.get("otm_rank") == rk), None)
+    if mode == "atm_itm_low_spread":
+        pool = [c for c in cands if c.get("otm_rank") in (-1, 0) and (c.get("spread_pct") is None or c["spread_pct"] <= 3.0)]
+        if not pool:
+            return None
+        return min(pool, key=lambda c: (c.get("spread_pct") if c.get("spread_pct") is not None else 999.0, abs(c["otm_rank"])))
+    if mode == "delta_mid":
+        # Target delta 0.45-0.65 (tiebreak lowest spread, closest to 0.55)
+        pool = [c for c in cands if c.get("delta") is not None and 0.45 <= c["delta"] <= 0.65]
+        if not pool:
+            pool = [c for c in cands if c.get("delta") is not None]
+        if not pool:
+            return None
+        return min(pool, key=lambda c: (abs(c["delta"] - 0.55), c.get("spread_pct") if c.get("spread_pct") is not None else 999.0))
+    if mode == "delta_itm_low_spread":
+        pool = [
+            c for c in cands
+            if c.get("delta") is not None
+            and c["delta"] >= 0.55
+            and (c.get("spread_pct") is None or c["spread_pct"] <= 3.0)
+        ]
+        if not pool:
+            return None
+        return min(pool, key=lambda c: (c.get("spread_pct") if c.get("spread_pct") is not None else 999.0, abs(c["delta"] - 0.65)))
+    return None
+
+
+def _summarize_rule_outcomes(pairs: list[tuple[dict | None, str | None]]) -> dict:
+    rets, pnls = [], []
+    for c, h_key in pairs:
+        r, p = _cand_return_at_horizon(c, h_key)
+        if r is not None:
+            rets.append(r)
+            if p is not None:
+                pnls.append(p)
+    wins = sum(1 for r in rets if r > 0)
+    return {
+        "n": len(rets),
+        "win_rate": round((wins / len(rets)) * 100.0, 1) if rets else None,
+        "avg_ret": _avg_or_none(rets, 2),
+        "med_ret": _median_or_none(rets, 2),
+        "avg_pnl": _avg_or_none(pnls, 2),
+        "total_pnl": round(sum(pnls), 2) if pnls else None,
+    }
+
+
+def _compute_entry_diagnostics(
+    events_out: list[dict],
+    best_rank_session: dict | None,
+    opt_bought: dict | None,
+) -> dict:
+    """Break down signal & candidate performance across symbols, RSI, spreads, deltas,
+    time of day, kinematics regimes, and non-hindsight live rules."""
+    opt_h_key = opt_bought["key"] if (opt_bought and opt_bought["key"] != "EOD") else "30m"
+    best_rk = best_rank_session["otm_rank"] if best_rank_session else -1
+    best_rk_lbl = best_rank_session["label"] if best_rank_session else _STRIKE_RANK_LABELS.get(best_rk, "-1 ITM")
+
+    # 1. Live Ex-Ante Rule Comparison (no hindsight)
+    ex_ante_specs = [
+        ("Current Rule (+2 OTM @ EOD)", "plus2", "EOD"),
+        (f"Bought/+2 OTM @ {opt_h_key}", "bought", opt_h_key),
+        (f"Best Rank ({best_rk_lbl}) @ EOD", f"rank:{best_rk}", "EOD"),
+        (f"Best Rank ({best_rk_lbl}) @ {opt_h_key}", f"rank:{best_rk}", opt_h_key),
+        (f"0 ATM @ {opt_h_key}", "rank:0", opt_h_key),
+        (f"ATM/ITM Spread<=3% @ {opt_h_key}", "atm_itm_low_spread", opt_h_key),
+        (f"Delta 0.45-0.65 @ {opt_h_key}", "delta_mid", opt_h_key),
+        (f"Delta>=0.55 & Spread<=3% @ {opt_h_key}", "delta_itm_low_spread", opt_h_key),
+    ]
+    ex_ante_rules = []
+    for label, mode, h_k in ex_ante_specs:
+        pairs = [(_pick_ex_ante_candidate(ev, mode), h_k) for ev in events_out]
+        st = _summarize_rule_outcomes(pairs)
+        ex_ante_rules.append({"label": label, "mode": mode, "horizon": h_k, **st})
+
+    # 2. Per-Symbol Breakdown
+    sym_groups: dict[str, list[dict]] = {}
+    for ev in events_out:
+        sym_groups.setdefault(ev["symbol"], []).append(ev)
+
+    by_symbol = []
+    for sym, evs in sorted(sym_groups.items()):
+        bought_eod = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, "bought"), "EOD") for e in evs])
+        bought_opt = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, "bought"), opt_h_key) for e in evs])
+        best_eod = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, f"rank:{best_rk}"), "EOD") for e in evs])
+        best_opt = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, f"rank:{best_rk}"), opt_h_key) for e in evs])
+        if bought_eod["n"] == 0 and best_eod["n"] == 0:
+            continue
+        by_symbol.append(
+            {
+                "symbol": sym,
+                "signals": len(evs),
+                "bought_eod": bought_eod,
+                "bought_opt": bought_opt,
+                "best_eod": best_eod,
+                "best_opt": best_opt,
+            }
+        )
+    by_symbol.sort(
+        key=lambda r: (
+            r["best_opt"]["avg_ret"] if r["best_opt"]["avg_ret"] is not None else -1e9,
+            r["bought_opt"]["avg_ret"] if r["bought_opt"]["avg_ret"] is not None else -1e9,
+        ),
+        reverse=True,
+    )
+
+    # Helper for grouping events into buckets
+    def _group_events(bucket_fn) -> list[dict]:
+        grouped: dict[str, list[dict]] = {}
+        order: dict[str, int] = {}
+        for ev in events_out:
+            ord_k, lbl = bucket_fn(ev)
+            if lbl is None:
+                continue
+            order[lbl] = ord_k
+            grouped.setdefault(lbl, []).append(ev)
+        rows = []
+        for lbl in sorted(grouped.keys(), key=lambda k: order[k]):
+            evs = grouped[lbl]
+            b_opt = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, "bought"), opt_h_key) for e in evs])
+            b_eod = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, "bought"), "EOD") for e in evs])
+            k_opt = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, f"rank:{best_rk}"), opt_h_key) for e in evs])
+            k_eod = _summarize_rule_outcomes([(_pick_ex_ante_candidate(e, f"rank:{best_rk}"), "EOD") for e in evs])
+            rows.append(
+                {
+                    "bucket": lbl,
+                    "signals": len(evs),
+                    "bought_opt": b_opt,
+                    "bought_eod": b_eod,
+                    "best_opt": k_opt,
+                    "best_eod": k_eod,
+                }
+            )
+        return rows
+
+    # 3. Entry RSI Bucket Breakdown
+    def _rsi_bucket(ev: dict):
+        r = ev.get("rsi")
+        if r is None:
+            return (99, "RSI Missing")
+        if r <= 20.0:
+            return (1, "RSI <= 20")
+        if r <= 25.0:
+            return (2, "RSI 20-25")
+        if r <= 30.0:
+            return (3, "RSI 25-30")
+        if r <= 35.0:
+            return (4, "RSI 30-35")
+        return (5, "RSI > 35")
+
+    by_rsi = _group_events(_rsi_bucket)
+
+    # 4. Time-of-Day (ET) Breakdown
+    def _tod_bucket(ev: dict):
+        dt_utc = _opt_parse_utc(ev.get("option_buy_dt_utc"))
+        if dt_utc is None:
+            return (99, "Unknown")
+        et = dt_utc.astimezone(MARKET_TZ)
+        mins = et.hour * 60 + et.minute
+        if mins < 10 * 60 + 30:
+            return (1, "09:30-10:30 ET (Open)")
+        if mins < 12 * 60:
+            return (2, "10:30-12:00 ET (Mid-AM)")
+        if mins < 14 * 60:
+            return (3, "12:00-14:00 ET (Midday)")
+        return (4, "14:00-16:00 ET (PM)")
+
+    by_time_of_day = _group_events(_tod_bucket)
+
+    # 5. Kinematics Regime Breakdown
+    def _regime_bucket(ev: dict):
+        kin = ev.get("kinematics") or {}
+        reg = kin.get("regime")
+        v = kin.get("v")
+        a = kin.get("a")
+        if reg:
+            return (1, str(reg))
+        if v is not None and a is not None:
+            if v > 0 and a > 0:
+                return (2, "v>0, a>0 (Thrust)")
+            if v <= 0 and a > 0:
+                return (3, "v<=0, a>0 (Decel)")
+            return (4, "v/a Bearish")
+        return (99, "No Kinematics")
+
+    by_regime = _group_events(_regime_bucket)
+
+    # 6. Candidate Spread% & Delta Breakdown (across ALL scored candidates -2 ITM..+4 OTM)
+    def _group_candidates(cand_bucket_fn) -> list[dict]:
+        grouped: dict[str, list[dict]] = {}
+        order: dict[str, int] = {}
+        for ev in events_out:
+            for c in ev.get("candidates") or []:
+                if c.get("session_return_pct") is None:
+                    continue
+                ord_k, lbl = cand_bucket_fn(c)
+                if lbl is None:
+                    continue
+                order[lbl] = ord_k
+                grouped.setdefault(lbl, []).append(c)
+        rows = []
+        for lbl in sorted(grouped.keys(), key=lambda k: order[k]):
+            cs = grouped[lbl]
+            st_opt = _summarize_rule_outcomes([(c, opt_h_key) for c in cs])
+            st_eod = _summarize_rule_outcomes([(c, "EOD") for c in cs])
+            sprds = [c["spread_pct"] for c in cs if c.get("spread_pct") is not None]
+            rows.append(
+                {
+                    "bucket": lbl,
+                    "count": len(cs),
+                    "avg_spread": _avg_or_none(sprds, 1),
+                    "opt": st_opt,
+                    "eod": st_eod,
+                }
+            )
+        return rows
+
+    def _spread_bucket(c: dict):
+        sp = c.get("spread_pct")
+        if sp is None:
+            return (99, None)
+        if sp <= 1.0:
+            return (1, "Spread <= 1.0%")
+        if sp <= 2.5:
+            return (2, "Spread 1.0-2.5%")
+        if sp <= 5.0:
+            return (3, "Spread 2.5-5.0%")
+        if sp <= 10.0:
+            return (4, "Spread 5.0-10.0%")
+        return (5, "Spread > 10.0%")
+
+    def _delta_bucket(c: dict):
+        d = c.get("delta")
+        if d is None:
+            return (99, None)
+        ad = abs(d)
+        if ad < 0.25:
+            return (1, "Delta < 0.25")
+        if ad < 0.40:
+            return (2, "Delta 0.25-0.40")
+        if ad < 0.55:
+            return (3, "Delta 0.40-0.55")
+        if ad < 0.70:
+            return (4, "Delta 0.55-0.70")
+        return (5, "Delta >= 0.70")
+
+    by_spread = _group_candidates(_spread_bucket)
+    by_delta = _group_candidates(_delta_bucket)
+
+    # 7. Auto-Discovered Top Ex-Ante Filter Combinations (non-hindsight)
+    min_sample = max(3, min(15, len(events_out) // 25)) if events_out else 1
+    rsi_filters = [
+        ("Any RSI", lambda e: True),
+        ("RSI<=30", lambda e: e.get("rsi") is not None and e["rsi"] <= 30.0),
+        ("RSI<=25", lambda e: e.get("rsi") is not None and e["rsi"] <= 25.0),
+    ]
+    spread_filters = [
+        ("Any Spread", None),
+        ("Spread<=3%", 3.0),
+        ("Spread<=2%", 2.0),
+    ]
+    rank_modes = [
+        ("-2 ITM", "rank:-2"),
+        ("-1 ITM", "rank:-1"),
+        ("0 ATM", "rank:0"),
+        ("+1 OTM", "rank:1"),
+        ("+2 OTM", "rank:2"),
+        ("Delta 0.45-0.65", "delta_mid"),
+    ]
+    horizons_test = list(dict.fromkeys([opt_h_key, "15m", "30m", "EOD"]))
+
+    combo_results = []
+    for r_lbl, r_fn in rsi_filters:
+        sub_evs = [e for e in events_out if r_fn(e)]
+        if len(sub_evs) < min_sample:
+            continue
+        for sp_lbl, sp_cap in spread_filters:
+            for rk_lbl, mode in rank_modes:
+                picked = []
+                for e in sub_evs:
+                    c = _pick_ex_ante_candidate(e, mode)
+                    if c is None:
+                        continue
+                    if sp_cap is not None and (c.get("spread_pct") is None or c["spread_pct"] > sp_cap):
+                        continue
+                    picked.append(c)
+                if len(picked) < min_sample:
+                    continue
+                for h_k in horizons_test:
+                    st = _summarize_rule_outcomes([(c, h_k) for c in picked])
+                    if st["n"] < min_sample or st["avg_ret"] is None:
+                        continue
+                    combo_results.append(
+                        {
+                            "description": f"{r_lbl} | {sp_lbl} | {rk_lbl} | Exit {h_k}",
+                            **st,
+                        }
+                    )
+
+    combo_results.sort(
+        key=lambda row: (
+            row["avg_ret"],
+            row["win_rate"] or -1.0,
+            row["n"],
+        ),
+        reverse=True,
+    )
+    top_combos = combo_results[:8]
+
+    return {
+        "opt_hold_key": opt_h_key,
+        "best_rank": best_rk,
+        "best_rank_label": best_rk_lbl,
+        "ex_ante_rules": ex_ante_rules,
+        "by_symbol": by_symbol,
+        "by_rsi": by_rsi,
+        "by_spread": by_spread,
+        "by_delta": by_delta,
+        "by_time_of_day": by_time_of_day,
+        "by_regime": by_regime,
+        "top_live_combos": top_combos,
+        "min_combo_sample": min_sample,
     }
 
 
@@ -2475,8 +3188,8 @@ def format_overall_strategy_summary(
     if buckets:
         lines.append("")
         lines.append(
-            f"  {'HOLD DURATION':<16} {'N(EXACT)':>8} {'BOUGHT AVG':>11} {'BOUGHT MED':>11} "
-            f"{'WIN%':>7} {'AVG PNL':>10} {'WINNER AVG':>11} {'ALL AVG':>10}"
+            f"  {'HOLD DURATION':<15} {'EXACT N/MTM':>11} {'EXACT AVG':>10} {'MTM AVG':>9} "
+            f"{'MTM MED':>9} {'WIN%':>7} {'AVG PNL':>10} {'WINNER':>9} {'ALL AVG':>9}"
         )
         lines.append("  " + "-" * 92)
         for b in buckets:
@@ -2490,17 +3203,164 @@ def format_overall_strategy_summary(
             n_txt = f"{bs['exact_n']}/{bs['capped_n']}" if bs["exact_n"] != bs["capped_n"] else str(bs["capped_n"])
             win_r = f"{bs['capped_win_rate']:.1f}%" if bs["capped_win_rate"] is not None else "--"
             lines.append(
-                f"  {lbl:<16} {n_txt:>8} "
-                f"{_fmt_pct(bs['capped_avg_ret'], 2):>11} "
-                f"{_fmt_pct(bs['capped_med_ret'], 2):>11} "
+                f"  {lbl:<15} {n_txt:>11} "
+                f"{_fmt_pct(bs['exact_avg_ret'], 2):>10} "
+                f"{_fmt_pct(bs['capped_avg_ret'], 2):>9} "
+                f"{_fmt_pct(bs['capped_med_ret'], 2):>9} "
                 f"{win_r:>7} "
                 f"{_fmt_dollars(bs['capped_avg_pnl'], 2):>10} "
-                f"{_fmt_pct(ws['capped_avg_ret'], 2):>11} "
-                f"{_fmt_pct(al['capped_avg_ret'], 2):>10}"
+                f"{_fmt_pct(ws['capped_avg_ret'], 2):>9} "
+                f"{_fmt_pct(al['capped_avg_ret'], 2):>9}"
             )
         lines.append(
-            "  (* = optimal hold duration for bought/+2 OTM; late-day signals shorter than Xm exit at EOD)"
+            "  (* = optimal hold; EXACT AVG = bars around Xm only; MTM AVG carries last bar<=Xm + late-day EOD)"
         )
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def format_entry_diagnostics(
+    analysis: dict, display_tz: ZoneInfo | None = None, tz_label: str = ""
+) -> str:
+    """Format detailed signal, symbol, spread, delta, RSI, time-of-day, and ex-ante rule diagnostics."""
+    summary = analysis.get("summary") or {}
+    overall = summary.get("overall_strategy") or {}
+    diag = overall.get("diagnostics") or {}
+    if not diag:
+        return ""
+
+    h_key = diag.get("opt_hold_key", "30m")
+    best_lbl = diag.get("best_rank_label", "-1 ITM")
+    lines = []
+    sep = "=" * 96
+    lines.append(sep)
+    lines.append(
+        f"  SIGNAL & ENTRY DIAGNOSTICS  (Where Gains/Losses Come From | Non-Hindsight Rules @ {h_key} vs EOD)"
+    )
+    lines.append(sep)
+
+    # A. Live Ex-Ante Rules
+    ex_rules = diag.get("ex_ante_rules") or []
+    if ex_rules:
+        lines.append("")
+        lines.append("  A. LIVE EX-ANTE CONTRACT + EXIT RULES (NO HINDSIGHT REQUIRED AT BUY TIME)")
+        lines.append("  " + "-" * 92)
+        lines.append(
+            f"  {'LIVE RULE':<42} {'N':>5} {'WIN%':>7} {'AVG RET':>9} {'MED RET':>9} {'AVG PNL':>10} {'TOT PNL':>11}"
+        )
+        lines.append("  " + "-" * 92)
+        for r in ex_rules:
+            wr = f"{r['win_rate']:.1f}%" if r["win_rate"] is not None else "--"
+            lines.append(
+                f"  {r['label']:<42} {r['n']:>5} {wr:>7} "
+                f"{_fmt_pct(r['avg_ret'], 2):>9} "
+                f"{_fmt_pct(r['med_ret'], 2):>9} "
+                f"{_fmt_dollars(r['avg_pnl'], 2):>10} "
+                f"{_fmt_dollars(r['total_pnl'], 2):>11}"
+            )
+
+    # B. Per-Symbol Breakdown
+    by_sym = diag.get("by_symbol") or []
+    if by_sym:
+        lines.append("")
+        lines.append(f"  B. BY SYMBOL (Bought/+2 OTM vs Best Fixed Rank [{best_lbl}] @ {h_key} & EOD)")
+        lines.append("  " + "-" * 92)
+        lines.append(
+            f"  {'SYMBOL':<7} {'N':>4} {'BUY ' + h_key:>9} {'BUY WIN%':>9} {'BUY EOD':>9} "
+            f"{best_lbl + ' ' + h_key:>11} {best_lbl + ' EOD':>11} {'BUY ' + h_key + '$':>11} {best_lbl + ' ' + h_key + '$':>13}"
+        )
+        lines.append("  " + "-" * 94)
+        for s in by_sym:
+            bo = s["bought_opt"]
+            be = s["bought_eod"]
+            ko = s["best_opt"]
+            ke = s["best_eod"]
+            b_wr = f"{bo['win_rate']:.1f}%" if bo["win_rate"] is not None else "--"
+            lines.append(
+                f"  {s['symbol']:<7} {s['signals']:>4} "
+                f"{_fmt_pct(bo['avg_ret'], 2):>9} {b_wr:>9} {_fmt_pct(be['avg_ret'], 2):>9} "
+                f"{_fmt_pct(ko['avg_ret'], 2):>11} {_fmt_pct(ke['avg_ret'], 2):>11} "
+                f"{_fmt_dollars(bo['total_pnl'], 0):>11} {_fmt_dollars(ko['total_pnl'], 0):>13}"
+            )
+
+    # C. Entry RSI Breakdown
+    def _append_group_table(title: str, rows: list[dict]):
+        if not rows:
+            return
+        lines.append("")
+        lines.append(f"  {title}")
+        lines.append("  " + "-" * 92)
+        lines.append(
+            f"  {'BUCKET':<26} {'N':>5} {'BUY ' + h_key:>9} {'BUY WIN%':>9} {'BUY EOD':>9} "
+            f"{best_lbl + ' ' + h_key:>12} {best_lbl + ' WIN%':>11} {best_lbl + ' EOD':>12}"
+        )
+        lines.append("  " + "-" * 92)
+        for r in rows:
+            bo = r["bought_opt"]
+            be = r["bought_eod"]
+            ko = r["best_opt"]
+            ke = r["best_eod"]
+            b_wr = f"{bo['win_rate']:.1f}%" if bo["win_rate"] is not None else "--"
+            k_wr = f"{ko['win_rate']:.1f}%" if ko["win_rate"] is not None else "--"
+            lines.append(
+                f"  {r['bucket']:<26} {r['signals']:>5} "
+                f"{_fmt_pct(bo['avg_ret'], 2):>9} {b_wr:>9} {_fmt_pct(be['avg_ret'], 2):>9} "
+                f"{_fmt_pct(ko['avg_ret'], 2):>12} {k_wr:>11} {_fmt_pct(ke['avg_ret'], 2):>12}"
+            )
+
+    _append_group_table("C. BY ENTRY RSI THRESHOLD", diag.get("by_rsi") or [])
+    _append_group_table("D. BY ENTRY TIME OF DAY (NYSE ET)", diag.get("by_time_of_day") or [])
+    _append_group_table("E. BY KINEMATICS REGIME", diag.get("by_regime") or [])
+
+    # F. Candidate Spread% & Delta Breakdown
+    def _append_cand_table(title: str, rows: list[dict]):
+        if not rows:
+            return
+        lines.append("")
+        lines.append(f"  {title} (All Candidate Strikes -2 ITM..+4 OTM)")
+        lines.append("  " + "-" * 92)
+        lines.append(
+            f"  {'BUCKET':<22} {'N':>6} {'AVG SPRD':>9} {h_key + ' AVG':>10} "
+            f"{h_key + ' WIN%':>9} {'EOD AVG':>10} {'EOD WIN%':>9} {'EOD PNL/CTR':>12}"
+        )
+        lines.append("  " + "-" * 92)
+        for r in rows:
+            so = r["opt"]
+            se = r["eod"]
+            o_wr = f"{so['win_rate']:.1f}%" if so["win_rate"] is not None else "--"
+            e_wr = f"{se['win_rate']:.1f}%" if se["win_rate"] is not None else "--"
+            lines.append(
+                f"  {r['bucket']:<22} {r['count']:>6} "
+                f"{_fmt_opt(r['avg_spread'], 1, '', '%'):>9} "
+                f"{_fmt_pct(so['avg_ret'], 2):>10} {o_wr:>9} "
+                f"{_fmt_pct(se['avg_ret'], 2):>10} {e_wr:>9} "
+                f"{_fmt_dollars(se['avg_pnl'], 2):>12}"
+            )
+
+    _append_cand_table("F. BY ENTRY BID-ASK SPREAD %", diag.get("by_spread") or [])
+    _append_cand_table("G. BY ENTRY OPTION DELTA", diag.get("by_delta") or [])
+
+    # G. Top Live Filter Combinations
+    combos = diag.get("top_live_combos") or []
+    if combos:
+        lines.append("")
+        lines.append(
+            f"  H. TOP NON-HINDSIGHT LIVE FILTER COMBINATIONS (min N={diag.get('min_combo_sample', 1)})"
+        )
+        lines.append("  " + "-" * 92)
+        lines.append(
+            f"  {'FILTER COMBINATION':<49} {'N':>5} {'WIN%':>7} {'AVG RET':>9} {'AVG PNL':>10} {'TOT PNL':>11}"
+        )
+        lines.append("  " + "-" * 96)
+        for c in combos:
+            wr = f"{c['win_rate']:.1f}%" if c["win_rate"] is not None else "--"
+            lines.append(
+                f"  {c['description']:<49} {c['n']:>5} {wr:>7} "
+                f"{_fmt_pct(c['avg_ret'], 2):>9} "
+                f"{_fmt_dollars(c['avg_pnl'], 2):>10} "
+                f"{_fmt_dollars(c['total_pnl'], 2):>11}"
+            )
 
     lines.append(sep)
     return "\n".join(lines)
@@ -2632,9 +3492,10 @@ def format_full_report(
     )
     lines.append(f"  Logs Directory : {analysis.get('log_root')}")
     lines.append(f"  Chains Source  : {analysis.get('chain_dir')}")
+    mode_lbl = "EXECUTED-ONLY" if analysis.get("executed_only") else "ALL-SIGNALS"
     lines.append(
         f"  Filters        : symbol={analysis.get('symbol_filter') or 'ALL'} | "
-        f"date={analysis.get('date_filter') or 'ALL'}"
+        f"date={analysis.get('date_filter') or 'ALL'} | mode={mode_lbl}"
     )
     lines.append(
         f"  Signals Scanned: {summary.get('total_signals', 0)} BUY signals across "
@@ -2642,6 +3503,14 @@ def format_full_report(
         f"({summary.get('executed_signals', 0)} matched executed trades)"
     )
     lines.append(f"  Market Bars    : {analysis.get('bars_note')}")
+    unmatched = analysis.get("unmatched_trades") or []
+    if unmatched:
+        lines.append(f"  Unmatched Buys : {len(unmatched)} executed trade(s) had no BUY chain within [-120s, +600s]")
+        for u in unmatched:
+            px_s = f"${u['entry_price']:.2f}" if u.get("entry_price") is not None else "--"
+            lines.append(
+                f"    - {u['symbol']} | {u['contract']} | {u['purchased_disp']} | entry={px_s} | {u['diag']}"
+            )
     lines.append("")
 
     # Section 1: Overall Strategy Summary (Contract Correctness & Optimal Hold Duration)
@@ -2655,10 +3524,10 @@ def format_full_report(
     if by_rank:
         lines.append(
             f"  {'RANK':<9} {'N':>4} {'AVG ASK':>8} {'SPRD%':>7} {'DELTA':>7} "
-            f"{'AVG +15m':>9} {'AVG +60m':>9} {'AVG SESS':>9} {'AVG PNL':>10} "
+            f"{'AVG +15m':>9} {'AVG +30m':>9} {'AVG +60m':>9} {'AVG SESS':>9} {'AVG PNL':>10} "
             f"{'AVG PEAK':>9} {'WIN%':>7} {'#1 WINS':>8}"
         )
-        lines.append("  " + "-" * 92)
+        lines.append("  " + "-" * 102)
         for r in by_rank:
             tag = "*" if r["otm_rank"] == 2 else " "
             lines.append(
@@ -2667,6 +3536,7 @@ def format_full_report(
                 f"{_fmt_opt(r['avg_spread_pct'], 1, '', '%'):>7} "
                 f"{_fmt_opt(r['avg_delta'], 2):>7} "
                 f"{_fmt_pct(r['avg_ret_15m'], 1):>9} "
+                f"{_fmt_pct(r['avg_ret_30m'], 1):>9} "
                 f"{_fmt_pct(r['avg_ret_60m'], 1):>9} "
                 f"{_fmt_pct(r['avg_ret_session'], 2):>9} "
                 f"{_fmt_dollars(r['avg_pnl_session'], 2):>10} "
@@ -2678,6 +3548,12 @@ def format_full_report(
     else:
         lines.append("  No aggregate strike-rank metrics available.")
     lines.append("")
+
+    # Section 2B: Entry & Ex-Ante Strategy Diagnostics
+    diag_text = format_entry_diagnostics(analysis, display_tz, tz_label)
+    if diag_text:
+        lines.append(diag_text)
+        lines.append("")
 
     # Section 3: Per-Signal Detailed Breakdown
     lines.append(sub)
@@ -2809,17 +3685,29 @@ def parse_args(argv=None):
         help="Include OPTION_BUY_DRY_RUN / OPTION_SELL_DRY_RUN log records when matching trades",
     )
     parser.add_argument(
+        "--executed-only",
+        action="store_true",
+        help="Only analyze BUY signals that match an actual executed buy in option_buyer/*.log",
+    )
+    parser.add_argument(
         "--no-alpaca",
         action="store_true",
         help="Skip Alpaca option bar requests (use only local snapshots/sell chains)",
+    )
+    parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress displaying individual input filenames as they are loaded",
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    show_input_files = not args.quiet
     log_root, ini_path = _resolve_default_paths(args.logs_dir, args.ini)
-    cfg = load_standalone_config(ini_path)
+    cfg = load_standalone_config(ini_path, show_input_files=show_input_files)
     display_tz, _ = _resolve_display_timezone(cfg["display_timezone"])
     run_at = datetime.now(UTC)
     tz_label = run_at.astimezone(display_tz).tzname() or cfg["display_timezone"]
@@ -2836,7 +3724,9 @@ def main(argv=None) -> int:
         date_filter=args.date,
         limit=args.limit,
         include_dry_run=args.include_dry_run,
+        executed_only=args.executed_only,
         now_utc=run_at,
+        show_input_files=show_input_files,
     )
 
     if args.output:
@@ -2849,11 +3739,17 @@ def main(argv=None) -> int:
     report_text = format_full_report(analysis, display_tz, tz_label, run_at)
     out_path.write_text(report_text, encoding="utf-8")
 
+    if show_input_files:
+        print()
     print(f"Report written to: {out_path}")
     print()
     print(format_winners_only_summary(analysis, display_tz, tz_label))
     print()
     print(format_overall_strategy_summary(analysis, display_tz, tz_label))
+    diag_txt = format_entry_diagnostics(analysis, display_tz, tz_label)
+    if diag_txt:
+        print()
+        print(diag_txt)
     return 0
 
 
