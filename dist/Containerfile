@@ -1,14 +1,13 @@
 # Pin explicitly to Red Hat Universal Base Image 9.8 (RHEL 9.8)
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
 
-
 # Install shadow-utils (for groupadd/useradd), CA certificates, and timezone data
 RUN microdnf install -y --setopt=install_weak_deps=0 shadow-utils ca-certificates tzdata && \
     microdnf clean all
 
 # Create non-root group and user 'jboa' with home directory /home/jboa
-RUN groupadd --gid 1000 jboa && \
-    useradd --uid 1000 --gid 1000 --create-home --home-dir /home/jboa --shell /bin/bash jboa
+RUN groupadd --gid 1001 jboa && \
+    useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
 # Create /home/jboa/app/src (for parms.ini) and /home/jboa/app/logs (for log output)
 WORKDIR /home/jboa/app
@@ -23,7 +22,8 @@ RUN chmod 0755 /home/jboa/app/multiStreamRSI
 USER jboa
 WORKDIR /home/jboa/app
 
-EXPOSE 5000
+# Document webhook/API port (5000) and UI dashboard port (5001)
+EXPOSE 5000 5001
 
 # Pass default config path matching utils.py's parent.parent log resolution
 ENTRYPOINT ["/home/jboa/app/multiStreamRSI", "-c", "/home/jboa/app/src/parms.ini"]
