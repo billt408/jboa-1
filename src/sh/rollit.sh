@@ -17,7 +17,7 @@ if [[ -d "${LOG_DIR}" ]]; then
     echo "==> Moving logs -> ${BACKUP_DIR}"
     mv "${LOG_DIR}" "${BACKUP_DIR}"
 
-    for subdir in option_buyer option_seller; do
+    for subdir in option_buyer option_seller optionchains; do
         if [[ -d "${BACKUP_DIR}/${subdir}" ]]; then
             echo "==> Restoring history for ${subdir}..."
             mkdir -p "${LOG_DIR}/${subdir}"

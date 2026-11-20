@@ -7063,7 +7063,7 @@ def _ini_float(cfg, section, option, env_name, default):
 
 
 def _apply_ini_feature_settings(cfg):
-    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], and [tastytrade_api] overrides from lib/parms.ini."""
+    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [feature_toggles], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
     global TASTYTRADE_TRANSACTION_ENV, TASTYTRADE_ACCOUNT_NUMBER
@@ -7101,7 +7101,7 @@ def _apply_ini_feature_settings(cfg):
     global DASHBOARD_SSL_ENABLED, DASHBOARD_SSL_MODE, DASHBOARD_SSL_CERT
     global DASHBOARD_SSL_KEY, DASHBOARD_SSL_AUTO_SELF_SIGNED
     global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
-    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES
+    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES, STRIKE_ANALYZER_ENABLED
 
     tz_setting = (
         _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
@@ -7709,6 +7709,10 @@ def _apply_ini_feature_settings(cfg):
             "until a non-empty password is set."
         )
 
+    STRIKE_ANALYZER_ENABLED = _ini_bool(
+        cfg, "feature_toggles", "strike_analyzer_enabled", "STRIKE_ANALYZER_ENABLED", False
+    )
+
     logging.info(
         "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s "
@@ -7718,7 +7722,7 @@ def _apply_ini_feature_settings(cfg):
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
-        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm",
+        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
         RSI_SESSION_MODE,
@@ -7766,6 +7770,7 @@ def _apply_ini_feature_settings(cfg):
         bool(DASHBOARD_AUTH_ENABLED and DASHBOARD_PASSWORD),
         DASHBOARD_SESSION_TTL_HOURS,
         DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
+        STRIKE_ANALYZER_ENABLED,
     )
 
 
@@ -8247,6 +8252,9 @@ try:
     )
 except ValueError:
     DASHBOARD_INACTIVITY_TIMEOUT_MINUTES = 15
+STRIKE_ANALYZER_ENABLED = os.getenv(
+    "STRIKE_ANALYZER_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes"}
 
 
 def rsi_signal(rsi):
@@ -16284,7 +16292,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     <button id="btnDetailBuySellLog" type="button" onclick="openOptionLogsPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="View Buy/Sell Decision Log for this symbol">
                                         Buy/Sell Log
                                     </button>
-                                    <button id="btnDetailStrikeAnalyzer" type="button" onclick="openStrikeAnalysisPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="Compare surrounding option strikes (-2 ITM to +4 OTM) across sell horizons">
+                                    <button id="btnDetailStrikeAnalyzer" type="button" onclick="openStrikeAnalysisPanel(selectedSymbol || '')" class="hidden px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="Compare surrounding option strikes (-2 ITM to +4 OTM) across sell horizons">
                                         Strike Analyzer
                                     </button>
                                 </div>
@@ -16519,7 +16527,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <div onclick="openStrikeAnalysisPanel('')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openStrikeAnalysisPanel('');}" class="group cursor-pointer flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-indigo-500/50 hover:bg-slate-900/80 transition gap-2">
+                        <div id="telemetryStrikeAnalyzerRow" onclick="openStrikeAnalysisPanel('')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openStrikeAnalysisPanel('');}" class="hidden group cursor-pointer flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-indigo-500/50 hover:bg-slate-900/80 transition gap-2">
                             <span class="text-slate-300 group-hover:text-white font-medium flex items-center gap-1.5">
                                 Option Chain Strike Analyzer
                             </span>
@@ -16720,6 +16728,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script>
         const DASHBOARD_AUTH_ENABLED = ('__DASHBOARD_AUTH_ENABLED__' === 'true');
         const DASHBOARD_INACTIVITY_MINUTES = Math.max(0, Number('__DASHBOARD_INACTIVITY_MINUTES__') || 0);
+        const STRIKE_ANALYZER_ENABLED = ('__STRIKE_ANALYZER_ENABLED__' === 'true');
         const _ACTIVITY_STORAGE_KEY = 'msi_dashboard_last_activity';
         let _lastUserActivityMs = Date.now();
         let _lastServerHeartbeatMs = Date.now();
@@ -16729,6 +16738,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         if (DASHBOARD_AUTH_ENABLED) {
             const logoutBtn = document.getElementById('btnLogout');
             if (logoutBtn) logoutBtn.classList.remove('hidden');
+        }
+        if (STRIKE_ANALYZER_ENABLED) {
+            const strikeBtn = document.getElementById('btnDetailStrikeAnalyzer');
+            if (strikeBtn) strikeBtn.classList.remove('hidden');
+            const strikeRow = document.getElementById('telemetryStrikeAnalyzerRow');
+            if (strikeRow) strikeRow.classList.remove('hidden');
         }
 
         function _buildLoginRedirectUrl(reason = '') {
@@ -20531,6 +20546,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let _strikeSearchDebounce = null;
 
         async function openStrikeAnalysisPanel(symbolFilter = '') {
+            if (!STRIKE_ANALYZER_ENABLED) return;
             if (typeof symbolFilter === 'string') {
                 strikeAnalysisSymbolFilter = symbolFilter.trim().toUpperCase();
             }
@@ -20578,6 +20594,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         async function fetchStrikeAnalysis(forceRefresh = false) {
+            if (!STRIKE_ANALYZER_ENABLED) return;
             const pane = document.getElementById('strikeAnalysisPane');
             const btn = document.getElementById('btnStrikeReanalyze');
             if (btn) {
@@ -22807,6 +22824,10 @@ class AdminCliProvider:
                     "__DASHBOARD_INACTIVITY_MINUTES__",
                     str(int(DASHBOARD_INACTIVITY_TIMEOUT_MINUTES or 0)),
                 )
+                .replace(
+                    "__STRIKE_ANALYZER_ENABLED__",
+                    "true" if STRIKE_ANALYZER_ENABLED else "false",
+                )
             )
             headers = {"Content-Type": "text/html; charset=utf-8"}
             if self._is_auth_active():
@@ -22926,6 +22947,14 @@ class AdminCliProvider:
 
         @app.get("/api/strike-analysis")
         def get_strike_analysis():
+            if not STRIKE_ANALYZER_ENABLED:
+                return (
+                    jsonify(
+                        status="error",
+                        message="Strike Analyzer is disabled ([feature_toggles] strike_analyzer_enabled=false)",
+                    ),
+                    403,
+                )
             symbol_q = str(request.args.get("symbol") or "").strip().upper()
             try:
                 limit_q = max(1, min(100, int(request.args.get("limit", "25"))))
