@@ -347,6 +347,9 @@ OPTION_HISTORY_MAX_BARS = max(
 OPTION_HISTORY_PRE_ENTRY_MINUTES = max(
     0, int(os.getenv("OPTION_HISTORY_PRE_ENTRY_MINUTES", "390"))
 )
+OPTION_POSITION_POLL_SECONDS = max(
+    5, min(60, int(os.getenv("OPTION_POSITION_POLL_SECONDS", "15")))
+)
 
 
 def compute_wma(values, period):
@@ -2444,6 +2447,7 @@ class OptionContractHistoryTracker:
         self._trading_client = None
         self._option_data_client = None
         self._stock_data_client = None
+        self._last_cache_write_mono = 0.0
 
     @classmethod
     def _history_cap(cls):
@@ -2592,6 +2596,7 @@ class OptionContractHistoryTracker:
         priority = {
             "order_fill": 4,
             "live_poll": 3,
+            "position_log": 3,
             "option_bar": 2,
             "stock_bar": 2,
             "carry_forward": 1,
@@ -2628,18 +2633,20 @@ class OptionContractHistoryTracker:
         bar_prices_by_min=None,
         stock_prices_by_min=None,
         is_closed=False,
+        live_marks_by_min=None,
     ):
         start_utc = as_utc(start_dt)
         end_utc = max(start_utc, as_utc(end_dt))
         start_min = minute_utc(start_utc)
         end_min = minute_utc(end_utc)
         bar_map = dict(bar_prices_by_min or {})
+        live_mark_map = dict(live_marks_by_min or {})
         stk_map = dict(stock_prices_by_min or {})
 
         preserved_by_min = {}
         for pt in existing_history or []:
             mk = pt.get("minute_utc")
-            if mk and pt.get("source") in {"live_poll", "order_fill"}:
+            if mk and pt.get("source") in {"live_poll", "order_fill", "position_log"}:
                 preserved_by_min[mk] = pt
 
         total_span_mins = int((end_min - start_min).total_seconds() // 60)
@@ -2652,6 +2659,7 @@ class OptionContractHistoryTracker:
                     or cur == end_min
                     or regular_session(cur)
                     or cur in bar_map
+                    or cur in live_mark_map
                     or cur in stk_map
                     or cur.isoformat() in preserved_by_min
                 ):
@@ -2673,6 +2681,9 @@ class OptionContractHistoryTracker:
             for bm in bar_map.keys():
                 if start_min <= bm <= end_min:
                     candidate_mins.append(bm)
+            for lm in live_mark_map.keys():
+                if start_min <= lm <= end_min:
+                    candidate_mins.append(lm)
             for sm in stk_map.keys():
                 if start_min <= sm <= end_min:
                     candidate_mins.append(sm)
@@ -2742,7 +2753,11 @@ class OptionContractHistoryTracker:
                 out.append(pt)
                 continue
 
-            if m_dt in bar_map and bar_map[m_dt] is not None and bar_map[m_dt] > 0:
+            if m_dt in live_mark_map and live_mark_map[m_dt] is not None and live_mark_map[m_dt] > 0:
+                p = float(live_mark_map[m_dt])
+                last_known_price = p
+                src = "position_log"
+            elif m_dt in bar_map and bar_map[m_dt] is not None and bar_map[m_dt] > 0:
                 p = float(bar_map[m_dt])
                 last_known_price = p
                 src = "option_bar"
@@ -3207,9 +3222,217 @@ class OptionContractHistoryTracker:
                     if opened_dt is None or (now_dt - opened_dt).total_seconds() > 20.0:
                         missing_symbols.append(sym)
 
+        if seen_symbols:
+            self._persist_option_prices_cache(force=False)
+
         if missing_symbols and self._trading_client is not None:
             for sym in missing_symbols:
                 self._reconcile_missing_open_contract(sym)
+
+    @staticmethod
+    def _cache_path():
+        return LOG_ROOT / "option_history_prices.json"
+
+    def _persist_option_prices_cache(self, force=False):
+        """Atomically persist observed live option marks to logs/option_history_prices.json."""
+        now_mono = time.monotonic()
+        if not force and (now_mono - self._last_cache_write_mono) < 12.0:
+            return
+        with self._lock:
+            snap = {}
+            for sym, entry in self.open_contracts.items():
+                pts = {}
+                for pt in entry.get("history") or []:
+                    if pt.get("source") in {"live_poll", "order_fill", "position_log"}:
+                        mk = pt.get("minute_utc")
+                        pr = _opt_safe_float(pt.get("price"), None)
+                        if mk and pr is not None and pr > 0:
+                            pts[mk] = round(pr, 4)
+                if pts:
+                    snap[sym] = pts
+            for entry in self.closed_contracts[:30]:
+                sym = entry.get("contract")
+                if not sym:
+                    continue
+                pts = snap.setdefault(sym, {})
+                for pt in entry.get("history") or []:
+                    if pt.get("source") in {"live_poll", "order_fill", "position_log"}:
+                        mk = pt.get("minute_utc")
+                        pr = _opt_safe_float(pt.get("price"), None)
+                        if mk and pr is not None and pr > 0:
+                            pts[mk] = round(pr, 4)
+        if not snap:
+            return
+        try:
+            cache_file = self._cache_path()
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            merged = {}
+            if cache_file.exists():
+                try:
+                    raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        for k, v in raw.items():
+                            if isinstance(v, dict):
+                                merged[str(k).upper()] = dict(v)
+                except Exception:
+                    merged = {}
+            cutoff_iso = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+            cap = self._history_cap()
+            for sym, pts in snap.items():
+                dest = merged.setdefault(sym, {})
+                dest.update(pts)
+            cleaned = {}
+            for sym, pts in merged.items():
+                valid_items = sorted(
+                    (k, float(v))
+                    for k, v in pts.items()
+                    if isinstance(k, str) and k >= cutoff_iso and _opt_safe_float(v, 0.0) > 0
+                )
+                if valid_items:
+                    if len(valid_items) > cap:
+                        valid_items = valid_items[-cap:]
+                    cleaned[sym] = {k: round(v, 4) for k, v in valid_items}
+            tmp_file = cache_file.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(cleaned, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp_file, cache_file)
+            self._last_cache_write_mono = now_mono
+        except Exception as exc:
+            logging.debug("OPTION_HISTORY_CACHE_WRITE_FAILED detail=%s", exc)
+
+    def _load_persisted_option_prices_map(self, symbol_ranges):
+        """Load UTC minute marks from logs/option_history_prices.json filtered by symbol_ranges."""
+        result = {}
+        if not symbol_ranges:
+            return result
+        cache_file = self._cache_path()
+        if not cache_file.exists():
+            return result
+        try:
+            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return result
+        if not isinstance(raw, dict):
+            return result
+        for sym, (s_dt, e_dt) in symbol_ranges.items():
+            pts = raw.get(sym)
+            if not isinstance(pts, dict):
+                continue
+            s_min = minute_utc(as_utc(s_dt))
+            e_min = minute_utc(as_utc(e_dt)) + MINUTE
+            per_min = result.setdefault(sym, {})
+            for mk, raw_p in pts.items():
+                p = _opt_safe_float(raw_p, None)
+                if p is None or p <= 0:
+                    continue
+                mdt = _opt_parse_utc(mk)
+                if mdt is None:
+                    continue
+                m_utc = minute_utc(mdt)
+                if s_min <= m_utc <= e_min:
+                    per_min[m_utc] = p
+        return result
+
+    def _load_logged_position_prices_map(self, symbol_ranges):
+        """Replay historical OPTION_POSITION current_price marks from logs/positions/*.log."""
+        result = {}
+        if not symbol_ranges:
+            return result
+        pos_dir = LOG_ROOT / "positions"
+        if not pos_dir.exists():
+            return result
+        import re
+
+        target_bounds = {
+            sym: (minute_utc(as_utc(s_dt)), minute_utc(as_utc(e_dt)) + MINUTE)
+            for sym, (s_dt, e_dt) in symbol_ranges.items()
+        }
+        earliest_ts = min(b[0] for b in target_bounds.values()).timestamp() - 86400.0
+        try:
+            candidates = sorted(
+                pos_dir.glob("*-POSITIONS-*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return result
+
+        selected_files = []
+        for fp in candidates[:40]:
+            try:
+                if fp.stat().st_mtime >= earliest_ts:
+                    selected_files.append(fp)
+            except Exception:
+                continue
+        # Process oldest-to-newest so newer polls within the same minute win
+        selected_files.reverse()
+
+        line_re = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?\s+\w+\s+OPTION_POSITION\s+.*\bsymbol=([A-Z0-9._-]+)\b.*\bcurrent_price=([0-9.]+)\b"
+        )
+        for fp in selected_files:
+            try:
+                with fp.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if "OPTION_POSITION " not in line:
+                            continue
+                        m = line_re.match(line)
+                        if not m:
+                            continue
+                        sym = m.group(2).strip().upper()
+                        if sym not in target_bounds:
+                            continue
+                        price = _opt_safe_float(m.group(3), None)
+                        if price is None or price <= 0:
+                            continue
+                        try:
+                            local_dt = datetime.strptime(
+                                m.group(1), "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=DISPLAY_TZ)
+                            m_utc = minute_utc(local_dt.astimezone(UTC))
+                        except Exception:
+                            continue
+                        s_min, e_min = target_bounds[sym]
+                        if s_min <= m_utc <= e_min:
+                            result.setdefault(sym, {})[m_utc] = price
+            except Exception:
+                continue
+        return result
+
+    def _load_live_marks_map(self, symbol_ranges):
+        """Combine logs/positions replay + persisted JSON cache into {sym: {min_dt: price}}."""
+        merged = self._load_logged_position_prices_map(symbol_ranges)
+        persisted = self._load_persisted_option_prices_map(symbol_ranges)
+        for sym, per_min in persisted.items():
+            dest = merged.setdefault(sym, {})
+            dest.update(per_min)
+        return merged
+
+    def refresh_stock_prices_for_minute(self, minute_dt):
+        """Sync finalized underlying stock closes into open option histories (in-memory, 0 API calls)."""
+        if minute_dt is None:
+            return
+        target_min = minute_utc(as_utc(minute_dt))
+        target_iso = target_min.isoformat()
+        with self._lock:
+            for entry in self.open_contracts.values():
+                und = entry.get("underlying")
+                if not und:
+                    continue
+                stk_p = self._lookup_live_stock_price(und, target_min)
+                if stk_p is None or stk_p <= 0:
+                    continue
+                hist = entry.get("history") or []
+                updated = False
+                for pt in reversed(hist[-10:]):
+                    if pt.get("minute_utc") == target_iso:
+                        pt["stock_price"] = round(float(stk_p), 4)
+                        updated = True
+                        break
+                if not updated and hist:
+                    # Also backfill stock_price on latest point if missing
+                    last_pt = hist[-1]
+                    if last_pt.get("stock_price") is None:
+                        last_pt["stock_price"] = round(float(stk_p), 4)
 
     def _reconcile_missing_open_contract(self, sym):
         if self._trading_client is None:
@@ -4084,8 +4307,8 @@ class OptionContractHistoryTracker:
                 if pre_cap > 0
                 else timedelta(0)
             )
-            bar_ranges = {}
-            stock_ranges = {}
+            open_bar_ranges = {}
+            open_stock_ranges = {}
             open_specs = {}
             for sym, pos in open_pos_by_sym.items():
                 rem_lots = [l for l in lots_by_sym.get(sym, []) if l["qty"] > 1e-6]
@@ -4100,9 +4323,9 @@ class OptionContractHistoryTracker:
                     buy_oid = None
                 open_specs[sym] = (pos, purchased_dt, buy_oid)
                 fetch_s = purchased_dt - pre_buf
-                s_min = bar_ranges[sym][0] if sym in bar_ranges else fetch_s
-                e_max = bar_ranges[sym][1] if sym in bar_ranges else now_dt
-                bar_ranges[sym] = (min(s_min, fetch_s), max(e_max, now_dt))
+                s_min = open_bar_ranges[sym][0] if sym in open_bar_ranges else fetch_s
+                e_max = open_bar_ranges[sym][1] if sym in open_bar_ranges else now_dt
+                open_bar_ranges[sym] = (min(s_min, fetch_s), max(e_max, now_dt))
 
                 _, parsed_und, _, _, _ = _parse_occ_contract(sym)
                 raw_und = (
@@ -4112,137 +4335,18 @@ class OptionContractHistoryTracker:
                 )
                 und = str(raw_und or parsed_und or sym).strip().upper()
                 if und:
-                    us0 = stock_ranges[und][0] if und in stock_ranges else fetch_s
-                    us1 = stock_ranges[und][1] if und in stock_ranges else now_dt
-                    stock_ranges[und] = (min(us0, fetch_s), max(us1, now_dt))
+                    us0 = open_stock_ranges[und][0] if und in open_stock_ranges else fetch_s
+                    us1 = open_stock_ranges[und][1] if und in open_stock_ranges else now_dt
+                    open_stock_ranges[und] = (min(us0, fetch_s), max(us1, now_dt))
 
-            for cm in closed_matches[:25]:
-                sym = cm["contract"]
-                fetch_s = cm["purchased_at"] - pre_buf
-                if sym in bar_ranges:
-                    s_min, e_max = bar_ranges[sym]
-                    bar_ranges[sym] = (
-                        min(s_min, fetch_s),
-                        max(e_max, cm["sold_at"]),
-                    )
-                else:
-                    bar_ranges[sym] = (fetch_s, cm["sold_at"])
-                _, und, _, _, _ = _parse_occ_contract(sym)
-                if und:
-                    us0 = stock_ranges[und][0] if und in stock_ranges else fetch_s
-                    us1 = stock_ranges[und][1] if und in stock_ranges else cm["sold_at"]
-                    stock_ranges[und] = (min(us0, fetch_s), max(us1, cm["sold_at"]))
-
-            bars_by_sym = self._fetch_option_bars_map(bar_ranges)
-            stock_bars_by_und = self._fetch_stock_bars_map(stock_ranges)
+            # Phase 1: Fast-path open contracts FIRST so live open charts appear within ~1-2s
+            # with full replayed position logs + persisted marks + Alpaca bars.
+            open_bars_by_sym = self._fetch_option_bars_map(open_bar_ranges)
+            open_marks_by_sym = self._load_live_marks_map(open_bar_ranges)
+            open_stock_bars_by_und = self._fetch_stock_bars_map(open_stock_ranges)
 
             with self._lock:
-                for cm in closed_matches:
-                    sym = cm["contract"]
-                    _, und, right, strike, expiry = _parse_occ_contract(sym)
-                    mult = 100.0
-                    q = cm["qty"]
-                    ep = cm["entry_price"]
-                    xp = cm["exit_price"]
-                    p_dt = cm["purchased_at"]
-                    s_dt = cm["sold_at"]
-                    trade_id = (
-                        str(cm["sell_order_id"])
-                        if cm["sell_order_id"]
-                        else f"{sym}@{s_dt.isoformat()}"
-                    )
-                    existing_closed = next(
-                        (
-                            x
-                            for x in self.closed_contracts
-                            if x.get("trade_id") == trade_id
-                        ),
-                        None,
-                    )
-                    existing_hist = (
-                        existing_closed.get("history") if existing_closed else []
-                    )
-                    opt_map = bars_by_sym.get(sym, {})
-                    stk_map = stock_bars_by_und.get(und, {})
-                    hist = self._fill_minute_gaps(
-                        existing_hist,
-                        p_dt,
-                        s_dt,
-                        ep,
-                        xp,
-                        q,
-                        mult,
-                        bar_prices_by_min=opt_map,
-                        stock_prices_by_min=stk_map,
-                        is_closed=True,
-                    )
-                    pre_hist = self._build_pre_entry_history(
-                        p_dt,
-                        ep,
-                        q,
-                        mult,
-                        opt_bars_by_min=opt_map,
-                        stk_bars_by_min=stk_map,
-                    ) or list((existing_closed or {}).get("pre_entry_history") or [])
-                    cost_b = round(ep * q * mult, 2)
-                    proceeds = round(xp * q * mult, 2)
-                    pnl_d = round(proceeds - cost_b, 2)
-                    pnl_p = round((pnl_d / cost_b) * 100.0, 2) if cost_b > 0 else 0.0
-                    rec = {
-                        "trade_id": trade_id,
-                        "contract": sym,
-                        "underlying": und,
-                        "is_option": True,
-                        "right": right,
-                        "strike": strike,
-                        "expiry": expiry,
-                        "qty": (
-                            int(round(q)) if abs(q - round(q)) < 1e-6 else round(q, 4)
-                        ),
-                        "multiplier": mult,
-                        "entry_price": round(ep, 4),
-                        "exit_price": round(xp, 4),
-                        "cost_basis": cost_b,
-                        "proceeds": proceeds,
-                        "total_pnl_dollars": pnl_d,
-                        "total_pnl_pct": pnl_p,
-                        "purchased_at_utc": p_dt.isoformat(),
-                        "sold_at_utc": s_dt.isoformat(),
-                        "hold_minutes": round(
-                            max(0.0, (s_dt - p_dt).total_seconds() / 60.0), 2
-                        ),
-                        "buy_order_id": (
-                            str(cm["buy_order_id"]) if cm["buy_order_id"] else None
-                        ),
-                        "sell_order_id": (
-                            str(cm["sell_order_id"]) if cm["sell_order_id"] else None
-                        ),
-                        "reason": (
-                            existing_closed.get("reason") if existing_closed else None
-                        )
-                        or "alpaca_closed_order",
-                        "dry_run": False,
-                        "history_source": (
-                            "backfilled" if bars_by_sym.get(sym) else "order_fills"
-                        ),
-                        "pre_entry_history": pre_hist,
-                        "history": hist,
-                    }
-                    if existing_closed is not None:
-                        idx = self.closed_contracts.index(existing_closed)
-                        self.closed_contracts[idx] = rec
-                    elif trade_id not in self._closed_ids:
-                        self._closed_ids.add(trade_id)
-                        self.closed_contracts.append(rec)
-
-                self.closed_contracts.sort(
-                    key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True
-                )
-                if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
-                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES :]:
-                        self._closed_ids.discard(dropped.get("trade_id"))
-                    del self.closed_contracts[self.MAX_CLOSED_TRADES :]
-
+                phase1_end_dt = max(now_dt, datetime.now(UTC))
                 for sym, (pos, purchased_dt, buy_oid) in open_specs.items():
                     _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
                     raw_und = (
@@ -4348,12 +4452,24 @@ class OptionContractHistoryTracker:
                     existing_hist = (
                         list(prev_entry.get("history") or []) if prev_entry else []
                     )
-                    opt_map = bars_by_sym.get(sym, {})
-                    stk_map = stock_bars_by_und.get(und, {})
+                    # Preserve fresher price if a live poll already updated this contract
+                    if prev_entry and prev_entry.get("last_updated_utc"):
+                        prev_ts = _opt_parse_utc(prev_entry.get("last_updated_utc"))
+                        if prev_ts and prev_ts > now_dt:
+                            p_cur = _opt_safe_float(prev_entry.get("current_price"), None)
+                            if p_cur and p_cur > 0:
+                                cur_price = p_cur
+                                mkt_val = _opt_safe_float(prev_entry.get("market_value"), mkt_val) or mkt_val
+                                upl = _opt_safe_float(prev_entry.get("pnl_dollars"), upl)
+                                pnl_pct = _opt_safe_float(prev_entry.get("pnl_pct"), pnl_pct)
+                                phase1_end_dt = max(phase1_end_dt, prev_ts)
+                    opt_map = open_bars_by_sym.get(sym, {})
+                    marks_map = open_marks_by_sym.get(sym, {})
+                    stk_map = open_stock_bars_by_und.get(und, {})
                     hist = self._fill_minute_gaps(
                         existing_hist,
                         purchased_dt,
-                        now_dt,
+                        phase1_end_dt,
                         avg_entry,
                         cur_price,
                         raw_qty,
@@ -4361,6 +4477,7 @@ class OptionContractHistoryTracker:
                         bar_prices_by_min=opt_map,
                         stock_prices_by_min=stk_map,
                         is_closed=False,
+                        live_marks_by_min=marks_map,
                     )
                     pre_hist = self._build_pre_entry_history(
                         purchased_dt,
@@ -4370,6 +4487,7 @@ class OptionContractHistoryTracker:
                         opt_bars_by_min=opt_map,
                         stk_bars_by_min=stk_map,
                     ) or list((prev_entry or {}).get("pre_entry_history") or [])
+                    has_hist_src = bool(opt_map or marks_map)
                     self.open_contracts[sym] = {
                         "contract": sym,
                         "underlying": und,
@@ -4397,9 +4515,9 @@ class OptionContractHistoryTracker:
                         "market_value": round(mkt_val, 2),
                         "pnl_dollars": round(upl, 2),
                         "pnl_pct": pnl_pct,
-                        "last_updated_utc": now_dt.isoformat(),
+                        "last_updated_utc": phase1_end_dt.isoformat(),
                         "history_source": (
-                            "backfilled+live" if bars_by_sym.get(sym) else "live"
+                            "backfilled+live" if has_hist_src else "live"
                         ),
                         "pre_entry_history": pre_hist,
                         "history": hist,
@@ -4409,16 +4527,161 @@ class OptionContractHistoryTracker:
                     if sym not in open_pos_by_sym:
                         self.open_contracts.pop(sym, None)
 
+            # Phase 2: Backfill closed contracts in background after open contracts are live
+            closed_bar_ranges = {}
+            closed_stock_ranges = {}
+            for cm in closed_matches[:25]:
+                sym = cm["contract"]
+                fetch_s = cm["purchased_at"] - pre_buf
+                if sym in closed_bar_ranges:
+                    s_min, e_max = closed_bar_ranges[sym]
+                    closed_bar_ranges[sym] = (
+                        min(s_min, fetch_s),
+                        max(e_max, cm["sold_at"]),
+                    )
+                else:
+                    closed_bar_ranges[sym] = (fetch_s, cm["sold_at"])
+                _, und, _, _, _ = _parse_occ_contract(sym)
+                if und:
+                    us0 = closed_stock_ranges[und][0] if und in closed_stock_ranges else fetch_s
+                    us1 = closed_stock_ranges[und][1] if und in closed_stock_ranges else cm["sold_at"]
+                    closed_stock_ranges[und] = (min(us0, fetch_s), max(us1, cm["sold_at"]))
+
+            closed_bars_by_sym = self._fetch_option_bars_map(closed_bar_ranges)
+            closed_marks_by_sym = self._load_live_marks_map(closed_bar_ranges)
+            closed_stock_bars_by_und = self._fetch_stock_bars_map(closed_stock_ranges)
+
+            bars_by_sym = {**open_bars_by_sym}
+            for sym, per_min in closed_bars_by_sym.items():
+                bars_by_sym.setdefault(sym, {}).update(per_min)
+            marks_by_sym = {**open_marks_by_sym}
+            for sym, per_min in closed_marks_by_sym.items():
+                marks_by_sym.setdefault(sym, {}).update(per_min)
+            stock_bars_by_und = {**open_stock_bars_by_und}
+            for und, per_min in closed_stock_bars_by_und.items():
+                stock_bars_by_und.setdefault(und, {}).update(per_min)
+
+            with self._lock:
+                for cm in closed_matches:
+                    sym = cm["contract"]
+                    _, und, right, strike, expiry = _parse_occ_contract(sym)
+                    mult = 100.0
+                    q = cm["qty"]
+                    ep = cm["entry_price"]
+                    xp = cm["exit_price"]
+                    p_dt = cm["purchased_at"]
+                    s_dt = cm["sold_at"]
+                    trade_id = (
+                        str(cm["sell_order_id"])
+                        if cm["sell_order_id"]
+                        else f"{sym}@{s_dt.isoformat()}"
+                    )
+                    existing_closed = next(
+                        (
+                            x
+                            for x in self.closed_contracts
+                            if x.get("trade_id") == trade_id
+                        ),
+                        None,
+                    )
+                    existing_hist = (
+                        existing_closed.get("history") if existing_closed else []
+                    )
+                    opt_map = bars_by_sym.get(sym, {})
+                    c_marks_map = marks_by_sym.get(sym, {})
+                    stk_map = stock_bars_by_und.get(und, {})
+                    hist = self._fill_minute_gaps(
+                        existing_hist,
+                        p_dt,
+                        s_dt,
+                        ep,
+                        xp,
+                        q,
+                        mult,
+                        bar_prices_by_min=opt_map,
+                        stock_prices_by_min=stk_map,
+                        is_closed=True,
+                        live_marks_by_min=c_marks_map,
+                    )
+                    pre_hist = self._build_pre_entry_history(
+                        p_dt,
+                        ep,
+                        q,
+                        mult,
+                        opt_bars_by_min=opt_map,
+                        stk_bars_by_min=stk_map,
+                    ) or list((existing_closed or {}).get("pre_entry_history") or [])
+                    cost_b = round(ep * q * mult, 2)
+                    proceeds = round(xp * q * mult, 2)
+                    pnl_d = round(proceeds - cost_b, 2)
+                    pnl_p = round((pnl_d / cost_b) * 100.0, 2) if cost_b > 0 else 0.0
+                    rec = {
+                        "trade_id": trade_id,
+                        "contract": sym,
+                        "underlying": und,
+                        "is_option": True,
+                        "right": right,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "qty": (
+                            int(round(q)) if abs(q - round(q)) < 1e-6 else round(q, 4)
+                        ),
+                        "multiplier": mult,
+                        "entry_price": round(ep, 4),
+                        "exit_price": round(xp, 4),
+                        "cost_basis": cost_b,
+                        "proceeds": proceeds,
+                        "total_pnl_dollars": pnl_d,
+                        "total_pnl_pct": pnl_p,
+                        "purchased_at_utc": p_dt.isoformat(),
+                        "sold_at_utc": s_dt.isoformat(),
+                        "hold_minutes": round(
+                            max(0.0, (s_dt - p_dt).total_seconds() / 60.0), 2
+                        ),
+                        "buy_order_id": (
+                            str(cm["buy_order_id"]) if cm["buy_order_id"] else None
+                        ),
+                        "sell_order_id": (
+                            str(cm["sell_order_id"]) if cm["sell_order_id"] else None
+                        ),
+                        "reason": (
+                            existing_closed.get("reason") if existing_closed else None
+                        )
+                        or "alpaca_closed_order",
+                        "dry_run": False,
+                        "history_source": (
+                            "backfilled" if (opt_map or c_marks_map) else "order_fills"
+                        ),
+                        "pre_entry_history": pre_hist,
+                        "history": hist,
+                    }
+                    if existing_closed is not None:
+                        idx = self.closed_contracts.index(existing_closed)
+                        self.closed_contracts[idx] = rec
+                    elif trade_id not in self._closed_ids:
+                        self._closed_ids.add(trade_id)
+                        self.closed_contracts.append(rec)
+
+                self.closed_contracts.sort(
+                    key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True
+                )
+                if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
+                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES :]:
+                        self._closed_ids.discard(dropped.get("trade_id"))
+                    del self.closed_contracts[self.MAX_CLOSED_TRADES :]
+
                 self.backfill_status = "completed"
                 self.backfill_last_utc = datetime.now(UTC).isoformat()
                 open_cnt = len(self.open_contracts)
                 closed_cnt = len(self.closed_contracts)
 
+            self._persist_option_prices_cache(force=True)
             logging.info(
-                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d stock_symbols=%d",
+                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d mark_symbols=%d stock_symbols=%d",
                 open_cnt,
                 closed_cnt,
                 len(bars_by_sym),
+                len(marks_by_sym),
                 len(stock_bars_by_und),
             )
             return {"open": open_cnt, "closed": closed_cnt}
@@ -5595,6 +5858,8 @@ class MinuteCoordinator:
                 self.late_counts[provider] = 0
                 emitted += 1
             self.last_finalized = minute
+            if hasattr(self, "option_history") and self.option_history is not None:
+                self.option_history.refresh_stock_prices_for_minute(minute)
             self.next_minute = next_session_minute(minute + MINUTE)
             # Discard pending records already at or before the just-finalized minute.
             next_day = self.next_minute.astimezone(MARKET_TZ).date()
@@ -7520,6 +7785,7 @@ def _apply_ini_feature_settings(cfg):
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
     global KINEMATICS_HISTORY_MAX_BARS
     global OPTION_HISTORY_MAX_BARS, OPTION_HISTORY_PRE_ENTRY_MINUTES
+    global OPTION_POSITION_POLL_SECONDS
     global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
     global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
@@ -7680,6 +7946,17 @@ def _apply_ini_feature_settings(cfg):
         "OPTION_HISTORY_PRE_ENTRY_MINUTES",
         390,
         minimum=0,
+    )
+    OPTION_POSITION_POLL_SECONDS = min(
+        60,
+        _ini_int(
+            cfg,
+            "option_history",
+            "position_poll_seconds",
+            "OPTION_POSITION_POLL_SECONDS",
+            15,
+            minimum=5,
+        ),
     )
     RSI_WARMUP_SESSIONS = _ini_int(
         cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
@@ -10460,6 +10737,8 @@ class AlpacaPositionMonitor:
         self.position_count = 0
         self.equity_count = 0
         self.option_count = 0
+        self._last_logged_minute = None
+        self._last_logged_sig = None
 
     @staticmethod
     def _num(obj, attr, default=0.0):
@@ -10543,52 +10822,83 @@ class AlpacaPositionMonitor:
         options = [p for p in positions if self._is_option(p)]
         equities = [p for p in positions if not self._is_option(p)]
 
+        poll_now_dt = datetime.now(timezone.utc)
         self.position_count = len(positions)
         self.equity_count = len(equities)
         self.option_count = len(options)
-        self.last_poll_utc = datetime.now(timezone.utc).isoformat()
+        self.last_poll_utc = poll_now_dt.isoformat()
         self.last_status = "healthy"
 
-        self.logger.info(
-            "POSITIONS_SNAPSHOT provider=%s equity=%.2f cash=%.2f buying_power=%.2f "
-            "long_market_value=%.2f short_market_value=%.2f positions=%d options=%d",
-            self.transaction_provider,
-            self._num(account, "equity", 0.0),
-            self._num(account, "cash", 0.0),
-            self._num(account, "buying_power", 0.0),
-            self._num(account, "long_market_value", 0.0),
-            self._num(account, "short_market_value", 0.0),
-            len(positions),
-            len(options),
+        cur_min = minute_utc(poll_now_dt)
+        opt_sig = tuple(
+            sorted(
+                str(
+                    (p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", ""))
+                    or ""
+                ).strip().upper()
+                for p in options
+            )
         )
+        cur_sig = (len(positions), len(options), opt_sig)
+        should_log = (
+            self._last_logged_minute != cur_min or self._last_logged_sig != cur_sig
+        )
+        if should_log:
+            self._last_logged_minute = cur_min
+            self._last_logged_sig = cur_sig
+            self.logger.info(
+                "POSITIONS_SNAPSHOT provider=%s equity=%.2f cash=%.2f buying_power=%.2f "
+                "long_market_value=%.2f short_market_value=%.2f positions=%d options=%d",
+                self.transaction_provider,
+                self._num(account, "equity", 0.0),
+                self._num(account, "cash", 0.0),
+                self._num(account, "buying_power", 0.0),
+                self._num(account, "long_market_value", 0.0),
+                self._num(account, "short_market_value", 0.0),
+                len(positions),
+                len(options),
+            )
 
-        for position in positions:
-            if self._is_option(position):
-                self.logger.info("OPTION_POSITION %s", self._format_option(position))
-            else:
-                pos_sym = (
-                    position.get("symbol")
-                    if isinstance(position, dict)
-                    else getattr(position, "symbol", "?")
-                ) or "?"
-                self.logger.info(
-                    "HOLDING type=equity symbol=%s qty=%.4g avg_entry=%.4f "
-                    "current_price=%.4f market_value=%.2f unrealized_pl=%.2f",
-                    pos_sym,
-                    self._num(position, "qty"),
-                    self._num(position, "avg_entry_price"),
-                    self._num(position, "current_price"),
-                    self._num(position, "market_value"),
-                    self._num(position, "unrealized_pl"),
-                )
+            for position in positions:
+                if self._is_option(position):
+                    self.logger.info("OPTION_POSITION %s", self._format_option(position))
+                else:
+                    pos_sym = (
+                        position.get("symbol")
+                        if isinstance(position, dict)
+                        else getattr(position, "symbol", "?")
+                    ) or "?"
+                    self.logger.info(
+                        "HOLDING type=equity symbol=%s qty=%.4g avg_entry=%.4f "
+                        "current_price=%.4f market_value=%.2f unrealized_pl=%.2f",
+                        pos_sym,
+                        self._num(position, "qty"),
+                        self._num(position, "avg_entry_price"),
+                        self._num(position, "current_price"),
+                        self._num(position, "market_value"),
+                        self._num(position, "unrealized_pl"),
+                    )
 
-        if not options:
-            self.logger.info("OPTIONS_POSITIONS none")
+            if not options:
+                self.logger.info("OPTIONS_POSITIONS none")
 
         if self.coordinator is not None and hasattr(self.coordinator, "option_history"):
             self.coordinator.option_history.record_positions_snapshot(
                 positions, timestamp=self.last_poll_utc
             )
+
+    @staticmethod
+    def _next_poll_target_utc(now_utc, interval_seconds):
+        """Return next aligned UTC poll timestamp (:02, :17, :32, :47 for 15s cadence)."""
+        interval = max(5, min(60, int(interval_seconds or 15)))
+        base_min = now_utc.replace(second=0, microsecond=0)
+        offset = 2
+        while offset < 60:
+            cand = base_min + timedelta(seconds=offset)
+            if cand > now_utc + timedelta(milliseconds=250):
+                return cand
+            offset += interval
+        return base_min + MINUTE + timedelta(seconds=2)
 
     async def run(self):
         if self.client is None:
@@ -10598,9 +10908,11 @@ class AlpacaPositionMonitor:
                 self.transaction_provider,
             )
             return
-        self.logger.info("POSITION_MONITOR_START cadence=every-minute")
+        poll_sec = max(5, min(60, int(OPTION_POSITION_POLL_SECONDS or 15)))
+        self.logger.info("POSITION_MONITOR_START cadence=%ds", poll_sec)
         logging.info(
-            "POSITION_MONITOR_START provider=POSITIONS log=%s",
+            "POSITION_MONITOR_START provider=POSITIONS cadence=%ds log=%s",
+            poll_sec,
             self.logger.handlers[0].baseFilename if self.logger.handlers else "n/a",
         )
         while True:
@@ -10615,11 +10927,9 @@ class AlpacaPositionMonitor:
                     type(exc).__name__,
                     exc,
                 )
-            # Sleep until just after the next minute boundary.
+            # Sleep until next minute-aligned slot (:02, :17, :32, :47 for 15s cadence).
             now = datetime.now(UTC)
-            target = (
-                now.replace(second=0, microsecond=0) + MINUTE + timedelta(seconds=2)
-            )
+            target = self._next_poll_target_utc(now, OPTION_POSITION_POLL_SECONDS)
             await asyncio.sleep(max(1.0, (target - now).total_seconds()))
 
 
