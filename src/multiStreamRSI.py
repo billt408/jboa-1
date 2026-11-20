@@ -7528,6 +7528,7 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_BUY_FETCH_IF_MISSING, OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING
     global OPTION_BUY_REQUIRE_PROJECTION_ALIGNMENT, OPTION_BUY_REQUIRE_RIGHT_MATCH
     global OPTION_BUY_ALLOWED_FORECASTS, OPTION_BUY_REQUIRE_POSITIVE_VELOCITY
+    global OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES, OPTION_BUY_BOUNCE_RSI_MAX
     global OPTION_BUY_MAX_SPREAD_PCT, OPTION_BUY_LIMIT_AGGRESSION, OPTION_BUY_MAX_BUYS_PER_MINUTE
     global OPTION_SELL_ENABLED, OPTION_SELL_DRY_RUN, OPTION_SELL_PAPER
     global OPTION_SELL_QTY, OPTION_SELL_CLOSE_FULL_POSITION
@@ -7797,6 +7798,24 @@ def _apply_ini_feature_settings(cfg):
         "require_positive_velocity",
         "OPTION_BUY_REQUIRE_POSITIVE_VELOCITY",
         True,
+    )
+    OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES = _ini_int(
+        cfg,
+        "option_buyer",
+        "oversold_lookback_minutes",
+        "OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES",
+        3,
+        minimum=0,
+    )
+    OPTION_BUY_BOUNCE_RSI_MAX = max(
+        OPTION_CHAIN_RSI_LOW,
+        _ini_float(
+            cfg,
+            "option_buyer",
+            "bounce_rsi_max",
+            "OPTION_BUY_BOUNCE_RSI_MAX",
+            45.0,
+        ),
     )
     OPTION_BUY_MAX_SPREAD_PCT = max(
         0.0,
@@ -8170,7 +8189,7 @@ def _apply_ini_feature_settings(cfg):
         "opt_chain=%s opt_tx=%s tt_tx_env=%s "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
-        "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_qty=%d sell_full=%s "
+        "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
@@ -8198,6 +8217,8 @@ def _apply_ini_feature_settings(cfg):
         OPTION_SELL_PAPER,
         OPTION_CHAIN_RSI_LOW,
         OPTION_CHAIN_RSI_HIGH,
+        OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
+        OPTION_BUY_BOUNCE_RSI_MAX,
         OPTION_BUY_QTY,
         OPTION_SELL_CLOSE_FULL_POSITION,
         OPTION_SELL_LIMIT_DISCOUNT_PCT,
@@ -8543,6 +8564,13 @@ OPTION_BUY_REQUIRE_RIGHT_MATCH = os.getenv(
 OPTION_BUY_REQUIRE_POSITIVE_VELOCITY = os.getenv(
     "OPTION_BUY_REQUIRE_POSITIVE_VELOCITY", "true"
 ).strip().lower() in {"1", "true", "yes"}
+OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES = max(
+    0, int(os.getenv("OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES", "3"))
+)
+OPTION_BUY_BOUNCE_RSI_MAX = max(
+    OPTION_CHAIN_RSI_LOW,
+    float(os.getenv("OPTION_BUY_BOUNCE_RSI_MAX", "45.0")),
+)
 OPTION_BUY_MAX_SPREAD_PCT = max(
     0.0, abs(float(os.getenv("OPTION_BUY_MAX_SPREAD_PCT", "5.0")))
 )
@@ -11010,11 +11038,53 @@ class AlpacaOptionBuyer:
         return bid, ask
 
     @staticmethod
-    def _evaluate_kinematics(entry):
+    def _find_recent_oversold_entry(entry, recent_history, lookback_minutes, rsi_low):
+        """Return (prev_entry, prev_rsi, mins_ago) if a finalized bar within
+        `lookback_minutes` prior to `entry` had finite RSI <= `rsi_low`."""
+        if not recent_history or lookback_minutes <= 0:
+            return None
+        curr_min = _hist_minute_utc(entry)
+        max_delta_sec = lookback_minutes * 60
+        seen_prior = 0
+        for prev in reversed(recent_history):
+            if prev is entry or not isinstance(prev, dict):
+                continue
+            prev_min = _hist_minute_utc(prev)
+            mins_ago = None
+            if curr_min is not None and prev_min is not None:
+                delta_sec = (curr_min - prev_min).total_seconds()
+                if delta_sec <= 0:
+                    continue
+                if delta_sec > max_delta_sec:
+                    break
+                mins_ago = max(1, int(round(delta_sec / 60.0)))
+            else:
+                seen_prior += 1
+                if seen_prior > lookback_minutes:
+                    break
+                mins_ago = seen_prior
+            raw_prev_rsi = prev.get("rsi")
+            if raw_prev_rsi is None or isinstance(raw_prev_rsi, bool):
+                continue
+            try:
+                prev_rsi = float(raw_prev_rsi)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(prev_rsi) and prev_rsi <= rsi_low:
+                return prev, prev_rsi, mins_ago
+        return None
+
+    @staticmethod
+    def _evaluate_kinematics(entry, recent_history=None):
         """Determine whether a finalized 1m snapshot triggers an option BUY.
 
         Mandatory rule:
-        1. RSI must be present and strictly <= OPTION_CHAIN_RSI_LOW.
+        1. RSI must be present and either:
+           (a) strictly <= OPTION_CHAIN_RSI_LOW on the current bar, OR
+           (b) within [OPTION_CHAIN_RSI_LOW, OPTION_BUY_BOUNCE_RSI_MAX] while
+               a finalized bar within the last OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES
+               had RSI <= OPTION_CHAIN_RSI_LOW (confirmed bounce lookback, which
+               always requires positive upward velocity v > 0).
         2. Kinematic metrics must be favorable for buying (positive upward
            acceleration a > 0 with either an oversold decelerating bottom or
            upward velocity thrust, or a bullish zero-line crossover), and
@@ -11035,7 +11105,33 @@ class AlpacaOptionBuyer:
         if not math.isfinite(rsi):
             return False, None, "rsi_nonfinite"
 
-        if rsi > OPTION_CHAIN_RSI_LOW:
+        used_lookback = False
+        lb_rsi = None
+        lb_mins = None
+        bounce_rsi_cap = max(OPTION_CHAIN_RSI_LOW, OPTION_BUY_BOUNCE_RSI_MAX)
+        if rsi <= OPTION_CHAIN_RSI_LOW:
+            rsi_tag = f"rsi={rsi:.2f}<=low"
+        elif OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES > 0 and rsi <= bounce_rsi_cap:
+            lb_match = AlpacaOptionBuyer._find_recent_oversold_entry(
+                entry,
+                recent_history,
+                OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
+                OPTION_CHAIN_RSI_LOW,
+            )
+            if lb_match is None:
+                return (
+                    False,
+                    None,
+                    f"rsi_above_buy_threshold(rsi={rsi:.2f}>{OPTION_CHAIN_RSI_LOW:.2f},"
+                    f"no_oversold_in_{OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES}m)",
+                )
+            _, lb_rsi, lb_mins = lb_match
+            used_lookback = True
+            rsi_tag = (
+                f"rsi={rsi:.2f}<={bounce_rsi_cap:.2f}"
+                f"(oversold_{lb_mins}m_ago={lb_rsi:.2f})"
+            )
+        else:
             return (
                 False,
                 None,
@@ -11076,6 +11172,14 @@ class AlpacaOptionBuyer:
         crossover = str(entry.get("crossover_signal") or "none").lower()
         proj_delta = entry.get("projected_delta")
 
+        if used_lookback and vel <= 0:
+            return (
+                False,
+                None,
+                f"bounce_velocity_not_positive(rsi={rsi:.2f},prev_rsi={lb_rsi:.2f}@{lb_mins}m,"
+                f"v={vel:+.4f},a={acc:+.4f})",
+            )
+
         if OPTION_BUY_REQUIRE_POSITIVE_VELOCITY and vel <= 0:
             return (
                 False,
@@ -11083,28 +11187,29 @@ class AlpacaOptionBuyer:
                 f"velocity_not_positive(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f})",
             )
 
+        require_pos_vel = OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or used_lookback
         reason = None
         if vel > 0 and acc > 0:
-            reason = f"rsi={rsi:.2f}<=low&bullish_thrust(v={vel:+.4f},a={acc:+.4f})"
-        elif not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY and vel < 0 and acc > 0:
+            reason = f"{rsi_tag}&bullish_thrust(v={vel:+.4f},a={acc:+.4f})"
+        elif not require_pos_vel and vel < 0 and acc > 0:
             tag = (
                 forecast
                 if forecast in OPTION_BUY_ALLOWED_FORECASTS
                 else "oversold_decel_bottom"
             )
-            reason = f"rsi={rsi:.2f}<=low&{tag}(v={vel:+.4f},a={acc:+.4f})"
+            reason = f"{rsi_tag}&{tag}(v={vel:+.4f},a={acc:+.4f})"
         elif (
             crossover in {"leading_bullish", "confirmed_bullish"}
             and acc >= 0
-            and (not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0)
+            and (not require_pos_vel or vel > 0)
         ):
-            reason = f"rsi={rsi:.2f}<=low&crossover={crossover}"
+            reason = f"{rsi_tag}&crossover={crossover}"
         elif (
             forecast in OPTION_BUY_ALLOWED_FORECASTS
             and acc > 0
-            and (not OPTION_BUY_REQUIRE_POSITIVE_VELOCITY or vel > 0)
+            and (not require_pos_vel or vel > 0)
         ):
-            reason = f"rsi={rsi:.2f}<=low&forecast={forecast}"
+            reason = f"{rsi_tag}&forecast={forecast}"
 
         if reason is None:
             details = []
@@ -11327,7 +11432,14 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
-            qualifies, desired_right, reason = self._evaluate_kinematics(entry)
+            recent_history = (
+                self.coordinator.kinematics_history.get((provider, symbol))
+                if provider is not None
+                else None
+            )
+            qualifies, desired_right, reason = self._evaluate_kinematics(
+                entry, recent_history=recent_history
+            )
             if not qualifies:
                 self._log_buy_analysis(
                     minute_key,
@@ -12024,10 +12136,12 @@ class AlpacaOptionBuyer:
 
         self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
         self.logger.info(
-            "OPTION_BUYER_START mode=%s rsi_low<=%.2f qty=%d order_type=%s aggr=%.2f "
+            "OPTION_BUYER_START mode=%s rsi_low<=%.2f lookback=%dm bounce_rsi<=%.2f qty=%d order_type=%s aggr=%.2f "
             "max_spread=%.2f%% pos_vel=%s max_per_min=%d cooldown_min=%d max_open=%d allowed=%s",
             self.mode,
             OPTION_CHAIN_RSI_LOW,
+            OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
+            OPTION_BUY_BOUNCE_RSI_MAX,
             OPTION_BUY_QTY,
             OPTION_BUY_ORDER_TYPE,
             OPTION_BUY_LIMIT_AGGRESSION,
@@ -17546,6 +17660,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             Closed Contracts (<span id="optTabClosedCount">0</span>)
                         </button>
                     </div>
+                    <div class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400 inline-flex items-center gap-1.5" title="Time remaining until next 1-minute finalization">
+                        <span>Next Minute:</span>
+                        <span id="optDrilldownMinuteCountdown" class="mono font-semibold text-amber-300">--s</span>
+                    </div>
                 </div>
 
                 <div class="flex items-center gap-2">
@@ -18143,7 +18261,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const diff = Math.max(0, Math.ceil((nextMinuteUtc.getTime() - serverNowMs) / 1000));
             const label = formatCountdownSeconds(diff);
             const cls = diff <= 5 ? 'mono font-semibold text-rose-400 animate-pulse' : 'mono font-semibold text-amber-300';
-            ['minuteCountdown', 'optLogsMinuteCountdown'].forEach((id) => {
+            ['minuteCountdown', 'optLogsMinuteCountdown', 'optDrilldownMinuteCountdown'].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) {
                     el.textContent = label;
@@ -21054,7 +21172,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 };
             });
             const canPan = maxOffset > 0;
-            window._optChartState = { W, H, padL, padR, plotW, pTop, pBot, qTop, qBot, n, cols, canPan };
+            window._optChartState = { W, H, padL, padR, plotW, pTop, pBot, qTop, qBot, n, cols, canPan, undSym };
             const cursorStyle = (window._optPanState.dragState.active) ? 'grabbing' : (canPan ? 'grab' : 'crosshair');
 
             return `
@@ -21117,11 +21235,25 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     ${pnlSegments}
                     ${lastValidPnlIdx >= 0 ? `<circle cx="${xAt(lastValidPnlIdx).toFixed(1)}" cy="${yPnl(lastPnlD).toFixed(1)}" r="4" fill="${lastPnlColor}" stroke="#020617" stroke-width="1.2" />` : ''}
 
-                    <!-- Interactive Crosshair Layer -->
-                    <line id="optHoverLine" x1="0" y1="${pTop}" x2="0" y2="${qBot}" stroke="#e2e8f0" stroke-opacity="0.45" stroke-dasharray="2,2" stroke-width="1" class="hidden" />
-                    <circle id="optHoverDotP" cx="0" cy="0" r="4" fill="#22d3ee" stroke="#020617" stroke-width="1.5" class="hidden" />
-                    <circle id="optHoverDotStk" cx="0" cy="0" r="3.8" fill="#c084fc" stroke="#020617" stroke-width="1.5" class="hidden" />
-                    <circle id="optHoverDotPnl" cx="0" cy="0" r="4" fill="#f8fafc" stroke="#020617" stroke-width="1.5" class="hidden" />
+                    <!-- Interactive Crosshair & Inline Value Popouts Layer -->
+                    <g id="optHoverGroup" style="display:none; pointer-events:none;">
+                        <line id="optHoverLine" x1="0" y1="${pTop}" x2="0" y2="${qBot}" stroke="#f8fafc" stroke-opacity="0.75" stroke-dasharray="3,2" stroke-width="1.2" />
+                        <rect id="optHoverTimeBg" x="0" y="${qBot + 4}" width="64" height="16" rx="3" fill="#0f172a" stroke="#38bdf8" stroke-width="0.9" />
+                        <text id="optHoverTimeTxt" x="0" y="${qBot + 15}" text-anchor="middle" fill="#e0f2fe" font-size="8.5" font-family="monospace" font-weight="700"></text>
+
+                        <circle id="optHoverDotP" cx="0" cy="0" r="4" fill="#22d3ee" stroke="#020617" stroke-width="1.5" />
+                        <circle id="optHoverDotStk" cx="0" cy="0" r="3.8" fill="#c084fc" stroke="#020617" stroke-width="1.5" />
+                        <circle id="optHoverDotPnl" cx="0" cy="0" r="4" fill="#f8fafc" stroke="#020617" stroke-width="1.5" />
+
+                        <rect id="optTagOptBg" x="0" y="${pTop + 3}" width="72" height="16" rx="3" fill="#020617" fill-opacity="0.92" stroke="#22d3ee" stroke-width="0.85" />
+                        <text id="optTagOptTxt" x="0" y="${pTop + 14}" fill="#cffafe" font-size="8.4" font-family="monospace" font-weight="600"></text>
+
+                        <rect id="optTagStkBg" x="0" y="${pTop + 22}" width="84" height="16" rx="3" fill="#020617" fill-opacity="0.92" stroke="#c084fc" stroke-width="0.85" />
+                        <text id="optTagStkTxt" x="0" y="${pTop + 33}" fill="#f3e8ff" font-size="8.4" font-family="monospace" font-weight="600"></text>
+
+                        <rect id="optTagPnlBg" x="0" y="${qTop + 6}" width="110" height="16" rx="3" fill="#020617" fill-opacity="0.92" stroke="#10b981" stroke-width="0.85" />
+                        <text id="optTagPnlTxt" x="0" y="${qTop + 17}" fill="#a7f3d0" font-size="8.4" font-family="monospace" font-weight="600"></text>
+                    </g>
 
                     <rect id="optHoverOverlay" x="${padL}" y="${pTop}" width="${plotW}" height="${qBot - pTop}" fill="transparent" style="cursor: ${cursorStyle};" />
                 </svg>
@@ -21205,48 +21337,150 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const col = st.cols[idx];
             if (!col || !col.pt) return;
             const pt = col.pt;
+            const W = st.W || 740;
+            const padL = st.padL ?? 56;
+            const padR = st.padR ?? 62;
+            const plotW = st.plotW ?? (W - padL - padR);
+            const pTop = st.pTop ?? 26;
+            const pBot = st.pBot ?? 142;
+            const qTop = st.qTop ?? 176;
+            const qBot = st.qBot ?? 272;
             const cx = col.x.toFixed(1);
 
+            const grp = document.getElementById('optHoverGroup');
             const line = document.getElementById('optHoverLine');
             const dotP = document.getElementById('optHoverDotP');
             const dotS = document.getElementById('optHoverDotStk');
             const dotQ = document.getElementById('optHoverDotPnl');
             const readout = document.getElementById('optChartHoverReadout');
 
-            if (line) { line.setAttribute('x1', cx); line.setAttribute('x2', cx); line.classList.remove('hidden'); }
-            if (dotP) {
-                if (col.yPrice !== null) {
-                    dotP.setAttribute('cx', cx);
-                    dotP.setAttribute('cy', col.yPrice.toFixed(1));
-                    dotP.classList.remove('hidden');
-                } else {
-                    dotP.classList.add('hidden');
+            const optVal = safeNum(pt.price);
+            const stkVal = safeNum(pt.stock_price);
+
+            if (grp) {
+                grp.style.display = 'inline';
+                if (line) {
+                    line.setAttribute('x1', cx);
+                    line.setAttribute('x2', cx);
                 }
-            }
-            if (dotS) {
-                if (col.yStock !== null) {
-                    dotS.setAttribute('cx', cx);
-                    dotS.setAttribute('cy', col.yStock.toFixed(1));
-                    dotS.classList.remove('hidden');
-                } else {
-                    dotS.classList.add('hidden');
+
+                // Bottom X-axis hovered timestamp pill
+                const tBg = document.getElementById('optHoverTimeBg');
+                const tTxt = document.getElementById('optHoverTimeTxt');
+                const ptIso = pt.timestamp || pt.minute_utc || '';
+                const shortDate = fmtShortDateOnly(ptIso);
+                const shortClk = fmtClockShort(ptIso);
+                const timeLbl = (shortDate && shortDate !== '--') ? `${shortDate} ${shortClk}` : shortClk;
+                const pillW = Math.max(44, timeLbl.length * 5.6 + 12);
+                const pillX = Math.max(4, Math.min(W - pillW - 4, col.x - pillW / 2));
+                if (tBg) {
+                    tBg.setAttribute('x', pillX.toFixed(1));
+                    tBg.setAttribute('width', pillW.toFixed(1));
                 }
-            }
-            if (dotQ) {
-                if (col.yPnl !== null) {
-                    dotQ.setAttribute('cx', cx);
-                    dotQ.setAttribute('cy', col.yPnl.toFixed(1));
-                    dotQ.setAttribute('fill', (pt.pnl_dollars ?? 0) >= 0 ? '#10b981' : '#f43f5e');
-                    dotQ.classList.remove('hidden');
+                if (tTxt) {
+                    tTxt.setAttribute('x', (pillX + pillW / 2).toFixed(1));
+                    tTxt.textContent = timeLbl;
+                }
+
+                // Crosshair dots
+                if (dotP) {
+                    if (col.yPrice !== null) {
+                        dotP.setAttribute('cx', cx);
+                        dotP.setAttribute('cy', col.yPrice.toFixed(1));
+                        dotP.style.display = 'inline';
+                    } else {
+                        dotP.style.display = 'none';
+                    }
+                }
+                if (dotS) {
+                    if (col.yStock !== null) {
+                        dotS.setAttribute('cx', cx);
+                        dotS.setAttribute('cy', col.yStock.toFixed(1));
+                        dotS.style.display = 'inline';
+                    } else {
+                        dotS.style.display = 'none';
+                    }
+                }
+                if (dotQ) {
+                    if (col.yPnl !== null) {
+                        dotQ.setAttribute('cx', cx);
+                        dotQ.setAttribute('cy', col.yPnl.toFixed(1));
+                        dotQ.setAttribute('fill', (pt.pnl_dollars ?? 0) >= 0 ? '#10b981' : '#f43f5e');
+                        dotQ.style.display = 'inline';
+                    } else {
+                        dotQ.style.display = 'none';
+                    }
+                }
+
+                // Inline floating value popout badges with edge-flip and vertical de-collision
+                const placeLeft = col.x > (padL + plotW * 0.62);
+                const placeTag = (bgId, txtId, anchorY, textStr, strokeCol, fillCol) => {
+                    const bg = document.getElementById(bgId);
+                    const tx = document.getElementById(txtId);
+                    if (!bg || !tx) return;
+                    if (!textStr || anchorY === null || anchorY === undefined || Number.isNaN(anchorY)) {
+                        bg.style.display = 'none';
+                        tx.style.display = 'none';
+                        return;
+                    }
+                    bg.style.display = 'inline';
+                    tx.style.display = 'inline';
+                    const boxW = Math.max(54, textStr.length * 5.4 + 12);
+                    const bx = placeLeft
+                        ? Math.max(padL + 3, col.x - boxW - 8)
+                        : Math.min(W - padR - boxW - 3, col.x + 8);
+                    bg.setAttribute('x', bx.toFixed(1));
+                    bg.setAttribute('y', anchorY.toFixed(1));
+                    bg.setAttribute('width', boxW.toFixed(1));
+                    bg.setAttribute('stroke', strokeCol || '#475569');
+                    tx.setAttribute('x', (bx + 6).toFixed(1));
+                    tx.setAttribute('y', (anchorY + 11).toFixed(1));
+                    if (fillCol) tx.setAttribute('fill', fillCol);
+                    tx.textContent = textStr;
+                };
+
+                const undSym = st.undSym || 'STK';
+                const optLbl = (optVal !== null && col.yPrice !== null) ? `Opt $${optVal.toFixed(2)}` : '';
+                const stkLbl = (stkVal !== null && col.yStock !== null) ? `${undSym} $${stkVal.toFixed(2)}` : '';
+
+                const minTopY = pTop + 3;
+                const maxTopY = pBot - 19;
+                let yOptTag = (optLbl && col.yPrice !== null) ? Math.max(minTopY, Math.min(maxTopY, col.yPrice - 8)) : null;
+                let yStkTag = (stkLbl && col.yStock !== null) ? Math.max(minTopY, Math.min(maxTopY, col.yStock - 8)) : null;
+
+                if (yOptTag !== null && yStkTag !== null && Math.abs(yOptTag - yStkTag) < 18) {
+                    const gap = 19;
+                    const midY = (yOptTag + yStkTag) / 2;
+                    const hiY = Math.max(minTopY, Math.min(maxTopY - gap, midY - gap / 2));
+                    const loY = hiY + gap;
+                    if (col.yPrice <= col.yStock) {
+                        yOptTag = hiY;
+                        yStkTag = loY;
+                    } else {
+                        yStkTag = hiY;
+                        yOptTag = loY;
+                    }
+                }
+
+                placeTag('optTagOptBg', 'optTagOptTxt', yOptTag, optLbl, '#22d3ee', '#cffafe');
+                placeTag('optTagStkBg', 'optTagStkTxt', yStkTag, stkLbl, '#c084fc', '#f3e8ff');
+
+                if (!pt.pre_entry && col.yPnl !== null) {
+                    const dPnl = safeNum(pt.pnl_dollars) ?? 0;
+                    const pPnl = safeNum(pt.pnl_pct) ?? 0;
+                    const pnlPos = dPnl >= 0;
+                    const pnlLbl = `P/L ${fmtSignedDollars(dPnl)} (${pPnl >= 0 ? '+' : ''}${pPnl.toFixed(1)}%)`;
+                    const yPnlTag = Math.max(qTop + 3, Math.min(qBot - 19, col.yPnl - 8));
+                    placeTag('optTagPnlBg', 'optTagPnlTxt', yPnlTag, pnlLbl, pnlPos ? '#10b981' : '#f43f5e', pnlPos ? '#a7f3d0' : '#fecdd3');
+                } else if (pt.pre_entry) {
+                    placeTag('optTagPnlBg', 'optTagPnlTxt', qTop + 6, 'PRE-ENTRY', '#10b981', '#6ee7b7');
                 } else {
-                    dotQ.classList.add('hidden');
+                    placeTag('optTagPnlBg', 'optTagPnlTxt', null, '', '#475569', '#cbd5e1');
                 }
             }
 
             if (readout) {
-                const stkVal = safeNum(pt.stock_price);
                 const stkPart = stkVal !== null ? ` · Stock <strong class="text-purple-300">$${stkVal.toFixed(2)}</strong>` : '';
-                const optVal = safeNum(pt.price);
                 const optPart = optVal !== null ? ` · Opt <strong class="text-cyan-300">$${optVal.toFixed(2)}</strong>` : ' · Opt <span class="text-slate-500">--</span>';
                 const hoverTsFull = fmtShortLocalTsWithYear(pt.timestamp || pt.minute_utc);
                 if (pt.pre_entry) {
@@ -21264,15 +21498,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function clearOptionChartHighlight() {
-            const line = document.getElementById('optHoverLine');
-            const dotP = document.getElementById('optHoverDotP');
-            const dotS = document.getElementById('optHoverDotStk');
-            const dotQ = document.getElementById('optHoverDotPnl');
+            const grp = document.getElementById('optHoverGroup');
             const readout = document.getElementById('optChartHoverReadout');
-            if (line) line.classList.add('hidden');
-            if (dotP) dotP.classList.add('hidden');
-            if (dotS) dotS.classList.add('hidden');
-            if (dotQ) dotQ.classList.add('hidden');
+            if (grp) grp.style.display = 'none';
             if (readout) readout.innerHTML = `<span class="text-slate-500">Hover over any minute on the chart to inspect exact option price, underlying stock price, and P/L ($ and %).</span>`;
         }
 
@@ -24100,6 +24328,8 @@ class AdminCliProvider:
                     getattr(ob, "last_error_detail", None) if ob else None
                 ),
                 "cached_contracts": len(self.coordinator.option_chain_cache),
+                "oversold_lookback_minutes": OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
+                "bounce_rsi_max": OPTION_BUY_BOUNCE_RSI_MAX,
                 "history_summary": (
                     self.coordinator.option_history.get_buyer_summary()
                     if hasattr(self.coordinator, "option_history")
