@@ -15841,7 +15841,6 @@ LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         class="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 rounded-md text-[11px] font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition"
                     >Show</button>
                 </div>
-                <p class="text-[11px] text-slate-500">Configured via <code class="text-slate-400">[dashboard] password</code> in <code class="text-slate-400">lib/parms.ini</code>.</p>
             </div>
 
             <button
