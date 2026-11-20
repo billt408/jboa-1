@@ -17803,6 +17803,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let chartCaptureEnabledState = null;
         let latestData = null;
         let nextMinuteUtc = null;
+        let serverClockOffsetMs = 0;
         let countdownTimer = null;
         let expandedSymbols = new Set();
         let displayTzIana = '__DISPLAY_TZ_IANA__';
@@ -18108,13 +18109,27 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function formatCountdownSeconds(sec) {
+            if (sec >= 3600) {
+                const h = Math.floor(sec / 3600);
+                const m = Math.floor((sec % 3600) / 60);
+                return `${h}h ${m}m`;
+            }
+            if (sec >= 120) {
+                const m = Math.floor(sec / 60);
+                const s = sec % 60;
+                return `${m}m ${s}s`;
+            }
+            return `${sec}s`;
+        }
+
         function updateCountdown() {
-            if (!nextMinuteUtc) return;
-            const now = new Date();
-            const diff = Math.max(0, Math.floor((nextMinuteUtc - now) / 1000));
+            if (!nextMinuteUtc || isNaN(nextMinuteUtc.getTime())) return;
+            const serverNowMs = Date.now() - serverClockOffsetMs;
+            const diff = Math.max(0, Math.ceil((nextMinuteUtc.getTime() - serverNowMs) / 1000));
             const el = document.getElementById('minuteCountdown');
             if (el) {
-                el.textContent = `${diff}s`;
+                el.textContent = formatCountdownSeconds(diff);
                 el.className = diff <= 5 ? 'mono font-semibold text-rose-400 animate-pulse' : 'mono font-semibold text-amber-300';
             }
         }
@@ -18176,8 +18191,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (m.display_timezone) syncDisplayTimezoneMeta(m.display_timezone);
             document.getElementById('pendingQueueSize').textContent = m.pending_queue_size ?? 0;
 
-            if (m.next_due_minute_utc) {
-                nextMinuteUtc = new Date(m.next_due_minute_utc);
+            if (m.server_time_utc) {
+                const srvMs = new Date(m.server_time_utc).getTime();
+                if (!isNaN(srvMs)) {
+                    serverClockOffsetMs = Date.now() - srvMs;
+                }
+            }
+            const nextTargetIso = m.next_finalize_utc || m.next_due_minute_utc;
+            if (nextTargetIso) {
+                nextMinuteUtc = new Date(nextTargetIso);
                 updateCountdown();
             }
 
@@ -24189,6 +24211,10 @@ class AdminCliProvider:
                 "unique_symbols_count": len(self.coordinator.symbols),
                 "total_stream_feeds": len(self.coordinator.kinematics_history),
                 "next_due_minute_utc": self.coordinator.next_minute.isoformat(),
+                "next_finalize_utc": (
+                    self.coordinator.next_minute + MINUTE + self.coordinator.delay
+                ).isoformat(),
+                "server_time_utc": datetime.now(UTC).isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
                 "loaded_providers": [
                     k
