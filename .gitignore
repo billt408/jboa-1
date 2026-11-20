@@ -11,6 +11,7 @@ src/logs/*
 src/logs_backup*/*
 src/logs_backup*/.gitkeep
 OLDLOGS/*
+OLDLOGS.BACKUP/*
 src/certs/*
 src/ngrok/ngrok.yml
 src/.build_venv/*
