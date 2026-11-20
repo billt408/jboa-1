@@ -37,6 +37,7 @@ import asyncio
 import base64
 import configparser
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -1814,7 +1815,9 @@ class TastytradeClient:
         return orders[: int(limit or 50)]
 
 
-def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL"):
+def get_pruned_option_chain_tastytrade(
+    underlying_ticker, tt_client, right="CALL", expiration_date=None
+):
     """Fetch option chain from Tastytrade Prod matching getOptionsContracts semantics."""
     if not underlying_ticker or tt_client is None:
         return None, json.dumps(
@@ -1825,8 +1828,16 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
     if target_right not in {"CALL", "PUT"}:
         target_right = "CALL"
 
-    target_friday = _three_fridays_away(datetime.now(MARKET_TZ).date())
-    expiration_date = target_friday.strftime("%Y-%m-%d")
+    if expiration_date and str(expiration_date).strip():
+        expiration_date = str(expiration_date).strip()[:10]
+        try:
+            target_friday = datetime.strptime(expiration_date, "%Y-%m-%d").date()
+        except ValueError:
+            target_friday = _three_fridays_away(datetime.now(MARKET_TZ).date())
+            expiration_date = target_friday.strftime("%Y-%m-%d")
+    else:
+        target_friday = _three_fridays_away(datetime.now(MARKET_TZ).date())
+        expiration_date = target_friday.strftime("%Y-%m-%d")
 
     nested = tt_client.get_option_chain_nested(ticker)
     expirations = (nested or {}).get("expirations") or []
@@ -1913,19 +1924,57 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
         [s for s, _ in strike_entries], is_option=True
     )
 
+    def _raw_quote_num(raw_dict, *keys):
+        if not isinstance(raw_dict, dict):
+            return None
+        for k in keys:
+            if raw_dict.get(k) is not None:
+                v = _opt_safe_float(raw_dict.get(k), None)
+                if v is not None:
+                    return v
+        return None
+
     parsed_contracts = []
     for compact_sym, strike_price in strike_entries:
         q = opt_quotes.get(compact_sym)
+        raw_q = getattr(q, "raw", None) if q is not None else None
         bid_val = (_opt_safe_float(q.bid_price, 0.0) or 0.0) if q is not None else 0.0
         ask_val = (_opt_safe_float(q.ask_price, 0.0) or 0.0) if q is not None else 0.0
+        mid_val = (
+            round((bid_val + ask_val) / 2.0, 4)
+            if (bid_val > 0 and ask_val > 0)
+            else (_opt_safe_float(getattr(q, "mid_price", None), None) if q is not None else None)
+        )
+        spread_pct = (
+            round(((ask_val - bid_val) / mid_val) * 100.0, 2)
+            if (mid_val is not None and mid_val > 0 and ask_val >= bid_val)
+            else None
+        )
+        last_px = _opt_safe_float(getattr(q, "last_price", None), None) if q is not None else None
+        delta_v = _raw_quote_num(raw_q, "delta")
+        gamma_v = _raw_quote_num(raw_q, "gamma")
+        theta_v = _raw_quote_num(raw_q, "theta")
+        vega_v = _raw_quote_num(raw_q, "vega")
+        iv_v = _raw_quote_num(raw_q, "volatility", "implied-volatility", "implied_volatility", "iv")
+        vol_v = _raw_quote_num(raw_q, "volume")
+        oi_v = _raw_quote_num(raw_q, "open-interest", "open_interest", "openInterest")
+
         parsed_contracts.append(
             {
                 "contract": compact_sym,
                 "strike": strike_price,
                 "bid": bid_val,
                 "ask": ask_val,
-                "gamma": 0,
-                "theta": 0,
+                "mid": round(mid_val, 4) if mid_val is not None else None,
+                "spread_pct": spread_pct,
+                "last_price": round(last_px, 4) if last_px is not None else None,
+                "delta": round(delta_v, 4) if delta_v is not None else None,
+                "gamma": round(gamma_v, 4) if gamma_v else 0,
+                "theta": round(theta_v, 4) if theta_v else 0,
+                "vega": round(vega_v, 4) if vega_v is not None else None,
+                "iv": round(iv_v, 4) if iv_v is not None else None,
+                "volume": int(vol_v) if vol_v is not None else None,
+                "open_interest": int(oi_v) if oi_v is not None else None,
                 "distance_from_spot": (
                     abs(strike_price - stk_ask_price)
                     if stk_ask_price > 0
@@ -1963,6 +2012,7 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
                     selected_contract = c
                     break
 
+    now_utc = datetime.now(UTC)
     payload_json = json.dumps(
         {
             "underlying": ticker,
@@ -1970,7 +2020,9 @@ def get_pruned_option_chain_tastytrade(underlying_ticker, tt_client, right="CALL
             "expiration_date": str(
                 chosen_exp.get("expiration-date") or expiration_date
             ),
-            "timestamp": format_display_ts(datetime.now(UTC), "%Y-%m-%d %H:%M:%S %Z"),
+            "option_type": target_right.lower(),
+            "timestamp": format_display_ts(now_utc, "%Y-%m-%d %H:%M:%S %Z"),
+            "utc_timestamp": now_utc.isoformat(),
             "spot_ask_price": stk_ask_price,
             "chain_snapshot": pruned_chain,
         },
@@ -11181,6 +11233,153 @@ class AlpacaOptionSeller:
         self.peak_profit_state_by_symbol = {}
         self.stop_loss_state_by_symbol = {}
         self.attempted_minutes = set()
+        self._exit_chain_client = None
+        self._exit_chain_dry_captured = set()
+
+    def _resolve_exit_chain_client(self, chain_prov):
+        if self._exit_chain_client is not None:
+            return self._exit_chain_client
+        if chain_prov == "tastytrade":
+            if isinstance(self.client, TastytradeClient) and self.client.has_env_credentials("prod"):
+                self._exit_chain_client = self.client
+                return self._exit_chain_client
+            if isinstance(self.option_data_client, TastytradeClient):
+                self._exit_chain_client = self.option_data_client
+                return self._exit_chain_client
+            self._exit_chain_client = _build_tastytrade_quote_client(self.credentials)
+            return self._exit_chain_client
+        if self.stock_data_client is not None and not isinstance(
+            self.stock_data_client, TastytradeClient
+        ):
+            self._exit_chain_client = self.stock_data_client
+            return self._exit_chain_client
+        self._exit_chain_client = build_option_chain_client(self.credentials)
+        return self._exit_chain_client
+
+    def _capture_exit_option_chain_sync(
+        self, underlying, contract_sym, trigger_kind, rsi, sell_dt
+    ):
+        is_opt, parsed_und, parsed_right, _, parsed_expiry = _parse_occ_contract(
+            contract_sym
+        )
+        if not is_opt or not parsed_expiry:
+            return None
+        und = str(underlying or parsed_und or "").strip().upper()
+        if not und:
+            return None
+        chain_prov = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+        chain_client = self._resolve_exit_chain_client(chain_prov)
+        if chain_client is None:
+            return None
+
+        eff_right = "PUT" if parsed_right == "PUT" else "CALL"
+        if chain_prov == "tastytrade":
+            raw_res = get_pruned_option_chain_tastytrade(
+                und,
+                chain_client,
+                right=eff_right,
+                expiration_date=parsed_expiry,
+            )
+        else:
+            api_key = self.credentials.get("alpaca_key")
+            api_secret = self.credentials.get("alpaca_secret")
+            if not api_key or not api_secret:
+                return None
+            try:
+                sig_params = inspect.signature(get_pruned_option_chain).parameters
+            except (TypeError, ValueError):
+                sig_params = {}
+            kwargs = {}
+            if "expiration_date" in sig_params:
+                kwargs["expiration_date"] = parsed_expiry
+            if "option_type" in sig_params:
+                kwargs["option_type"] = eff_right.lower()
+            raw_res = get_pruned_option_chain(
+                und, api_key, api_secret, chain_client, **kwargs
+            )
+
+        _, clean_payload = _unpack_pruned_option_chain_result(raw_res)
+        if not isinstance(clean_payload, dict) or clean_payload.get("error"):
+            return None
+
+        enriched_payload = dict(clean_payload)
+        enriched_payload["exit_contract"] = str(contract_sym or "").strip().upper()
+        enriched_payload["exit_trigger"] = str(trigger_kind or "sell").strip()
+        enriched_payload["sell_utc_timestamp"] = as_utc(sell_dt).isoformat()
+
+        directory = LOG_ROOT / "optionchains"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_und = "".join(c if c.isalnum() or c in "-_." else "_" for c in und)
+        safe_trig = "".join(
+            c if c.isalnum() or c in "-_" else "_"
+            for c in str(trigger_kind or "sell")
+        ).upper()
+        dt_disp = as_display_tz(sell_dt)
+        tz_lbl = "".join(c for c in display_tz_abbr(dt_disp) if c.isalnum()) or "TZ"
+        stamp = f"{dt_disp.strftime('%Y%m%dT%H%M%S')}_{tz_lbl}"
+        rsi_val = _opt_safe_float(rsi, None)
+        rsi_tag = f"{rsi_val:.2f}" if rsi_val is not None else "na"
+        path = (
+            directory
+            / f"optionchain-OPTION_SELLER-{chain_prov.upper()}-{safe_und}-SELL-{safe_trig}-rsi{rsi_tag}-{stamp}-{uuid4().hex[:6]}.json"
+        )
+        path.write_text(
+            json.dumps(enriched_payload, indent=2, default=str), encoding="utf-8"
+        )
+        self.logger.info(
+            "OPTION_SELL_CHAIN_CAPTURED provider=%s underlying=%s contract=%s trigger=%s expiry=%s file=%s",
+            chain_prov,
+            und,
+            contract_sym,
+            trigger_kind,
+            parsed_expiry,
+            path.name,
+        )
+        return path
+
+    async def _capture_exit_option_chain_async(
+        self, underlying, contract_sym, trigger_kind, rsi, sell_dt
+    ):
+        try:
+            await asyncio.to_thread(
+                self._capture_exit_option_chain_sync,
+                underlying,
+                contract_sym,
+                trigger_kind,
+                rsi,
+                sell_dt,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "OPTION_SELL_CHAIN_CAPTURE_FAILED underlying=%s contract=%s trigger=%s error_type=%s detail=%s",
+                underlying,
+                contract_sym,
+                trigger_kind,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _schedule_exit_option_chain_capture(
+        self, underlying, contract_sym, trigger_kind, rsi, sell_dt, is_dry_run=False
+    ):
+        sym = str(contract_sym or "").strip().upper()
+        if not sym or not _is_option_contract_symbol(sym):
+            return
+        if is_dry_run:
+            if sym in self._exit_chain_dry_captured:
+                return
+            if len(self._exit_chain_dry_captured) > 500:
+                self._exit_chain_dry_captured.clear()
+            self._exit_chain_dry_captured.add(sym)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._capture_exit_option_chain_async(
+                    underlying, sym, trigger_kind, rsi, sell_dt
+                )
+            )
+        except RuntimeError:
+            pass
 
     @staticmethod
     def _extract_underlying(pos, pos_sym, is_option):
@@ -12315,6 +12514,14 @@ class AlpacaOptionSeller:
                     f"QUALIFIED_DRY_RUN({trigger_kind})",
                     reason,
                 )
+                self._schedule_exit_option_chain_capture(
+                    underlying,
+                    pos_sym,
+                    trigger_kind,
+                    entry.get("rsi") if entry else None,
+                    now,
+                    is_dry_run=True,
+                )
                 self.logger.info(
                     "OPTION_SELL_DRY_RUN tx_provider=%s dry_mode=%s kind=%s order_type=%s bid=%s ask=%s "
                     "limit_price=%s total_sale=%s provider=%s underlying=%s symbol=%s "
@@ -12495,6 +12702,14 @@ class AlpacaOptionSeller:
                     pnl_pct,
                     f"QUALIFIED_SUBMITTED({trigger_kind})",
                     reason,
+                )
+                self._schedule_exit_option_chain_capture(
+                    underlying,
+                    pos_sym,
+                    trigger_kind,
+                    entry.get("rsi") if entry else None,
+                    exec_at,
+                    is_dry_run=False,
                 )
                 self.logger.info(
                     "OPTION_SELL_SUBMITTED kind=%s order_type=%s bid=%s ask=%s "
@@ -16065,10 +16280,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     </div>
                                 </div>
                             </div>
-                            <div class="pt-2 border-t border-slate-800/70 flex items-center justify-between gap-2">
-                                <button id="btnDetailBuySellLog" type="button" onclick="openOptionLogsPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="View Buy/Sell Decision Log for this symbol">
-                                    Buy/Sell Log
-                                </button>
+                            <div class="pt-2 border-t border-slate-800/70 flex items-center justify-between gap-2 flex-wrap">
+                                <div class="flex items-center gap-1.5 flex-wrap">
+                                    <button id="btnDetailBuySellLog" type="button" onclick="openOptionLogsPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="View Buy/Sell Decision Log for this symbol">
+                                        Buy/Sell Log
+                                    </button>
+                                    <button id="btnDetailStrikeAnalyzer" type="button" onclick="openStrikeAnalysisPanel(selectedSymbol || '')" class="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 hover:text-white border border-indigo-500/40 text-[11px] font-semibold mono transition flex items-center gap-1.5" title="Compare surrounding option strikes (-2 ITM to +4 OTM) across sell horizons">
+                                        Strike Analyzer
+                                    </button>
+                                </div>
                                 <span class="text-[10px] text-slate-500 mono">1m Option Analysis</span>
                             </div>
                         </div>
@@ -16299,6 +16519,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </button>
                             </div>
                         </div>
+
+                        <div onclick="openStrikeAnalysisPanel('')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openStrikeAnalysisPanel('');}" class="group cursor-pointer flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-indigo-500/50 hover:bg-slate-900/80 transition gap-2">
+                            <span class="text-slate-300 group-hover:text-white font-medium flex items-center gap-1.5">
+                                Option Chain Strike Analyzer
+                            </span>
+                            <span class="text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-semibold mono">Analyze &#9656;</span>
+                        </div>
                     </div>
 
                     <div class="pt-2 border-t border-slate-800/80">
@@ -16454,6 +16681,38 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
             <div id="optLogsPane" class="flex-1 min-h-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
                 <div class="text-xs text-slate-500 text-center py-12">Loading buy/sell logs...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Option Chain Strike Selection & Exit Horizon Analyzer Modal -->
+    <div id="strikeAnalysisModal" onclick="if(event.target===this) closeStrikeAnalysisModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-7xl w-full h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-indigo-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">Option Chain Strike Selection &amp; Exit Horizon Analyzer</h3>
+                        <span id="strikeModalBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 BUY signals</span>
+                    </div>
+                    <p id="strikeModalSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Compares -2 ITM through +4 OTM strikes captured at BUY signals across +5m, +10m, +15m, +30m, +60m, Actual Exit &amp; Peak</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <input id="strikeSymbolInput" type="text" placeholder="Symbol (all)" oninput="onStrikeSymbolInput(this.value)" onkeydown="if(event.key==='Enter'){event.preventDefault();fetchStrikeAnalysis(false);}" class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] text-white uppercase mono w-28 focus:outline-none focus:border-indigo-500" />
+                    <select id="strikeLimitSelect" onchange="onStrikeLimitChange(this.value)" class="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] text-slate-200 mono focus:outline-none focus:border-indigo-500">
+                        <option value="15">Last 15</option>
+                        <option value="25" selected>Last 25</option>
+                        <option value="50">Last 50</option>
+                        <option value="100">Last 100</option>
+                    </select>
+                    <button id="btnStrikeReanalyze" type="button" onclick="fetchStrikeAnalysis(true)" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                        Re-analyze
+                    </button>
+                    <button type="button" onclick="closeStrikeAnalysisModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div id="strikeAnalysisPane" class="flex-1 min-h-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
+                <div class="text-xs text-slate-500 text-center py-12 mono">Select Strike Analyzer to inspect option chain strike performance...</div>
             </div>
         </div>
     </div>
@@ -20264,8 +20523,389 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             })();
         }
 
+        let latestStrikeAnalysis = null;
+        let strikeAnalysisSymbolFilter = '';
+        let strikeAnalysisLimit = 25;
+        let selectedStrikeEventId = null;
+        let _strikeAbortCtrl = null;
+        let _strikeReqSeq = 0;
+        let _strikeSearchDebounce = null;
+
+        async function openStrikeAnalysisPanel(symbolFilter = '') {
+            if (typeof symbolFilter === 'string') {
+                strikeAnalysisSymbolFilter = symbolFilter.trim().toUpperCase();
+            }
+            const inp = document.getElementById('strikeSymbolInput');
+            if (inp) inp.value = strikeAnalysisSymbolFilter;
+            const limSel = document.getElementById('strikeLimitSelect');
+            if (limSel) limSel.value = String(strikeAnalysisLimit || 25);
+
+            const modal = document.getElementById('strikeAnalysisModal');
+            if (modal) modal.classList.remove('hidden');
+            await fetchStrikeAnalysis(false);
+        }
+
+        function closeStrikeAnalysisModal() {
+            if (_strikeSearchDebounce) {
+                clearTimeout(_strikeSearchDebounce);
+                _strikeSearchDebounce = null;
+            }
+            if (_strikeAbortCtrl) {
+                try { _strikeAbortCtrl.abort(); } catch (_) {}
+                _strikeAbortCtrl = null;
+            }
+            const modal = document.getElementById('strikeAnalysisModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function onStrikeSymbolInput(val) {
+            strikeAnalysisSymbolFilter = String(val || '').trim().toUpperCase();
+            if (_strikeSearchDebounce) clearTimeout(_strikeSearchDebounce);
+            _strikeSearchDebounce = setTimeout(() => {
+                _strikeSearchDebounce = null;
+                fetchStrikeAnalysis(false);
+            }, 280);
+        }
+
+        function onStrikeLimitChange(val) {
+            const n = parseInt(val, 10);
+            strikeAnalysisLimit = (Number.isFinite(n) && n > 0) ? n : 25;
+            fetchStrikeAnalysis(false);
+        }
+
+        function selectStrikeEvent(evId) {
+            selectedStrikeEventId = evId;
+            renderStrikeAnalysisModal();
+        }
+
+        async function fetchStrikeAnalysis(forceRefresh = false) {
+            const pane = document.getElementById('strikeAnalysisPane');
+            const btn = document.getElementById('btnStrikeReanalyze');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = forceRefresh ? 'Analyzing...' : 'Loading...';
+            }
+            if (pane && (!latestStrikeAnalysis || forceRefresh)) {
+                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Scanning saved BUY option chains, linking trades &amp; fetching 1m option bars...</div>`;
+            }
+            if (_strikeAbortCtrl) {
+                try { _strikeAbortCtrl.abort(); } catch (_) {}
+            }
+            _strikeAbortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const reqSeq = ++_strikeReqSeq;
+            try {
+                const params = new URLSearchParams();
+                if (strikeAnalysisSymbolFilter) params.set('symbol', strikeAnalysisSymbolFilter);
+                params.set('limit', String(strikeAnalysisLimit || 25));
+                if (forceRefresh) params.set('force', '1');
+                params.set('_ts', String(Date.now()));
+                const fetchOpts = { cache: 'no-store' };
+                if (_strikeAbortCtrl) fetchOpts.signal = _strikeAbortCtrl.signal;
+                const res = await fetch(`/api/strike-analysis?${params.toString()}`, fetchOpts);
+                const data = await res.json();
+                if (reqSeq !== _strikeReqSeq) return;
+                if (res.ok && data && data.status === 'ok') {
+                    latestStrikeAnalysis = data;
+                    const evs = Array.isArray(data.events) ? data.events : [];
+                    if (evs.length > 0 && !evs.some(e => e.event_id === selectedStrikeEventId)) {
+                        selectedStrikeEventId = evs[0].event_id;
+                    } else if (evs.length === 0) {
+                        selectedStrikeEventId = null;
+                    }
+                    renderStrikeAnalysisModal();
+                } else if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-10 mono">Failed to run strike analysis: ${escSvg((data && data.message) || 'Unknown error')}</div>`;
+                }
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-10 mono">Strike analysis error: ${escSvg(err.message)}</div>`;
+                }
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Re-analyze';
+                }
+            }
+        }
+
+        function _fmtStrikePct(v) {
+            if (v === null || v === undefined || !Number.isFinite(Number(v))) return '<span class="text-slate-500">--</span>';
+            const n = Number(v);
+            const cls = n > 0 ? 'text-emerald-400' : (n < 0 ? 'text-rose-400' : 'text-slate-300');
+            return `<span class="font-semibold ${cls}">${n > 0 ? '+' : ''}${n.toFixed(1)}%</span>`;
+        }
+
+        function _fmtStrikeNum(v, decimals = 2, prefix = '') {
+            if (v === null || v === undefined || !Number.isFinite(Number(v))) return '--';
+            return `${prefix}${Number(v).toFixed(decimals)}`;
+        }
+
+        function _fmtStrikeCell(hObj) {
+            if (!hObj || hObj.ret_pct === null || hObj.ret_pct === undefined) {
+                return `<span class="text-slate-500">--</span>`;
+            }
+            const pct = Number(hObj.ret_pct);
+            const cls = pct > 0 ? 'text-emerald-400' : (pct < 0 ? 'text-rose-400' : 'text-slate-300');
+            const pxTxt = Number.isFinite(Number(hObj.price)) ? `@${Number(hObj.price).toFixed(2)}` : '';
+            return `<div class="font-semibold ${cls}">${pct > 0 ? '+' : ''}${pct.toFixed(1)}%</div>${pxTxt ? `<div class="text-[9px] text-slate-500">${pxTxt}</div>` : ''}`;
+        }
+
+        function renderStrikeAnalysisModal() {
+            const pane = document.getElementById('strikeAnalysisPane');
+            const badge = document.getElementById('strikeModalBadge');
+            const sub = document.getElementById('strikeModalSubtitle');
+            if (!pane) return;
+
+            const data = latestStrikeAnalysis || {};
+            const events = Array.isArray(data.events) ? data.events : [];
+            const summary = data.summary || {};
+            const byRank = Array.isArray(summary.by_rank) ? summary.by_rank : [];
+
+            if (badge) {
+                badge.textContent = `${events.length} BUY signal${events.length === 1 ? '' : 's'}`;
+            }
+            if (sub) {
+                const symLbl = data.symbol_filter ? `Symbol: ${data.symbol_filter}` : 'All Symbols';
+                const barInfo = data.bars_note ? ` · ${data.bars_note}` : '';
+                sub.textContent = `${symLbl} · ${summary.executed_signals || 0} executed trades matched · ${summary.exit_chains_matched || 0} exit chains captured${barInfo}`;
+            }
+
+            if (events.length === 0) {
+                pane.innerHTML = `
+                    <div class="flex-1 flex flex-col items-center justify-center text-center p-8 space-y-2">
+                        <div class="text-sm font-semibold text-slate-300">No BUY Option Chain Snapshots Found</div>
+                        <p class="text-xs text-slate-400 max-w-lg">
+                            Option chain snapshots saved under <code class="mono text-indigo-300">logs/optionchains/*-BUY-*.json</code>
+                            ${data.symbol_filter ? `for <strong class="text-white">${escSvg(data.symbol_filter)}</strong>` : ''} will appear here for multi-strike return comparison.
+                        </p>
+                    </div>`;
+                return;
+            }
+
+            const curRow = byRank.find(r => r.otm_rank === 2) || null;
+            const best15 = summary.best_rank_15m;
+            const bestAct = summary.best_rank_actual;
+            const insightParts = [];
+            if (curRow && curRow.avg_ret_15m !== null && curRow.avg_ret_15m !== undefined) {
+                insightParts.push(`Current +2 OTM avg +15m: <strong class="${curRow.avg_ret_15m >= 0 ? 'text-emerald-300' : 'text-rose-300'}">${curRow.avg_ret_15m >= 0 ? '+' : ''}${Number(curRow.avg_ret_15m).toFixed(1)}%</strong> (${curRow.win_rate_15m !== null ? `${Number(curRow.win_rate_15m).toFixed(0)}% win` : 'n/a'})`);
+            }
+            if (best15 && best15.label) {
+                insightParts.push(`Top +15m Strike Rank: <strong class="text-cyan-300">${escSvg(best15.label)}</strong> (<span class="${best15.avg_ret >= 0 ? 'text-emerald-300' : 'text-rose-300'}">${best15.avg_ret >= 0 ? '+' : ''}${Number(best15.avg_ret).toFixed(1)}%</span>)`);
+            }
+            if (bestAct && bestAct.label) {
+                insightParts.push(`Top Actual-Exit Rank: <strong class="text-amber-300">${escSvg(bestAct.label)}</strong> (<span class="${bestAct.avg_ret >= 0 ? 'text-emerald-300' : 'text-rose-300'}">${bestAct.avg_ret >= 0 ? '+' : ''}${Number(bestAct.avg_ret).toFixed(1)}%</span>)`);
+            }
+
+            const scoreboardRows = byRank.map(r => {
+                const isCur = r.otm_rank === 2;
+                const isBest15 = best15 && best15.otm_rank === r.otm_rank;
+                const rowBg = isCur ? 'bg-indigo-950/35 border-indigo-500/40' : 'hover:bg-slate-900/60';
+                return `
+                    <tr class="border-b border-slate-800/60 ${rowBg}">
+                        <td class="px-2.5 py-1.5 whitespace-nowrap font-semibold ${isCur ? 'text-indigo-200' : 'text-slate-200'}">
+                            ${escSvg(r.label)}
+                            ${isCur ? `<span class="ml-1 text-[9px] px-1 py-0.5 rounded bg-indigo-500/25 text-indigo-200 border border-indigo-400/40">CURRENT</span>` : ''}
+                            ${isBest15 ? `<span class="ml-1 text-[9px] px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">BEST 15m</span>` : ''}
+                        </td>
+                        <td class="px-2 py-1.5 text-right text-slate-300">${r.count || 0}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-200">${_fmtStrikeNum(r.avg_entry_ask, 2, '$')}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-300">${r.avg_spread_pct !== null && r.avg_spread_pct !== undefined ? `${Number(r.avg_spread_pct).toFixed(1)}%` : '--'}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-300">${_fmtStrikeNum(r.avg_delta, 2)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_5m)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_10m)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_15m)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_30m)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_60m)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_actual)}</td>
+                        <td class="px-2 py-1.5 text-right">${_fmtStrikePct(r.avg_ret_peak)}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-300">${r.win_rate_15m !== null && r.win_rate_15m !== undefined ? `${Number(r.win_rate_15m).toFixed(0)}%` : '--'}</td>
+                        <td class="px-2 py-1.5 text-right text-cyan-300">${r.best_count_15m || 0} / ${r.best_count_actual || 0}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const activeEv = events.find(e => e.event_id === selectedStrikeEventId) || events[0];
+            const eventListHtml = events.map(ev => {
+                const isSel = activeEv && ev.event_id === activeEv.event_id;
+                const tr = ev.matched_trade;
+                const pnlBadge = tr && tr.total_pnl_pct !== null && tr.total_pnl_pct !== undefined
+                    ? `<span class="text-[9.5px] px-1.5 py-0.5 rounded border ${tr.total_pnl_pct >= 0 ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/35' : 'bg-rose-500/15 text-rose-300 border-rose-500/35'}">${tr.total_pnl_pct >= 0 ? '+' : ''}${Number(tr.total_pnl_pct).toFixed(1)}%</span>`
+                    : `<span class="text-[9.5px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">Signal</span>`;
+                const bestTag = ev.best_rank_15m_label
+                    ? `<span class="text-cyan-300">Best 15m: ${escSvg(ev.best_rank_15m_label)}</span>`
+                    : `<span class="text-slate-500">${ev.expiry || ''}</span>`;
+                return `
+                    <button type="button" onclick="selectStrikeEvent('${escSvg(ev.event_id)}')" class="w-full text-left p-2.5 rounded-xl border transition ${isSel ? 'bg-indigo-950/50 border-indigo-500/60' : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900/70'}">
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="font-bold text-white text-xs mono">${escSvg(ev.symbol)} <span class="text-[10px] font-normal text-slate-400">RSI ${ev.rsi !== null && ev.rsi !== undefined ? Number(ev.rsi).toFixed(1) : '--'}</span></span>
+                            ${pnlBadge}
+                        </div>
+                        <div class="flex items-center justify-between gap-2 text-[10px] mono text-slate-400 mt-1">
+                            <span>${escSvg(ev.timestamp_short || ev.timestamp_display || '--')}</span>
+                            <span>${ev.spot_price ? `$${Number(ev.spot_price).toFixed(2)}` : '--'}</span>
+                        </div>
+                        <div class="flex items-center justify-between gap-2 text-[10px] mono mt-1">
+                            ${bestTag}
+                            <span class="text-slate-500">${ev.expiry || ''}</span>
+                        </div>
+                    </button>
+                `;
+            }).join('');
+
+            let detailHtml = `<div class="text-xs text-slate-500 text-center py-10 mono">Select a BUY signal on the left.</div>`;
+            if (activeEv) {
+                const kin = activeEv.kinematics || {};
+                const tr = activeEv.matched_trade || null;
+                const candRows = (Array.isArray(activeEv.candidates) ? activeEv.candidates : []).map(c => {
+                    const isPicked = !!c.is_current_pick || !!c.is_matched_contract;
+                    const isBest15 = activeEv.best_rank_15m !== null && activeEv.best_rank_15m === c.otm_rank;
+                    const isBestAct = activeEv.best_rank_actual !== null && activeEv.best_rank_actual === c.otm_rank;
+                    const h = c.horizons || {};
+                    const exitSpread = (c.exit_bid !== null && c.exit_bid !== undefined && c.exit_ask !== null && c.exit_ask !== undefined)
+                        ? `$${Number(c.exit_bid).toFixed(2)}/${Number(c.exit_ask).toFixed(2)}${c.exit_spread_pct !== null && c.exit_spread_pct !== undefined ? ` (${Number(c.exit_spread_pct).toFixed(1)}%)` : ''}`
+                        : '--';
+                    return `
+                        <tr class="border-b border-slate-800/60 ${isPicked ? 'bg-indigo-950/35' : 'hover:bg-slate-900/50'}">
+                            <td class="px-2.5 py-2 whitespace-nowrap">
+                                <span class="font-semibold ${isPicked ? 'text-indigo-200' : 'text-slate-200'}">${escSvg(c.label)}</span>
+                                ${c.is_matched_contract ? `<div class="text-[9px] text-cyan-300">BOUGHT</div>` : (isPicked ? `<div class="text-[9px] text-indigo-300">CURRENT +2</div>` : '')}
+                                ${isBest15 ? `<span class="inline-block text-[8.5px] px-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 mr-1">Best 15m</span>` : ''}
+                                ${isBestAct ? `<span class="inline-block text-[8.5px] px-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40">Best Exit</span>` : ''}
+                            </td>
+                            <td class="px-2 py-2 whitespace-nowrap text-slate-300">${escSvg(c.contract)}</td>
+                            <td class="px-2 py-2 text-right font-semibold text-white">$${Number(c.strike).toFixed(2)}</td>
+                            <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${_fmtStrikeNum(c.bid, 2, '$')} / <span class="text-white font-semibold">${_fmtStrikeNum(c.ask, 2, '$')}</span></td>
+                            <td class="px-2 py-2 text-right ${c.spread_pct > 15 ? 'text-amber-300' : 'text-slate-300'}">${c.spread_pct !== null && c.spread_pct !== undefined ? `${Number(c.spread_pct).toFixed(1)}%` : '--'}</td>
+                            <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${_fmtStrikeNum(c.delta, 2)} · ${c.iv !== null && c.iv !== undefined ? `${(Number(c.iv) * 100).toFixed(0)}%` : '--'} · ${c.open_interest ?? '--'}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['5m'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['10m'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['15m'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['30m'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['60m'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['actual'])}</td>
+                            <td class="px-2 py-2 text-right">${_fmtStrikeCell(h['peak'])}</td>
+                            <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${exitSpread}</td>
+                        </tr>
+                    `;
+                }).join('');
+
+                detailHtml = `
+                    <div class="space-y-3">
+                        <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-[11px] mono">
+                            <div class="space-y-0.5">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-sm font-bold text-white">${escSvg(activeEv.symbol)}</span>
+                                    <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">${escSvg(activeEv.timestamp_display || '--')}</span>
+                                    <span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">Spot $${_fmtStrikeNum(activeEv.spot_price, 2)} (${escSvg(activeEv.spot_source || 'chain')})</span>
+                                    <span class="text-slate-400">Exp ${escSvg(activeEv.expiry || '--')}</span>
+                                </div>
+                                <div class="text-[10px] text-slate-400">
+                                    RSI=${_fmtStrikeNum(activeEv.rsi, 2)} · v=${_fmtStrikeNum(kin.v, 4)} · a=${_fmtStrikeNum(kin.a, 4)} · Regime=${escSvg(kin.regime || 'n/a')} · File: ${escSvg(activeEv.filename || '')}
+                                </div>
+                            </div>
+                            <div class="text-right space-y-0.5">
+                                ${tr ? `
+                                    <div class="text-xs font-semibold ${Number(tr.total_pnl_pct || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
+                                        Executed ${escSvg(tr.status || 'trade').toUpperCase()}: ${escSvg(tr.contract)} (${tr.total_pnl_pct !== null && tr.total_pnl_pct !== undefined ? `${Number(tr.total_pnl_pct) >= 0 ? '+' : ''}${Number(tr.total_pnl_pct).toFixed(1)}%` : '--'})
+                                    </div>
+                                    <div class="text-[10px] text-slate-400">Entry $${_fmtStrikeNum(tr.entry_price, 2)} · Exit $${_fmtStrikeNum(tr.exit_price, 2)} · Hold ${tr.hold_minutes !== null && tr.hold_minutes !== undefined ? `${Number(tr.hold_minutes).toFixed(1)}m` : '--'} ${tr.reason ? `· ${escSvg(tr.reason)}` : ''}</div>
+                                ` : `<div class="text-[11px] text-slate-400">No executed BUY trade matched within window (signal-only chain)</div>`}
+                            </div>
+                        </div>
+
+                        <div class="overflow-x-auto rounded-xl border border-slate-800/80 bg-slate-950/60">
+                            <table class="w-full text-left text-[11px] mono border-collapse">
+                                <thead class="bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
+                                    <tr>
+                                        <th class="px-2.5 py-2">Rank</th>
+                                        <th class="px-2 py-2">Contract</th>
+                                        <th class="px-2 py-2 text-right">Strike</th>
+                                        <th class="px-2 py-2 text-right">Entry Bid/Ask</th>
+                                        <th class="px-2 py-2 text-right">Sprd%</th>
+                                        <th class="px-2 py-2 text-right">&Delta; · IV · OI</th>
+                                        <th class="px-2 py-2 text-right">+5m</th>
+                                        <th class="px-2 py-2 text-right">+10m</th>
+                                        <th class="px-2 py-2 text-right">+15m</th>
+                                        <th class="px-2 py-2 text-right">+30m</th>
+                                        <th class="px-2 py-2 text-right">+60m</th>
+                                        <th class="px-2 py-2 text-right">Actual Exit</th>
+                                        <th class="px-2 py-2 text-right">Peak</th>
+                                        <th class="px-2 py-2 text-right">Exit Chain B/A</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${candRows || `<tr><td colspan="14" class="px-4 py-8 text-center text-slate-500">No candidate strikes around spot in this snapshot.</td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+            }
+
+            pane.innerHTML = `
+                ${insightParts.length ? `
+                    <div class="px-3.5 py-2 rounded-xl bg-slate-950/70 border border-indigo-500/30 text-[11px] mono text-slate-300 flex flex-wrap items-center justify-between gap-2 shrink-0">
+                        <div class="flex flex-wrap items-center gap-x-4 gap-y-1">${insightParts.join(' <span class="text-slate-600">|</span> ')}</div>
+                        <span class="text-[10px] text-slate-500">Buy rule: +2 OTM unchanged</span>
+                    </div>
+                ` : ''}
+
+                <div class="rounded-xl border border-slate-800/80 bg-slate-950/60 overflow-hidden shrink-0">
+                    <div class="px-3.5 py-1.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        <span>Aggregate Strike-Rank Comparison Across Analyzed Signals</span>
+                        <span class="font-normal text-slate-500">Returns measured vs entry Ask</span>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-[11px] mono border-collapse">
+                            <thead class="bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
+                                <tr>
+                                    <th class="px-2.5 py-1.5">Strike Rank</th>
+                                    <th class="px-2 py-1.5 text-right">N</th>
+                                    <th class="px-2 py-1.5 text-right">Avg Ask</th>
+                                    <th class="px-2 py-1.5 text-right">Sprd%</th>
+                                    <th class="px-2 py-1.5 text-right">Avg &Delta;</th>
+                                    <th class="px-2 py-1.5 text-right">+5m</th>
+                                    <th class="px-2 py-1.5 text-right">+10m</th>
+                                    <th class="px-2 py-1.5 text-right">+15m</th>
+                                    <th class="px-2 py-1.5 text-right">+30m</th>
+                                    <th class="px-2 py-1.5 text-right">+60m</th>
+                                    <th class="px-2 py-1.5 text-right">Actual Exit</th>
+                                    <th class="px-2 py-1.5 text-right">Peak</th>
+                                    <th class="px-2 py-1.5 text-right">15m Win%</th>
+                                    <th class="px-2 py-1.5 text-right">Best 15m/Exit</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${scoreboardRows || `<tr><td colspan="14" class="px-3 py-4 text-center text-slate-500">No strike aggregate metrics available yet.</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="flex-1 min-h-0 flex flex-col lg:flex-row gap-3 overflow-hidden">
+                    <div class="w-full lg:w-72 shrink-0 rounded-xl border border-slate-800/80 bg-slate-950/40 flex flex-col max-h-48 lg:max-h-full overflow-hidden">
+                        <div class="px-3 py-1.5 border-b border-slate-800 text-[10px] font-bold uppercase tracking-wider text-slate-400 flex justify-between">
+                            <span>BUY Signals (${events.length})</span>
+                            <span class="font-normal text-slate-500">Newest first</span>
+                        </div>
+                        <div class="flex-1 overflow-y-auto p-2 space-y-1.5">
+                            ${eventListHtml}
+                        </div>
+                    </div>
+                    <div class="flex-1 min-w-0 overflow-y-auto pr-1">
+                        ${detailHtml}
+                    </div>
+                </div>
+            `;
+        }
+
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
+                const strikeModal = document.getElementById('strikeAnalysisModal');
+                if (strikeModal && !strikeModal.classList.contains('hidden')) {
+                    closeStrikeAnalysisModal();
+                }
                 const logsModal = document.getElementById('optionLogsModal');
                 if (logsModal && !logsModal.classList.contains('hidden')) {
                     closeOptionLogsModal();
@@ -20812,6 +21452,940 @@ def read_option_analysis_logs(
     }
 
 
+_STRIKE_BAR_CACHE_LOCK = threading.Lock()
+_STRIKE_BAR_CACHE = {}
+_MINUTE_KINEMATICS_CACHE_LOCK = threading.Lock()
+_MINUTE_KINEMATICS_CACHE = {"sig": None, "index": {}}
+
+_CHAIN_TZ_ABBR_MAP = {
+    "PST": "America/Los_Angeles",
+    "PDT": "America/Los_Angeles",
+    "EST": "America/New_York",
+    "EDT": "America/New_York",
+    "CST": "America/Chicago",
+    "CDT": "America/Chicago",
+    "MST": "America/Denver",
+    "MDT": "America/Denver",
+    "UTC": "UTC",
+    "GMT": "UTC",
+}
+
+_OPTIONCHAIN_BUY_RE = re.compile(
+    r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-BUY-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
+)
+_OPTIONCHAIN_SELL_RE = re.compile(
+    r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-SELL-(.+?)-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
+)
+
+_STRIKE_RANK_LABELS = {
+    -2: "-2 ITM",
+    -1: "-1 ITM",
+    0: "0 ATM",
+    1: "+1 OTM",
+    2: "+2 OTM",
+    3: "+3 OTM",
+    4: "+4 OTM",
+}
+
+
+def _parse_chain_tz_stamp(stamp_str: str, tz_abbr: str):
+    try:
+        naive = datetime.strptime(stamp_str, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None
+    tz_name = _CHAIN_TZ_ABBR_MAP.get(str(tz_abbr or "").strip().upper())
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else DISPLAY_TZ
+    except Exception:
+        tz = DISPLAY_TZ
+    return naive.replace(tzinfo=tz).astimezone(UTC)
+
+
+def _parse_optionchain_file_meta(path: Path, payload: dict):
+    """Extract (signal_side, symbol, rsi, event_dt_utc, source, expiry, trigger) from filename + JSON."""
+    name = path.name
+    side = None
+    sym = None
+    rsi = None
+    dt_utc = None
+    source = None
+    trigger = None
+
+    m_buy = _OPTIONCHAIN_BUY_RE.match(name)
+    if m_buy:
+        source, sym, rsi_raw, stamp_s, tz_s, _ = m_buy.groups()
+        side = "BUY"
+        rsi = _opt_safe_float(rsi_raw, None)
+        dt_utc = _parse_chain_tz_stamp(stamp_s, tz_s)
+    else:
+        m_sell = _OPTIONCHAIN_SELL_RE.match(name)
+        if m_sell:
+            source, sym, trigger, rsi_raw, stamp_s, tz_s, _ = m_sell.groups()
+            side = "SELL"
+            rsi = _opt_safe_float(rsi_raw, None)
+            dt_utc = _parse_chain_tz_stamp(stamp_s, tz_s)
+
+    if isinstance(payload, dict):
+        if payload.get("underlying"):
+            sym = str(payload.get("underlying")).strip().upper()
+        ts_resolved = None
+        for ts_k in ("sell_utc_timestamp", "utc_timestamp"):
+            parsed_ts = _opt_parse_utc(payload.get(ts_k))
+            if parsed_ts is not None:
+                ts_resolved = parsed_ts
+                break
+        if ts_resolved is None:
+            raw_ts = payload.get("timestamp")
+            if isinstance(raw_ts, str) and raw_ts.strip():
+                try:
+                    parsed_raw = datetime.fromisoformat(raw_ts.strip().replace("Z", "+00:00"))
+                    if parsed_raw.tzinfo is not None:
+                        ts_resolved = as_utc(parsed_raw)
+                    elif dt_utc is None:
+                        ts_resolved = parsed_raw.replace(tzinfo=DISPLAY_TZ).astimezone(UTC)
+                except ValueError:
+                    pass
+        if ts_resolved is not None:
+            dt_utc = ts_resolved
+        if trigger is None and payload.get("exit_trigger"):
+            trigger = str(payload.get("exit_trigger"))
+
+    if dt_utc is None:
+        try:
+            dt_utc = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        except OSError:
+            dt_utc = datetime.now(UTC)
+
+    expiry = None
+    if isinstance(payload, dict):
+        exp_raw = str(payload.get("expiration_date") or "").strip()
+        if exp_raw:
+            expiry = exp_raw[:10]
+        if not expiry:
+            for item in payload.get("chain_snapshot") or []:
+                if isinstance(item, dict) and item.get("contract"):
+                    is_o, _, _, _, exp_p = _parse_occ_contract(item["contract"])
+                    if is_o and exp_p:
+                        expiry = exp_p
+                        break
+
+    return {
+        "signal": side,
+        "symbol": str(sym or "").strip().upper(),
+        "rsi": rsi,
+        "dt_utc": as_utc(dt_utc),
+        "source": source or (payload.get("provider") if isinstance(payload, dict) else None),
+        "expiry": expiry,
+        "trigger": trigger,
+    }
+
+
+def _load_minute_summary_kinematics_index():
+    """Load {(minute_utc_iso, symbol): kinematics_dict} from logs/minute-summary-*.jsonl (stat-cached)."""
+    if not LOG_ROOT.exists() or not LOG_ROOT.is_dir():
+        return {}
+    files = []
+    for p in sorted(LOG_ROOT.glob("minute-summary-*.jsonl")):
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+            files.append((p, (str(p), int(st.st_mtime_ns), int(st.st_size))))
+        except OSError:
+            continue
+
+    sig = tuple(item[1] for item in files)
+    with _MINUTE_KINEMATICS_CACHE_LOCK:
+        if _MINUTE_KINEMATICS_CACHE["sig"] == sig:
+            return _MINUTE_KINEMATICS_CACHE["index"]
+
+    idx = {}
+    for p, _ in files:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    dt = _opt_parse_utc(rec.get("minute_utc") or rec.get("minute"))
+                    if dt is None:
+                        continue
+                    min_iso = minute_utc(dt).isoformat()
+                    syms_block = rec.get("symbols") if isinstance(rec.get("symbols"), dict) else {}
+                    for sym_k, prov_map in syms_block.items():
+                        if not isinstance(prov_map, dict):
+                            continue
+                        sym_u = str(sym_k).strip().upper()
+                        # Prefer TRADINGVIEW, then any provider with finite RSI/close
+                        best_p = None
+                        best_e = None
+                        for prov_name in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+                            cand = prov_map.get(prov_name)
+                            if isinstance(cand, dict) and (_opt_safe_float(cand.get("close"), None) is not None or _opt_safe_float(cand.get("rsi"), None) is not None):
+                                best_p, best_e = prov_name, cand
+                                if _opt_safe_float(cand.get("rsi"), None) is not None:
+                                    break
+                        if best_e is None:
+                            for prov_name, cand in prov_map.items():
+                                if isinstance(cand, dict):
+                                    best_p, best_e = prov_name, cand
+                                    break
+                        if isinstance(best_e, dict):
+                            v_val = _opt_safe_float(
+                                best_e.get("smoothed_velocity") if best_e.get("smoothed_velocity") is not None else best_e.get("price_velocity"),
+                                None,
+                            )
+                            a_val = _opt_safe_float(
+                                best_e.get("smoothed_acceleration") if best_e.get("smoothed_acceleration") is not None else best_e.get("price_acceleration"),
+                                None,
+                            )
+                            idx[(min_iso, sym_u)] = {
+                                "provider": best_p,
+                                "close": _opt_safe_float(best_e.get("close"), None),
+                                "rsi": _opt_safe_float(best_e.get("rsi"), None),
+                                "v": v_val,
+                                "a": a_val,
+                                "regime": best_e.get("regime"),
+                            }
+        except OSError:
+            continue
+
+    with _MINUTE_KINEMATICS_CACHE_LOCK:
+        _MINUTE_KINEMATICS_CACHE["sig"] = sig
+        _MINUTE_KINEMATICS_CACHE["index"] = idx
+    return idx
+
+
+def _infer_spot_from_chain_snapshot(payload: dict, dt_utc: datetime, symbol: str, kin_index: dict):
+    """Recover spot price at chain capture time: explicit -> minute summary close -> strike/distance consensus."""
+    if isinstance(payload, dict):
+        sp = _opt_safe_float(payload.get("spot_ask_price"), None)
+        if sp is not None and sp > 0:
+            return round(sp, 4), "snapshot"
+
+    base_min = minute_utc(as_utc(dt_utc))
+    for offset in (0, -1, 1, -2):
+        m_iso = (base_min + timedelta(minutes=offset)).isoformat()
+        kin = kin_index.get((m_iso, symbol))
+        if kin and kin.get("close") is not None and kin["close"] > 0:
+            return round(float(kin["close"]), 4), "minute_summary"
+
+    chain = payload.get("chain_snapshot") if isinstance(payload, dict) else None
+    pairs = []
+    for c in chain or []:
+        if not isinstance(c, dict):
+            continue
+        k = _opt_safe_float(c.get("strike"), None)
+        d = _opt_safe_float(c.get("distance_from_spot"), None)
+        if k is not None and d is not None and k > 0 and d >= 0:
+            pairs.append((k, d))
+    if not pairs:
+        return None, "missing"
+
+    # Candidate spots: k + d (strike below spot) or k - d (strike above spot)
+    candidates = []
+    for k, d in pairs[:30]:
+        if k + d > 0:
+            candidates.append(round(k + d, 4))
+        if k - d > 0:
+            candidates.append(round(k - d, 4))
+    if not candidates:
+        return None, "missing"
+
+    best_s = None
+    best_err = None
+    for cand in set(candidates):
+        err = sum(abs(abs(k - cand) - d) for k, d in pairs)
+        if best_err is None or err < best_err:
+            best_err = err
+            best_s = cand
+    if best_s is not None and best_s > 0:
+        return round(best_s, 4), "inferred_from_chain"
+    return None, "missing"
+
+
+def _resolve_alpaca_option_data_client_for_analysis(coordinator=None):
+    """Return an Alpaca OptionHistoricalDataClient if credentials are configured, else None."""
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    if oh is not None:
+        if getattr(oh, "_option_data_client", None) is not None:
+            return oh._option_data_client
+        creds = getattr(oh, "_credentials", None) or {}
+        if creds.get("alpaca_key") and creds.get("alpaca_secret"):
+            try:
+                try:
+                    from alpaca.data.historical.option import OptionHistoricalDataClient
+                except ImportError:
+                    from alpaca.data.historical import OptionHistoricalDataClient
+                client = OptionHistoricalDataClient(creds["alpaca_key"], creds["alpaca_secret"])
+                oh._option_data_client = client
+                return client
+            except Exception:
+                pass
+
+    for reg_key in ("OPTION_BUYER", "OPTION_SELLER", "POSITIONS_MONITOR"):
+        router = (PROVIDER_REGISTRY.get(reg_key) or {}).get("router")
+        if router is None:
+            continue
+        oc = getattr(router, "option_data_client", None)
+        if oc is not None and not isinstance(oc, TastytradeClient):
+            return oc
+        rc = getattr(router, "credentials", None) or {}
+        if rc.get("alpaca_key") and rc.get("alpaca_secret"):
+            try:
+                try:
+                    from alpaca.data.historical.option import OptionHistoricalDataClient
+                except ImportError:
+                    from alpaca.data.historical import OptionHistoricalDataClient
+                return OptionHistoricalDataClient(rc["alpaca_key"], rc["alpaca_secret"])
+            except Exception:
+                pass
+
+    env_key = os.getenv("ALPACA_API_KEY", "").strip()
+    env_sec = os.getenv("ALPACA_SECRET_KEY", "").strip()
+    if not env_key or not env_sec:
+        try:
+            loaded_keys, _ = load_settings(INI_PATH if "INI_PATH" in globals() else "lib/parms.ini")
+            env_key = env_key or str((loaded_keys or {}).get("alpaca_key") or "").strip()
+            env_sec = env_sec or str((loaded_keys or {}).get("alpaca_secret") or "").strip()
+        except Exception:
+            pass
+    if env_key and env_sec:
+        try:
+            try:
+                from alpaca.data.historical.option import OptionHistoricalDataClient
+            except ImportError:
+                from alpaca.data.historical import OptionHistoricalDataClient
+            return OptionHistoricalDataClient(env_key, env_sec)
+        except Exception:
+            return None
+    return None
+
+
+def _fetch_strike_option_bars_cached(symbol_ranges, coordinator=None, force_refresh=False):
+    """Fetch {contract: {minute_dt: {"c": float, "h": float}}} from Alpaca with TTL cache."""
+    bars_out = {sym: {} for sym in symbol_ranges.keys()}
+    if not symbol_ranges:
+        return bars_out, True, None
+
+    now_utc = datetime.now(UTC)
+    now_mono = time.monotonic()
+    to_fetch = {}
+
+    if not force_refresh:
+        with _STRIKE_BAR_CACHE_LOCK:
+            for sym, (s_dt, e_dt) in symbol_ranges.items():
+                s_min = minute_utc(as_utc(s_dt))
+                e_min = minute_utc(as_utc(e_dt))
+                cached = _STRIKE_BAR_CACHE.get(sym)
+                if cached is not None:
+                    ttl = 90.0 if (now_utc - e_min).total_seconds() < 7200.0 else 3600.0
+                    c_start = cached.get("start_min")
+                    c_end = cached.get("end_min")
+                    if (
+                        (now_mono - cached.get("fetched_mono", 0.0)) < ttl
+                        and c_start is not None
+                        and c_end is not None
+                        and c_start <= s_min
+                        and c_end >= e_min
+                    ):
+                        bars_out[sym] = {
+                            m: dict(v)
+                            for m, v in (cached.get("bars") or {}).items()
+                            if s_min <= m <= e_min
+                        }
+                        continue
+                to_fetch[sym] = (s_min, e_min)
+    else:
+        to_fetch = {
+            sym: (minute_utc(as_utc(r[0])), minute_utc(as_utc(r[1])))
+            for sym, r in symbol_ranges.items()
+        }
+
+    # Overlay any live/in-memory tracker history points first
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    if oh is not None:
+        with oh._lock:
+            tracked_pools = list(oh.open_contracts.values()) + list(oh.closed_contracts)
+        for item in tracked_pools:
+            con = str(item.get("contract") or "").strip().upper()
+            if con not in bars_out:
+                continue
+            for pt in item.get("history") or []:
+                pt_dt = _opt_parse_utc(pt.get("minute_utc") or pt.get("timestamp"))
+                pt_p = _opt_safe_float(pt.get("price"), None)
+                if pt_dt is not None and pt_p is not None and pt_p > 0:
+                    m_k = minute_utc(pt_dt)
+                    bars_out[con].setdefault(m_k, {"c": pt_p, "h": pt_p})
+
+    if not to_fetch:
+        return bars_out, True, None
+
+    client = _resolve_alpaca_option_data_client_for_analysis(coordinator)
+    if client is None:
+        return bars_out, False, "Alpaca option bar credentials unavailable (showing snapshot quotes & trades only)"
+
+    try:
+        from alpaca.data.requests import OptionBarsRequest
+    except Exception:
+        return bars_out, False, "alpaca.data.requests.OptionBarsRequest unavailable"
+
+    def _parse_bar_list(sym_u, raw_bars):
+        per_min = {}
+        for b in raw_bars or []:
+            ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
+            close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
+            high_p = _opt_safe_float(b.get("high") if isinstance(b, dict) else getattr(b, "high", None), None)
+            if ts is not None and close_p is not None and close_p > 0:
+                mk = minute_utc(ts)
+                h_eff = high_p if (high_p is not None and high_p >= close_p) else close_p
+                per_min[mk] = {"c": round(float(close_p), 4), "h": round(float(h_eff), 4)}
+        return per_min
+
+    items = list(to_fetch.items())
+    chunk_size = 10
+    fetched_map = {}
+    for i in range(0, len(items), chunk_size):
+        chunk = items[i : i + chunk_size]
+        chunk_syms = [s for s, _ in chunk]
+        min_start = min(r[0] for _, r in chunk)
+        max_end = max(r[1] for _, r in chunk) + MINUTE
+        try:
+            req = OptionBarsRequest(
+                symbol_or_symbols=chunk_syms,
+                timeframe=TimeFrame.Minute,
+                start=min_start,
+                end=max_end,
+            )
+            resp = client.get_option_bars(req)
+            raw_dict = getattr(resp, "data", resp)
+            if isinstance(raw_dict, dict):
+                for raw_sym, b_list in raw_dict.items():
+                    s_u = str(raw_sym).strip().upper()
+                    fetched_map[s_u] = _parse_bar_list(s_u, b_list)
+            for s_u in chunk_syms:
+                fetched_map.setdefault(s_u, {})
+        except Exception:
+            for s_u, (s_min, e_min) in chunk:
+                try:
+                    req = OptionBarsRequest(
+                        symbol_or_symbols=s_u,
+                        timeframe=TimeFrame.Minute,
+                        start=s_min,
+                        end=e_min + MINUTE,
+                    )
+                    resp = client.get_option_bars(req)
+                    raw_dict = getattr(resp, "data", resp)
+                    if isinstance(raw_dict, dict):
+                        b_list = raw_dict.get(s_u) or (next(iter(raw_dict.values()), []) if raw_dict else [])
+                        fetched_map[s_u] = _parse_bar_list(s_u, b_list)
+                    else:
+                        fetched_map[s_u] = {}
+                except Exception:
+                    fetched_map[s_u] = {}
+
+    with _STRIKE_BAR_CACHE_LOCK:
+        for s_u, (s_min, e_min) in to_fetch.items():
+            fresh_bars = fetched_map.get(s_u, {})
+            existing = _STRIKE_BAR_CACHE.get(s_u)
+            if existing is not None:
+                merged = dict(existing.get("bars") or {})
+                merged.update(fresh_bars)
+                new_start = min(existing.get("start_min") or s_min, s_min)
+                new_end = max(existing.get("end_min") or e_min, e_min)
+            else:
+                merged = dict(fresh_bars)
+                new_start = s_min
+                new_end = e_min
+            _STRIKE_BAR_CACHE[s_u] = {
+                "fetched_mono": now_mono,
+                "start_min": new_start,
+                "end_min": new_end,
+                "bars": merged,
+            }
+            for mk, bval in merged.items():
+                if s_min <= mk <= e_min:
+                    bars_out[s_u][mk] = dict(bval)
+
+    return bars_out, True, f"Alpaca 1m bars fetched for {len(bars_out)} strike contracts"
+
+
+def analyze_option_chain_strikes(
+    coordinator=None, symbol_filter: str = "", limit: int = 25, force_refresh: bool = False
+):
+    """Compare candidate option strikes (-2 ITM to +4 OTM) captured at BUY signals across sell horizons."""
+    chain_dir = LOG_ROOT / "optionchains"
+    sym_q = str(symbol_filter or "").strip().upper()
+    try:
+        eff_limit = max(1, min(100, int(limit or 25)))
+    except (TypeError, ValueError):
+        eff_limit = 25
+
+    if not chain_dir.exists() or not chain_dir.is_dir():
+        return {
+            "symbol_filter": sym_q,
+            "limit": eff_limit,
+            "bars_available": True,
+            "bars_note": "No optionchains directory yet",
+            "summary": {
+                "total_signals": 0,
+                "executed_signals": 0,
+                "exit_chains_matched": 0,
+                "by_rank": [],
+                "best_rank_15m": None,
+                "best_rank_actual": None,
+            },
+            "events": [],
+        }
+
+    kin_index = _load_minute_summary_kinematics_index()
+    buy_records = []
+    sell_records = []
+
+    for path in chain_dir.glob("*.json"):
+        try:
+            if not path.is_file():
+                continue
+            raw_txt = path.read_text(encoding="utf-8", errors="replace")
+            payload = json.loads(raw_txt)
+        except Exception:
+            continue
+        if not isinstance(payload, dict) or payload.get("error"):
+            continue
+        meta = _parse_optionchain_file_meta(path, payload)
+        if not meta["symbol"]:
+            continue
+        if sym_q and meta["symbol"] != sym_q:
+            continue
+        if meta["signal"] == "BUY":
+            buy_records.append((meta["dt_utc"], path, payload, meta))
+        elif meta["signal"] == "SELL":
+            sell_records.append((meta["dt_utc"], path, payload, meta))
+
+    buy_records.sort(key=lambda item: item[0], reverse=True)
+    buy_records = buy_records[:eff_limit]
+
+    # Collect known trades (closed + open + submitted logs) to match BUY signals with actual trades
+    all_trades = []
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    if oh is not None:
+        with oh._lock:
+            for c in oh.closed_contracts:
+                if isinstance(c, dict) and not c.get("dry_run"):
+                    all_trades.append({
+                        "status": "closed",
+                        "contract": str(c.get("contract") or "").strip().upper(),
+                        "underlying": str(c.get("underlying") or "").strip().upper(),
+                        "expiry": c.get("expiry"),
+                        "entry_price": _opt_safe_float(c.get("entry_price"), None),
+                        "exit_price": _opt_safe_float(c.get("exit_price"), None),
+                        "purchased_dt": _opt_parse_utc(c.get("purchased_at_utc")),
+                        "sold_dt": _opt_parse_utc(c.get("sold_at_utc")),
+                        "hold_minutes": _opt_safe_float(c.get("hold_minutes"), None),
+                        "total_pnl_pct": _opt_safe_float(c.get("total_pnl_pct"), None),
+                        "total_pnl_dollars": _opt_safe_float(c.get("total_pnl_dollars"), None),
+                        "reason": c.get("reason") or c.get("buy_reason"),
+                    })
+            for c in oh.open_contracts.values():
+                if isinstance(c, dict) and not c.get("dry_run"):
+                    all_trades.append({
+                        "status": "open",
+                        "contract": str(c.get("contract") or "").strip().upper(),
+                        "underlying": str(c.get("underlying") or "").strip().upper(),
+                        "expiry": c.get("expiry"),
+                        "entry_price": _opt_safe_float(c.get("entry_price"), None),
+                        "exit_price": _opt_safe_float(c.get("current_price"), None),
+                        "purchased_dt": _opt_parse_utc(c.get("purchased_at_utc")),
+                        "sold_dt": None,
+                        "hold_minutes": None,
+                        "total_pnl_pct": _opt_safe_float(c.get("pnl_pct"), None),
+                        "total_pnl_dollars": _opt_safe_float(c.get("pnl_dollars"), None),
+                        "reason": c.get("buy_reason"),
+                    })
+
+    # Pre-index SELL optionchain snapshots by (symbol, expiry)
+    sell_by_sym_exp = {}
+    for s_dt, _, s_payload, s_meta in sell_records:
+        key = (s_meta["symbol"], s_meta["expiry"] or "")
+        by_con = {}
+        for c in s_payload.get("chain_snapshot") or []:
+            if isinstance(c, dict) and c.get("contract"):
+                by_con[str(c["contract"]).strip().upper()] = c
+        sell_by_sym_exp.setdefault(key, []).append((s_dt, s_meta, by_con))
+
+    now_utc = datetime.now(UTC)
+    prepared_events = []
+    bar_ranges = {}
+
+    for buy_dt, path, payload, meta in buy_records:
+        sym = meta["symbol"]
+        spot, spot_source = _infer_spot_from_chain_snapshot(payload, buy_dt, sym, kin_index)
+        if spot is None or spot <= 0:
+            continue
+
+        # Determine dominant option type
+        raw_opt_type = str(payload.get("option_type") or "").strip().upper()
+        right = "PUT" if raw_opt_type == "PUT" else "CALL"
+        chain = [
+            dict(c) for c in (payload.get("chain_snapshot") or [])
+            if isinstance(c, dict) and _opt_safe_float(c.get("strike"), None) is not None and c.get("contract")
+        ]
+        if not raw_opt_type and chain:
+            _, _, first_r, _, _ = _parse_occ_contract(chain[0]["contract"])
+            if first_r in {"CALL", "PUT"}:
+                right = first_r
+
+        # Match executed trade by underlying + purchase time [-120s, +600s]
+        matched_trade = None
+        best_tdiff = None
+        for tr in all_trades:
+            if tr["underlying"] != sym:
+                continue
+            p_dt = tr.get("purchased_dt")
+            if p_dt is None:
+                continue
+            diff = (p_dt - buy_dt).total_seconds()
+            if -120.0 <= diff <= 600.0:
+                if best_tdiff is None or abs(diff) < best_tdiff:
+                    best_tdiff = abs(diff)
+                    matched_trade = tr
+
+        # Match SELL exit-time option chain snapshot
+        matched_sell_chain = None
+        exp_key = (sym, meta["expiry"] or "")
+        sell_cands = sell_by_sym_exp.get(exp_key, [])
+        if matched_trade and matched_trade.get("sold_dt") is not None:
+            sdt = matched_trade["sold_dt"]
+            best_sdiff = None
+            for cand_dt, cand_meta, by_con in sell_cands:
+                sd = abs((cand_dt - sdt).total_seconds())
+                if sd <= 240.0 and (best_sdiff is None or sd < best_sdiff):
+                    best_sdiff = sd
+                    matched_sell_chain = by_con
+        elif sell_cands:
+            for cand_dt, _, by_con in sell_cands:
+                sd = (cand_dt - buy_dt).total_seconds()
+                if 30.0 <= sd <= 21600.0:
+                    matched_sell_chain = by_con
+                    break
+
+        # Assign OTM ranks matching get_one_contract (+2 == 2nd OTM)
+        if right == "CALL":
+            itm_atm = sorted([c for c in chain if float(c["strike"]) <= spot], key=lambda c: float(c["strike"]), reverse=True)
+            otm = sorted([c for c in chain if float(c["strike"]) > spot], key=lambda c: float(c["strike"]))
+        else:
+            itm_atm = sorted([c for c in chain if float(c["strike"]) >= spot], key=lambda c: float(c["strike"]))
+            otm = sorted([c for c in chain if float(c["strike"]) < spot], key=lambda c: float(c["strike"]), reverse=True)
+
+        ranked_cands = []
+        for idx, c in enumerate(itm_atm[:3]):
+            ranked_cands.append((-idx, c))
+        for idx, c in enumerate(otm[:4], start=1):
+            ranked_cands.append((idx, c))
+        ranked_cands.sort(key=lambda pair: pair[0])
+
+        buy_min = minute_utc(buy_dt)
+        sold_dt = matched_trade.get("sold_dt") if matched_trade else None
+        horizon_end = buy_min + timedelta(minutes=65)
+        if sold_dt is not None:
+            horizon_end = max(horizon_end, minute_utc(sold_dt) + timedelta(minutes=3))
+        horizon_end = min(horizon_end, buy_min + timedelta(minutes=390), minute_utc(now_utc) + MINUTE)
+        start_req = buy_min - MINUTE
+
+        cand_list = []
+        for rank, c in ranked_cands:
+            con = str(c.get("contract") or "").strip().upper()
+            if con and horizon_end > start_req:
+                prev_r = bar_ranges.get(con)
+                if prev_r is None:
+                    bar_ranges[con] = (start_req, horizon_end)
+                else:
+                    bar_ranges[con] = (min(prev_r[0], start_req), max(prev_r[1], horizon_end))
+            cand_list.append((rank, c, con))
+
+        base_kin = kin_index.get((buy_min.isoformat(), sym)) or kin_index.get(((buy_min - MINUTE).isoformat(), sym)) or {}
+        prepared_events.append({
+            "event_id": path.name,
+            "filename": path.name,
+            "symbol": sym,
+            "right": right,
+            "expiry": meta["expiry"],
+            "rsi": meta["rsi"] if meta["rsi"] is not None else base_kin.get("rsi"),
+            "buy_dt": buy_dt,
+            "buy_min": buy_min,
+            "horizon_end": horizon_end,
+            "spot_price": spot,
+            "spot_source": spot_source,
+            "kinematics": base_kin,
+            "matched_trade": matched_trade,
+            "matched_sell_chain": matched_sell_chain,
+            "cand_list": cand_list,
+        })
+
+    bars_map, bars_available, bars_note = _fetch_strike_option_bars_cached(
+        bar_ranges, coordinator=coordinator, force_refresh=force_refresh
+    )
+
+    def _lookup_bar_near(con_bars, target_min):
+        if not con_bars:
+            return None
+        if target_min in con_bars:
+            return con_bars[target_min].get("c")
+        for delta_m in (-1, 1, -2, 2, -3):
+            cand = con_bars.get(target_min + timedelta(minutes=delta_m))
+            if cand and cand.get("c"):
+                return cand["c"]
+        return None
+
+    events_out = []
+    rank_stats = {
+        rk: {
+            "otm_rank": rk,
+            "label": _STRIKE_RANK_LABELS[rk],
+            "asks": [],
+            "spreads": [],
+            "deltas": [],
+            "ret_5m": [],
+            "ret_10m": [],
+            "ret_15m": [],
+            "ret_30m": [],
+            "ret_60m": [],
+            "ret_actual": [],
+            "ret_peak": [],
+            "best_15m": 0,
+            "best_actual": 0,
+        }
+        for rk in range(-2, 5)
+    }
+
+    executed_count = 0
+    exit_chain_count = 0
+
+    for ev in prepared_events:
+        tr = ev["matched_trade"]
+        if tr is not None:
+            executed_count += 1
+        sell_chain = ev["matched_sell_chain"]
+        if sell_chain is not None:
+            exit_chain_count += 1
+
+        sold_min = minute_utc(tr["sold_dt"]) if (tr and tr.get("sold_dt")) else None
+        matched_con = tr.get("contract") if tr else None
+
+        candidates_out = []
+        best_15_rk, best_15_ret = None, None
+        best_act_rk, best_act_ret = None, None
+
+        for rk, c, con in ev["cand_list"]:
+            bid = _opt_safe_float(c.get("bid"), 0.0) or 0.0
+            ask = _opt_safe_float(c.get("ask"), 0.0) or 0.0
+            mid = _opt_safe_float(c.get("mid"), None)
+            if mid is None and bid > 0 and ask > 0:
+                mid = round((bid + ask) / 2.0, 4)
+            spread_pct = _opt_safe_float(c.get("spread_pct"), None)
+            if spread_pct is None and mid and mid > 0 and ask >= bid:
+                spread_pct = round(((ask - bid) / mid) * 100.0, 2)
+            delta_v = _opt_safe_float(c.get("delta"), None)
+            iv_v = _opt_safe_float(c.get("iv"), None)
+            oi_raw = _opt_safe_float(c.get("open_interest"), None)
+            oi_v = int(oi_raw) if oi_raw is not None else None
+
+            con_bars = bars_map.get(con, {})
+            entry_bar_px = _lookup_bar_near(con_bars, ev["buy_min"])
+            entry_ref = (
+                ask if ask > 0 else (mid if (mid and mid > 0) else (_opt_safe_float(c.get("last_price"), None) or entry_bar_px))
+            )
+
+            horizons = {}
+            for h_key, h_mins in (("5m", 5), ("10m", 10), ("15m", 15), ("30m", 30), ("60m", 60)):
+                t_min = ev["buy_min"] + timedelta(minutes=h_mins)
+                px = _lookup_bar_near(con_bars, t_min) if t_min <= now_utc else None
+                if px is not None and entry_ref and entry_ref > 0:
+                    ret_p = round(((px - entry_ref) / entry_ref) * 100.0, 2)
+                    pnl_d = round((px - entry_ref) * 100.0, 2)
+                    horizons[h_key] = {"price": round(px, 4), "ret_pct": ret_p, "pnl_dollars": pnl_d}
+                    rank_stats[rk][f"ret_{h_key}"].append(ret_p)
+                    if h_key == "15m" and (best_15_ret is None or ret_p > best_15_ret):
+                        best_15_ret = ret_p
+                        best_15_rk = rk
+                else:
+                    horizons[h_key] = None
+
+            # Actual exit horizon
+            act_px = None
+            if sold_min is not None:
+                if matched_con == con and tr.get("exit_price") and tr["exit_price"] > 0:
+                    act_px = float(tr["exit_price"])
+                else:
+                    act_px = _lookup_bar_near(con_bars, sold_min)
+            if act_px is not None and entry_ref and entry_ref > 0:
+                act_ret = round(((act_px - entry_ref) / entry_ref) * 100.0, 2)
+                horizons["actual"] = {
+                    "price": round(act_px, 4),
+                    "ret_pct": act_ret,
+                    "pnl_dollars": round((act_px - entry_ref) * 100.0, 2),
+                }
+                rank_stats[rk]["ret_actual"].append(act_ret)
+                if best_act_ret is None or act_ret > best_act_ret:
+                    best_act_ret = act_ret
+                    best_act_rk = rk
+            else:
+                horizons["actual"] = None
+
+            # Peak within hold/60m window
+            peak_px = None
+            for bm, bval in con_bars.items():
+                if ev["buy_min"] < bm <= ev["horizon_end"]:
+                    cand_h = bval.get("h") or bval.get("c")
+                    if cand_h and (peak_px is None or cand_h > peak_px):
+                        peak_px = cand_h
+            if peak_px is not None and entry_ref and entry_ref > 0:
+                pk_ret = round(((peak_px - entry_ref) / entry_ref) * 100.0, 2)
+                horizons["peak"] = {
+                    "price": round(peak_px, 4),
+                    "ret_pct": pk_ret,
+                    "pnl_dollars": round((peak_px - entry_ref) * 100.0, 2),
+                }
+                rank_stats[rk]["ret_peak"].append(pk_ret)
+            else:
+                horizons["peak"] = None
+
+            if ask > 0:
+                rank_stats[rk]["asks"].append(ask)
+            if spread_pct is not None:
+                rank_stats[rk]["spreads"].append(spread_pct)
+            if delta_v is not None:
+                rank_stats[rk]["deltas"].append(delta_v)
+
+            exit_snap = sell_chain.get(con) if sell_chain else None
+            exit_bid = _opt_safe_float(exit_snap.get("bid"), None) if exit_snap else None
+            exit_ask = _opt_safe_float(exit_snap.get("ask"), None) if exit_snap else None
+            exit_spread_pct = _opt_safe_float(exit_snap.get("spread_pct"), None) if exit_snap else None
+            if exit_spread_pct is None and exit_bid and exit_ask and exit_ask >= exit_bid and (exit_bid + exit_ask) > 0:
+                exit_mid = (exit_bid + exit_ask) / 2.0
+                exit_spread_pct = round(((exit_ask - exit_bid) / exit_mid) * 100.0, 2)
+
+            candidates_out.append({
+                "otm_rank": rk,
+                "label": _STRIKE_RANK_LABELS.get(rk, f"{rk:+d}"),
+                "contract": con,
+                "strike": round(float(c["strike"]), 4),
+                "bid": round(bid, 4),
+                "ask": round(ask, 4),
+                "mid": mid,
+                "spread_pct": spread_pct,
+                "delta": delta_v,
+                "iv": iv_v,
+                "open_interest": oi_v,
+                "is_current_pick": rk == 2,
+                "is_matched_contract": bool(matched_con and matched_con == con),
+                "exit_bid": exit_bid,
+                "exit_ask": exit_ask,
+                "exit_spread_pct": exit_spread_pct,
+                "horizons": horizons,
+            })
+
+        if best_15_rk is not None and best_15_rk in rank_stats:
+            rank_stats[best_15_rk]["best_15m"] += 1
+        if best_act_rk is not None and best_act_rk in rank_stats:
+            rank_stats[best_act_rk]["best_actual"] += 1
+
+        disp_dt = as_display_tz(ev["buy_dt"])
+        tr_out = None
+        if tr is not None:
+            tr_out = {
+                "status": tr.get("status"),
+                "contract": tr.get("contract"),
+                "entry_price": tr.get("entry_price"),
+                "exit_price": tr.get("exit_price"),
+                "hold_minutes": tr.get("hold_minutes"),
+                "total_pnl_pct": tr.get("total_pnl_pct"),
+                "total_pnl_dollars": tr.get("total_pnl_dollars"),
+                "reason": tr.get("reason"),
+            }
+
+        events_out.append({
+            "event_id": ev["event_id"],
+            "filename": ev["filename"],
+            "symbol": ev["symbol"],
+            "right": ev["right"],
+            "expiry": ev["expiry"],
+            "rsi": round(float(ev["rsi"]), 2) if ev["rsi"] is not None else None,
+            "timestamp_utc": ev["buy_dt"].isoformat(),
+            "timestamp_display": format_display_ts(ev["buy_dt"], "%Y-%m-%d %H:%M %Z"),
+            "timestamp_short": disp_dt.strftime("%m-%d %H:%M"),
+            "spot_price": ev["spot_price"],
+            "spot_source": ev["spot_source"],
+            "kinematics": ev["kinematics"],
+            "matched_trade": tr_out,
+            "best_rank_15m": best_15_rk,
+            "best_rank_15m_label": _STRIKE_RANK_LABELS.get(best_15_rk) if best_15_rk is not None else None,
+            "best_rank_actual": best_act_rk,
+            "best_rank_actual_label": _STRIKE_RANK_LABELS.get(best_act_rk) if best_act_rk is not None else None,
+            "candidates": candidates_out,
+        })
+
+    def _avg_or_none(vals, dec=2):
+        return round(sum(vals) / len(vals), dec) if vals else None
+
+    by_rank_out = []
+    best_summary_15m = None
+    best_summary_actual = None
+
+    for rk in range(-2, 5):
+        st = rank_stats[rk]
+        cnt = max(len(st["asks"]), len(st["ret_15m"]), len(st["ret_5m"]), len(st["ret_actual"]))
+        if cnt == 0:
+            continue
+        avg_15 = _avg_or_none(st["ret_15m"])
+        avg_act = _avg_or_none(st["ret_actual"])
+        wins_15 = sum(1 for v in st["ret_15m"] if v > 0)
+        win_rate_15 = round((wins_15 / len(st["ret_15m"])) * 100.0, 1) if st["ret_15m"] else None
+        row = {
+            "otm_rank": rk,
+            "label": st["label"],
+            "count": cnt,
+            "avg_entry_ask": _avg_or_none(st["asks"]),
+            "avg_spread_pct": _avg_or_none(st["spreads"], 1),
+            "avg_delta": _avg_or_none(st["deltas"], 2),
+            "avg_ret_5m": _avg_or_none(st["ret_5m"]),
+            "avg_ret_10m": _avg_or_none(st["ret_10m"]),
+            "avg_ret_15m": avg_15,
+            "avg_ret_30m": _avg_or_none(st["ret_30m"]),
+            "avg_ret_60m": _avg_or_none(st["ret_60m"]),
+            "avg_ret_actual": avg_act,
+            "avg_ret_peak": _avg_or_none(st["ret_peak"]),
+            "win_rate_15m": win_rate_15,
+            "best_count_15m": st["best_15m"],
+            "best_count_actual": st["best_actual"],
+        }
+        by_rank_out.append(row)
+        if avg_15 is not None and (best_summary_15m is None or avg_15 > best_summary_15m["avg_ret"]):
+            best_summary_15m = {"otm_rank": rk, "label": st["label"], "avg_ret": avg_15}
+        if avg_act is not None and (best_summary_actual is None or avg_act > best_summary_actual["avg_ret"]):
+            best_summary_actual = {"otm_rank": rk, "label": st["label"], "avg_ret": avg_act}
+
+    return {
+        "symbol_filter": sym_q,
+        "limit": eff_limit,
+        "bars_available": bars_available,
+        "bars_note": bars_note,
+        "summary": {
+            "total_signals": len(events_out),
+            "executed_signals": executed_count,
+            "exit_chains_matched": exit_chain_count,
+            "by_rank": by_rank_out,
+            "best_rank_15m": best_summary_15m,
+            "best_rank_actual": best_summary_actual,
+        },
+        "events": events_out,
+    }
+
+
 class AdminCliProvider:
     _AUTH_COOKIE_NAME = "msi_dashboard_auth"
     _AUTH_MAX_FAILURES = 10
@@ -21350,6 +22924,25 @@ class AdminCliProvider:
                 ),
                 200,
             )
+
+        @app.get("/api/strike-analysis")
+        def get_strike_analysis():
+            symbol_q = str(request.args.get("symbol") or "").strip().upper()
+            try:
+                limit_q = max(1, min(100, int(request.args.get("limit", "25"))))
+            except (TypeError, ValueError):
+                limit_q = 25
+            force_q = str(request.args.get("force") or "").strip().lower() in {"1", "true", "yes"}
+            try:
+                result = analyze_option_chain_strikes(
+                    coordinator=self.coordinator,
+                    symbol_filter=symbol_q,
+                    limit=limit_q,
+                    force_refresh=force_q,
+                )
+                return jsonify(status="ok", run_id=RUN_ID, **result), 200
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
 
         @app.post("/api/option-history/refresh")
         def refresh_option_history():

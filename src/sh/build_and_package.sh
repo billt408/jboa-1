@@ -120,7 +120,6 @@ cat <<'EOF' > "${DIST_DIR}/Containerfile"
 # Pin explicitly to Red Hat Universal Base Image 9.8 (RHEL 9.8)
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
 
-
 # Install shadow-utils (for groupadd/useradd), CA certificates, and timezone data
 RUN microdnf install -y --setopt=install_weak_deps=0 shadow-utils ca-certificates tzdata && \
     microdnf clean all
@@ -142,7 +141,8 @@ RUN chmod 0755 /home/jboa/app/multiStreamRSI
 USER jboa
 WORKDIR /home/jboa/app
 
-EXPOSE 5000
+# Document webhook/API port (5000) and UI dashboard port (5001)
+EXPOSE 5000 5001
 
 # Pass default config path matching utils.py's parent.parent log resolution
 ENTRYPOINT ["/home/jboa/app/multiStreamRSI", "-c", "/home/jboa/app/src/parms.ini"]
@@ -161,5 +161,6 @@ echo "BUILD & PACKAGING COMPLETE"
 echo "  Standalone Binary : ${DIST_DIR}/${BINARY_NAME}"
 echo "  Podman Image      : ${IMAGE_NAME}:${IMAGE_TAG} (RHEL 9.8 UBI)"
 echo "  Container User    : jboa (UID 1001 / GID 1001)"
+echo "  Exposed Ports     : 5000 5001"
 echo "  Default Entrypoint: /home/jboa/app/multiStreamRSI -c /home/jboa/app/src/parms.ini"
 echo "=============================================================================="
