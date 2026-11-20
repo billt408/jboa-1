@@ -110,6 +110,15 @@ FEED = (
 # Populated by load_settings(); provider startup is controlled only by parms.ini.
 selected: list[str] = []
 required: dict[str, list[str]] = {}
+DEFAULT_PROVIDER_PRIORITY: tuple[str, ...] = (
+    "TRADINGVIEW",
+    "ALPACA",
+    "TASTYTRADE",
+    "TRADIER",
+    "TWELVEDATA",
+    "YAHOOFINANCE",
+)
+PROVIDER_PRIORITY: tuple[str, ...] = DEFAULT_PROVIDER_PRIORITY
 FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
@@ -999,6 +1008,17 @@ def _from_tastytrade_occ(symbol):
     return s
 
 
+def _to_dxlink_option_symbol(compact_occ):
+    """Convert compact OCC (AAPL261218C00250000) to dxFeed streamer symbol (.AAPL261218C250)."""
+    is_opt, und, right, strike, expiry = _parse_occ_contract(compact_occ)
+    if not is_opt or strike is None or not expiry:
+        return str(compact_occ or "").strip().upper()
+    yy_mm_dd = expiry[2:4] + expiry[5:7] + expiry[8:10]
+    cp = "C" if right == "CALL" else "P"
+    strike_str = f"{strike:.4f}".rstrip("0").rstrip(".")
+    return f".{und}{yy_mm_dd}{cp}{strike_str}"
+
+
 def _three_fridays_away(start_date=None):
     """Compute target Friday 3 Fridays away, matching getOptionsContracts semantics."""
     base = start_date or datetime.now(MARKET_TZ).date()
@@ -1074,6 +1094,8 @@ class TastytradeClient:
         self._configured_account_number = explicit_acct
         self._account_number = explicit_acct
         self._tokens = {"prod": None, "sandbox": None}
+        self._nested_chain_cache = {}
+        self._quote_token_cache = None
         self._lock = threading.RLock()
 
     def has_env_credentials(self, env):
@@ -1152,6 +1174,7 @@ class TastytradeClient:
         env="prod",
         query=None,
         retry_on_401=True,
+        max_429_retries=2,
     ):
         url = f"{self._base_url(env)}{path}"
         if query:
@@ -1162,42 +1185,74 @@ class TastytradeClient:
             if qstr:
                 url = f"{url}{'&' if '?' in url else '?'}{qstr}"
 
-        token = self._get_access_token(env, force_refresh=False)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": TASTYTRADE_USER_AGENT,
-        }
-        data_bytes = None
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-            data_bytes = json.dumps(payload).encode("utf-8")
-
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            method=str(method).upper(),
-            headers=headers,
+        method_upper = str(method).upper()
+        data_bytes = (
+            json.dumps(payload).encode("utf-8") if payload is not None else None
         )
-        try:
-            with urllib.request.urlopen(req, timeout=20.0) as resp:
-                raw_txt = resp.read().decode("utf-8")
-                return json.loads(raw_txt) if raw_txt.strip() else {}
-        except urllib.error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8", errors="replace")[:500]
-            if exc.code == 401 and retry_on_401:
-                self._get_access_token(env, force_refresh=True)
-                return self._request_json(
-                    method,
-                    path,
-                    payload=payload,
-                    env=env,
-                    query=query,
-                    retry_on_401=False,
-                )
-            raise RuntimeError(
-                f"Tastytrade {env} {method} {path} HTTP {exc.code}: {err_body}"
-            ) from exc
+        attempts = max(0, int(max_429_retries)) + 1 if method_upper == "GET" else 1
+        for attempt in range(attempts):
+            token = self._get_access_token(env, force_refresh=False)
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": TASTYTRADE_USER_AGENT,
+            }
+            if data_bytes is not None:
+                headers["Content-Type"] = "application/json"
+
+            req = urllib.request.Request(
+                url,
+                data=data_bytes,
+                method=method_upper,
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20.0) as resp:
+                    raw_txt = resp.read().decode("utf-8")
+                    return json.loads(raw_txt) if raw_txt.strip() else {}
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace")[:500]
+                if exc.code == 401 and retry_on_401:
+                    self._get_access_token(env, force_refresh=True)
+                    return self._request_json(
+                        method,
+                        path,
+                        payload=payload,
+                        env=env,
+                        query=query,
+                        retry_on_401=False,
+                        max_429_retries=max_429_retries,
+                    )
+                if (
+                    exc.code == 429
+                    and method_upper == "GET"
+                    and attempt < attempts - 1
+                ):
+                    retry_after_hdr = (
+                        exc.headers.get("Retry-After")
+                        if getattr(exc, "headers", None) is not None
+                        else None
+                    )
+                    sleep_s = None
+                    if retry_after_hdr:
+                        try:
+                            sleep_s = min(10.0, max(0.5, float(str(retry_after_hdr).strip())))
+                        except (TypeError, ValueError):
+                            sleep_s = None
+                    if sleep_s is None:
+                        sleep_s = min(10.0, 1.5 * (2 ** attempt))
+                    logging.warning(
+                        "TASTYTRADE_HTTP_429_BACKOFF env=%s path=%s attempt=%d sleep_s=%.2f",
+                        env,
+                        path,
+                        attempt + 1,
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(
+                    f"Tastytrade {env} {method} {path} HTTP {exc.code}: {err_body}"
+                ) from exc
 
     @staticmethod
     def _extract_items(resp):
@@ -1327,18 +1382,285 @@ class TastytradeClient:
         quotes = self.get_quotes_batch(syms, is_option=False)
         return {s: SimpleNamespace(latest_quote=q) for s, q in quotes.items()}
 
-    def get_option_chain_nested(self, underlying):
-        """Fetch nested option chain for underlying from Tastytrade Prod."""
+    def get_option_chain_nested(self, underlying, force_refresh=False, cache_ttl_seconds=3600.0):
+        """Fetch nested option chain for underlying from Tastytrade Prod with per-session caching."""
         sym = str(underlying or "").strip().upper()
         if not sym:
             raise ValueError("Underlying symbol is required")
+        today_key = datetime.now(MARKET_TZ).date().isoformat()
+        now_mono = time.monotonic()
+        if not force_refresh and cache_ttl_seconds > 0:
+            with self._lock:
+                cached = self._nested_chain_cache.get(sym)
+                if (
+                    cached is not None
+                    and cached.get("date") == today_key
+                    and now_mono < cached.get("expires_at", 0.0)
+                    and isinstance(cached.get("data"), dict)
+                    and (cached["data"].get("expirations") or [])
+                ):
+                    return cached["data"]
+
         encoded = urllib.parse.quote(sym, safe="")
         resp = self._request_json("GET", f"/option-chains/{encoded}/nested", env="prod")
         items = self._extract_items(resp)
         if items:
-            return items[0]
+            result = items[0]
+        else:
+            data = resp.get("data", resp) if isinstance(resp, dict) else {}
+            result = data if isinstance(data, dict) else {}
+
+        if cache_ttl_seconds > 0 and isinstance(result, dict) and (result.get("expirations") or []):
+            with self._lock:
+                self._nested_chain_cache[sym] = {
+                    "date": today_key,
+                    "expires_at": time.monotonic() + float(cache_ttl_seconds),
+                    "data": result,
+                }
+        return result
+
+    def _get_quote_token(self, force_refresh=False):
+        """Fetch & cache Prod DXLink quote token/URL via GET /api-quote-tokens."""
+        with self._lock:
+            now_mono = time.monotonic()
+            if (
+                not force_refresh
+                and self._quote_token_cache is not None
+                and now_mono < self._quote_token_cache.get("expires_at", 0.0)
+            ):
+                return (
+                    self._quote_token_cache["dxlink_url"],
+                    self._quote_token_cache["token"],
+                )
+        resp = self._request_json("GET", "/api-quote-tokens", env="prod")
         data = resp.get("data", resp) if isinstance(resp, dict) else {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise RuntimeError("Tastytrade /api-quote-tokens invalid payload")
+        token = str(data.get("token") or "").strip()
+        dxlink_url = str(data.get("dxlink-url") or data.get("dxlink_url") or "").strip()
+        if not token or not dxlink_url:
+            raise RuntimeError("Tastytrade /api-quote-tokens missing dxlink-url or token")
+        with self._lock:
+            self._quote_token_cache = {
+                "dxlink_url": dxlink_url,
+                "token": token,
+                "expires_at": time.monotonic() + 20 * 3600.0,
+            }
+        return dxlink_url, token
+
+    @staticmethod
+    def _parse_dxlink_greeks_payload(data, field_order):
+        order = list(field_order or ("eventSymbol", "volatility", "delta", "gamma", "theta", "vega"))
+        parsed = []
+
+        def _extract_dict(obj):
+            if not isinstance(obj, dict):
+                return None
+            sym = obj.get("eventSymbol") or obj.get("symbol")
+            if not sym:
+                return None
+            return {
+                "eventSymbol": str(sym).strip(),
+                "delta": _opt_safe_float(obj.get("delta"), None),
+                "gamma": _opt_safe_float(obj.get("gamma"), None),
+                "theta": _opt_safe_float(obj.get("theta"), None),
+                "vega": _opt_safe_float(obj.get("vega"), None),
+                "iv": _opt_safe_float(obj.get("volatility"), None),
+            }
+
+        def _extract_row(row):
+            if not isinstance(row, (list, tuple)) or len(row) < len(order):
+                return None
+            return _extract_dict({field: row[idx] for idx, field in enumerate(order)})
+
+        if not isinstance(data, list):
+            return parsed
+
+        if data and all(isinstance(item, dict) for item in data):
+            for item in data:
+                if str(item.get("eventType") or "Greeks") == "Greeks":
+                    rec = _extract_dict(item)
+                    if rec:
+                        parsed.append(rec)
+            return parsed
+
+        idx = 0
+        n = len(data)
+        while idx < n:
+            head = data[idx]
+            if isinstance(head, str):
+                ev_name = head
+                idx += 1
+                while idx < n and not isinstance(data[idx], str):
+                    chunk = data[idx]
+                    idx += 1
+                    if ev_name != "Greeks" or not isinstance(chunk, list) or not chunk:
+                        continue
+                    if isinstance(chunk[0], list):
+                        for sub in chunk:
+                            rec = _extract_row(sub)
+                            if rec:
+                                parsed.append(rec)
+                    elif isinstance(chunk[0], dict):
+                        for sub in chunk:
+                            rec = _extract_dict(sub)
+                            if rec:
+                                parsed.append(rec)
+                    else:
+                        step = len(order)
+                        if step > 0:
+                            for pos in range(0, len(chunk) - step + 1, step):
+                                rec = _extract_row(chunk[pos : pos + step])
+                                if rec:
+                                    parsed.append(rec)
+                continue
+            elif isinstance(head, dict):
+                if str(head.get("eventType") or "Greeks") == "Greeks":
+                    rec = _extract_dict(head)
+                    if rec:
+                        parsed.append(rec)
+            idx += 1
+        return parsed
+
+    def get_option_greeks_batch(self, streamer_by_compact, timeout_seconds=1.8):
+        """Best-effort DXLink snapshot for option Greeks (delta/gamma/theta/vega/iv).
+
+        Returns dict keyed by compact OCC symbol; returns {} silently on errors/timeouts.
+        """
+        if not streamer_by_compact or not self.has_env_credentials("prod"):
+            return {}
+        compact_by_streamer = {}
+        sub_syms = []
+        for compact_sym, raw_stream in streamer_by_compact.items():
+            c_u = str(compact_sym or "").strip().upper()
+            s_u = str(raw_stream or "").strip() or _to_dxlink_option_symbol(c_u)
+            if not c_u or not s_u:
+                continue
+            if s_u not in compact_by_streamer:
+                sub_syms.append(s_u)
+            compact_by_streamer[s_u] = c_u
+            compact_by_streamer[s_u.upper()] = c_u
+        if not sub_syms:
+            return {}
+
+        async def _async_fetch(dxlink_url, quote_token):
+            results = {}
+            field_order = ["eventSymbol", "volatility", "delta", "gamma", "theta", "vega"]
+            deadline = time.monotonic() + max(0.5, float(timeout_seconds or 1.8))
+            last_update = None
+            timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_seconds or 1.8) + 1.0))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(
+                    dxlink_url, heartbeat=20, max_msg_size=8 * 1024 * 1024
+                ) as ws:
+                    await ws.send_json(
+                        {
+                            "type": "SETUP",
+                            "channel": 0,
+                            "version": "0.1-DXF-JS/0.3.0",
+                            "keepaliveTimeout": 60,
+                            "acceptKeepaliveTimeout": 60,
+                        }
+                    )
+                    channel_opened = False
+                    while True:
+                        now_m = time.monotonic()
+                        remaining = deadline - now_m
+                        if last_update is not None and results:
+                            remaining = min(remaining, max(0.05, 0.35 - (now_m - last_update)))
+                        if remaining <= 0 or len(results) >= len(sub_syms):
+                            break
+                        try:
+                            msg = await ws.receive(timeout=remaining)
+                        except asyncio.TimeoutError:
+                            break
+                        if msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                            break
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        for line in msg.data.splitlines():
+                            if not line.strip():
+                                continue
+                            try:
+                                frame = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(frame, dict):
+                                continue
+                            ftype = str(frame.get("type") or "").upper()
+                            if ftype == "AUTH_STATE":
+                                st = str(frame.get("state") or "").upper()
+                                if st == "UNAUTHORIZED":
+                                    await ws.send_json({"type": "AUTH", "channel": 0, "token": quote_token})
+                                elif st == "AUTHORIZED" and not channel_opened:
+                                    await ws.send_json(
+                                        {
+                                            "type": "CHANNEL_REQUEST",
+                                            "channel": 1,
+                                            "service": "FEED",
+                                            "parameters": {"contract": "AUTO"},
+                                        }
+                                    )
+                            elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                                channel_opened = True
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SETUP",
+                                        "channel": 1,
+                                        "acceptAggregationPeriod": 0.0,
+                                        "acceptDataFormat": "COMPACT",
+                                        "acceptEventFields": {"Greeks": field_order},
+                                    }
+                                )
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SUBSCRIPTION",
+                                        "channel": 1,
+                                        "add": [{"type": "Greeks", "symbol": s} for s in sub_syms],
+                                    }
+                                )
+                            elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
+                                ev_fields = frame.get("eventFields") or {}
+                                if isinstance(ev_fields, dict) and isinstance(ev_fields.get("Greeks"), list):
+                                    field_order = list(ev_fields["Greeks"])
+                            elif ftype == "FEED_DATA" and frame.get("channel") == 1:
+                                recs = self._parse_dxlink_greeks_payload(frame.get("data"), field_order)
+                                for rec in recs:
+                                    esym = rec["eventSymbol"]
+                                    c_occ = compact_by_streamer.get(esym) or compact_by_streamer.get(esym.upper())
+                                    if not c_occ:
+                                        continue
+                                    prev = results.get(c_occ, {})
+                                    merged = {
+                                        "delta": rec["delta"] if rec["delta"] is not None else prev.get("delta"),
+                                        "gamma": rec["gamma"] if rec["gamma"] is not None else prev.get("gamma"),
+                                        "theta": rec["theta"] if rec["theta"] is not None else prev.get("theta"),
+                                        "vega": rec["vega"] if rec["vega"] is not None else prev.get("vega"),
+                                        "iv": rec["iv"] if rec["iv"] is not None else prev.get("iv"),
+                                    }
+                                    if any(v is not None for v in merged.values()):
+                                        results[c_occ] = merged
+                                        last_update = time.monotonic()
+            return results
+
+        try:
+            dxlink_url, quote_token = self._get_quote_token()
+            try:
+                asyncio.get_running_loop()
+                in_running_loop = True
+            except RuntimeError:
+                in_running_loop = False
+            if in_running_loop:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(
+                        lambda: asyncio.run(_async_fetch(dxlink_url, quote_token))
+                    ).result(timeout=max(2.0, float(timeout_seconds or 1.8) + 1.5))
+            return asyncio.run(_async_fetch(dxlink_url, quote_token))
+        except Exception as exc:
+            logging.debug("TASTYTRADE_DXLINK_GREEKS_SKIP detail=%s", exc)
+            return {}
 
     def get_account_number(self):
         with self._lock:
@@ -1816,7 +2138,13 @@ class TastytradeClient:
 
 
 def get_pruned_option_chain_tastytrade(
-    underlying_ticker, tt_client, right="CALL", expiration_date=None
+    underlying_ticker,
+    tt_client,
+    right="CALL",
+    expiration_date=None,
+    spot_hint=None,
+    include_greeks=True,
+    prefer_spot_hint=False,
 ):
     """Fetch option chain from Tastytrade Prod matching getOptionsContracts semantics."""
     if not underlying_ticker or tt_client is None:
@@ -1889,6 +2217,8 @@ def get_pruned_option_chain_tastytrade(
 
     strike_entries = []
     sym_key = "call" if target_right == "CALL" else "put"
+    stream_key = "call-streamer-symbol" if target_right == "CALL" else "put-streamer-symbol"
+    streamer_by_compact = {}
     for st_obj in strikes_list:
         if not isinstance(st_obj, dict):
             continue
@@ -1898,6 +2228,12 @@ def get_pruned_option_chain_tastytrade(
             continue
         compact_sym = _from_tastytrade_occ(raw_opt_sym).upper()
         strike_entries.append((compact_sym, sp))
+        raw_stream = st_obj.get(stream_key)
+        streamer_by_compact[compact_sym] = (
+            str(raw_stream).strip()
+            if raw_stream
+            else _to_dxlink_option_symbol(compact_sym)
+        )
 
     if not strike_entries:
         return None, json.dumps(
@@ -1907,21 +2243,43 @@ def get_pruned_option_chain_tastytrade(
             indent=2,
         )
 
-    # Fetch live Prod spot equity ask price and Prod option quotes
-    spot_quote = tt_client.get_quote(ticker, is_option=False)
+    # Determine spot reference price so we can pre-prune strikes to <= 80 (1 batch call).
+    # When prefer_spot_hint=True (used by eager RSI-signal background snapshots), reuse
+    # the freshly finalized 1m close price directly to save an extra equity REST call.
+    hint_val = _opt_safe_float(spot_hint, None)
     stk_ask_price = 0.0
-    if spot_quote is not None:
-        stk_ask_price = (
-            _opt_safe_float(spot_quote.ask_price, None)
-            or _opt_safe_float(spot_quote.last_price, None)
-            or _opt_safe_float(spot_quote.mark_price, None)
-            or _opt_safe_float(spot_quote.mid_price, None)
-            or _opt_safe_float(spot_quote.bid_price, None)
-            or 0.0
-        )
+    if prefer_spot_hint and hint_val is not None and hint_val > 0:
+        stk_ask_price = hint_val
+    else:
+        spot_quote = tt_client.get_quote(ticker, is_option=False)
+        if spot_quote is not None:
+            stk_ask_price = (
+                _opt_safe_float(spot_quote.ask_price, None)
+                or _opt_safe_float(spot_quote.last_price, None)
+                or _opt_safe_float(spot_quote.mark_price, None)
+                or _opt_safe_float(spot_quote.mid_price, None)
+                or _opt_safe_float(spot_quote.bid_price, None)
+                or 0.0
+            )
+        if stk_ask_price <= 0 and hint_val is not None and hint_val > 0:
+            stk_ask_price = hint_val
+
+    if stk_ask_price > 0:
+        target_entries = sorted(
+            strike_entries, key=lambda pair: (abs(pair[1] - stk_ask_price), pair[1])
+        )[:80]
+        target_entries = sorted(target_entries, key=lambda pair: pair[1])
+    else:
+        sorted_all = sorted(strike_entries, key=lambda pair: pair[1])
+        if len(sorted_all) <= 20:
+            target_entries = sorted_all
+        else:
+            mid_idx = len(sorted_all) // 2
+            start_i = max(0, mid_idx - 10)
+            target_entries = sorted_all[start_i : start_i + 20]
 
     opt_quotes = tt_client.get_quotes_batch(
-        [s for s, _ in strike_entries], is_option=True
+        [s for s, _ in target_entries], is_option=True
     )
 
     def _raw_quote_num(raw_dict, *keys):
@@ -1935,19 +2293,30 @@ def get_pruned_option_chain_tastytrade(
         return None
 
     parsed_contracts = []
-    for compact_sym, strike_price in strike_entries:
+    need_greeks_map = {}
+    for compact_sym, strike_price in target_entries:
         q = opt_quotes.get(compact_sym)
         raw_q = getattr(q, "raw", None) if q is not None else None
-        bid_val = (_opt_safe_float(q.bid_price, 0.0) or 0.0) if q is not None else 0.0
-        ask_val = (_opt_safe_float(q.ask_price, 0.0) or 0.0) if q is not None else 0.0
+        raw_bid = _opt_safe_float(q.bid_price, None) if q is not None else None
+        raw_ask = _opt_safe_float(q.ask_price, None) if q is not None else None
+        bid_val = round(raw_bid, 4) if (raw_bid is not None and raw_bid > 0) else None
+        ask_val = round(raw_ask, 4) if (raw_ask is not None and raw_ask > 0) else None
         mid_val = (
             round((bid_val + ask_val) / 2.0, 4)
-            if (bid_val > 0 and ask_val > 0)
+            if (bid_val is not None and ask_val is not None and ask_val >= bid_val)
             else (_opt_safe_float(getattr(q, "mid_price", None), None) if q is not None else None)
         )
+        if mid_val is not None and mid_val <= 0:
+            mid_val = None
         spread_pct = (
             round(((ask_val - bid_val) / mid_val) * 100.0, 2)
-            if (mid_val is not None and mid_val > 0 and ask_val >= bid_val)
+            if (
+                bid_val is not None
+                and ask_val is not None
+                and mid_val is not None
+                and mid_val > 0
+                and ask_val >= bid_val
+            )
             else None
         )
         last_px = _opt_safe_float(getattr(q, "last_price", None), None) if q is not None else None
@@ -1959,6 +2328,9 @@ def get_pruned_option_chain_tastytrade(
         vol_v = _raw_quote_num(raw_q, "volume")
         oi_v = _raw_quote_num(raw_q, "open-interest", "open_interest", "openInterest")
 
+        if delta_v is None and compact_sym in streamer_by_compact:
+            need_greeks_map[compact_sym] = streamer_by_compact[compact_sym]
+
         parsed_contracts.append(
             {
                 "contract": compact_sym,
@@ -1969,29 +2341,44 @@ def get_pruned_option_chain_tastytrade(
                 "spread_pct": spread_pct,
                 "last_price": round(last_px, 4) if last_px is not None else None,
                 "delta": round(delta_v, 4) if delta_v is not None else None,
-                "gamma": round(gamma_v, 4) if gamma_v else 0,
-                "theta": round(theta_v, 4) if theta_v else 0,
+                "gamma": round(gamma_v, 4) if gamma_v is not None else None,
+                "theta": round(theta_v, 4) if theta_v is not None else None,
                 "vega": round(vega_v, 4) if vega_v is not None else None,
                 "iv": round(iv_v, 4) if iv_v is not None else None,
                 "volume": int(vol_v) if vol_v is not None else None,
                 "open_interest": int(oi_v) if oi_v is not None else None,
                 "distance_from_spot": (
-                    abs(strike_price - stk_ask_price)
+                    round(abs(strike_price - stk_ask_price), 4)
                     if stk_ask_price > 0
                     else strike_price
                 ),
             }
         )
 
-    if stk_ask_price > 0:
-        sorted_by_proximity = sorted(
-            parsed_contracts, key=lambda x: x["distance_from_spot"]
-        )
-        pruned_list = sorted_by_proximity[:1000]
-        pruned_chain = sorted(pruned_list, key=lambda x: x["strike"])
-    else:
-        sorted_by_strike = sorted(parsed_contracts, key=lambda x: x["strike"])
-        pruned_chain = sorted_by_strike[:20]
+    if (
+        include_greeks
+        and stk_ask_price > 0
+        and need_greeks_map
+        and hasattr(tt_client, "get_option_greeks_batch")
+    ):
+        greeks_map = tt_client.get_option_greeks_batch(need_greeks_map) or {}
+        if greeks_map:
+            for item in parsed_contracts:
+                g = greeks_map.get(item["contract"])
+                if not isinstance(g, dict):
+                    continue
+                if item["delta"] is None and g.get("delta") is not None:
+                    item["delta"] = round(g["delta"], 4)
+                if item["gamma"] is None and g.get("gamma") is not None:
+                    item["gamma"] = round(g["gamma"], 4)
+                if item["theta"] is None and g.get("theta") is not None:
+                    item["theta"] = round(g["theta"], 4)
+                if item["vega"] is None and g.get("vega") is not None:
+                    item["vega"] = round(g["vega"], 4)
+                if item["iv"] is None and g.get("iv") is not None:
+                    item["iv"] = round(g["iv"], 4)
+
+    pruned_chain = sorted(parsed_contracts, key=lambda x: x["strike"])
 
     # Select 2nd OTM contract matching getOptionsContracts.get_one_contract
     selected_contract = None
@@ -2023,7 +2410,7 @@ def get_pruned_option_chain_tastytrade(
             "option_type": target_right.lower(),
             "timestamp": format_display_ts(now_utc, "%Y-%m-%d %H:%M:%S %Z"),
             "utc_timestamp": now_utc.isoformat(),
-            "spot_ask_price": stk_ask_price,
+            "spot_ask_price": round(float(stk_ask_price), 4) if stk_ask_price > 0 else None,
             "chain_snapshot": pruned_chain,
         },
         indent=2,
@@ -2107,7 +2494,7 @@ class OptionContractHistoryTracker:
         best_latest_ts = None
 
         kin_map = getattr(coord, "kinematics_history", None) or {}
-        for prov in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+        for prov in _provider_priority_order():
             hist = kin_map.get((prov, und))
             if not hist:
                 continue
@@ -3293,7 +3680,7 @@ class OptionContractHistoryTracker:
                 s_min = minute_utc(as_utc(s_dt))
                 e_min = minute_utc(as_utc(e_dt))
                 per_min = result.setdefault(und, {})
-                for prov in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+                for prov in _provider_priority_order():
                     for h in kin_map.get((prov, und), []) or []:
                         hm = _hist_minute_utc(h)
                         hc = _opt_safe_float(h.get("close"), None)
@@ -7062,9 +7449,56 @@ def _ini_float(cfg, section, option, env_name, default):
     return float(os.getenv(env_name, str(default)))
 
 
+_KNOWN_PROVIDERS = frozenset(DEFAULT_PROVIDER_PRIORITY)
+
+
+def _parse_provider_priority(raw_value):
+    """Parse comma-separated [providers] priority list and append unspecified known providers."""
+    if not raw_value or not str(raw_value).strip():
+        return DEFAULT_PROVIDER_PRIORITY
+    ordered = []
+    seen = set()
+    for part in str(raw_value).split(","):
+        name = part.strip().upper()
+        if not name:
+            continue
+        if name not in _KNOWN_PROVIDERS:
+            raise ValueError(
+                f"Unknown provider in [providers] priority: {name!r}; "
+                f"expected one of {sorted(_KNOWN_PROVIDERS)}"
+            )
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    for fallback in DEFAULT_PROVIDER_PRIORITY:
+        if fallback not in seen:
+            ordered.append(fallback)
+            seen.add(fallback)
+    return tuple(ordered)
+
+
+def _provider_priority_order():
+    """Return active provider preference order (highest priority first)."""
+    prio = globals().get("PROVIDER_PRIORITY")
+    if isinstance(prio, (tuple, list)) and prio:
+        return tuple(prio)
+    return DEFAULT_PROVIDER_PRIORITY
+
+
+def _provider_priority_score(provider):
+    """Return descending integer preference score for provider (higher = preferred)."""
+    p = str(provider or "").strip().upper()
+    order = _provider_priority_order()
+    try:
+        return len(order) - order.index(p)
+    except ValueError:
+        return 0
+
+
 def _apply_ini_feature_settings(cfg):
     """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [feature_toggles], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA
+    global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
     global TASTYTRADE_TRANSACTION_ENV, TASTYTRADE_ACCOUNT_NUMBER
     global TASTYTRADE_PROD_ACCOUNT_NUMBER, TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
@@ -7109,6 +7543,10 @@ def _apply_ini_feature_settings(cfg):
     DISPLAY_TIMEZONE_SETTING = tz_setting
     DISPLAY_TZ, DISPLAY_TZ_IANA = _resolve_display_timezone(tz_setting)
     _reconfigure_logging_timezone()
+
+    raw_prio = _ini_str(cfg, "providers", "priority", "PROVIDER_PRIORITY", "")
+    PROVIDER_PRIORITY = _parse_provider_priority(raw_prio)
+    logging.info("PROVIDER_PRIORITY order=%s", list(PROVIDER_PRIORITY))
 
     chain_prov = (
         _ini_str(
@@ -8067,6 +8505,15 @@ OPTION_BUY_MAX_OPEN_CONTRACTS = max(
 OPTION_BUY_MAX_AGE_SECONDS = max(
     30, int(os.getenv("OPTION_BUY_MAX_AGE_SECONDS", "180"))
 )
+OPTION_CHAIN_RSI_COOLDOWN_SECONDS = max(
+    0, int(os.getenv("OPTION_CHAIN_RSI_COOLDOWN_SECONDS", "0"))
+)
+OPTION_CHAIN_PACING_SECONDS = max(
+    0.0, float(os.getenv("OPTION_CHAIN_PACING_SECONDS", "0.20"))
+)
+OPTION_CHAIN_429_BACKOFF_SECONDS = max(
+    5.0, float(os.getenv("OPTION_CHAIN_429_BACKOFF_SECONDS", "20.0"))
+)
 OPTION_BUY_FETCH_IF_MISSING = os.getenv(
     "OPTION_BUY_FETCH_IF_MISSING", "true"
 ).strip().lower() in {"1", "true", "yes"}
@@ -8915,11 +9362,11 @@ def _has_finite_field(entry, *keys):
     return False
 
 
-def _kinematics_entry_rank(provider, entry):
-    """Rank kinematics entry quality so incomplete bars with rsi=None never override finite RSI feeds."""
+def _kinematics_entry_rank(provider, entry, *, is_current=True, is_recent=True, is_connected=True):
+    """Rank kinematics entry by freshness, completeness, health, and [providers] priority."""
     if not isinstance(entry, dict):
-        return (-1, 0, 0, 0, 0, "")
-    is_tv = 1 if provider == "TRADINGVIEW" else 0
+        return (-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, "")
+    prio_score = _provider_priority_score(provider)
     has_complete = _has_complete_kinematics(entry)
     has_rsi = _has_finite_field(entry, "rsi")
     has_vel = _has_finite_field(entry, "smoothed_velocity", "price_velocity")
@@ -8931,9 +9378,7 @@ def _kinematics_entry_rank(provider, entry):
         else -1
     )
     ts = str(entry.get("timestamp") or "")
-    if is_tv and has_complete:
-        tier = 4
-    elif has_complete:
+    if has_complete:
         tier = 3
     elif has_rsi:
         tier = 2
@@ -8941,19 +9386,64 @@ def _kinematics_entry_rank(provider, entry):
         tier = 1
     else:
         tier = 0
-    return (tier, 1 if has_vel else 0, is_tv, changes_val, 1 if has_close else 0, ts)
+    cur_flag = 1 if is_current else 0
+    rec_flag = 1 if is_recent else 0
+    conn_flag = 1 if is_connected else 0
+    return (
+        1 if (tier >= 3 and cur_flag) else 0,
+        1 if (tier >= 3 and rec_flag) else 0,
+        tier,
+        cur_flag,
+        rec_flag,
+        conn_flag,
+        prio_score,
+        1 if has_vel else 0,
+        changes_val,
+        1 if has_close else 0,
+        ts,
+    )
 
 
 def _select_best_kinematics_entry(coordinator, symbol):
-    """Return (provider, latest_entry) for symbol ranked by completeness tier, then freshness."""
-    best_provider = None
-    best_entry = None
-    best_rank = None
+    """Return (provider, latest_entry) prioritizing healthy, fresh bars in [providers] priority order."""
+    candidates = []
     for (provider, sym), hist in coordinator.kinematics_history.items():
         if sym != symbol or not hist:
             continue
         cand = hist[-1]
-        rank = _kinematics_entry_rank(provider, cand)
+        cand_min = _hist_minute_utc(cand)
+        candidates.append((provider, cand, cand_min))
+    if not candidates:
+        return None, None
+
+    ref_min = getattr(coordinator, "last_finalized", None)
+    if ref_min is not None:
+        ref_min = minute_utc(as_utc(ref_min))
+    else:
+        valid_mins = [
+            cm for _, c, cm in candidates if cm is not None and _has_complete_kinematics(c)
+        ] or [cm for _, _, cm in candidates if cm is not None]
+        ref_min = max(valid_mins) if valid_mins else None
+
+    connected_map = getattr(coordinator, "connected", None) or {}
+    best_provider = None
+    best_entry = None
+    best_rank = None
+    for provider, cand, cand_min in candidates:
+        if ref_min is not None and cand_min is not None:
+            is_current = cand_min >= ref_min
+            is_recent = cand_min >= (ref_min - MINUTE)
+        else:
+            is_current = True
+            is_recent = True
+        is_connected = bool(connected_map.get(provider, True))
+        rank = _kinematics_entry_rank(
+            provider,
+            cand,
+            is_current=is_current,
+            is_recent=is_recent,
+            is_connected=is_connected,
+        )
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_provider = provider
@@ -9515,10 +10005,10 @@ class TradingviewProvider:
 
                     try:
                         self.record(event)
-                        # Out-of-band RSI values trigger option-chain
-                        # collection as a background task; the shutdown drain
-                        # below intentionally calls only record().
-                        self.schedule_option_chain(event)
+                        # Eager RSI-signal option-chain collection is handled centrally by
+                        # RsiOptionChainCollector on finalized minutes using [providers] priority
+                        # (with per-symbol cooldown, pacing, and single-call safeguards) so
+                        # TradingView, Tastytrade, and Alpaca never double-fetch.
                     finally:
                         self.queue.task_done()
 
@@ -9546,6 +10036,368 @@ class TradingviewProvider:
                     self.record(event)
                 finally:
                     self.queue.task_done()
+
+
+class RsiOptionChainCollector:
+    """Always-on, rate-limit-safe RSI option-chain collector driven by [providers] priority.
+
+    Listens for finalized minutes on MinuteCoordinator, selects each symbol's best
+    healthy provider according to [providers] priority (e.g. TRADINGVIEW first or
+    TASTYTRADE first, with automatic failover), and collects pruned option-chain
+    snapshots whenever RSI crosses OPTION_CHAIN_RSI_LOW (BUY) or OPTION_CHAIN_RSI_HIGH (SELL).
+
+    Built-in rate-limit safeguards:
+      1. Per-(symbol, signal) cooldown aligned with OPTION_BUY_MAX_AGE_SECONDS (default 180s).
+      2. Skips redundant fetches when a fresh cached snapshot for the same signal already exists.
+      3. Tastytrade eager fetches pass include_greeks=False and prefer_spot_hint=True
+         (1 REST call total, 0 extra DXLink WebSocket sessions).
+      4. Strictly serialized behind a single asyncio.Lock with gentle inter-call pacing
+         and automatic HTTP 429 cooldown backoff.
+    """
+
+    def __init__(self, credentials, coordinator, option_client=None):
+        self.provider = "OPTION_CHAIN_COLLECTOR"
+        self.credentials = dict(credentials or {})
+        self.coordinator = coordinator
+        self.option_client = (
+            option_client
+            if option_client is not None
+            else build_option_chain_client(self.credentials)
+        )
+        self.option_chain_lock = asyncio.Lock()
+        self.logger = make_logger("OPTION_CHAIN_COLLECTOR", "_RSI")
+        self._last_collected_monotonic = {}
+        self._scheduled_keys = set()
+        self._rate_limited_until = 0.0
+        self._warned_missing_creds = False
+        self._stats = {
+            "collected": 0,
+            "skipped_cooldown": 0,
+            "skipped_cached": 0,
+            "skipped_rate_limit": 0,
+            "errors": 0,
+            "last_collected_utc": None,
+            "last_symbol": None,
+            "last_provider": None,
+        }
+
+    def effective_cooldown_seconds(self):
+        if OPTION_CHAIN_RSI_COOLDOWN_SECONDS > 0:
+            return float(OPTION_CHAIN_RSI_COOLDOWN_SECONDS)
+        return float(max(60, int(OPTION_BUY_MAX_AGE_SECONDS)))
+
+    def _credentials_ready(self, chain_prov):
+        if chain_prov == "tastytrade":
+            has_creds = bool(
+                self.credentials.get("tastytrade_prod_client_secret")
+                and self.credentials.get("tastytrade_prod_refresh_token")
+            )
+            return isinstance(self.option_client, TastytradeClient) and (
+                has_creds or self.option_client.has_env_credentials("prod")
+            )
+        return bool(
+            self.credentials.get("alpaca_key")
+            and self.credentials.get("alpaca_secret")
+            and self.option_client is not None
+        )
+
+    def _has_fresh_same_signal_cache(self, symbol, signal, max_age_seconds):
+        cached = self.coordinator.latest_option_contract(
+            symbol, max_age_seconds=max_age_seconds
+        )
+        if not cached:
+            return False
+        cached_sig = str(cached.get("signal") or "").strip().lower()
+        return cached_sig == str(signal or "").strip().lower()
+
+    def write_option_chain_payload(
+        self, provider, symbol, rsi, signal, event_time, clean_payload
+    ):
+        """Write the full clean payload using the standard optionchain filename format."""
+        directory = LOG_ROOT / "optionchains"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(symbol))
+        prov_tag = "".join(
+            c if c.isalnum() or c in "-_" else "_" for c in str(provider or "UNKNOWN").upper()
+        )
+        try:
+            bar_time = as_display_tz(event_time)
+        except (TypeError, ValueError):
+            bar_time = as_display_tz()
+        tz_lbl = "".join(c for c in display_tz_abbr(bar_time) if c.isalnum()) or "TZ"
+        stamp = f"{bar_time.strftime('%Y%m%dT%H%M%S')}_{tz_lbl}"
+        filename = (
+            f"optionchain-{prov_tag}-{safe}-{str(signal).upper()}-rsi{float(rsi):.2f}-"
+            f"{stamp}-{uuid4().hex[:6]}.json"
+        )
+        path = directory / filename
+        path.write_text(
+            json.dumps(clean_payload, indent=2, default=str), encoding="utf-8"
+        )
+        return path
+
+    async def collect_for_finalized_minute(self, finalized_minute=None):
+        """Evaluate all symbols for the finalized minute using [providers] priority."""
+        target_minute = (
+            minute_utc(finalized_minute)
+            if finalized_minute is not None
+            else self.coordinator.last_finalized
+        )
+        if target_minute is None:
+            return 0
+        target_minute = minute_utc(target_minute)
+        finalized_iso = target_minute.isoformat()
+        chain_prov = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+
+        if not self._credentials_ready(chain_prov):
+            if not self._warned_missing_creds:
+                self._warned_missing_creds = True
+                self.logger.warning(
+                    "OPTION_CHAIN_COLLECTOR_DISABLED chain_provider=%s reason=missing_credentials_or_client",
+                    chain_prov,
+                )
+            return 0
+
+        cooldown_sec = self.effective_cooldown_seconds()
+        now_mono = time.monotonic()
+        candidates = []
+
+        for symbol in self.coordinator.symbols:
+            provider, entry = _select_best_kinematics_entry(self.coordinator, symbol)
+            if not provider or not isinstance(entry, dict):
+                continue
+            entry_min = _hist_minute_utc(entry)
+            if entry_min is None or entry_min != target_minute:
+                continue
+            rsi = entry.get("rsi")
+            if rsi is None:
+                continue
+            signal = rsi_signal(rsi)
+            if signal is None:
+                continue
+
+            self.logger.info(
+                "RSI_SIGNAL provider=%s symbol=%s rsi=%.4f signal=%s",
+                provider,
+                symbol,
+                rsi,
+                signal.upper(),
+            )
+            logging.info(
+                "RSI_SIGNAL provider=%s symbol=%s rsi=%.4f signal=%s",
+                provider,
+                symbol,
+                rsi,
+                signal.upper(),
+            )
+
+            dedup_key = (symbol, finalized_iso, signal)
+            if dedup_key in self._scheduled_keys:
+                continue
+            if len(self._scheduled_keys) > 1000:
+                self._scheduled_keys.clear()
+            self._scheduled_keys.add(dedup_key)
+
+            last_ts = self._last_collected_monotonic.get((symbol, signal))
+            if last_ts is not None and (now_mono - last_ts) < cooldown_sec:
+                self._stats["skipped_cooldown"] += 1
+                self.logger.debug(
+                    "OPTION_CHAIN_COOLDOWN_SKIP provider=%s symbol=%s signal=%s rsi=%.4f remaining_s=%.1f",
+                    provider,
+                    symbol,
+                    signal.upper(),
+                    rsi,
+                    cooldown_sec - (now_mono - last_ts),
+                )
+                continue
+
+            if self._has_fresh_same_signal_cache(symbol, signal, cooldown_sec):
+                self._stats["skipped_cached"] += 1
+                self.logger.debug(
+                    "OPTION_CHAIN_CACHE_SKIP provider=%s symbol=%s signal=%s rsi=%.4f",
+                    provider,
+                    symbol,
+                    signal.upper(),
+                    rsi,
+                )
+                continue
+
+            candidates.append((symbol, provider, entry, signal))
+
+        if not candidates:
+            return 0
+
+        collected_count = 0
+        async with self.option_chain_lock:
+            for idx, (symbol, provider, entry, signal) in enumerate(candidates):
+                now_loop = time.monotonic()
+                if now_loop < self._rate_limited_until:
+                    self._stats["skipped_rate_limit"] += 1
+                    self.logger.warning(
+                        "OPTION_CHAIN_RATE_LIMIT_SKIP provider=%s symbol=%s signal=%s backoff_remaining_s=%.1f",
+                        provider,
+                        symbol,
+                        signal.upper(),
+                        self._rate_limited_until - now_loop,
+                    )
+                    continue
+
+                # Re-check cache right before network call in case OptionBuyer fetched concurrently
+                if self._has_fresh_same_signal_cache(symbol, signal, cooldown_sec):
+                    self._stats["skipped_cached"] += 1
+                    continue
+
+                rsi = float(entry["rsi"])
+                label = signal.upper()
+                event_time = entry.get("timestamp") or finalized_iso
+                try:
+                    if chain_prov == "tastytrade":
+                        if not isinstance(self.option_client, TastytradeClient):
+                            raise RuntimeError(
+                                "optionchainprovider=tastytrade requires a TastytradeClient (no fallbacks)"
+                            )
+                        raw_chain_res = await asyncio.to_thread(
+                            get_pruned_option_chain_tastytrade,
+                            symbol,
+                            self.option_client,
+                            right="CALL",
+                            spot_hint=entry.get("close"),
+                            include_greeks=False,
+                            prefer_spot_hint=True,
+                        )
+                    else:
+                        raw_chain_res = await asyncio.to_thread(
+                            get_pruned_option_chain,
+                            symbol,
+                            self.credentials["alpaca_key"],
+                            self.credentials["alpaca_secret"],
+                            self.option_client,
+                        )
+                    contract, clean_payload = _unpack_pruned_option_chain_result(
+                        raw_chain_res
+                    )
+                except Exception as exc:
+                    self._stats["errors"] += 1
+                    err_str = str(exc)
+                    if "HTTP 429" in err_str or "429" in err_str:
+                        self._rate_limited_until = (
+                            time.monotonic() + OPTION_CHAIN_429_BACKOFF_SECONDS
+                        )
+                        self.logger.warning(
+                            "OPTION_CHAIN_RATE_LIMITED provider=%s chain_provider=%s symbol=%s backoff_s=%.1f",
+                            provider,
+                            chain_prov,
+                            symbol,
+                            OPTION_CHAIN_429_BACKOFF_SECONDS,
+                        )
+                    self.logger.error(
+                        "OPTION_CHAIN_FAILED provider=%s chain_provider=%s signal=%s symbol=%s rsi=%.4f error_type=%s detail=%s",
+                        provider,
+                        chain_prov,
+                        label,
+                        symbol,
+                        rsi,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+
+                self._last_collected_monotonic[(symbol, signal)] = time.monotonic()
+
+                try:
+                    path = await asyncio.to_thread(
+                        self.write_option_chain_payload,
+                        provider,
+                        symbol,
+                        rsi,
+                        signal,
+                        event_time,
+                        clean_payload,
+                    )
+                except Exception as exc:
+                    self._stats["errors"] += 1
+                    self.logger.error(
+                        "OPTION_CHAIN_WRITE_FAILED provider=%s signal=%s symbol=%s rsi=%.4f error_type=%s detail=%s",
+                        provider,
+                        label,
+                        symbol,
+                        rsi,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+
+                parsed_sym, _, _ = AlpacaOptionBuyer._extract_contract_details(
+                    contract, clean_payload
+                )
+                if contract is None or not parsed_sym:
+                    err_detail = (
+                        _extract_option_chain_error_message(contract, clean_payload)
+                        or "empty_chain"
+                    )
+                    self.logger.warning(
+                        "OPTION_CHAIN_NO_CONTRACT provider=%s chain_provider=%s signal=%s symbol=%s rsi=%.4f detail=%s file=%s",
+                        provider,
+                        chain_prov,
+                        label,
+                        symbol,
+                        rsi,
+                        err_detail,
+                        path.name,
+                    )
+                else:
+                    self.coordinator.record_option_contract(
+                        symbol=symbol,
+                        contract=contract,
+                        signal=signal,
+                        event_time=event_time,
+                        clean_payload=clean_payload,
+                        source=f"{provider}:{chain_prov.upper()}",
+                    )
+                    self._stats["collected"] += 1
+                    self._stats["last_collected_utc"] = datetime.now(UTC).isoformat()
+                    self._stats["last_symbol"] = symbol
+                    self._stats["last_provider"] = provider
+                    collected_count += 1
+                    self.logger.info(
+                        "OPTION_CHAIN_CONTRACT provider=%s chain_provider=%s signal=%s symbol=%s rsi=%.4f contract=%s file=%s",
+                        provider,
+                        chain_prov,
+                        label,
+                        symbol,
+                        rsi,
+                        parsed_sym,
+                        path.name,
+                    )
+
+                if OPTION_CHAIN_PACING_SECONDS > 0 and idx < len(candidates) - 1:
+                    await asyncio.sleep(OPTION_CHAIN_PACING_SECONDS)
+
+        return collected_count
+
+    async def run(self):
+        minute_event = self.coordinator.subscribe_minute_finalized()
+        self.logger.info(
+            "OPTION_CHAIN_COLLECTOR_START chain_provider=%s priority=%s cooldown_s=%.0f pacing_s=%.2f",
+            str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower(),
+            ",".join(_provider_priority_order()),
+            self.effective_cooldown_seconds(),
+            OPTION_CHAIN_PACING_SECONDS,
+        )
+        while True:
+            await minute_event.wait()
+            minute_event.clear()
+            try:
+                await self.collect_for_finalized_minute()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._stats["errors"] += 1
+                self.logger.error(
+                    "OPTION_CHAIN_COLLECTOR_LOOP_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
 
 
 class AlpacaPositionMonitor:
@@ -10496,6 +11348,57 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
+            try:
+                await ensure_open_positions()
+            except Exception as exc:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"positions_check_failed({type(exc).__name__})",
+                )
+                self.logger.warning(
+                    "OPTION_BUY_POSITIONS_CHECK_FAILED symbol=%s error_type=%s detail=%s",
+                    symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+
+            if open_option_count >= OPTION_BUY_MAX_OPEN_CONTRACTS:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"max_open_contracts({open_option_count}/{OPTION_BUY_MAX_OPEN_CONTRACTS})",
+                )
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s reason=max_open_contracts count=%d limit=%d",
+                    symbol,
+                    open_option_count,
+                    OPTION_BUY_MAX_OPEN_CONTRACTS,
+                )
+                continue
+
+            if not OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING and symbol in open_underlyings:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    "underlying_option_already_held",
+                )
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s reason=underlying_option_already_held",
+                    symbol,
+                )
+                continue
+
             cached = self.coordinator.latest_option_contract(
                 symbol, max_age_seconds=OPTION_BUY_MAX_AGE_SECONDS
             )
@@ -10547,6 +11450,8 @@ class AlpacaOptionBuyer:
                             get_pruned_option_chain_tastytrade,
                             symbol,
                             tt_chain_client,
+                            right=desired_right,
+                            spot_hint=entry.get("close"),
                         )
                     else:
                         raw_chain_res = await asyncio.to_thread(
@@ -10559,7 +11464,7 @@ class AlpacaOptionBuyer:
                     contract, clean_payload = _unpack_pruned_option_chain_result(
                         raw_chain_res
                     )
-                    signal_label = "buy" if desired_right == "CALL" else "sell"
+                    signal_label = "buy"
                     parsed_sym, _, _ = self._extract_contract_details(
                         contract, clean_payload, desired_right=desired_right
                     )
@@ -10674,45 +11579,6 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
-            try:
-                await ensure_open_positions()
-            except Exception as exc:
-                self._log_buy_analysis(
-                    minute_key,
-                    symbol,
-                    provider,
-                    entry,
-                    "REJECTED",
-                    f"positions_check_failed({type(exc).__name__})",
-                    contract_symbol=contract_symbol,
-                )
-                self.logger.warning(
-                    "OPTION_BUY_POSITIONS_CHECK_FAILED symbol=%s error_type=%s detail=%s",
-                    symbol,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-
-            if open_option_count >= OPTION_BUY_MAX_OPEN_CONTRACTS:
-                self._log_buy_analysis(
-                    minute_key,
-                    symbol,
-                    provider,
-                    entry,
-                    "REJECTED",
-                    f"max_open_contracts({open_option_count}/{OPTION_BUY_MAX_OPEN_CONTRACTS})",
-                    contract_symbol=contract_symbol,
-                )
-                self.logger.info(
-                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=max_open_contracts count=%d limit=%d",
-                    symbol,
-                    contract_symbol,
-                    open_option_count,
-                    OPTION_BUY_MAX_OPEN_CONTRACTS,
-                )
-                continue
-
             if contract_symbol in open_contracts:
                 self._log_buy_analysis(
                     minute_key,
@@ -10730,41 +11596,29 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
-            if not OPTION_BUY_ALLOW_DUPLICATE_UNDERLYING and symbol in open_underlyings:
-                self._log_buy_analysis(
-                    minute_key,
-                    symbol,
-                    provider,
-                    entry,
-                    "REJECTED",
-                    "underlying_option_already_held",
-                    contract_symbol=contract_symbol,
-                )
-                self.logger.info(
-                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=underlying_option_already_held",
-                    symbol,
-                    contract_symbol,
-                )
-                continue
-
             contract_bid, contract_ask = self._extract_contract_quote(
                 contract,
                 clean_payload,
                 contract_symbol=contract_symbol,
                 desired_right=desired_right,
             )
+            if contract_bid is not None and contract_bid <= 0:
+                contract_bid = None
+            if contract_ask is not None and contract_ask <= 0:
+                contract_ask = None
             if contract_bid is None or contract_ask is None:
                 live_bid, live_ask = await asyncio.to_thread(
                     self._fetch_option_quote, contract_symbol
                 )
-                if contract_bid is None:
+                if contract_bid is None and live_bid is not None and live_bid > 0:
                     contract_bid = live_bid
-                if contract_ask is None:
+                if contract_ask is None and live_ask is not None and live_ask > 0:
                     contract_ask = live_ask
 
             if (
                 contract_bid is not None
                 and contract_ask is not None
+                and contract_bid > 0
                 and contract_ask >= contract_bid
             ):
                 mid_quote = (contract_bid + contract_ask) / 2.0
@@ -10797,6 +11651,24 @@ class AlpacaOptionBuyer:
                         contract_ask,
                     )
                     continue
+            elif OPTION_BUY_MAX_SPREAD_PCT > 0:
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"missing_quote_for_spread_check(bid={contract_bid},ask={contract_ask})",
+                    contract_symbol=contract_symbol,
+                )
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=missing_quote_for_spread_check bid=%s ask=%s",
+                    symbol,
+                    contract_symbol,
+                    contract_bid,
+                    contract_ask,
+                )
+                continue
 
             if OPTION_BUY_ORDER_TYPE == "limit":
                 if (
@@ -16196,12 +17068,60 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <thead class="sticky top-0 z-20 bg-slate-950/90 backdrop-blur border-b border-slate-800 text-slate-400 font-semibold shadow-sm">
                         <tr>
                             <th class="px-4 py-2.5" id="thSymbolCol">Symbol / Feeds</th>
-                            <th class="px-4 py-2.5 text-right">Close ($)</th>
-                            <th class="px-4 py-2.5 text-right">Projected P̂<sub>t+1</sub></th>
-                            <th class="px-4 py-2.5 text-right">Price Velocity (v)</th>
-                            <th class="px-4 py-2.5 text-right">Price Accel (a)</th>
-                            <th class="px-4 py-2.5 min-w-[130px]">RSI (14)</th>
-                            <th class="px-4 py-2.5 text-right">RSI Vel / Acc</th>
+                            <th class="px-4 py-2.5 text-right">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('close')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="close" title="Sort by Close ($)">Close ($)</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('close', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="close:asc" title="Sort Close ($) ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('close', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="close:desc" title="Sort Close ($) descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
+                            <th class="px-4 py-2.5 text-right">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('projected')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="projected" title="Sort by Projected P&#770; t+1">Projected P&#770;<sub>t+1</sub></button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('projected', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="projected:asc" title="Sort Projected Price ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('projected', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="projected:desc" title="Sort Projected Price descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
+                            <th class="px-4 py-2.5 text-right">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('price_vel')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="price_vel" title="Sort by Price Velocity (v)">Price Velocity (v)</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('price_vel', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="price_vel:asc" title="Sort Price Velocity ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('price_vel', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="price_vel:desc" title="Sort Price Velocity descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
+                            <th class="px-4 py-2.5 text-right">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('price_accel')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="price_accel" title="Sort by Price Accel (a)">Price Accel (a)</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('price_accel', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="price_accel:asc" title="Sort Price Accel ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('price_accel', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="price_accel:desc" title="Sort Price Accel descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
+                            <th class="px-4 py-2.5 min-w-[130px]">
+                                <div class="inline-flex items-center gap-1">
+                                    <button type="button" onclick="toggleTableSort('rsi')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="rsi" title="Sort by RSI (14)">RSI (14)</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('rsi', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi:asc" title="Sort RSI (14) ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('rsi', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi:desc" title="Sort RSI (14) descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
+                            <th class="px-4 py-2.5 text-right">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('rsi_vel')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="rsi_vel" title="Sort by RSI Vel / Acc">RSI Vel / Acc</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('rsi_vel', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi_vel:asc" title="Sort RSI Vel / Acc ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('rsi_vel', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi_vel:desc" title="Sort RSI Vel / Acc descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
                             <th class="px-4 py-2.5">Forecast Matrix Signal</th>
                             <th class="px-4 py-2.5 text-center">Inspect / Test</th>
                         </tr>
@@ -16876,6 +17796,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         let currentFilter = 'all';
         let currentViewMode = 'consolidated'; // 'consolidated' or 'streams'
+        let tableSortKey = null;
+        let tableSortDir = null; // 'asc' | 'desc' | null
         let selectedSymbol = null;
         let userSelectedSymbol = false;
         let chartCaptureEnabledState = null;
@@ -17664,14 +18586,102 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
+        function updateSortHeaderIndicators() {
+            document.querySelectorAll('.sort-header-btn').forEach(btn => {
+                const isActive = btn.dataset.sortKey === tableSortKey && tableSortDir !== null;
+                btn.classList.toggle('text-indigo-300', isActive);
+                btn.classList.toggle('font-bold', isActive);
+            });
+            document.querySelectorAll('.sort-arrow-btn').forEach(btn => {
+                const target = `${tableSortKey || ''}:${tableSortDir || ''}`;
+                const isActive = tableSortKey !== null && tableSortDir !== null && btn.dataset.sortArrow === target;
+                btn.classList.toggle('text-cyan-300', isActive);
+                btn.classList.toggle('text-slate-600', !isActive);
+            });
+        }
+
+        function setTableSort(key, dir) {
+            if (tableSortKey === key && tableSortDir === dir) {
+                tableSortKey = null;
+                tableSortDir = null;
+            } else {
+                tableSortKey = key;
+                tableSortDir = dir;
+            }
+            updateSortHeaderIndicators();
+            applyFilters();
+        }
+
+        function toggleTableSort(key) {
+            if (tableSortKey !== key) {
+                tableSortKey = key;
+                tableSortDir = 'asc';
+            } else if (tableSortDir === 'asc') {
+                tableSortDir = 'desc';
+            } else {
+                tableSortKey = null;
+                tableSortDir = null;
+            }
+            updateSortHeaderIndicators();
+            applyFilters();
+        }
+
+        function getSortValue(item, key) {
+            if (!item) return null;
+            if (key === 'close') return safeNum(item.close);
+            if (key === 'projected') return safeNum(item.projected_price_next);
+            if (key === 'price_vel') {
+                if (currentViewMode === 'consolidated') {
+                    return safeNum(item.smoothed_velocity !== null && item.smoothed_velocity !== undefined ? item.smoothed_velocity : item.price_velocity);
+                }
+                return safeNum(item.price_velocity);
+            }
+            if (key === 'price_accel') {
+                if (currentViewMode === 'consolidated') {
+                    return safeNum(item.smoothed_acceleration !== null && item.smoothed_acceleration !== undefined ? item.smoothed_acceleration : item.price_acceleration);
+                }
+                return safeNum(item.price_acceleration);
+            }
+            if (key === 'rsi') return safeNum(item.rsi);
+            if (key === 'rsi_vel') return safeNum(item.rsi_velocity);
+            return null;
+        }
+
+        function sortTableDataset(list) {
+            if (!tableSortKey || !tableSortDir) return list;
+            const mult = tableSortDir === 'asc' ? 1 : -1;
+            return [...list].sort((a, b) => {
+                const va = getSortValue(a, tableSortKey);
+                const vb = getSortValue(b, tableSortKey);
+                if (va === null && vb === null) {
+                    const sa = String(a.symbol || '');
+                    const sb = String(b.symbol || '');
+                    return sa !== sb ? sa.localeCompare(sb) : String(a.provider || '').localeCompare(String(b.provider || ''));
+                }
+                if (va === null) return 1;
+                if (vb === null) return -1;
+                if (va !== vb) return (va - vb) * mult;
+                if (tableSortKey === 'rsi_vel') {
+                    const aa = safeNum(a.rsi_acceleration);
+                    const ab = safeNum(b.rsi_acceleration);
+                    if (aa !== null && ab !== null && aa !== ab) return (aa - ab) * mult;
+                    if (aa === null && ab !== null) return 1;
+                    if (aa !== null && ab === null) return -1;
+                }
+                const sa = String(a.symbol || '');
+                const sb = String(b.symbol || '');
+                return sa !== sb ? sa.localeCompare(sb) : String(a.provider || '').localeCompare(String(b.provider || ''));
+            });
+        }
+
         function applyFilters() {
             if (!latestData) return;
             const search = (document.getElementById('symbolSearch').value || '').trim().toUpperCase();
             const tbody = document.getElementById('kinematicsTableBody');
 
             let dataset = currentViewMode === 'consolidated' 
-                ? (latestData.consolidated_symbols || []) 
-                : (latestData.instruments || []);
+                ? [...(latestData.consolidated_symbols || [])] 
+                : [...(latestData.instruments || [])];
 
             // Normalize regimes
             dataset.forEach(item => { item.regime = getRegime(item); });
@@ -17685,6 +18695,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (search) {
                 dataset = dataset.filter(i => i.symbol.includes(search));
             }
+
+            // Apply column sorting
+            dataset = sortTableDataset(dataset);
 
             if (dataset.length === 0) {
                 tbody.innerHTML = `<tr><td colspan="10" class="px-4 py-8 text-center text-slate-500">No instruments match current filter criteria.</td></tr>`;
@@ -21636,10 +22649,10 @@ def _load_minute_summary_kinematics_index():
                         if not isinstance(prov_map, dict):
                             continue
                         sym_u = str(sym_k).strip().upper()
-                        # Prefer TRADINGVIEW, then any provider with finite RSI/close
+                        # Follow configured [providers] priority, preferring finite RSI/close
                         best_p = None
                         best_e = None
-                        for prov_name in ("TRADINGVIEW", "ALPACA", "YAHOOFINANCE", "TRADIER", "TASTYTRADE"):
+                        for prov_name in _provider_priority_order():
                             cand = prov_map.get(prov_name)
                             if isinstance(cand, dict) and (_opt_safe_float(cand.get("close"), None) is not None or _opt_safe_float(cand.get("rsi"), None) is not None):
                                 best_p, best_e = prov_name, cand
@@ -23159,6 +24172,7 @@ class AdminCliProvider:
                     "transactionprovider": OPTION_TRANSACTION_PROVIDER,
                     "tastytrade_transaction_env": TASTYTRADE_TRANSACTION_ENV,
                 },
+                "provider_priority": list(_provider_priority_order()),
                 "dashboard_ssl": {
                     "enabled": bool(DASHBOARD_SSL_ENABLED),
                     "mode": DASHBOARD_SSL_MODE,
@@ -23185,6 +24199,7 @@ class AdminCliProvider:
                         "OPTION_BUYER",
                         "OPTION_SELLER",
                         "CHART_CAPTURE",
+                        "OPTION_CHAIN_COLLECTOR",
                     }
                 ],
                 "position_monitor": position_monitor_report,
@@ -23688,14 +24703,15 @@ async def main():
         SUMMARY_DELAY_SECONDS,
     )
 
-    # 3. Initialize background providers
+    # 3. Initialize background providers (share one option-chain client so nested-chain & OAuth caches are reused)
+    shared_option_chain_client = build_option_chain_client(keys)
     for provider in selected:
         if provider == "TRADINGVIEW":
             router_instance = TradingviewProvider(
                 symbols,
                 coordinator,
                 credentials=keys,
-                option_client=build_option_chain_client(keys),
+                option_client=shared_option_chain_client,
             )
         else:
             router_instance = ProviderRouter(provider, symbols, keys, coordinator)
@@ -23747,7 +24763,11 @@ async def main():
     )
     tasks.append(pm_task)
 
-    option_buyer = AlpacaOptionBuyer(keys, coordinator)
+    option_buyer = AlpacaOptionBuyer(
+        keys,
+        coordinator,
+        option_chain_client=shared_option_chain_client,
+    )
     ob_task = asyncio.create_task(
         run_provider_isolated(option_buyer, coordinator),
         name="ALPACA_OPTION_BUYER",
@@ -23755,11 +24775,24 @@ async def main():
     tasks.append(ob_task)
 
     option_seller = AlpacaOptionSeller(keys, coordinator)
+    if shared_option_chain_client is not None:
+        option_seller._exit_chain_client = shared_option_chain_client
     os_task = asyncio.create_task(
         run_provider_isolated(option_seller, coordinator),
         name="ALPACA_OPTION_SELLER",
     )
     tasks.append(os_task)
+
+    option_chain_collector = RsiOptionChainCollector(
+        keys,
+        coordinator,
+        option_client=shared_option_chain_client,
+    )
+    occ_task = asyncio.create_task(
+        run_provider_isolated(option_chain_collector, coordinator),
+        name="OPTION_CHAIN_COLLECTOR",
+    )
+    tasks.append(occ_task)
 
     startup_t_client = (
         position_monitor.client or option_buyer.client or option_seller.client
@@ -23813,6 +24846,10 @@ async def main():
     PROVIDER_REGISTRY["CHART_CAPTURE"] = {
         "router": chart_capture,
         "task": cc_task,
+    }
+    PROVIDER_REGISTRY["OPTION_CHAIN_COLLECTOR"] = {
+        "router": option_chain_collector,
+        "task": occ_task,
     }
 
     # 4b. Interactive TTY stdin CLI (strictly guarded by isatty so systemd/daemons never read EOF)
