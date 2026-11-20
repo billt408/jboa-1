@@ -6969,7 +6969,7 @@ class ProviderRouter:
                                     {
                                         "type": "FEED_SETUP",
                                         "channel": 1,
-                                        "acceptAggregationPeriod": 60.0,
+                                        "acceptAggregationPeriod": 1.0,
                                         "acceptDataFormat": "COMPACT",
                                         "acceptEventFields": {
                                             "Candle": [
@@ -7028,7 +7028,21 @@ class ProviderRouter:
                                         and dt <= self.coordinator.last_finalized
                                     ):
                                         continue
-                                    self.enqueue(base_sym, "bar", Bar(dt, price))
+                                    now_bar_utc = datetime.now(UTC)
+                                    if now_bar_utc < dt + MINUTE:
+                                        # Developing intra-minute candle: submit as 'tick' so the
+                                        # pending close tracks live 1s updates up to :59 without
+                                        # hijacking the dashboard row into a permanent PENDING preview.
+                                        tick_ts = max(
+                                            dt,
+                                            min(
+                                                now_bar_utc,
+                                                dt + timedelta(seconds=59, microseconds=999999),
+                                            ),
+                                        )
+                                        self.enqueue(base_sym, "tick", (tick_ts, price))
+                                    else:
+                                        self.enqueue(base_sym, "bar", Bar(dt, price))
                                 delay = 1
                             elif ftype == "ERROR":
                                 safe = sanitize_provider_event(
@@ -18127,11 +18141,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!nextMinuteUtc || isNaN(nextMinuteUtc.getTime())) return;
             const serverNowMs = Date.now() - serverClockOffsetMs;
             const diff = Math.max(0, Math.ceil((nextMinuteUtc.getTime() - serverNowMs) / 1000));
-            const el = document.getElementById('minuteCountdown');
-            if (el) {
-                el.textContent = formatCountdownSeconds(diff);
-                el.className = diff <= 5 ? 'mono font-semibold text-rose-400 animate-pulse' : 'mono font-semibold text-amber-300';
-            }
+            const label = formatCountdownSeconds(diff);
+            const cls = diff <= 5 ? 'mono font-semibold text-rose-400 animate-pulse' : 'mono font-semibold text-amber-300';
+            ['minuteCountdown', 'optLogsMinuteCountdown'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.textContent = label;
+                    el.className = cls;
+                }
+            });
         }
 
         async function fetchAllData() {
@@ -20478,6 +20496,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${countQualified})</button>
                             <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${countRejected})</button>
                         </div>
+                        <div class="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/70 border border-slate-700/60 rounded-lg text-[11px]">
+                            <span class="text-slate-400">Next Minute:</span>
+                            <span id="optLogsMinuteCountdown" class="mono font-semibold text-amber-300">--s</span>
+                        </div>
                     </div>
                     <div class="flex items-center gap-1.5">
                         <input id="optLogSearchInput" type="text" value="${escSvg(optionLogSearchFilter)}" oninput="setOptionLogSearchFilter(this.value)" placeholder="Filter symbol / contract / reason..." class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] text-white mono w-48 focus:outline-none focus:border-indigo-500">
@@ -20509,6 +20531,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             `;
 
+            updateCountdown();
             const scrollBox = document.getElementById('optLogsScrollContainer');
             if (scrollBox) scrollBox.scrollTop = prevScroll;
             if (shouldFocusSearch) {
