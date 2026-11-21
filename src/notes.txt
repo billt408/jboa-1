@@ -112,8 +112,12 @@ pip install -r requirements.txt
 pip install cryptography nuitka ordered-set zstandard
 
 podman save -o /home/billt/jboa-1/dist/multistream-rsi-9.8.tar localhost/multistream-rsi:9.8
+on windows to run the container
 
-
+wsl --install --no-distribution
+winget install RedHat.Podman
+podman machiine init
+podman machine srart
 sudo groupadd --gid 1001 jboa
 sudo useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
@@ -131,6 +135,33 @@ Usage Examples
 Added independent daemon/background controls: Supports --run1 --bg, --run2 --bg, --run-only --bg, --stop1, --stop2, --stop-all, and --status using PID/log files in /tmp/ (so /home/billt/jboa-1 is never written to or modified).
 Safe process targeting & startup check: Background starts verify the process stays alive after launch (printing log tail on early crash), and --stop1/--stop2 confirm the PID belongs to the expected user running multiStreamRSI.py before sending SIGTERM.
 
+==============================================================================
+BUILD & PACKAGING COMPLETE (Target: both)
+  Standalone Binary : /home/billt/jboa-1/dist/multiStreamRSI
+  RHEL Podman Image : multistream-rsi:9.8 (local Podman storage)
+  Windows Bundle    : /home/billt/jboa-1/dist/windows_package/
+    - Image Archive : /home/billt/jboa-1/dist/windows_package/multistream-rsi-9.8-windows-amd64.tar
+    - Launcher      : /home/billt/jboa-1/dist/windows_package/run_windows.bat
+  Container User    : jboa (UID 1001 / GID 1001)
+  Exposed Ports     : 5000 5001
+==============================================================================
+((.venv) ) [billt@localhost src]$ ls -ltra dis
+ls: cannot access 'dis': No such file or directory
+((.venv) ) [billt@localhost src]$ ls -ltra ../dist
+total 69836
+drwxr-xr-x. 11 billt billt     4096 Nov 21 11:33 ..
+-rwxr-xr-x.  1 billt billt 71503416 Nov 21 11:55 multiStreamRSI
+-rw-r--r--.  1 billt billt     1207 Nov 21 11:55 Containerfile
+drwxr-xr-x.  3 billt billt       72 Nov 21 11:55 .
+drwxr-xr-x.  3 billt billt       86 Nov 21 11:55 windows_package
+((.venv) ) [billt@localhost src]$ ls -ltra ../dist/windows_package/
+total 195880
+drwxr-xr-x. 2 billt billt         6 Nov 21 11:55 logs
+drwxr-xr-x. 3 billt billt        72 Nov 21 11:55 ..
+-rw-r--r--. 1 billt billt 200575488 Nov 21 11:55 multistream-rsi-9.8-windows-amd64.tar
+-rw-r--r--. 1 billt billt       895 Nov 21 11:55 run_windows.bat
+drwxr-xr-x. 3 billt billt        86 Nov 21 11:55 .
+((.venv) ) [billt@localhost src]$ 
 
 
 
