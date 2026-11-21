@@ -117,4 +117,18 @@ podman save -o /home/billt/jboa-1/dist/multistream-rsi-9.8.tar localhost/multist
 sudo groupadd --gid 1001 jboa
 sudo useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
+===================================
+Quick Start
+If jboa-rsi.service is currently running on ports 5000/5001, stop it first (sudo systemctl stop jboa-rsi.service).
+Run ./run_dual_instances.sh --setup-only once, review /home/jboa/lib/parms.ini (confirm [tastytrade_api] credentials, transaction_env, and [dashboard] password), and optionally add owner = billt under [general] in /home/billt/jboa-1/src/lib/parms.ini.
+Launch both concurrently in one window: ./run_dual_instances.sh --run-only (press Ctrl+C to stop both cleanly).
+Usage Examples
+./run_dual_instances.sh --setup-only  create/sync /home/jboa (never alters /home/billt/jboa-1)
+./run_dual_instances.sh --run1  run only billt (Alpaca, ports 5000/5001)
+./run_dual_instances.sh --run2  run only jboa (Tastytrade, ports 6000/6001)
+./run_dual_instances.sh --run-only  run both concurrently in one window
+./run_dual_instances.sh --clean2  interactively confirm and remove all Instance 2 artifacts under /home/jboa (add --yes to skip prompt)
+
+
+
 

@@ -264,7 +264,7 @@ def _strip_ini_value(raw: str) -> str:
 def load_standalone_config(
     ini_path: Path | None, show_input_files: bool = True
 ) -> dict:
-    """Load display timezone and Alpaca credentials from parms.ini + environment."""
+    """Load display timezone and Alpaca/Tastytrade credentials from parms.ini + environment."""
     cfg_out = {
         "ini_path": str(ini_path) if ini_path else None,
         "display_timezone": os.getenv("DISPLAY_TIMEZONE", "PST").strip() or "PST",
@@ -272,6 +272,19 @@ def load_standalone_config(
         "alpaca_secret": os.getenv("ALPACA_SECRET_KEY", "").strip(),
         "alpaca_paper": os.getenv("ALPACA_PAPER", "true").strip().lower()
         in {"1", "true", "yes"},
+        "option_chain_provider": os.getenv("OPTION_CHAIN_PROVIDER", "").strip().lower(),
+        "tastytrade_prod_client_id": os.getenv("TASTYTRADE_PROD_CLIENT_ID", "").strip(),
+        "tastytrade_prod_client_secret": os.getenv(
+            "TASTYTRADE_PROD_CLIENT_SECRET", ""
+        ).strip(),
+        "tastytrade_prod_refresh_token": os.getenv(
+            "TASTYTRADE_PROD_REFRESH_TOKEN", ""
+        ).strip(),
+        "tastytrade_prod_base_url": os.getenv(
+            "TASTYTRADE_PROD_BASE_URL", "https://api.tastyworks.com"
+        )
+        .strip()
+        .rstrip("/"),
     }
 
     if ini_path is None or not ini_path.is_file():
@@ -298,7 +311,7 @@ def load_standalone_config(
         parser = None
 
     if parser is not None:
-        for sec in ("display", "feature_toggles"):
+        for sec in ("general", "display", "feature_toggles"):
             if parser.has_option(sec, "timezone"):
                 val = _strip_ini_value(parser.get(sec, "timezone", fallback=""))
                 if val:
@@ -309,6 +322,22 @@ def load_standalone_config(
                 parser.get("option_buyer", "paper", fallback="true")
             ).lower()
             cfg_out["alpaca_paper"] = raw_paper in {"1", "true", "yes"}
+
+        if parser.has_option("option_trading", "optionchainprovider"):
+            val = _strip_ini_value(
+                parser.get("option_trading", "optionchainprovider", fallback="")
+            ).lower()
+            if val in {"alpaca", "tastytrade"}:
+                cfg_out["option_chain_provider"] = val
+        elif not cfg_out["option_chain_provider"] and parser.has_section("providers"):
+            tt_raw = _strip_ini_value(
+                parser.get("providers", "TASTYTRADE.enabled", fallback="false")
+            ).lower()
+            alp_raw = _strip_ini_value(
+                parser.get("providers", "ALPACA.enabled", fallback="false")
+            ).lower()
+            if tt_raw in {"1", "true", "yes"} and alp_raw not in {"1", "true", "yes"}:
+                cfg_out["option_chain_provider"] = "tastytrade"
 
         for sec in ("CREDENTIALS", "credentials", "alpaca_api", "alpaca"):
             if parser.has_section(sec):
@@ -322,6 +351,17 @@ def load_standalone_config(
                         cfg_out["alpaca_secret"] = _strip_ini_value(
                             parser.get(sec, sec_opt, fallback="")
                         )
+
+        if parser.has_section("tastytrade_api"):
+            for opt_name, target_key in (
+                ("prod_client_id", "tastytrade_prod_client_id"),
+                ("prod_client_secret", "tastytrade_prod_client_secret"),
+                ("prod_refresh_token", "tastytrade_prod_refresh_token"),
+            ):
+                if not cfg_out[target_key] and parser.has_option("tastytrade_api", opt_name):
+                    cfg_out[target_key] = _strip_ini_value(
+                        parser.get("tastytrade_api", opt_name, fallback="")
+                    )
 
     # Fallback: scan JSON-style CREDENTIALS block if configparser didn't populate keys
     if not cfg_out["alpaca_key"] or not cfg_out["alpaca_secret"]:
@@ -1122,6 +1162,351 @@ def _fetch_option_bars_alpaca(
     )
 
 
+def _to_dxlink_option_symbol_standalone(compact_occ: str) -> str:
+    """Convert compact OCC (AAPL261218C00250000) to dxFeed streamer symbol (.AAPL261218C250)."""
+    is_opt, und, right, strike, expiry = _parse_occ_contract(compact_occ)
+    if not is_opt or strike is None or not expiry:
+        return str(compact_occ or "").strip().upper()
+    yy_mm_dd = expiry[2:4] + expiry[5:7] + expiry[8:10]
+    cp = "C" if right == "CALL" else "P"
+    strike_str = f"{strike:.4f}".rstrip("0").rstrip(".")
+    return f".{und}{yy_mm_dd}{cp}{strike_str}"
+
+
+def _fetch_option_bars_tastytrade(
+    symbol_ranges: dict[str, tuple[datetime, datetime]],
+    client_secret: str,
+    refresh_token: str,
+    client_id: str = "",
+    prod_base_url: str = "https://api.tastyworks.com",
+) -> tuple[dict[str, dict[datetime, dict]], bool, str]:
+    """Fetch 1m option bars for each contract via Tastytrade Prod DXLink Candle{=1m}."""
+    bars_out: dict[str, dict[datetime, dict]] = {s: {} for s in symbol_ranges}
+    if not symbol_ranges:
+        return bars_out, True, "No contracts to fetch"
+    if not client_secret or not refresh_token:
+        return (
+            bars_out,
+            False,
+            "Tastytrade Prod credentials unavailable (set TASTYTRADE_PROD_CLIENT_SECRET/TASTYTRADE_PROD_REFRESH_TOKEN or lib/parms.ini)",
+        )
+
+    try:
+        import asyncio
+        import time as _time
+        import aiohttp  # type: ignore
+    except Exception as exc:
+        return (
+            bars_out,
+            False,
+            f"Tastytrade DXLink option bars require aiohttp ({type(exc).__name__})",
+        )
+
+    base = str(prod_base_url or "https://api.tastyworks.com").rstrip("/")
+    ua = os.getenv("TASTYTRADE_USER_AGENT", "multiStreamRSI/1.0")
+
+    try:
+        form_data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token.strip(),
+            "client_secret": client_secret.strip(),
+        }
+        if str(client_id or "").strip():
+            form_data["client_id"] = str(client_id).strip()
+        tok_req = urllib.request.Request(
+            f"{base}/oauth/token",
+            data=urllib.parse.urlencode(form_data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": ua,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(tok_req, timeout=20) as resp:
+            tok_payload = json.loads(resp.read().decode("utf-8"))
+        access_token = str(tok_payload.get("access_token") or "").strip()
+        if not access_token:
+            return bars_out, False, "Tastytrade OAuth token exchange returned no access_token"
+
+        qt_req = urllib.request.Request(
+            f"{base}/api-quote-tokens",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "User-Agent": ua,
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(qt_req, timeout=20) as resp:
+            qt_payload = json.loads(resp.read().decode("utf-8"))
+        qt_data = qt_payload.get("data", qt_payload) if isinstance(qt_payload, dict) else {}
+        quote_token = str(qt_data.get("token") or "").strip()
+        dxlink_url = str(qt_data.get("dxlink-url") or qt_data.get("dxlink_url") or "").strip()
+        if not quote_token or not dxlink_url:
+            return bars_out, False, "Tastytrade /api-quote-tokens missing dxlink-url or token"
+    except Exception as exc:
+        return (
+            bars_out,
+            False,
+            f"Tastytrade Prod auth/quote-token failed ({type(exc).__name__}: {exc})",
+        )
+
+    norm_items = []
+    for raw_sym, (s_dt, e_dt) in symbol_ranges.items():
+        sym_u = str(raw_sym or "").strip().upper()
+        if not sym_u:
+            continue
+        s_min = minute_utc(as_utc(s_dt))
+        e_min = minute_utc(as_utc(e_dt))
+        if e_min < s_min:
+            e_min = s_min
+        dx_sym = _to_dxlink_option_symbol_standalone(sym_u)
+        norm_items.append((sym_u, dx_sym, s_min, e_min))
+
+    def _parse_dx_candles(data, field_order):
+        order = list(field_order or ("eventSymbol", "time", "close", "high", "low", "eventFlags"))
+        out_rows = []
+
+        def _extract_dict(obj):
+            if not isinstance(obj, dict):
+                return None
+            ev_sym = obj.get("eventSymbol") or obj.get("symbol")
+            raw_time = obj.get("time")
+            if ev_sym is None or raw_time is None:
+                return None
+            return (
+                str(ev_sym),
+                raw_time,
+                obj.get("close"),
+                obj.get("high"),
+                obj.get("low"),
+                obj.get("eventFlags", 0),
+            )
+
+        def _extract_row(vals):
+            if not isinstance(vals, (list, tuple)) or len(vals) < len(order):
+                return None
+            return _extract_dict({f: vals[i] for i, f in enumerate(order)})
+
+        if not isinstance(data, list):
+            return out_rows
+        if data and all(isinstance(item, dict) for item in data):
+            for item in data:
+                if str(item.get("eventType") or "Candle") == "Candle":
+                    r = _extract_dict(item)
+                    if r:
+                        out_rows.append(r)
+            return out_rows
+        idx = 0
+        n = len(data)
+        while idx < n:
+            head = data[idx]
+            if isinstance(head, str):
+                ev_name = head
+                idx += 1
+                while idx < n and not isinstance(data[idx], str):
+                    chunk = data[idx]
+                    idx += 1
+                    if ev_name != "Candle" or not isinstance(chunk, list) or not chunk:
+                        continue
+                    if isinstance(chunk[0], list):
+                        for sub in chunk:
+                            r = _extract_row(sub)
+                            if r:
+                                out_rows.append(r)
+                    elif isinstance(chunk[0], dict):
+                        for sub in chunk:
+                            r = _extract_dict(sub)
+                            if r:
+                                out_rows.append(r)
+                    else:
+                        step = len(order)
+                        if step > 0:
+                            for pos in range(0, len(chunk) - step + 1, step):
+                                r = _extract_row(chunk[pos : pos + step])
+                                if r:
+                                    out_rows.append(r)
+                continue
+            elif isinstance(head, dict):
+                if str(head.get("eventType") or "Candle") == "Candle":
+                    r = _extract_dict(head)
+                    if r:
+                        out_rows.append(r)
+            idx += 1
+        return out_rows
+
+    async def _fetch_all_chunks():
+        chunk_size = 15
+        timeout = aiohttp.ClientTimeout(total=25, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for i in range(0, len(norm_items), chunk_size):
+                chunk = norm_items[i : i + chunk_size]
+                dx_to_meta = {dx.upper(): (sym_u, s_min, e_min) for sym_u, dx, s_min, e_min in chunk}
+                sub_adds = [
+                    {
+                        "type": "Candle",
+                        "symbol": f"{dx}{{=1m}}",
+                        "fromTime": int(s_min.timestamp() * 1000),
+                    }
+                    for _, dx, s_min, _ in chunk
+                ]
+                target_dx = set(dx_to_meta.keys())
+                completed_dx = set()
+                field_order = ["eventSymbol", "time", "close", "high", "low", "eventFlags"]
+                deadline = _time.monotonic() + 18.0
+                last_activity = _time.monotonic()
+                try:
+                    async with session.ws_connect(
+                        dxlink_url, heartbeat=20, max_msg_size=16 * 1024 * 1024
+                    ) as ws:
+                        await ws.send_json(
+                            {
+                                "type": "SETUP",
+                                "channel": 0,
+                                "version": "0.1-DXF-JS/0.3.0",
+                                "keepaliveTimeout": 60,
+                                "acceptKeepaliveTimeout": 60,
+                            }
+                        )
+                        channel_opened = False
+                        subscribed = False
+                        while _time.monotonic() < deadline:
+                            wait_for = min(1.5, max(0.05, deadline - _time.monotonic()))
+                            try:
+                                msg = await ws.receive(timeout=wait_for)
+                            except asyncio.TimeoutError:
+                                if subscribed and (_time.monotonic() - last_activity) >= 1.5:
+                                    break
+                                continue
+                            if msg.type in {
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            }:
+                                break
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            for line in msg.data.splitlines():
+                                if not line.strip():
+                                    continue
+                                try:
+                                    frame = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if not isinstance(frame, dict):
+                                    continue
+                                ftype = str(frame.get("type") or "").upper()
+                                if ftype == "AUTH_STATE":
+                                    st = str(frame.get("state") or "").upper()
+                                    if st == "UNAUTHORIZED":
+                                        await ws.send_json(
+                                            {"type": "AUTH", "channel": 0, "token": quote_token}
+                                        )
+                                    elif st == "AUTHORIZED" and not channel_opened:
+                                        await ws.send_json(
+                                            {
+                                                "type": "CHANNEL_REQUEST",
+                                                "channel": 1,
+                                                "service": "FEED",
+                                                "parameters": {"contract": "AUTO"},
+                                            }
+                                        )
+                                elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                                    channel_opened = True
+                                    await ws.send_json(
+                                        {
+                                            "type": "FEED_SETUP",
+                                            "channel": 1,
+                                            "acceptAggregationPeriod": 0.0,
+                                            "acceptDataFormat": "COMPACT",
+                                            "acceptEventFields": {"Candle": field_order},
+                                        }
+                                    )
+                                    await ws.send_json(
+                                        {
+                                            "type": "FEED_SUBSCRIPTION",
+                                            "channel": 1,
+                                            "add": sub_adds,
+                                        }
+                                    )
+                                    subscribed = True
+                                    last_activity = _time.monotonic()
+                                elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
+                                    ev_fields = frame.get("eventFields") or {}
+                                    if isinstance(ev_fields, dict) and isinstance(
+                                        ev_fields.get("Candle"), list
+                                    ):
+                                        field_order = list(ev_fields["Candle"])
+                                elif ftype == "FEED_DATA" and frame.get("channel") == 1:
+                                    last_activity = _time.monotonic()
+                                    for raw_sym, raw_time, raw_close, raw_high, raw_low, raw_flags in _parse_dx_candles(
+                                        frame.get("data"), field_order
+                                    ):
+                                        base_dx = str(raw_sym or "").split("{", 1)[0].strip().upper()
+                                        meta = dx_to_meta.get(base_dx)
+                                        if meta is None:
+                                            continue
+                                        sym_u, s_min, e_min = meta
+                                        try:
+                                            flags = (
+                                                int(raw_flags or 0)
+                                                if not isinstance(raw_flags, bool)
+                                                else 0
+                                            )
+                                        except (TypeError, ValueError):
+                                            flags = 0
+                                        if not (flags & 0x02):
+                                            c_p = _opt_safe_float(raw_close, None)
+                                            h_p = _opt_safe_float(raw_high, None)
+                                            l_p = _opt_safe_float(raw_low, None)
+                                            epoch_ms = _opt_safe_float(raw_time, None)
+                                            if (
+                                                c_p is not None
+                                                and c_p > 0
+                                                and epoch_ms is not None
+                                                and epoch_ms > 0
+                                            ):
+                                                try:
+                                                    mk = minute_utc(
+                                                        datetime.fromtimestamp(
+                                                            epoch_ms / 1000.0, UTC
+                                                        )
+                                                    )
+                                                    if s_min <= mk <= e_min:
+                                                        h_eff = h_p if (h_p is not None and h_p >= c_p) else c_p
+                                                        l_eff = l_p if (l_p is not None and 0 < l_p <= c_p) else c_p
+                                                        bars_out[sym_u][mk] = {
+                                                            "c": round(float(c_p), 4),
+                                                            "h": round(float(h_eff), 4),
+                                                            "l": round(float(l_eff), 4),
+                                                        }
+                                                except (ValueError, OverflowError, OSError):
+                                                    pass
+                                        if flags & 0x18:
+                                            completed_dx.add(base_dx)
+                                    if completed_dx >= target_dx:
+                                        break
+                except Exception:
+                    continue
+
+    try:
+        asyncio.run(_fetch_all_chunks())
+    except Exception as exc:
+        return (
+            bars_out,
+            False,
+            f"Tastytrade DXLink option bars fetch failed ({type(exc).__name__}: {exc})",
+        )
+
+    with_bars = sum(1 for v in bars_out.values() if v)
+    return (
+        bars_out,
+        True,
+        f"Tastytrade DXLink 1m bars fetched ({with_bars}/{len(bars_out)} contracts returned bars)",
+    )
+
+
 def _lookup_bar_near(con_bars: dict, target_min: datetime):
     if not con_bars:
         return None
@@ -1223,6 +1608,11 @@ def analyze_session_winners(
     bars_override: dict | None = None,
     now_utc: datetime | None = None,
     show_input_files: bool = True,
+    bar_provider: str = "",
+    tastytrade_client_secret: str = "",
+    tastytrade_refresh_token: str = "",
+    tastytrade_client_id: str = "",
+    tastytrade_prod_base_url: str = "https://api.tastyworks.com",
 ) -> dict:
     """Run strike analyzer logic from option buy time to end of session."""
     chain_dir = log_root / "optionchains"
@@ -1679,9 +2069,21 @@ def analyze_session_winners(
         bars_available = True
         bars_note = f"Using supplied option bar dataset ({len(bars_map)} contracts)"
     else:
-        bars_map, bars_available, bars_note = _fetch_option_bars_alpaca(
-            bar_ranges, api_key=api_key, api_secret=api_secret
-        )
+        pref = str(bar_provider or "").strip().lower()
+        has_alp = bool(api_key and api_secret)
+        has_tt = bool(tastytrade_client_secret and tastytrade_refresh_token)
+        if pref == "tastytrade" or (pref != "alpaca" and not has_alp and has_tt):
+            bars_map, bars_available, bars_note = _fetch_option_bars_tastytrade(
+                bar_ranges,
+                client_secret=tastytrade_client_secret,
+                refresh_token=tastytrade_refresh_token,
+                client_id=tastytrade_client_id,
+                prod_base_url=tastytrade_prod_base_url,
+            )
+        else:
+            bars_map, bars_available, bars_note = _fetch_option_bars_alpaca(
+                bar_ranges, api_key=api_key, api_secret=api_secret
+            )
 
     rank_stats = {
         rk: {
@@ -3691,8 +4093,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--no-alpaca",
+        "--no-bars",
+        dest="no_alpaca",
         action="store_true",
-        help="Skip Alpaca option bar requests (use only local snapshots/sell chains)",
+        help="Skip remote option bar requests (use only local snapshots/sell chains)",
     )
     parser.add_argument(
         "--quiet",
@@ -3714,6 +4118,10 @@ def main(argv=None) -> int:
 
     api_key = "" if args.no_alpaca else cfg["alpaca_key"]
     api_secret = "" if args.no_alpaca else cfg["alpaca_secret"]
+    tt_secret = "" if args.no_alpaca else cfg["tastytrade_prod_client_secret"]
+    tt_refresh = "" if args.no_alpaca else cfg["tastytrade_prod_refresh_token"]
+    tt_cid = "" if args.no_alpaca else cfg["tastytrade_prod_client_id"]
+    bar_prov = "" if args.no_alpaca else cfg["option_chain_provider"]
 
     analysis = analyze_session_winners(
         log_root=log_root,
@@ -3727,6 +4135,11 @@ def main(argv=None) -> int:
         executed_only=args.executed_only,
         now_utc=run_at,
         show_input_files=show_input_files,
+        bar_provider=bar_prov,
+        tastytrade_client_secret=tt_secret,
+        tastytrade_refresh_token=tt_refresh,
+        tastytrade_client_id=tt_cid,
+        tastytrade_prod_base_url=cfg["tastytrade_prod_base_url"],
     )
 
     if args.output:
