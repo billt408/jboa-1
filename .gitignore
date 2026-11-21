@@ -19,6 +19,7 @@ src/.build_venv/*
 dist/multiStreamRSI
 **/multistream-rsi-*.tar
 *.tar.gz
-
+dist/parms.ini
+dist/windows_package/parms.ini
 
 
