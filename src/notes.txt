@@ -163,5 +163,26 @@ drwxr-xr-x. 3 billt billt        72 Nov 21 11:55 ..
 drwxr-xr-x. 3 billt billt        86 Nov 21 11:55 .
 ((.venv) ) [billt@localhost src]$ 
 
+1. Create a folder on your Windows machine, such as C:\jboa-rsi\.
+2. Copy multistream-rsi-9.8-windows-amd64.tar and your parms.ini into C:\jboa-rsi\.
+3. Create an empty logs subfolder inside C:\jboa-rsi\ (so your path looks like C:\jboa-rsi\logs).
+4. create a parms.ini file in the jboa-rsi directory
+5.  copy over the run_windows.bat file
+podman machine init
+podman machine strart
+run_windows.bat
+use container IP address (i.e. http://172.24.209.143:5001 on the local machine, comes from the container log, use 'podman logs multistream-rsi'
+2026-11-21 14:02:36,059 INFO ==================================================================
+2026-11-21 14:02:36,059 INFO RSI & Kinematics Web Dashboard Ready (ssl=True mode=auto):
+2026-11-21 14:02:36,059 INFO   -> Local Machine (HTTPS): https://127.0.0.1:5001/
+2026-11-21 14:02:36,059 INFO   -> Local Machine (HTTP):  http://127.0.0.1:5001/
+2026-11-21 14:02:36,059 INFO   -> Subnet / LAN (HTTPS):  https://172.24.209.143:5001/ (self-signed SAN cert)
+2026-11-21 14:02:36,059 INFO   -> Subnet / LAN (HTTP):   http://172.24.209.143:5001/ (accessible from other machines)
+2026-11-21 14:02:36,059 INFO ==================================================================
+Run these 2 commands in PowerShell as Administrator on the Windows host (forwards LAN port 5001 ? WSL2 Podman IP and opens Windows Firewall; this also makes localhost:5001 work locally):
+Powershell (run as Administrator)
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=5001 connectaddress=172.24.209.143 connectport=5001
+New-NetFirewallRule -DisplayName "JBOA-RSI Dashboard (TCP 5001)" -Direction Inbound -Protocol TCP -LocalPort 5001 -Action Allow -Profile Any
+use the windows ip address from the other machine after you issue the commands above
 
 

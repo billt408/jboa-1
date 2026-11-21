@@ -117,7 +117,9 @@ python -m nuitka \
 chmod 755 "${DIST_DIR}/${BINARY_NAME}"
 echo "    Binary created at: ${DIST_DIR}/${BINARY_NAME}"
 
-if [[ -f "${SRC_DIR}/parms.ini" ]]; then
+if [[ -f "${SRC_DIR}/lib/parms.ini" ]]; then
+    cp "${SRC_DIR}/lib/parms.ini" "${DIST_DIR}/parms.ini"
+elif [[ -f "${SRC_DIR}/parms.ini" ]]; then
     cp "${SRC_DIR}/parms.ini" "${DIST_DIR}/parms.ini"
 elif [[ -f "${PROJECT_ROOT}/parms.ini" ]]; then
     cp "${PROJECT_ROOT}/parms.ini" "${DIST_DIR}/parms.ini"
@@ -139,9 +141,9 @@ RUN microdnf install -y --setopt=install_weak_deps=0 shadow-utils ca-certificate
 RUN groupadd --gid 1001 jboa && \
     useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
-# Create /home/jboa/app/src (for parms.ini) and /home/jboa/app/logs (for log output)
+# Create /home/jboa/app/src (parms.ini), /home/jboa/app/logs (logs), /home/jboa/app/certs (TLS)
 WORKDIR /home/jboa/app
-RUN mkdir -p /home/jboa/app/src /home/jboa/app/logs && \
+RUN mkdir -p /home/jboa/app/src /home/jboa/app/logs /home/jboa/app/certs && \
     chown -R jboa:jboa /home/jboa
 
 # Copy compiled standalone binary into /home/jboa/app owned by jboa
@@ -152,11 +154,16 @@ RUN chmod 0755 /home/jboa/app/multiStreamRSI
 USER jboa
 WORKDIR /home/jboa/app
 
+# Default config & log paths for Nuitka --onefile execution
+ENV INI_PATH=/home/jboa/app/src/parms.ini
+ENV LOG_ROOT=/home/jboa/app/logs
+
 # Document webhook/API port (5000) and UI dashboard port (5001)
 EXPOSE 5000 5001
 
-# Pass default config path matching utils.py's parent.parent log resolution
-ENTRYPOINT ["/home/jboa/app/multiStreamRSI", "-c", "/home/jboa/app/src/parms.ini"]
+# Use --ini (never -c, which triggers Nuitka's self-execution guard)
+ENTRYPOINT ["/home/jboa/app/multiStreamRSI"]
+CMD ["--ini", "/home/jboa/app/src/parms.ini"]
 EOF
 
 # ==============================================================================
@@ -167,13 +174,13 @@ cd "${DIST_DIR}"
 podman build --platform linux/amd64 -t "${IMAGE_NAME}:${IMAGE_TAG}" -t "${IMAGE_NAME}:latest" -f Containerfile .
 
 # ==============================================================================
-# 7. Package Windows Docker Archive (if target is 'windows' or 'both')
+# 7. Package Windows Container Archive (if target is 'windows' or 'both')
 # ==============================================================================
 if [[ "${TARGET}" == "windows" || "${TARGET}" == "both" ]]; then
-    echo "==> [7/7] Packaging Docker archive for Windows..."
+    echo "==> [7/7] Packaging container archive for Windows..."
     mkdir -p "${WIN_PKG_DIR}/logs"
 
-    # Export using docker-archive format so Windows Docker Desktop can load it cleanly
+    # Export using docker-archive format (compatible with both Podman and Docker Desktop on Windows)
     podman save --format docker-archive -o "${WIN_ARCHIVE}" "${IMAGE_NAME}:${IMAGE_TAG}"
 
     # Copy sample/active parms.ini if available
@@ -181,11 +188,22 @@ if [[ "${TARGET}" == "windows" || "${TARGET}" == "both" ]]; then
         cp "${DIST_DIR}/parms.ini" "${WIN_PKG_DIR}/parms.ini"
     fi
 
-    # Create Windows launcher script with CRLF line endings
+    # Create Windows launcher script with CRLF line endings (auto-detects podman or docker)
     cat <<EOF > "${WIN_PKG_DIR}/run_windows.bat"
 @echo off
 setlocal
 cd /d "%~dp0"
+
+set "CTR_BIN="
+where podman >nul 2>&1 && set "CTR_BIN=podman"
+if not defined CTR_BIN (
+    where docker >nul 2>&1 && set "CTR_BIN=docker"
+)
+if not defined CTR_BIN (
+    echo ERROR: Neither podman nor docker was found in PATH.
+    pause
+    exit /b 1
+)
 
 if not exist "logs" mkdir logs
 if not exist "parms.ini" (
@@ -195,25 +213,28 @@ if not exist "parms.ini" (
     exit /b 1
 )
 
-echo [1/3] Loading Docker image ${IMAGE_NAME}:${IMAGE_TAG}...
-docker load -i "${IMAGE_NAME}-${IMAGE_TAG}-windows-amd64.tar"
+echo [1/3] Loading image ${IMAGE_NAME}:${IMAGE_TAG} using %CTR_BIN%...
+%CTR_BIN% load -i "${IMAGE_NAME}-${IMAGE_TAG}-windows-amd64.tar"
 
 echo [2/3] Removing any previous container instance...
-docker rm -f multistream-rsi >nul 2>&1
+%CTR_BIN% rm -f multistream-rsi >nul 2>&1
 
 echo [3/3] Starting multistream-rsi container on ports 5000 and 5001...
-docker run -d ^
+%CTR_BIN% run -d ^
   --name multistream-rsi ^
   --restart unless-stopped ^
   -p 5000:5000 ^
   -p 5001:5001 ^
+  -e INI_PATH=/home/jboa/app/src/parms.ini ^
+  -e LOG_ROOT=/home/jboa/app/logs ^
   -v "%cd%\parms.ini:/home/jboa/app/src/parms.ini:ro" ^
   -v "%cd%\logs:/home/jboa/app/logs" ^
-  ${IMAGE_NAME}:${IMAGE_TAG}
+  ${IMAGE_NAME}:${IMAGE_TAG} ^
+  --ini /home/jboa/app/src/parms.ini
 
 echo.
-echo Container started! Dashboard available at http://localhost:5001
-docker ps --filter "name=multistream-rsi"
+echo Container started! Dashboard available at https://localhost:5001 (or http://localhost:5001)
+%CTR_BIN% ps --filter "name=multistream-rsi"
 pause
 EOF
     # Convert batch file line endings to Windows CRLF

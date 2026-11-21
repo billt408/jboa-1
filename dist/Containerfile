@@ -9,9 +9,9 @@ RUN microdnf install -y --setopt=install_weak_deps=0 shadow-utils ca-certificate
 RUN groupadd --gid 1001 jboa && \
     useradd --uid 1001 --gid 1001 --create-home --home-dir /home/jboa --shell /bin/bash jboa
 
-# Create /home/jboa/app/src (for parms.ini) and /home/jboa/app/logs (for log output)
+# Create /home/jboa/app/src (parms.ini), /home/jboa/app/logs (logs), /home/jboa/app/certs (TLS)
 WORKDIR /home/jboa/app
-RUN mkdir -p /home/jboa/app/src /home/jboa/app/logs && \
+RUN mkdir -p /home/jboa/app/src /home/jboa/app/logs /home/jboa/app/certs && \
     chown -R jboa:jboa /home/jboa
 
 # Copy compiled standalone binary into /home/jboa/app owned by jboa
@@ -22,8 +22,13 @@ RUN chmod 0755 /home/jboa/app/multiStreamRSI
 USER jboa
 WORKDIR /home/jboa/app
 
+# Default config & log paths for Nuitka --onefile execution
+ENV INI_PATH=/home/jboa/app/src/parms.ini
+ENV LOG_ROOT=/home/jboa/app/logs
+
 # Document webhook/API port (5000) and UI dashboard port (5001)
 EXPOSE 5000 5001
 
-# Pass default config path matching utils.py's parent.parent log resolution
-ENTRYPOINT ["/home/jboa/app/multiStreamRSI", "-c", "/home/jboa/app/src/parms.ini"]
+# Use --ini (never -c, which triggers Nuitka's self-execution guard)
+ENTRYPOINT ["/home/jboa/app/multiStreamRSI"]
+CMD ["--ini", "/home/jboa/app/src/parms.ini"]

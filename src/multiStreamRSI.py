@@ -123,7 +123,36 @@ FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
-LOG_ROOT = Path(__file__).resolve().parent / "logs"
+def _get_app_base_dir():
+    """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
+    if ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False)):
+        try:
+            return Path.cwd()
+        except Exception:
+            return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resolve_log_root():
+    for env_key in ("LOG_ROOT", "LOGS_DIR"):
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            return Path(raw).expanduser()
+    if ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False)):
+        try:
+            cwd_logs = Path.cwd() / "logs"
+            if cwd_logs.exists():
+                return cwd_logs
+        except Exception:
+            pass
+        try:
+            return Path(sys.executable).resolve().parent / "logs"
+        except Exception:
+            return Path("logs")
+    return Path(__file__).resolve().parent / "logs"
+
+
+LOG_ROOT = _resolve_log_root()
 MINUTE = timedelta(minutes=1)
 UTC = timezone.utc
 SUMMARY_DELAY_SECONDS = float(os.getenv("SUMMARY_DELAY_SECONDS", "45"))
@@ -8552,8 +8581,77 @@ def _sanitize_parms_for_json_ini(raw_text):
     return "".join(out_lines)
 
 
+_CLI_INI_PATH = None
+
+
+def _is_compiled_binary():
+    """Return True when executing as a Nuitka/frozen standalone or onefile binary."""
+    return ("__compiled__" in globals()) or bool(getattr(sys, "frozen", False))
+
+
+def _extract_cli_ini_arg(argv=None):
+    """Extract ``--ini <path>`` or ``--ini=<path>`` from CLI arguments safely."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    for idx, arg in enumerate(args):
+        if arg == "--ini" and idx + 1 < len(args):
+            val = str(args[idx + 1]).strip()
+            if val:
+                return val
+        elif arg.startswith("--ini="):
+            val = arg.split("=", 1)[1].strip()
+            if val:
+                return val
+    return None
+
+
+def resolve_parms_ini_path(ini_path=None):
+    """Resolve the active parms.ini path for both source and Nuitka --onefile runs.
+
+    Precedence:
+      1. Explicit ``ini_path`` parameter (if provided)
+      2. CLI ``--ini`` argument (captured via handle_cli_command or sys.argv)
+      3. ``INI_PATH`` environment variable
+      4. Uncompiled source fallback: ``Path(__file__).resolve().parent / "lib" / "parms.ini"``
+      5. Compiled binary fallback: existing ``parms.ini`` / ``lib/parms.ini`` in CWD or
+         executable directory (never falling back to Nuitka's /tmp/onefile_* unpack dir)
+    """
+    for candidate in (
+        ini_path,
+        _CLI_INI_PATH,
+        _extract_cli_ini_arg(),
+        os.getenv("INI_PATH"),
+    ):
+        if candidate is not None:
+            cleaned = str(candidate).strip()
+            if cleaned:
+                return Path(cleaned).expanduser()
+
+    if not _is_compiled_binary():
+        return Path(__file__).resolve().parent / "lib" / "parms.ini"
+
+    compiled_candidates = []
+    try:
+        cwd = Path.cwd()
+        compiled_candidates.extend([cwd / "parms.ini", cwd / "lib" / "parms.ini"])
+    except Exception:
+        pass
+    try:
+        exe_dir = Path(sys.executable).resolve().parent
+        compiled_candidates.extend(
+            [exe_dir / "parms.ini", exe_dir / "lib" / "parms.ini"]
+        )
+    except Exception:
+        pass
+
+    for path_cand in compiled_candidates:
+        if path_cand.is_file():
+            return path_cand
+
+    return compiled_candidates[0] if compiled_candidates else Path("parms.ini")
+
+
 def get_default_parms_ini_path():
-    return Path(__file__).resolve().parent / "lib" / "parms.ini"
+    return resolve_parms_ini_path()
 
 
 def _read_chart_capture_ini_enabled(ini_path=None):
@@ -9654,7 +9752,7 @@ def _apply_ini_feature_settings(cfg):
     )
 
 
-def load_settings():
+def load_settings(ini_path=None):
     """Load enabled providers, symbols and credentials from project configuration.
 
     selected contains ALL enabled providers, including TRADINGVIEW.
@@ -9677,9 +9775,19 @@ def load_settings():
         "TRADINGVIEW": [],
     }
 
-    config_path = Path(__file__).resolve().parent / "lib" / "parms.ini"
+    config_path = resolve_parms_ini_path(ini_path=ini_path)
     if not config_path.is_file():
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        hint = (
+            " (specify --ini /path/to/parms.ini or set INI_PATH)"
+            if _is_compiled_binary()
+            else ""
+        )
+        raise FileNotFoundError(f"Configuration file not found: {config_path}{hint}")
+    logging.info(
+        "CONFIG_PATH_RESOLVED path=%s compiled=%s",
+        config_path,
+        _is_compiled_binary(),
+    )
 
     # Read provider and feature flags with standard INI semantics, independent of
     # how the project's JsonIniParser interprets dotted names, unquoted strings,
@@ -9719,14 +9827,25 @@ def load_settings():
     sanitized_ini = _sanitize_parms_for_json_ini(raw_ini_text)
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix=".parms_sanitized_",
-            suffix=".ini",
-            dir=str(config_path.parent),
-            encoding="utf-8",
-            delete=False,
-        ) as tmp_file:
+        try:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix=".parms_sanitized_",
+                suffix=".ini",
+                dir=str(config_path.parent),
+                encoding="utf-8",
+                delete=False,
+            )
+        except OSError:
+            # Fallback to system temp dir when parms.ini is on a read-only mount (e.g. Podman :ro)
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                prefix=".parms_sanitized_",
+                suffix=".ini",
+                encoding="utf-8",
+                delete=False,
+            )
+        with tmp_file:
             tmp_file.write(sanitized_ini)
             tmp_path = tmp_file.name
 
@@ -17926,7 +18045,7 @@ class ChartCaptureManager:
     def __init__(self, coordinator, output_dir=None, enabled=None):
         self.provider = "CHART_CAPTURE"
         self.coordinator = coordinator
-        base_dir = Path(__file__).resolve().parent
+        base_dir = _get_app_base_dir()
         raw_dir = output_dir or CHART_CAPTURE_DIR or str(LOG_ROOT / "charts")
         cfg_path = Path(raw_dir)
         self.output_dir = cfg_path if cfg_path.is_absolute() else (base_dir / cfg_path)
@@ -24734,7 +24853,7 @@ def _resolve_alpaca_option_data_client_for_analysis(coordinator=None):
     env_sec = os.getenv("ALPACA_SECRET_KEY", "").strip()
     if not env_key or not env_sec:
         try:
-            loaded_keys, _ = load_settings(INI_PATH if "INI_PATH" in globals() else "lib/parms.ini")
+            _, loaded_keys = load_settings(resolve_parms_ini_path())
             env_key = env_key or str((loaded_keys or {}).get("alpaca_key") or "").strip()
             env_sec = env_sec or str((loaded_keys or {}).get("alpaca_secret") or "").strip()
         except Exception:
@@ -26558,7 +26677,7 @@ class AdminCliProvider:
             self.ssl_cert_path = None
             return None
 
-        base_dir = Path(__file__).resolve().parent
+        base_dir = _get_app_base_dir()
         raw_cert = Path(DASHBOARD_SSL_CERT or "certs/dashboard.crt")
         raw_key = Path(DASHBOARD_SSL_KEY or "certs/dashboard.key")
         cert_path = raw_cert if raw_cert.is_absolute() else (base_dir / raw_cert)
@@ -27156,6 +27275,11 @@ def handle_cli_command(argv=None):
     cc_parser.add_argument("--port", dest="sub_port", type=int, default=None)
 
     args = parser.parse_args(raw_args)
+    ini_path = getattr(args, "sub_ini", None) or args.ini
+    if ini_path:
+        global _CLI_INI_PATH
+        _CLI_INI_PATH = str(ini_path).strip() or None
+
     action = (
         args.action
         if getattr(args, "subcommand", None) == "chart-capture"
@@ -27164,7 +27288,6 @@ def handle_cli_command(argv=None):
     if not action:
         return None
 
-    ini_path = getattr(args, "sub_ini", None) or args.ini
     port = (
         getattr(args, "sub_port", None)
         or args.port
