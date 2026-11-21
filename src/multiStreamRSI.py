@@ -1047,6 +1047,80 @@ class TastytradeClient:
       `prod` -> `prod_base_url`), with NO fallback between environments or brokers.
     """
 
+    @staticmethod
+    def _clean_credential(value):
+        """Strip quotes, accidental Bearer prefix, and internal line-breaks/whitespace from OAuth credentials."""
+        txt = str(value or "").strip()
+        if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in {"'", '"'}:
+            txt = txt[1:-1].strip()
+        if txt.lower().startswith("bearer "):
+            txt = txt[7:].strip()
+        return re.sub(r"\s+", "", txt)
+
+    @staticmethod
+    def _decode_jwt_claims_unverified(token):
+        """Decode public unverified JWT payload claims (iss/aud/exp/env) for safe error diagnostics only."""
+        parts = str(token or "").split(".")
+        if len(parts) != 3 or not parts[1]:
+            return None
+        try:
+            b64 = parts[1]
+            pad = "=" * ((4 - len(b64) % 4) % 4)
+            raw = base64.urlsafe_b64decode((b64 + pad).encode("ascii")).decode("utf-8")
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def _diagnose_token_exchange_error(self, env, err_txt):
+        """Return a safe, non-secret diagnostic hint when Tastytrade rejects /oauth/token."""
+        low = str(err_txt or "").lower()
+        if "invalid_grant" not in low and "invalid jwt" not in low and "invalid_client" not in low:
+            return ""
+        cfg = self._creds.get(env) or {}
+        other_env = "prod" if env == "sandbox" else "sandbox"
+        other_cfg = self._creds.get(other_env) or {}
+        refresh = cfg.get("refresh_token") or ""
+        other_refresh = other_cfg.get("refresh_token") or ""
+        if refresh and other_refresh and refresh == other_refresh:
+            return (
+                f" | Hint: {env}_refresh_token is identical to {other_env}_refresh_token — "
+                f"Sandbox and Prod require separate OAuth apps/grants (or set [tastytrade_api] transaction_env = prod)."
+            )
+        parts = refresh.split(".")
+        if len(parts) != 3:
+            return (
+                f" | Hint: [tastytrade_api] {env}_refresh_token is not a 3-part JWT "
+                f"(parts={len(parts)}, len={len(refresh)}) — paste the {env} OAuth Personal Grant refresh_token "
+                f"(not a client_secret, placeholder, or legacy token)."
+            )
+        claims = self._decode_jwt_claims_unverified(refresh)
+        if isinstance(claims, dict):
+            exp = claims.get("exp")
+            if isinstance(exp, (int, float)) and exp > 0 and exp < time.time():
+                exp_iso = datetime.fromtimestamp(exp, tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
+                return (
+                    f" | Hint: {env}_refresh_token JWT expired at {exp_iso} — "
+                    f"create a fresh {env} OAuth grant (and make sure you didn't paste a 15m access_token)."
+                )
+            iss = str(claims.get("iss") or claims.get("aud") or "").strip().lower()
+            if iss:
+                is_cert_iss = ("cert" in iss) or ("sandbox" in iss)
+                if env == "sandbox" and not is_cert_iss and ("tasty" in iss):
+                    return (
+                        f" | Hint: JWT issuer ({iss}) is Prod, not Sandbox — "
+                        f"generate a Sandbox grant in Tastytrade Cert/Sandbox or set [tastytrade_api] transaction_env = prod."
+                    )
+                if env == "prod" and is_cert_iss:
+                    return (
+                        f" | Hint: JWT issuer ({iss}) is Sandbox/Cert, not Prod — "
+                        f"generate a Prod grant or set [tastytrade_api] transaction_env = sandbox."
+                    )
+        return (
+            f" | Hint: verify [tastytrade_api] {env}_refresh_token and {env}_client_secret "
+            f"were created in Tastytrade's {env} OAuth portal (not {other_env}) and were not revoked/regenerated."
+        )
+
     def __init__(
         self,
         *,
@@ -1077,14 +1151,14 @@ class TastytradeClient:
         ).rstrip("/")
         self._creds = {
             "prod": {
-                "client_id": str(prod_client_id or "").strip(),
-                "client_secret": str(prod_client_secret or "").strip(),
-                "refresh_token": str(prod_refresh_token or "").strip(),
+                "client_id": self._clean_credential(prod_client_id),
+                "client_secret": self._clean_credential(prod_client_secret),
+                "refresh_token": self._clean_credential(prod_refresh_token),
             },
             "sandbox": {
-                "client_id": str(sandbox_client_id or "").strip(),
-                "client_secret": str(sandbox_client_secret or "").strip(),
-                "refresh_token": str(sandbox_refresh_token or "").strip(),
+                "client_id": self._clean_credential(sandbox_client_id),
+                "client_secret": self._clean_credential(sandbox_client_secret),
+                "refresh_token": self._clean_credential(sandbox_refresh_token),
             },
         }
         explicit_acct = str(account_number or "").strip()
@@ -1100,6 +1174,11 @@ class TastytradeClient:
         self._nested_chain_cache = {}
         self._quote_token_cache = None
         self._lock = threading.RLock()
+
+    @property
+    def env(self):
+        """Alias for transaction_env ('sandbox' or 'prod')."""
+        return self.transaction_env
 
     def has_env_credentials(self, env):
         cfg = self._creds.get(env, {})
@@ -1153,8 +1232,9 @@ class TastytradeClient:
                     raw = json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 err_txt = exc.read().decode("utf-8", errors="replace")[:300]
+                hint = self._diagnose_token_exchange_error(env, err_txt)
                 raise RuntimeError(
-                    f"Tastytrade {env} token exchange HTTP {exc.code}: {err_txt}"
+                    f"Tastytrade {env} token exchange HTTP {exc.code}: {err_txt}{hint}"
                 ) from exc
 
             access_token = raw.get("access_token")
@@ -2434,6 +2514,7 @@ class OptionContractHistoryTracker:
 
     def __init__(self):
         self._lock = threading.RLock()
+        self._disk_lock = threading.Lock()
         self.open_contracts = {}
         self.closed_contracts = []
         self._closed_ids = set()
@@ -2447,7 +2528,65 @@ class OptionContractHistoryTracker:
         self._trading_client = None
         self._option_data_client = None
         self._stock_data_client = None
-        self._last_cache_write_mono = 0.0
+        self._last_cache_write_mono = -9999.0
+        self._last_mark_stats = {}
+        self._scope = self._active_scope()
+        self._load_persisted_state()
+
+    def _active_scope(self):
+        """Return (provider, env) tuple identifying the active broker + account environment."""
+        client = getattr(self, "_trading_client", None)
+        if client is not None:
+            if isinstance(client, TastytradeClient):
+                env = str(getattr(client, "transaction_env", "sandbox") or "sandbox").strip().lower()
+                if env == "live":
+                    env = "prod"
+                return ("tastytrade", env if env in {"sandbox", "prod"} else "sandbox")
+            is_paper = getattr(client, "_sandbox", None)
+            if is_paper is None:
+                is_paper = bool(globals().get("ALPACA_PAPER", True))
+            return ("alpaca", "paper" if bool(is_paper) else "live")
+
+        provider = (
+            str(globals().get("OPTION_TRANSACTION_PROVIDER", "alpaca") or "alpaca")
+            .strip()
+            .lower()
+            or "alpaca"
+        )
+        if provider == "tastytrade":
+            raw_env = (
+                str(
+                    (getattr(self, "_credentials", None) or {}).get("tastytrade_transaction_env")
+                    or globals().get("TASTYTRADE_TRANSACTION_ENV", "sandbox")
+                    or "sandbox"
+                )
+                .strip()
+                .lower()
+            )
+            env = "prod" if raw_env in {"prod", "live"} else "sandbox"
+            return ("tastytrade", env)
+        env = "paper" if bool(globals().get("ALPACA_PAPER", True)) else "live"
+        return ("alpaca", env)
+
+    def _scope_slug(self):
+        provider, env = self._active_scope()
+        safe_p = re.sub(r"[^a-z0-9]+", "_", provider.lower()).strip("_") or "alpaca"
+        safe_e = re.sub(r"[^a-z0-9]+", "_", env.lower()).strip("_") or "default"
+        return f"{safe_p}_{safe_e}"
+
+    def _log_matches_provider(self, filename):
+        """Return True if a position/seller log filename belongs to the active transaction provider."""
+        provider, _ = self._active_scope()
+        fname = str(filename or "").upper()
+        if provider == "tastytrade":
+            return fname.startswith("TASTYTRADE-")
+        # Alpaca matches explicit ALPACA- logs plus legacy unprefixed logs, never TASTYTRADE-
+        return not fname.startswith("TASTYTRADE-")
+
+    def mark_client_disabled(self, reason=None):
+        with self._lock:
+            self.backfill_status = "disabled"
+            self.backfill_error = str(reason or "missing_trading_client")
 
     @classmethod
     def _history_cap(cls):
@@ -2476,7 +2615,9 @@ class OptionContractHistoryTracker:
         option_data_client=None,
         stock_data_client=None,
     ):
+        scope_changed = False
         with self._lock:
+            prev_scope = getattr(self, "_scope", None)
             if credentials:
                 self._credentials = dict(credentials)
             if trading_client is not None:
@@ -2485,6 +2626,16 @@ class OptionContractHistoryTracker:
                 self._option_data_client = option_data_client
             if stock_data_client is not None:
                 self._stock_data_client = stock_data_client
+            new_scope = self._active_scope()
+            if prev_scope != new_scope:
+                self._scope = new_scope
+                self.open_contracts = {}
+                self.closed_contracts = []
+                self._closed_ids = set()
+                self.filled_orders_history = []
+                scope_changed = True
+        if scope_changed:
+            self._load_persisted_state()
 
     def _lookup_live_stock_price(self, underlying, at_dt=None):
         """Look up underlying stock close price from MinuteCoordinator kinematics/pending state."""
@@ -2896,52 +3047,53 @@ class OptionContractHistoryTracker:
                         stock_price=stk_p,
                     )
                     self._upsert_point(existing["history"], pt)
-                return existing
-
-            history = []
-            if eff_price > 0:
-                history.append(
-                    self._build_point(
-                        exec_dt,
-                        eff_price,
-                        eff_price,
-                        eff_qty,
-                        mult,
-                        source="order_fill",
-                        stock_price=stk_p,
+                res_entry = existing
+            else:
+                history = []
+                if eff_price > 0:
+                    history.append(
+                        self._build_point(
+                            exec_dt,
+                            eff_price,
+                            eff_price,
+                            eff_qty,
+                            mult,
+                            source="order_fill",
+                            stock_price=stk_p,
+                        )
                     )
-                )
-            entry = {
-                "contract": sym,
-                "underlying": eff_und,
-                "is_option": eff_opt,
-                "right": right,
-                "strike": strike,
-                "expiry": expiry,
-                "qty": (
-                    int(round(eff_qty))
-                    if abs(eff_qty - round(eff_qty)) < 1e-6
-                    else round(eff_qty, 4)
-                ),
-                "multiplier": mult,
-                "entry_price": round(eff_price, 4),
-                "cost_basis": cost_basis,
-                "purchased_at_utc": exec_dt.isoformat(),
-                "purchased_minute_utc": minute_utc(exec_dt).isoformat(),
-                "order_id": str(order_id) if order_id else None,
-                "buy_reason": reason,
-                "dry_run": False,
-                "current_price": round(eff_price, 4),
-                "market_value": cost_basis,
-                "pnl_dollars": 0.0,
-                "pnl_pct": 0.0,
-                "last_updated_utc": exec_dt.isoformat(),
-                "history_source": "live",
-                "pre_entry_history": [],
-                "history": history,
-            }
-            self.open_contracts[sym] = entry
-            return entry
+                res_entry = {
+                    "contract": sym,
+                    "underlying": eff_und,
+                    "is_option": eff_opt,
+                    "right": right,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "qty": (
+                        int(round(eff_qty))
+                        if abs(eff_qty - round(eff_qty)) < 1e-6
+                        else round(eff_qty, 4)
+                    ),
+                    "multiplier": mult,
+                    "entry_price": round(eff_price, 4),
+                    "cost_basis": cost_basis,
+                    "purchased_at_utc": exec_dt.isoformat(),
+                    "purchased_minute_utc": minute_utc(exec_dt).isoformat(),
+                    "order_id": str(order_id) if order_id else None,
+                    "buy_reason": reason,
+                    "dry_run": False,
+                    "current_price": round(eff_price, 4),
+                    "market_value": cost_basis,
+                    "pnl_dollars": 0.0,
+                    "pnl_pct": 0.0,
+                    "last_updated_utc": exec_dt.isoformat(),
+                    "history_source": "live",
+                    "pre_entry_history": [],
+                    "history": history,
+                }
+                self.open_contracts[sym] = res_entry
+        self._persist_option_prices_cache(force=True)
+        return res_entry
 
     def update_buy_fill(
         self, contract, order_id, filled_price, filled_at=None, filled_qty=None
@@ -3173,18 +3325,6 @@ class OptionContractHistoryTracker:
                         "pre_entry_history": [],
                         "history": [],
                     }
-                    if avg_entry > 0:
-                        existing["history"].append(
-                            self._build_point(
-                                now_dt,
-                                avg_entry,
-                                avg_entry,
-                                raw_qty,
-                                mult,
-                                source="order_fill",
-                                stock_price=stk_p,
-                            )
-                        )
                     self.open_contracts[sym] = existing
                 else:
                     existing["qty"] = clean_qty
@@ -3200,10 +3340,11 @@ class OptionContractHistoryTracker:
                     if "live" not in str(existing.get("history_source") or ""):
                         existing["history_source"] = "backfilled+live"
 
-                if cur_price > 0 and avg_entry > 0:
+                eff_poll_price = cur_price if cur_price > 0 else avg_entry
+                if eff_poll_price > 0 and avg_entry > 0:
                     pt = self._build_point(
                         now_dt,
-                        cur_price,
+                        eff_poll_price,
                         avg_entry,
                         raw_qty,
                         mult,
@@ -3229,20 +3370,155 @@ class OptionContractHistoryTracker:
             for sym in missing_symbols:
                 self._reconcile_missing_open_contract(sym)
 
+    def _cache_path(self):
+        return LOG_ROOT / f"option_history_prices_{self._scope_slug()}.json"
+
+    def _state_path(self):
+        return LOG_ROOT / f"option_history_state_{self._scope_slug()}.json"
+
     @staticmethod
-    def _cache_path():
+    def _legacy_cache_path():
         return LOG_ROOT / "option_history_prices.json"
 
+    @staticmethod
+    def _legacy_state_path():
+        return LOG_ROOT / "option_history_state.json"
+
+    def _load_persisted_state(self):
+        """Immediately restore open & closed option histories for the active provider/env on startup."""
+        provider, env = self._active_scope()
+        state_file = self._state_path()
+        using_legacy = False
+        if not state_file.exists():
+            # Only migrate legacy unscoped state file for Alpaca (never bleed Alpaca history into Tastytrade)
+            legacy_file = self._legacy_state_path()
+            if provider == "alpaca" and legacy_file.exists():
+                state_file = legacy_file
+                using_legacy = True
+            else:
+                return 0
+        try:
+            raw = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("OPTION_HISTORY_STATE_LOAD_FAILED detail=%s", exc)
+            return 0
+        if not isinstance(raw, dict):
+            return 0
+
+        saved_prov = str(raw.get("provider") or "").strip().lower()
+        saved_env = str(raw.get("env") or "").strip().lower()
+        if saved_prov and saved_prov != provider:
+            logging.info(
+                "OPTION_HISTORY_STATE_SKIPPED reason=provider_mismatch saved=%s active=%s path=%s",
+                saved_prov,
+                provider,
+                state_file,
+            )
+            return 0
+        if saved_env and saved_env != env:
+            logging.info(
+                "OPTION_HISTORY_STATE_SKIPPED reason=env_mismatch saved=%s active=%s path=%s",
+                saved_env,
+                env,
+                state_file,
+            )
+            return 0
+        if using_legacy and saved_prov and saved_prov != "alpaca":
+            return 0
+
+        cap = self._history_cap()
+        pre_cap = self._pre_entry_cap()
+        restored_open = 0
+        restored_closed = 0
+        with self._lock:
+            raw_open = raw.get("open_contracts")
+            if isinstance(raw_open, dict):
+                for sym, entry in raw_open.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    s_u = str(entry.get("contract") or sym or "").strip().upper()
+                    if not s_u:
+                        continue
+                    hist = [
+                        dict(pt)
+                        for pt in (entry.get("history") or [])
+                        if isinstance(pt, dict) and pt.get("minute_utc")
+                    ]
+                    if len(hist) > cap:
+                        hist = hist[-cap:]
+                    pre_hist = [
+                        dict(pt)
+                        for pt in (entry.get("pre_entry_history") or [])
+                        if isinstance(pt, dict) and pt.get("minute_utc")
+                    ]
+                    if pre_cap > 0 and len(pre_hist) > pre_cap:
+                        pre_hist = pre_hist[-pre_cap:]
+                    restored = dict(entry)
+                    restored["contract"] = s_u
+                    restored["history"] = hist
+                    restored["pre_entry_history"] = pre_hist
+                    self.open_contracts[s_u] = restored
+                    restored_open += 1
+
+            raw_closed = raw.get("closed_contracts")
+            if isinstance(raw_closed, list):
+                for rec in raw_closed[: self.MAX_CLOSED_TRADES]:
+                    if not isinstance(rec, dict):
+                        continue
+                    tid = str(rec.get("trade_id") or "").strip()
+                    if not tid or tid in self._closed_ids:
+                        continue
+                    hist = [
+                        dict(pt)
+                        for pt in (rec.get("history") or [])
+                        if isinstance(pt, dict) and pt.get("minute_utc")
+                    ]
+                    if len(hist) > cap:
+                        hist = hist[-cap:]
+                    pre_hist = [
+                        dict(pt)
+                        for pt in (rec.get("pre_entry_history") or [])
+                        if isinstance(pt, dict) and pt.get("minute_utc")
+                    ]
+                    if pre_cap > 0 and len(pre_hist) > pre_cap:
+                        pre_hist = pre_hist[-pre_cap:]
+                    restored_rec = dict(rec)
+                    restored_rec["history"] = hist
+                    restored_rec["pre_entry_history"] = pre_hist
+                    self._closed_ids.add(tid)
+                    self.closed_contracts.append(restored_rec)
+                    restored_closed += 1
+
+            raw_orders = raw.get("filled_orders_history")
+            if isinstance(raw_orders, list) and not self.filled_orders_history:
+                self.filled_orders_history = [
+                    dict(o) for o in raw_orders[:500] if isinstance(o, dict)
+                ]
+
+        if restored_open or restored_closed:
+            logging.info(
+                "OPTION_HISTORY_STATE_RESTORED open=%d closed=%d path=%s",
+                restored_open,
+                restored_closed,
+                state_file,
+            )
+        return restored_open + restored_closed
+
     def _persist_option_prices_cache(self, force=False):
-        """Atomically persist observed live option marks to logs/option_history_prices.json."""
+        """Atomically persist observed live option marks & full contract state to disk."""
         now_mono = time.monotonic()
-        if not force and (now_mono - self._last_cache_write_mono) < 12.0:
+        if not force and (now_mono - self._last_cache_write_mono) < 10.0:
             return
         with self._lock:
             snap = {}
+            open_state = {}
+            closed_state = []
+            cap = self._history_cap()
+            pre_cap = self._pre_entry_cap()
             for sym, entry in self.open_contracts.items():
                 pts = {}
-                for pt in entry.get("history") or []:
+                hist = list(entry.get("history") or [])
+                for pt in hist:
                     if pt.get("source") in {"live_poll", "order_fill", "position_log"}:
                         mk = pt.get("minute_utc")
                         pr = _opt_safe_float(pt.get("price"), None)
@@ -3250,63 +3526,109 @@ class OptionContractHistoryTracker:
                             pts[mk] = round(pr, 4)
                 if pts:
                     snap[sym] = pts
-            for entry in self.closed_contracts[:30]:
+                pre_hist = list(entry.get("pre_entry_history") or [])
+                open_state[sym] = {
+                    **entry,
+                    "history": hist[-cap:],
+                    "pre_entry_history": pre_hist[-pre_cap:] if pre_cap > 0 else [],
+                }
+            for entry in self.closed_contracts[: self.MAX_CLOSED_TRADES]:
                 sym = entry.get("contract")
-                if not sym:
-                    continue
-                pts = snap.setdefault(sym, {})
-                for pt in entry.get("history") or []:
-                    if pt.get("source") in {"live_poll", "order_fill", "position_log"}:
-                        mk = pt.get("minute_utc")
-                        pr = _opt_safe_float(pt.get("price"), None)
-                        if mk and pr is not None and pr > 0:
-                            pts[mk] = round(pr, 4)
-        if not snap:
-            return
-        try:
-            cache_file = self._cache_path()
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            merged = {}
-            if cache_file.exists():
-                try:
-                    raw = json.loads(cache_file.read_text(encoding="utf-8"))
-                    if isinstance(raw, dict):
-                        for k, v in raw.items():
-                            if isinstance(v, dict):
-                                merged[str(k).upper()] = dict(v)
-                except Exception:
-                    merged = {}
-            cutoff_iso = (datetime.now(UTC) - timedelta(days=14)).isoformat()
-            cap = self._history_cap()
-            for sym, pts in snap.items():
-                dest = merged.setdefault(sym, {})
-                dest.update(pts)
-            cleaned = {}
-            for sym, pts in merged.items():
-                valid_items = sorted(
-                    (k, float(v))
-                    for k, v in pts.items()
-                    if isinstance(k, str) and k >= cutoff_iso and _opt_safe_float(v, 0.0) > 0
+                hist = list(entry.get("history") or [])
+                pre_hist = list(entry.get("pre_entry_history") or [])
+                if sym:
+                    pts = snap.setdefault(sym, {})
+                    for pt in hist:
+                        if pt.get("source") in {"live_poll", "order_fill", "position_log"}:
+                            mk = pt.get("minute_utc")
+                            pr = _opt_safe_float(pt.get("price"), None)
+                            if mk and pr is not None and pr > 0:
+                                pts[mk] = round(pr, 4)
+                closed_state.append(
+                    {
+                        **entry,
+                        "history": hist[-cap:],
+                        "pre_entry_history": pre_hist[-pre_cap:] if pre_cap > 0 else [],
+                    }
                 )
-                if valid_items:
-                    if len(valid_items) > cap:
-                        valid_items = valid_items[-cap:]
-                    cleaned[sym] = {k: round(v, 4) for k, v in valid_items}
-            tmp_file = cache_file.with_suffix(".json.tmp")
-            tmp_file.write_text(json.dumps(cleaned, separators=(",", ":")), encoding="utf-8")
-            os.replace(tmp_file, cache_file)
-            self._last_cache_write_mono = now_mono
-        except Exception as exc:
-            logging.debug("OPTION_HISTORY_CACHE_WRITE_FAILED detail=%s", exc)
+            orders_state = list(self.filled_orders_history[-500:])
+            provider, env = self._active_scope()
+        if not force and not snap and not open_state and not closed_state:
+            return
+        with self._disk_lock:
+            try:
+                cache_file = self._cache_path()
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                if snap:
+                    merged = {}
+                    if cache_file.exists():
+                        try:
+                            raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                            if isinstance(raw, dict):
+                                for k, v in raw.items():
+                                    if isinstance(v, dict):
+                                        merged[str(k).upper()] = dict(v)
+                        except Exception:
+                            merged = {}
+                    cutoff_iso = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+                    for sym, pts in snap.items():
+                        dest = merged.setdefault(sym, {})
+                        dest.update(pts)
+                    cleaned = {}
+                    for sym, pts in merged.items():
+                        valid_items = sorted(
+                            (k, float(v))
+                            for k, v in pts.items()
+                            if isinstance(k, str)
+                            and k >= cutoff_iso
+                            and _opt_safe_float(v, 0.0) > 0
+                        )
+                        if valid_items:
+                            if len(valid_items) > cap:
+                                valid_items = valid_items[-cap:]
+                            cleaned[sym] = {k: round(v, 4) for k, v in valid_items}
+                    tmp_file = cache_file.with_name(
+                        f".{cache_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                    )
+                    tmp_file.write_text(
+                        json.dumps(cleaned, separators=(",", ":")), encoding="utf-8"
+                    )
+                    os.replace(tmp_file, cache_file)
+
+                state_file = self._state_path()
+                state_payload = {
+                    "version": 2,
+                    "provider": provider,
+                    "env": env,
+                    "saved_at_utc": datetime.now(UTC).isoformat(),
+                    "open_contracts": open_state,
+                    "closed_contracts": closed_state,
+                    "filled_orders_history": orders_state,
+                }
+                tmp_state = state_file.with_name(
+                    f".{state_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                tmp_state.write_text(
+                    json.dumps(state_payload, separators=(",", ":")), encoding="utf-8"
+                )
+                os.replace(tmp_state, state_file)
+                self._last_cache_write_mono = now_mono
+            except Exception as exc:
+                logging.warning("OPTION_HISTORY_CACHE_WRITE_FAILED detail=%s", exc)
 
     def _load_persisted_option_prices_map(self, symbol_ranges):
-        """Load UTC minute marks from logs/option_history_prices.json filtered by symbol_ranges."""
+        """Load UTC minute marks from provider-scoped option_history_prices JSON filtered by symbol_ranges."""
         result = {}
         if not symbol_ranges:
             return result
+        provider, _ = self._active_scope()
         cache_file = self._cache_path()
         if not cache_file.exists():
-            return result
+            legacy_cache = self._legacy_cache_path()
+            if provider == "alpaca" and legacy_cache.exists():
+                cache_file = legacy_cache
+            else:
+                return result
         try:
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
         except Exception:
@@ -3335,12 +3657,12 @@ class OptionContractHistoryTracker:
     def _load_logged_position_prices_map(self, symbol_ranges):
         """Replay historical OPTION_POSITION current_price marks from logs/positions/*.log."""
         result = {}
+        stats = {"pos_files": 0, "pos_marks": 0}
         if not symbol_ranges:
-            return result
+            return result, stats
         pos_dir = LOG_ROOT / "positions"
         if not pos_dir.exists():
-            return result
-        import re
+            return result, stats
 
         target_bounds = {
             sym: (minute_utc(as_utc(s_dt)), minute_utc(as_utc(e_dt)) + MINUTE)
@@ -3349,25 +3671,28 @@ class OptionContractHistoryTracker:
         earliest_ts = min(b[0] for b in target_bounds.values()).timestamp() - 86400.0
         try:
             candidates = sorted(
-                pos_dir.glob("*-POSITIONS-*.log"),
+                pos_dir.glob("*.log"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
         except Exception:
-            return result
+            return result, stats
 
         selected_files = []
-        for fp in candidates[:40]:
+        for fp in candidates[:120]:
             try:
+                if not self._log_matches_provider(fp.name):
+                    continue
                 if fp.stat().st_mtime >= earliest_ts:
                     selected_files.append(fp)
             except Exception:
                 continue
         # Process oldest-to-newest so newer polls within the same minute win
         selected_files.reverse()
+        stats["pos_files"] = len(selected_files)
 
         line_re = re.compile(
-            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?\s+\w+\s+OPTION_POSITION\s+.*\bsymbol=([A-Z0-9._-]+)\b.*\bcurrent_price=([0-9.]+)\b"
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[,.]\d+)?(?:\s+[A-Z]{2,5})?\s+\w+\s+OPTION_POSITION\s+.*\bsymbol=([A-Za-z0-9._/-]+)\b.*\bcurrent_price=([0-9.]+)\b"
         )
         for fp in selected_files:
             try:
@@ -3396,15 +3721,106 @@ class OptionContractHistoryTracker:
                             result.setdefault(sym, {})[m_utc] = price
             except Exception:
                 continue
-        return result
+        stats["pos_marks"] = sum(len(v) for v in result.values())
+        return result, stats
 
-    def _load_live_marks_map(self, symbol_ranges):
-        """Combine logs/positions replay + persisted JSON cache into {sym: {min_dt: price}}."""
-        merged = self._load_logged_position_prices_map(symbol_ranges)
+    def _load_seller_analysis_prices_map(self, symbol_ranges, entry_prices_by_sym=None):
+        """Reconstruct minute option prices from logs/option_seller/*.log OPTION_SELL_ANALYSIS pnl% lines."""
+        result = {}
+        stats = {"seller_files": 0, "seller_marks": 0}
+        if not symbol_ranges or not entry_prices_by_sym:
+            return result, stats
+        seller_dir = LOG_ROOT / "option_seller"
+        if not seller_dir.exists():
+            return result, stats
+
+        target_bounds = {}
+        for sym, (s_dt, e_dt) in symbol_ranges.items():
+            ep = _opt_safe_float(entry_prices_by_sym.get(sym), None)
+            if ep is not None and ep > 0:
+                target_bounds[sym] = (
+                    minute_utc(as_utc(s_dt)),
+                    minute_utc(as_utc(e_dt)) + MINUTE,
+                    ep,
+                )
+        if not target_bounds:
+            return result, stats
+
+        earliest_ts = min(b[0] for b in target_bounds.values()).timestamp() - 86400.0
+        try:
+            candidates = sorted(
+                seller_dir.glob("*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return result, stats
+
+        selected_files = []
+        for fp in candidates[:120]:
+            try:
+                if not self._log_matches_provider(fp.name):
+                    continue
+                if fp.stat().st_mtime >= earliest_ts:
+                    selected_files.append(fp)
+            except Exception:
+                continue
+        selected_files.reverse()
+        stats["seller_files"] = len(selected_files)
+
+        line_re = re.compile(
+            r"OPTION_SELL_ANALYSIS\s+minute=(\S+)\s+contract=([A-Za-z0-9._/-]+)\s+.*\bpnl%=([+-]?[0-9.]+)%"
+        )
+        for fp in selected_files:
+            try:
+                with fp.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if "OPTION_SELL_ANALYSIS " not in line:
+                            continue
+                        m = line_re.search(line)
+                        if not m:
+                            continue
+                        sym = m.group(2).strip().upper()
+                        if sym not in target_bounds:
+                            continue
+                        pnl_pct = _opt_safe_float(m.group(3), None)
+                        if pnl_pct is None:
+                            continue
+                        mdt = _opt_parse_utc(m.group(1))
+                        if mdt is None:
+                            continue
+                        m_utc = minute_utc(mdt)
+                        s_min, e_min, ep = target_bounds[sym]
+                        if s_min <= m_utc <= e_min:
+                            est_price = round(ep * (1.0 + pnl_pct / 100.0), 4)
+                            if est_price > 0:
+                                result.setdefault(sym, {})[m_utc] = est_price
+            except Exception:
+                continue
+        stats["seller_marks"] = sum(len(v) for v in result.values())
+        return result, stats
+
+    def _load_live_marks_map(self, symbol_ranges, entry_prices_by_sym=None):
+        """Combine seller log fallback + position log replay + persisted JSON cache into {sym: {min_dt: price}}."""
+        seller_marks, seller_stats = self._load_seller_analysis_prices_map(
+            symbol_ranges, entry_prices_by_sym=entry_prices_by_sym
+        )
+        pos_marks, pos_stats = self._load_logged_position_prices_map(symbol_ranges)
         persisted = self._load_persisted_option_prices_map(symbol_ranges)
-        for sym, per_min in persisted.items():
-            dest = merged.setdefault(sym, {})
-            dest.update(per_min)
+
+        merged = {}
+        # Priority order (lowest to highest): seller pnl% estimate < exact position log < persisted live JSON cache
+        for src_map in (seller_marks, pos_marks, persisted):
+            for sym, per_min in src_map.items():
+                dest = merged.setdefault(sym, {})
+                dest.update(per_min)
+
+        self._last_mark_stats = {
+            **pos_stats,
+            **seller_stats,
+            "cache_marks": sum(len(v) for v in persisted.values()),
+            "merged_marks": sum(len(v) for v in merged.values()),
+        }
         return merged
 
     def refresh_stock_prices_for_minute(self, minute_dt):
@@ -3672,7 +4088,8 @@ class OptionContractHistoryTracker:
                     open_entry["pnl_dollars"] = round(
                         open_entry["market_value"] - open_entry["cost_basis"], 2
                     )
-            return closed_record
+        self._persist_option_prices_cache(force=True)
+        return closed_record
 
     def update_sell_fill(self, order_id, filled_price, filled_at=None):
         fp = _opt_safe_float(filled_price, None)
@@ -3819,16 +4236,40 @@ class OptionContractHistoryTracker:
                 return raw
             return {}
 
-        items = list(symbol_ranges.items())
-        chunk_size = 10
-        for i in range(0, len(items), chunk_size):
-            chunk = items[i : i + chunk_size]
+        # Sort newest contracts first and only batch symbols whose start times are within 24h,
+        # preventing a multi-week contract from forcing 20+ days of pagination onto today's contracts.
+        items = sorted(
+            symbol_ranges.items(),
+            key=lambda kv: minute_utc(as_utc(kv[1][0])),
+            reverse=True,
+        )
+        chunks = []
+        cur_chunk = []
+        cur_anchor = None
+        for item in items:
+            s_start = minute_utc(as_utc(item[1][0]))
+            if (
+                cur_chunk
+                and len(cur_chunk) < 10
+                and cur_anchor is not None
+                and abs((cur_anchor - s_start).total_seconds()) <= 86400.0
+            ):
+                cur_chunk.append(item)
+            else:
+                if cur_chunk:
+                    chunks.append(cur_chunk)
+                cur_chunk = [item]
+                cur_anchor = s_start
+        if cur_chunk:
+            chunks.append(cur_chunk)
+
+        for chunk in chunks:
             chunk_syms = [s for s, _ in chunk]
             min_start = min(minute_utc(as_utc(r[0])) for _, r in chunk)
             max_end = max(as_utc(r[1]) + MINUTE for _, r in chunk)
             try:
                 req = OptionBarsRequest(
-                    symbol_or_symbols=chunk_syms,
+                    symbol_or_symbols=chunk_syms if len(chunk_syms) > 1 else chunk_syms[0],
                     timeframe=TimeFrame.Minute,
                     start=min_start,
                     end=max_end,
@@ -4063,12 +4504,17 @@ class OptionContractHistoryTracker:
     def startup_backfill(
         self, trading_client=None, option_data_client=None, stock_data_client=None
     ):
-        """Scan open positions & closed/filled orders in Alpaca and backfill 1m option history."""
+        """Scan open positions & closed/filled orders from the active broker and backfill 1m option history."""
         client = trading_client or self._trading_client
         if client is None:
+            disable_reason = (
+                diagnose_trading_client_config(self._credentials)
+                or self.backfill_error
+                or "missing_trading_client"
+            )
             with self._lock:
                 self.backfill_status = "disabled"
-                self.backfill_error = "missing_trading_client"
+                self.backfill_error = disable_reason
             return {"open": 0, "closed": 0}
 
         self.attach_clients(
@@ -4144,8 +4590,11 @@ class OptionContractHistoryTracker:
             except Exception as exc:
                 logging.warning("OPTION_HISTORY_GET_ORDERS_FAILED detail=%s", exc)
 
+            def _ord_get(obj, attr, default=None):
+                return obj.get(attr, default) if isinstance(obj, dict) else getattr(obj, attr, default)
+
             seen_order_syms = {
-                str(getattr(o, "symbol", "") or "").strip().upper() for o in orders
+                str(_ord_get(o, "symbol", "") or "").strip().upper() for o in orders
             }
             missing_open_syms = [
                 s for s in open_pos_by_sym.keys() if s not in seen_order_syms
@@ -4187,32 +4636,32 @@ class OptionContractHistoryTracker:
             filled_orders = []
             dedup_oids = set()
             for o in orders:
-                oid = str(getattr(o, "id", "") or "")
+                oid = str(_ord_get(o, "id", "") or "")
                 if oid and oid in dedup_oids:
                     continue
                 if oid:
                     dedup_oids.add(oid)
-                sym = str(getattr(o, "symbol", "") or "").strip().upper()
-                raw_ac = getattr(o, "asset_class", None)
+                sym = str(_ord_get(o, "symbol", "") or "").strip().upper()
+                raw_ac = _ord_get(o, "asset_class", None)
                 if not sym or not _is_option_contract_symbol(sym, raw_ac):
                     continue
-                f_qty = _opt_safe_float(getattr(o, "filled_qty", None), 0.0) or 0.0
+                f_qty = _opt_safe_float(_ord_get(o, "filled_qty", None), 0.0) or 0.0
                 f_price = (
-                    _opt_safe_float(getattr(o, "filled_avg_price", None), 0.0) or 0.0
+                    _opt_safe_float(_ord_get(o, "filled_avg_price", None), 0.0) or 0.0
                 )
                 if f_qty <= 0 or f_price <= 0:
                     continue
                 f_at = (
-                    _opt_parse_utc(getattr(o, "filled_at", None))
-                    or _opt_parse_utc(getattr(o, "updated_at", None))
-                    or _opt_parse_utc(getattr(o, "submitted_at", None))
-                    or _opt_parse_utc(getattr(o, "created_at", None))
+                    _opt_parse_utc(_ord_get(o, "filled_at", None))
+                    or _opt_parse_utc(_ord_get(o, "updated_at", None))
+                    or _opt_parse_utc(_ord_get(o, "submitted_at", None))
+                    or _opt_parse_utc(_ord_get(o, "created_at", None))
                 )
                 if f_at is None:
                     continue
+                raw_side = _ord_get(o, "side", "")
                 side_val = str(
-                    getattr(getattr(o, "side", None), "value", getattr(o, "side", ""))
-                    or ""
+                    getattr(raw_side, "value", raw_side) or ""
                 ).lower()
                 if side_val not in {"buy", "sell"}:
                     continue
@@ -4310,8 +4759,14 @@ class OptionContractHistoryTracker:
             open_bar_ranges = {}
             open_stock_ranges = {}
             open_specs = {}
+            open_entry_prices = {}
+            with self._lock:
+                existing_open_snapshot = {
+                    k: dict(v) for k, v in self.open_contracts.items()
+                }
             for sym, pos in open_pos_by_sym.items():
                 rem_lots = [l for l in lots_by_sym.get(sym, []) if l["qty"] > 1e-6]
+                prev_saved = existing_open_snapshot.get(sym)
                 if rem_lots:
                     purchased_dt = rem_lots[0]["filled_at"]
                     buy_oid = rem_lots[0]["order_id"]
@@ -4319,9 +4774,30 @@ class OptionContractHistoryTracker:
                     purchased_dt = latest_buy_by_sym[sym]["filled_at"]
                     buy_oid = latest_buy_by_sym[sym]["order_id"]
                 else:
-                    purchased_dt = now_dt
-                    buy_oid = None
-                open_specs[sym] = (pos, purchased_dt, buy_oid)
+                    saved_pdt = (
+                        _opt_parse_utc(prev_saved.get("purchased_at_utc"))
+                        if prev_saved
+                        else None
+                    )
+                    purchased_dt = (
+                        saved_pdt
+                        if (saved_pdt is not None and saved_pdt < now_dt)
+                        else now_dt
+                    )
+                    buy_oid = prev_saved.get("order_id") if prev_saved else None
+
+                pos_entry = _opt_safe_float(
+                    (
+                        pos.get("avg_entry_price")
+                        if isinstance(pos, dict)
+                        else getattr(pos, "avg_entry_price", None)
+                    ),
+                    None,
+                )
+                if pos_entry and pos_entry > 0:
+                    open_entry_prices[sym] = pos_entry
+
+                open_specs[sym] = [pos, purchased_dt, buy_oid]
                 fetch_s = purchased_dt - pre_buf
                 s_min = open_bar_ranges[sym][0] if sym in open_bar_ranges else fetch_s
                 e_max = open_bar_ranges[sym][1] if sym in open_bar_ranges else now_dt
@@ -4339,199 +4815,255 @@ class OptionContractHistoryTracker:
                     us1 = open_stock_ranges[und][1] if und in open_stock_ranges else now_dt
                     open_stock_ranges[und] = (min(us0, fetch_s), max(us1, now_dt))
 
-            # Phase 1: Fast-path open contracts FIRST so live open charts appear within ~1-2s
-            # with full replayed position logs + persisted marks + Alpaca bars.
-            open_bars_by_sym = self._fetch_option_bars_map(open_bar_ranges)
-            open_marks_by_sym = self._load_live_marks_map(open_bar_ranges)
-            open_stock_bars_by_und = self._fetch_stock_bars_map(open_stock_ranges)
+            # Phase 0 (instant local replay, 0 market-data HTTP calls):
+            # Load position logs + seller logs + persisted JSON cache immediately so open
+            # contracts show full pre-restart history even before Alpaca bar requests finish.
+            open_marks_by_sym = self._load_live_marks_map(
+                open_bar_ranges, entry_prices_by_sym=open_entry_prices
+            )
+            open_mark_stats = dict(self._last_mark_stats)
+            for sym, spec in open_specs.items():
+                pos, purchased_dt, buy_oid = spec
+                marks_map = open_marks_by_sym.get(sym, {})
+                if buy_oid is None and marks_map:
+                    earliest_mark = min(marks_map.keys())
+                    if earliest_mark < purchased_dt:
+                        spec[1] = earliest_mark
+                        new_fetch_s = earliest_mark - pre_buf
+                        open_bar_ranges[sym] = (
+                            min(open_bar_ranges[sym][0], new_fetch_s),
+                            open_bar_ranges[sym][1],
+                        )
 
-            with self._lock:
-                phase1_end_dt = max(now_dt, datetime.now(UTC))
-                for sym, (pos, purchased_dt, buy_oid) in open_specs.items():
-                    _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
-                    raw_und = (
-                        pos.get("underlying_symbol")
-                        if isinstance(pos, dict)
-                        else getattr(pos, "underlying_symbol", None)
-                    )
-                    und = str(raw_und or parsed_und or sym).strip().upper()
-                    mult = 100.0
-                    raw_qty = (
-                        _opt_safe_float(
+            def _publish_open_contracts(opt_bars_map, marks_map_all, stk_bars_map):
+                with self._lock:
+                    phase_end_dt = max(now_dt, datetime.now(UTC))
+                    for sym, (pos, purchased_dt, buy_oid) in open_specs.items():
+                        _, parsed_und, right, strike, expiry = _parse_occ_contract(sym)
+                        raw_und = (
+                            pos.get("underlying_symbol")
+                            if isinstance(pos, dict)
+                            else getattr(pos, "underlying_symbol", None)
+                        )
+                        und = str(raw_und or parsed_und or sym).strip().upper()
+                        mult = 100.0
+                        raw_qty = (
+                            _opt_safe_float(
+                                (
+                                    pos.get("qty")
+                                    if isinstance(pos, dict)
+                                    else getattr(pos, "qty", None)
+                                ),
+                                1.0,
+                            )
+                            or 1.0
+                        )
+                        clean_qty = (
+                            int(round(raw_qty))
+                            if abs(raw_qty - round(raw_qty)) < 1e-6
+                            else round(raw_qty, 4)
+                        )
+                        avg_entry = _opt_safe_float(
                             (
-                                pos.get("qty")
+                                pos.get("avg_entry_price")
                                 if isinstance(pos, dict)
-                                else getattr(pos, "qty", None)
+                                else getattr(pos, "avg_entry_price", None)
                             ),
-                            1.0,
+                            None,
                         )
-                        or 1.0
-                    )
-                    clean_qty = (
-                        int(round(raw_qty))
-                        if abs(raw_qty - round(raw_qty)) < 1e-6
-                        else round(raw_qty, 4)
-                    )
-                    avg_entry = _opt_safe_float(
-                        (
-                            pos.get("avg_entry_price")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "avg_entry_price", None)
-                        ),
-                        None,
-                    )
-                    cur_price = _opt_safe_float(
-                        (
-                            pos.get("current_price")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "current_price", None)
-                        ),
-                        None,
-                    )
-                    mkt_val = _opt_safe_float(
-                        (
-                            pos.get("market_value")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "market_value", None)
-                        ),
-                        None,
-                    )
-                    cost_b = _opt_safe_float(
-                        (
-                            pos.get("cost_basis")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "cost_basis", None)
-                        ),
-                        None,
-                    )
-                    upl = _opt_safe_float(
-                        (
-                            pos.get("unrealized_pl")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "unrealized_pl", None)
-                        ),
-                        None,
-                    )
-                    uplpc = _opt_safe_float(
-                        (
-                            pos.get("unrealized_plpc")
-                            if isinstance(pos, dict)
-                            else getattr(pos, "unrealized_plpc", None)
-                        ),
-                        None,
-                    )
-
-                    if (avg_entry is None or avg_entry <= 0) and cost_b and raw_qty > 0:
-                        avg_entry = cost_b / (raw_qty * mult)
-                    if (
-                        (cur_price is None or cur_price <= 0)
-                        and mkt_val
-                        and raw_qty > 0
-                    ):
-                        cur_price = mkt_val / (raw_qty * mult)
-                    avg_entry = avg_entry or cur_price or 0.0
-                    cur_price = cur_price or avg_entry
-                    cost_b = (
-                        cost_b
-                        if (cost_b is not None and cost_b > 0)
-                        else round(avg_entry * raw_qty * mult, 2)
-                    )
-                    mkt_val = (
-                        mkt_val
-                        if (mkt_val is not None and mkt_val > 0)
-                        else round(cur_price * raw_qty * mult, 2)
-                    )
-                    upl = upl if upl is not None else round(mkt_val - cost_b, 2)
-                    pnl_pct = (
-                        round(uplpc * 100.0, 2)
-                        if uplpc is not None
-                        else (round((upl / cost_b) * 100.0, 2) if cost_b > 0 else 0.0)
-                    )
-
-                    prev_entry = self.open_contracts.get(sym)
-                    existing_hist = (
-                        list(prev_entry.get("history") or []) if prev_entry else []
-                    )
-                    # Preserve fresher price if a live poll already updated this contract
-                    if prev_entry and prev_entry.get("last_updated_utc"):
-                        prev_ts = _opt_parse_utc(prev_entry.get("last_updated_utc"))
-                        if prev_ts and prev_ts > now_dt:
-                            p_cur = _opt_safe_float(prev_entry.get("current_price"), None)
-                            if p_cur and p_cur > 0:
-                                cur_price = p_cur
-                                mkt_val = _opt_safe_float(prev_entry.get("market_value"), mkt_val) or mkt_val
-                                upl = _opt_safe_float(prev_entry.get("pnl_dollars"), upl)
-                                pnl_pct = _opt_safe_float(prev_entry.get("pnl_pct"), pnl_pct)
-                                phase1_end_dt = max(phase1_end_dt, prev_ts)
-                    opt_map = open_bars_by_sym.get(sym, {})
-                    marks_map = open_marks_by_sym.get(sym, {})
-                    stk_map = open_stock_bars_by_und.get(und, {})
-                    hist = self._fill_minute_gaps(
-                        existing_hist,
-                        purchased_dt,
-                        phase1_end_dt,
-                        avg_entry,
-                        cur_price,
-                        raw_qty,
-                        mult,
-                        bar_prices_by_min=opt_map,
-                        stock_prices_by_min=stk_map,
-                        is_closed=False,
-                        live_marks_by_min=marks_map,
-                    )
-                    pre_hist = self._build_pre_entry_history(
-                        purchased_dt,
-                        avg_entry,
-                        raw_qty,
-                        mult,
-                        opt_bars_by_min=opt_map,
-                        stk_bars_by_min=stk_map,
-                    ) or list((prev_entry or {}).get("pre_entry_history") or [])
-                    has_hist_src = bool(opt_map or marks_map)
-                    self.open_contracts[sym] = {
-                        "contract": sym,
-                        "underlying": und,
-                        "is_option": True,
-                        "right": right,
-                        "strike": strike,
-                        "expiry": expiry,
-                        "qty": clean_qty,
-                        "multiplier": mult,
-                        "entry_price": round(avg_entry, 4),
-                        "cost_basis": round(cost_b, 2),
-                        "purchased_at_utc": purchased_dt.isoformat(),
-                        "purchased_minute_utc": minute_utc(purchased_dt).isoformat(),
-                        "order_id": (
-                            str(buy_oid)
-                            if buy_oid
-                            else (prev_entry.get("order_id") if prev_entry else None)
-                        ),
-                        "buy_reason": (
-                            prev_entry.get("buy_reason") if prev_entry else None
+                        cur_price = _opt_safe_float(
+                            (
+                                pos.get("current_price")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "current_price", None)
+                            ),
+                            None,
                         )
-                        or "alpaca_open_position",
-                        "dry_run": False,
-                        "current_price": round(cur_price, 4),
-                        "market_value": round(mkt_val, 2),
-                        "pnl_dollars": round(upl, 2),
-                        "pnl_pct": pnl_pct,
-                        "last_updated_utc": phase1_end_dt.isoformat(),
-                        "history_source": (
-                            "backfilled+live" if has_hist_src else "live"
-                        ),
-                        "pre_entry_history": pre_hist,
-                        "history": hist,
-                    }
+                        mkt_val = _opt_safe_float(
+                            (
+                                pos.get("market_value")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "market_value", None)
+                            ),
+                            None,
+                        )
+                        cost_b = _opt_safe_float(
+                            (
+                                pos.get("cost_basis")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "cost_basis", None)
+                            ),
+                            None,
+                        )
+                        upl = _opt_safe_float(
+                            (
+                                pos.get("unrealized_pl")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "unrealized_pl", None)
+                            ),
+                            None,
+                        )
+                        uplpc = _opt_safe_float(
+                            (
+                                pos.get("unrealized_plpc")
+                                if isinstance(pos, dict)
+                                else getattr(pos, "unrealized_plpc", None)
+                            ),
+                            None,
+                        )
 
-                for sym in list(self.open_contracts.keys()):
-                    if sym not in open_pos_by_sym:
-                        self.open_contracts.pop(sym, None)
+                        if (avg_entry is None or avg_entry <= 0) and cost_b and raw_qty > 0:
+                            avg_entry = cost_b / (raw_qty * mult)
+                        if (
+                            (cur_price is None or cur_price <= 0)
+                            and mkt_val
+                            and raw_qty > 0
+                        ):
+                            cur_price = mkt_val / (raw_qty * mult)
+                        avg_entry = avg_entry or cur_price or 0.0
+                        cur_price = cur_price or avg_entry
+                        cost_b = (
+                            cost_b
+                            if (cost_b is not None and cost_b > 0)
+                            else round(avg_entry * raw_qty * mult, 2)
+                        )
+                        mkt_val = (
+                            mkt_val
+                            if (mkt_val is not None and mkt_val > 0)
+                            else round(cur_price * raw_qty * mult, 2)
+                        )
+                        upl = upl if upl is not None else round(mkt_val - cost_b, 2)
+                        pnl_pct = (
+                            round(uplpc * 100.0, 2)
+                            if uplpc is not None
+                            else (round((upl / cost_b) * 100.0, 2) if cost_b > 0 else 0.0)
+                        )
+
+                        prev_entry = self.open_contracts.get(sym)
+                        existing_hist = (
+                            list(prev_entry.get("history") or []) if prev_entry else []
+                        )
+                        end_dt_sym = phase_end_dt
+                        if prev_entry and prev_entry.get("last_updated_utc"):
+                            prev_ts = _opt_parse_utc(prev_entry.get("last_updated_utc"))
+                            if prev_ts and prev_ts > now_dt:
+                                p_cur = _opt_safe_float(prev_entry.get("current_price"), None)
+                                if p_cur and p_cur > 0:
+                                    cur_price = p_cur
+                                    mkt_val = _opt_safe_float(prev_entry.get("market_value"), mkt_val) or mkt_val
+                                    upl = _opt_safe_float(prev_entry.get("pnl_dollars"), upl)
+                                    pnl_pct = _opt_safe_float(prev_entry.get("pnl_pct"), pnl_pct)
+                                    end_dt_sym = max(end_dt_sym, prev_ts)
+
+                        opt_map = opt_bars_map.get(sym, {})
+                        marks_map = marks_map_all.get(sym, {})
+                        stk_map = dict(stk_bars_map.get(und, {}))
+                        # Also seed stk_map from any previously persisted stock_price points
+                        for prev_pt in existing_hist:
+                            pm = _opt_parse_utc(prev_pt.get("minute_utc"))
+                            ps = _opt_safe_float(prev_pt.get("stock_price"), None)
+                            if pm is not None and ps is not None and ps > 0:
+                                stk_map.setdefault(minute_utc(pm), ps)
+
+                        hist = self._fill_minute_gaps(
+                            existing_hist,
+                            purchased_dt,
+                            end_dt_sym,
+                            avg_entry,
+                            cur_price,
+                            raw_qty,
+                            mult,
+                            bar_prices_by_min=opt_map,
+                            stock_prices_by_min=stk_map,
+                            is_closed=False,
+                            live_marks_by_min=marks_map,
+                        )
+                        pre_hist = self._build_pre_entry_history(
+                            purchased_dt,
+                            avg_entry,
+                            raw_qty,
+                            mult,
+                            opt_bars_by_min=opt_map,
+                            stk_bars_by_min=stk_map,
+                        ) or list((prev_entry or {}).get("pre_entry_history") or [])
+                        has_hist_src = bool(
+                            opt_map
+                            or marks_map
+                            or any(
+                                pt.get("source") in {"position_log", "option_bar", "live_poll"}
+                                for pt in existing_hist
+                            )
+                        )
+                        self.open_contracts[sym] = {
+                            "contract": sym,
+                            "underlying": und,
+                            "is_option": True,
+                            "right": right,
+                            "strike": strike,
+                            "expiry": expiry,
+                            "qty": clean_qty,
+                            "multiplier": mult,
+                            "entry_price": round(avg_entry, 4),
+                            "cost_basis": round(cost_b, 2),
+                            "purchased_at_utc": purchased_dt.isoformat(),
+                            "purchased_minute_utc": minute_utc(purchased_dt).isoformat(),
+                            "order_id": (
+                                str(buy_oid)
+                                if buy_oid
+                                else (prev_entry.get("order_id") if prev_entry else None)
+                            ),
+                            "buy_reason": (
+                                prev_entry.get("buy_reason") if prev_entry else None
+                            )
+                            or f"{self._active_scope()[0]}_open_position",
+                            "dry_run": False,
+                            "current_price": round(cur_price, 4),
+                            "market_value": round(mkt_val, 2),
+                            "pnl_dollars": round(upl, 2),
+                            "pnl_pct": pnl_pct,
+                            "last_updated_utc": end_dt_sym.isoformat(),
+                            "history_source": (
+                                "backfilled+live" if has_hist_src else "live"
+                            ),
+                            "pre_entry_history": pre_hist,
+                            "history": hist,
+                        }
+
+                    for sym in list(self.open_contracts.keys()):
+                        if sym not in open_pos_by_sym:
+                            self.open_contracts.pop(sym, None)
+
+            # Publish Phase 0 immediately using local state + position/seller logs + in-memory stock history
+            in_mem_stock = {}
+            coord = self._coordinator
+            if coord is not None:
+                kin_map = getattr(coord, "kinematics_history", None) or {}
+                for und, (s_dt, e_dt) in open_stock_ranges.items():
+                    s_min = minute_utc(as_utc(s_dt))
+                    e_min = minute_utc(as_utc(e_dt))
+                    per_min = in_mem_stock.setdefault(und, {})
+                    for prov in _provider_priority_order():
+                        for h in kin_map.get((prov, und), []) or []:
+                            hm = _hist_minute_utc(h)
+                            hc = _opt_safe_float(h.get("close"), None)
+                            if hm is not None and hc is not None and hc > 0 and s_min <= hm <= e_min:
+                                per_min.setdefault(hm, float(hc))
+            _publish_open_contracts({}, open_marks_by_sym, in_mem_stock)
+
+            # Phase 1: Fetch tight per-contract Alpaca option bars + stock bars for open contracts
+            open_bars_by_sym = self._fetch_option_bars_map(open_bar_ranges)
+            open_stock_bars_by_und = self._fetch_stock_bars_map(open_stock_ranges)
+            _publish_open_contracts(open_bars_by_sym, open_marks_by_sym, open_stock_bars_by_und)
+            self._persist_option_prices_cache(force=True)
 
             # Phase 2: Backfill closed contracts in background after open contracts are live
             closed_bar_ranges = {}
             closed_stock_ranges = {}
+            closed_entry_prices = {}
             for cm in closed_matches[:25]:
                 sym = cm["contract"]
+                if cm.get("entry_price") and cm["entry_price"] > 0:
+                    closed_entry_prices[sym] = cm["entry_price"]
                 fetch_s = cm["purchased_at"] - pre_buf
                 if sym in closed_bar_ranges:
                     s_min, e_max = closed_bar_ranges[sym]
@@ -4548,7 +5080,9 @@ class OptionContractHistoryTracker:
                     closed_stock_ranges[und] = (min(us0, fetch_s), max(us1, cm["sold_at"]))
 
             closed_bars_by_sym = self._fetch_option_bars_map(closed_bar_ranges)
-            closed_marks_by_sym = self._load_live_marks_map(closed_bar_ranges)
+            closed_marks_by_sym = self._load_live_marks_map(
+                closed_bar_ranges, entry_prices_by_sym=closed_entry_prices
+            )
             closed_stock_bars_by_und = self._fetch_stock_bars_map(closed_stock_ranges)
 
             bars_by_sym = {**open_bars_by_sym}
@@ -4561,7 +5095,15 @@ class OptionContractHistoryTracker:
             for und, per_min in closed_stock_bars_by_und.items():
                 stock_bars_by_und.setdefault(und, {}).update(per_min)
 
+            active_provider_name = self._active_scope()[0]
             with self._lock:
+                existing_by_tid = {
+                    str(x.get("trade_id") or ""): x
+                    for x in self.closed_contracts
+                    if x.get("trade_id")
+                }
+                rebuilt_closed = []
+                rebuilt_ids = set()
                 for cm in closed_matches:
                     sym = cm["contract"]
                     _, und, right, strike, expiry = _parse_occ_contract(sym)
@@ -4576,14 +5118,7 @@ class OptionContractHistoryTracker:
                         if cm["sell_order_id"]
                         else f"{sym}@{s_dt.isoformat()}"
                     )
-                    existing_closed = next(
-                        (
-                            x
-                            for x in self.closed_contracts
-                            if x.get("trade_id") == trade_id
-                        ),
-                        None,
-                    )
+                    existing_closed = existing_by_tid.get(trade_id)
                     existing_hist = (
                         existing_closed.get("history") if existing_closed else []
                     )
@@ -4647,7 +5182,7 @@ class OptionContractHistoryTracker:
                         "reason": (
                             existing_closed.get("reason") if existing_closed else None
                         )
-                        or "alpaca_closed_order",
+                        or f"{active_provider_name}_closed_order",
                         "dry_run": False,
                         "history_source": (
                             "backfilled" if (opt_map or c_marks_map) else "order_fills"
@@ -4655,20 +5190,32 @@ class OptionContractHistoryTracker:
                         "pre_entry_history": pre_hist,
                         "history": hist,
                     }
-                    if existing_closed is not None:
-                        idx = self.closed_contracts.index(existing_closed)
-                        self.closed_contracts[idx] = rec
-                    elif trade_id not in self._closed_ids:
-                        self._closed_ids.add(trade_id)
-                        self.closed_contracts.append(rec)
+                    if trade_id not in rebuilt_ids:
+                        rebuilt_ids.add(trade_id)
+                        rebuilt_closed.append(rec)
 
-                self.closed_contracts.sort(
+                # Preserve any closed trades recorded live during this run that haven't appeared in broker orders yet
+                run_start = self._run_start_dt()
+                for prev_closed in self.closed_contracts:
+                    prev_tid = str(prev_closed.get("trade_id") or "")
+                    if not prev_tid or prev_tid in rebuilt_ids:
+                        continue
+                    prev_sold_dt = _opt_parse_utc(prev_closed.get("sold_at_utc"))
+                    if prev_sold_dt is not None and prev_sold_dt >= run_start:
+                        rebuilt_ids.add(prev_tid)
+                        rebuilt_closed.append(prev_closed)
+
+                rebuilt_closed.sort(
                     key=lambda r: str(r.get("sold_at_utc") or ""), reverse=True
                 )
-                if len(self.closed_contracts) > self.MAX_CLOSED_TRADES:
-                    for dropped in self.closed_contracts[self.MAX_CLOSED_TRADES :]:
-                        self._closed_ids.discard(dropped.get("trade_id"))
-                    del self.closed_contracts[self.MAX_CLOSED_TRADES :]
+                if len(rebuilt_closed) > self.MAX_CLOSED_TRADES:
+                    rebuilt_closed = rebuilt_closed[: self.MAX_CLOSED_TRADES]
+                self.closed_contracts = rebuilt_closed
+                self._closed_ids = {
+                    str(r.get("trade_id"))
+                    for r in self.closed_contracts
+                    if r.get("trade_id")
+                }
 
                 self.backfill_status = "completed"
                 self.backfill_last_utc = datetime.now(UTC).isoformat()
@@ -4677,18 +5224,24 @@ class OptionContractHistoryTracker:
 
             self._persist_option_prices_cache(force=True)
             logging.info(
-                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d bar_symbols=%d mark_symbols=%d stock_symbols=%d",
+                "OPTION_HISTORY_BACKFILL status=completed open_contracts=%d closed_contracts=%d "
+                "bar_symbols=%d mark_symbols=%d stock_symbols=%d "
+                "open_pos_files=%d open_pos_marks=%d open_seller_marks=%d open_cache_marks=%d",
                 open_cnt,
                 closed_cnt,
                 len(bars_by_sym),
                 len(marks_by_sym),
                 len(stock_bars_by_und),
+                int(open_mark_stats.get("pos_files", 0)),
+                int(open_mark_stats.get("pos_marks", 0)),
+                int(open_mark_stats.get("seller_marks", 0)),
+                int(open_mark_stats.get("cache_marks", 0)),
             )
             return {"open": open_cnt, "closed": closed_cnt}
         except Exception as exc:
             with self._lock:
                 self.backfill_status = "error"
-                self.backfill_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                self.backfill_error = f"{type(exc).__name__}: {str(exc)[:420]}"
             logging.warning(
                 "OPTION_HISTORY_BACKFILL_FAILED error_type=%s detail=%s",
                 type(exc).__name__,
@@ -4823,7 +5376,10 @@ class OptionContractHistoryTracker:
                 p_dt = _opt_parse_utc(c.get("purchased_at_utc"))
                 if (p_dt is not None and p_dt >= run_start) or (con_sym and con_sym in live_buy_contracts):
                     run_open += 1
+            provider, env = self._active_scope()
             return {
+                "provider": provider,
+                "env": env,
                 "open_count": len(items),
                 "run_open_count": run_open,
                 "overall_buy_orders": max(len(items), overall_buys),
@@ -4833,6 +5389,7 @@ class OptionContractHistoryTracker:
                 "total_pnl_pct": total_pct,
                 "backfill_status": self.backfill_status,
                 "backfill_last_utc": self.backfill_last_utc,
+                "backfill_error": self.backfill_error,
             }
 
     def get_seller_summary(self):
@@ -4871,7 +5428,10 @@ class OptionContractHistoryTracker:
                 s_dt = _opt_parse_utc(c.get("sold_at_utc"))
                 if s_dt is not None and s_dt >= run_start:
                     run_closed += 1
+            provider, env = self._active_scope()
             return {
+                "provider": provider,
+                "env": env,
                 "closed_count": len(items),
                 "run_closed_count": run_closed,
                 "overall_sell_orders": max(len(items), overall_sells),
@@ -4883,10 +5443,12 @@ class OptionContractHistoryTracker:
                 "total_pnl_pct": total_pct,
                 "backfill_status": self.backfill_status,
                 "backfill_last_utc": self.backfill_last_utc,
+                "backfill_error": self.backfill_error,
             }
 
     def get_snapshot(self):
         with self._lock:
+            provider, env = self._active_scope()
             open_list = [
                 {
                     **c,
@@ -4908,6 +5470,8 @@ class OptionContractHistoryTracker:
                 for c in self.closed_contracts
             ]
             return {
+                "provider": provider,
+                "env": env,
                 "backfill_status": self.backfill_status,
                 "backfill_last_utc": self.backfill_last_utc,
                 "backfill_error": self.backfill_error,
@@ -6743,20 +7307,28 @@ class ProviderRouter:
             return {
                 "env": "sandbox",
                 "base_url": TASTYTRADE_SANDBOX_BASE_URL,
-                "client_id": self.credentials.get("tastytrade_sandbox_client_id", ""),
-                "client_secret": self.credentials.get(
-                    "tastytrade_sandbox_client_secret", ""
+                "client_id": TastytradeClient._clean_credential(
+                    self.credentials.get("tastytrade_sandbox_client_id", "")
                 ),
-                "refresh_token": self.credentials.get(
-                    "tastytrade_sandbox_refresh_token", ""
+                "client_secret": TastytradeClient._clean_credential(
+                    self.credentials.get("tastytrade_sandbox_client_secret", "")
+                ),
+                "refresh_token": TastytradeClient._clean_credential(
+                    self.credentials.get("tastytrade_sandbox_refresh_token", "")
                 ),
             }
         return {
             "env": "prod",
             "base_url": TASTYTRADE_PROD_BASE_URL,
-            "client_id": self.credentials.get("tastytrade_prod_client_id", ""),
-            "client_secret": self.credentials.get("tastytrade_prod_client_secret", ""),
-            "refresh_token": self.credentials.get("tastytrade_prod_refresh_token", ""),
+            "client_id": TastytradeClient._clean_credential(
+                self.credentials.get("tastytrade_prod_client_id", "")
+            ),
+            "client_secret": TastytradeClient._clean_credential(
+                self.credentials.get("tastytrade_prod_client_secret", "")
+            ),
+            "refresh_token": TastytradeClient._clean_credential(
+                self.credentials.get("tastytrade_prod_refresh_token", "")
+            ),
         }
 
     async def _tastytrade_get_access_token(self, env="prod", force_refresh=False):
@@ -7424,11 +7996,13 @@ _INI_FEATURE_SECTIONS = frozenset(
         "general",
         "providers",
         "kinematics",
+        "option_history",
         "option_trading",
         "option_buyer",
         "option_seller",
         "chart_capture",
         "dashboard",
+        "feature_toggles",
         "tastytrade_api",
     }
 )
@@ -8464,7 +9038,7 @@ def _apply_ini_feature_settings(cfg):
     logging.info(
         "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s "
-        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d "
+        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
@@ -8486,6 +9060,7 @@ def _apply_ini_feature_settings(cfg):
         KINEMATICS_HISTORY_MAX_BARS,
         OPTION_HISTORY_MAX_BARS,
         OPTION_HISTORY_PRE_ENTRY_MINUTES,
+        OPTION_POSITION_POLL_SECONDS,
         OPTION_BUY_ENABLED,
         OPTION_BUY_DRY_RUN,
         OPTION_SELL_ENABLED,
@@ -8696,8 +9271,8 @@ def load_settings():
             ),
         )
         for dest_key, ini_opt, env_opt in tt_ini_map:
-            keys[dest_key] = _ini_str(
-                provider_config, "tastytrade_api", ini_opt, env_opt, ""
+            keys[dest_key] = TastytradeClient._clean_credential(
+                _ini_str(provider_config, "tastytrade_api", ini_opt, env_opt, "")
             )
 
         if (
@@ -9329,6 +9904,40 @@ def _build_tastytrade_quote_client(keys):
         prod_account_number=p_acct,
         account_number=p_acct,
     )
+
+
+def diagnose_trading_client_config(keys, paper=None):
+    """Return a concise diagnostic string if trading client credentials are missing, else None."""
+    provider = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+    if provider == "tastytrade":
+        env = (
+            str(
+                (keys or {}).get("tastytrade_transaction_env")
+                or TASTYTRADE_TRANSACTION_ENV
+                or "sandbox"
+            )
+            .strip()
+            .lower()
+        )
+        if env == "live":
+            env = "prod"
+        if env not in {"sandbox", "prod"}:
+            return f"unsupported_tastytrade_transaction_env:{env}"
+        prefix = f"tastytrade_{env}_"
+        c_sec = ((keys or {}).get(prefix + "client_secret") or "").strip()
+        c_ref = ((keys or {}).get(prefix + "refresh_token") or "").strip()
+        if not c_sec or not c_ref:
+            return f"missing_tastytrade_{env}_credentials (client_secret/refresh_token)"
+        p_sec = ((keys or {}).get("tastytrade_prod_client_secret") or "").strip()
+        p_ref = ((keys or {}).get("tastytrade_prod_refresh_token") or "").strip()
+        if env == "sandbox" and (not p_sec or not p_ref):
+            return "missing_prod_quote_credentials (tastytrade sandbox also requires prod client_secret/refresh_token)"
+        return None
+    if provider != "alpaca":
+        return f"unsupported_transactionprovider:{provider}"
+    if not (keys or {}).get("alpaca_key") or not (keys or {}).get("alpaca_secret"):
+        return "missing_alpaca_credentials (api_key/secret_key)"
+    return None
 
 
 def build_trading_client(keys, paper=None):
@@ -10734,6 +11343,11 @@ class AlpacaPositionMonitor:
         # --- NEW: Status Tracking State Variables ---
         self.last_poll_utc = None
         self.last_status = "uninitialized"
+        self.last_error_detail = (
+            diagnose_trading_client_config(self.credentials)
+            if self.client is None
+            else None
+        )
         self.position_count = 0
         self.equity_count = 0
         self.option_count = 0
@@ -10828,14 +11442,18 @@ class AlpacaPositionMonitor:
         self.option_count = len(options)
         self.last_poll_utc = poll_now_dt.isoformat()
         self.last_status = "healthy"
+        self.last_error_detail = None
 
         cur_min = minute_utc(poll_now_dt)
         opt_sig = tuple(
             sorted(
-                str(
-                    (p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", ""))
-                    or ""
-                ).strip().upper()
+                (
+                    str(
+                        (p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", ""))
+                        or ""
+                    ).strip().upper(),
+                    round(self._num(p, "current_price", 0.0), 2),
+                )
                 for p in options
             )
         )
@@ -10903,9 +11521,14 @@ class AlpacaPositionMonitor:
     async def run(self):
         if self.client is None:
             self.last_status = "disabled"
+            self.last_error_detail = (
+                diagnose_trading_client_config(self.credentials)
+                or "missing_credentials"
+            )
             self.logger.warning(
-                "POSITION_MONITOR_DISABLED provider=%s reason=missing_credentials",
+                "POSITION_MONITOR_DISABLED provider=%s reason=%s",
                 self.transaction_provider,
+                self.last_error_detail,
             )
             return
         poll_sec = max(5, min(60, int(OPTION_POSITION_POLL_SECONDS or 15)))
@@ -10922,6 +11545,7 @@ class AlpacaPositionMonitor:
                 raise
             except Exception as exc:
                 self.last_status = f"error: {type(exc).__name__}"
+                self.last_error_detail = f"{type(exc).__name__}: {str(exc)[:420]}"
                 self.logger.warning(
                     "POSITION_MONITOR_ERROR error_type=%s detail=%s",
                     type(exc).__name__,
@@ -11052,7 +11676,7 @@ class AlpacaOptionBuyer:
             self.mode = "dry_run"
         elif self.transaction_provider == "tastytrade":
             self.mode = (
-                self.client.env
+                self.client.transaction_env
                 if isinstance(self.client, TastytradeClient)
                 else TASTYTRADE_TRANSACTION_ENV
             )
@@ -12528,7 +13152,7 @@ class AlpacaOptionSeller:
             self.mode = "dry_run"
         elif self.transaction_provider == "tastytrade":
             self.mode = (
-                self.client.env
+                self.client.transaction_env
                 if isinstance(self.client, TastytradeClient)
                 else TASTYTRADE_TRANSACTION_ENV
             )
@@ -17803,6 +18427,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
                         </div>
 
+                        <div id="posMonitorErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
+
                         <div onclick="openOptionDrilldown('buyer')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openOptionDrilldown('buyer');}" class="group cursor-pointer p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-cyan-500/50 hover:bg-slate-900/80 transition space-y-1">
                             <div class="flex justify-between items-center gap-2">
                                 <span class="text-slate-300 group-hover:text-white shrink-0 flex items-center gap-1.5 font-medium">
@@ -17977,13 +18603,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
 
                 <div class="flex items-center gap-2">
+                    <span id="optProviderBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-900 text-indigo-300 border border-indigo-500/40 uppercase">broker</span>
                     <span id="optBackfillBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">backfill: idle</span>
                     <button id="btnOptSyncAlpaca" onclick="refreshOptionHistoryFromAlpaca()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
-                        Sync Alpaca History
+                        Sync Broker History
                     </button>
                     <button onclick="closeOptionDrilldown()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
                 </div>
             </div>
+
+            <div id="optBackfillErrorBanner" class="hidden px-5 py-2 bg-rose-950/50 border-b border-rose-800/60 text-[11px] font-mono text-rose-300 break-words"></div>
 
             <!-- Aggregate Summary Banner -->
             <div id="optAggregateBanner" class="px-5 py-2.5 bg-slate-950/40 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -18650,10 +19279,29 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             if (m.position_monitor) {
-                document.getElementById('posMonitorStatus').textContent = m.position_monitor.status || 'not_loaded';
-                document.getElementById('posMonitorEquity').textContent = m.position_monitor.active_equity_positions ?? 0;
-                document.getElementById('posMonitorOption').textContent = m.position_monitor.active_option_positions ?? 0;
-                document.getElementById('posMonitorLastPoll').textContent = m.position_monitor.last_poll_utc ? `${fmtTzClock(m.position_monitor.last_poll_utc, { second: '2-digit' })} ${displayTzAbbr}` : '--';
+                const pm = m.position_monitor;
+                const pmStatusEl = document.getElementById('posMonitorStatus');
+                const pmSt = pm.status || 'not_loaded';
+                pmStatusEl.textContent = pmSt;
+                pmStatusEl.className = `mono font-semibold ${
+                    (String(pmSt).includes('error') || pmSt === 'disabled')
+                        ? 'text-rose-400'
+                        : (pmSt === 'healthy' ? 'text-emerald-300' : 'text-slate-200')
+                }`;
+                document.getElementById('posMonitorEquity').textContent = pm.active_equity_positions ?? 0;
+                document.getElementById('posMonitorOption').textContent = pm.active_option_positions ?? 0;
+                document.getElementById('posMonitorLastPoll').textContent = pm.last_poll_utc ? `${fmtTzClock(pm.last_poll_utc, { second: '2-digit' })} ${displayTzAbbr}` : '--';
+                const pmErrEl = document.getElementById('posMonitorErrorRow');
+                if (pmErrEl) {
+                    const errTxt = pm.last_error_detail || (pm.provider && (pmSt === 'disabled' || String(pmSt).includes('error')) ? `${pm.provider}: ${pmSt}` : '');
+                    if (errTxt) {
+                        pmErrEl.textContent = `[${String(pm.provider || 'broker').toUpperCase()}] ${errTxt}`;
+                        pmErrEl.classList.remove('hidden');
+                    } else {
+                        pmErrEl.textContent = '';
+                        pmErrEl.classList.add('hidden');
+                    }
+                }
             }
             if (m.option_buyer) {
                 const ob = m.option_buyer;
@@ -20987,19 +21635,33 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function _formatBrokerSyncLabel(provider) {
+            const p = String(provider || '').trim().toLowerCase();
+            if (p === 'tastytrade') return 'Sync Tastytrade History';
+            if (p === 'alpaca') return 'Sync Alpaca History';
+            return 'Sync Broker History';
+        }
+
         async function refreshOptionHistoryFromAlpaca() {
             const btn = document.getElementById('btnOptSyncAlpaca');
             if (btn) {
                 btn.disabled = true;
                 btn.textContent = 'Syncing...';
             }
+            let syncedProv = latestOptionHistory && latestOptionHistory.provider;
             try {
                 const res = await fetch('/api/option-history/refresh', { method: 'POST' });
                 const data = await res.json();
                 if (res.ok && data && data.status === 'ok') {
                     latestOptionHistory = data;
+                    syncedProv = data.provider || syncedProv;
                     renderOptionDrilldown();
-                    showToast('Synced open & closed option contract histories from Alpaca.');
+                    const brokerName = syncedProv ? (syncedProv.charAt(0).toUpperCase() + syncedProv.slice(1)) : 'broker';
+                    if (data.backfill_status === 'error' || data.backfill_status === 'disabled') {
+                        showToast(`${brokerName} sync ${data.backfill_status}: ${data.backfill_error || 'Check credentials/logs'}`, 'error');
+                    } else {
+                        showToast(`Synced open & closed option contract histories from ${brokerName}.`);
+                    }
                 } else {
                     showToast(`Sync failed: ${(data && data.message) || 'Unknown error'}`, 'error');
                 }
@@ -21008,7 +21670,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             } finally {
                 if (btn) {
                     btn.disabled = false;
-                    btn.textContent = 'Sync Alpaca History';
+                    btn.textContent = _formatBrokerSyncLabel(syncedProv);
                 }
             }
         }
@@ -21846,15 +22508,42 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 listHeaderLabel.textContent = 'Select Closed Contract';
             }
 
+            const provBadge = document.getElementById('optProviderBadge');
+            const activeProv = String(data.provider || '').trim().toLowerCase();
+            const activeEnv = String(data.env || '').trim().toLowerCase();
+            if (provBadge) {
+                provBadge.textContent = activeProv ? `${activeProv.toUpperCase()}${activeEnv ? ' · ' + activeEnv.toUpperCase() : ''}` : 'BROKER';
+            }
+            const syncBtn = document.getElementById('btnOptSyncAlpaca');
+            if (syncBtn && !syncBtn.disabled) {
+                syncBtn.textContent = _formatBrokerSyncLabel(activeProv);
+            }
+
             const bfBadge = document.getElementById('optBackfillBadge');
             if (bfBadge) {
                 const st = data.backfill_status || 'idle';
                 bfBadge.textContent = `backfill: ${st}`;
+                bfBadge.title = data.backfill_error || '';
                 bfBadge.className = `text-[10px] mono px-2 py-0.5 rounded border ${
                     st === 'completed'
                         ? 'bg-emerald-950/50 text-emerald-300 border-emerald-800/60'
-                        : (st === 'running' ? 'bg-cyan-950/50 text-cyan-300 border-cyan-800/60' : 'bg-slate-800 text-slate-300 border-slate-700')
+                        : (st === 'running'
+                            ? 'bg-cyan-950/50 text-cyan-300 border-cyan-800/60'
+                            : ((st === 'error' || st === 'disabled')
+                                ? 'bg-rose-950/50 text-rose-300 border-rose-800/60'
+                                : 'bg-slate-800 text-slate-300 border-slate-700'))
                 }`;
+            }
+
+            const bfErrBanner = document.getElementById('optBackfillErrorBanner');
+            if (bfErrBanner) {
+                if (data.backfill_error && (data.backfill_status === 'error' || data.backfill_status === 'disabled')) {
+                    bfErrBanner.textContent = `${(activeProv || 'broker').toUpperCase()} backfill ${data.backfill_status}: ${data.backfill_error}`;
+                    bfErrBanner.classList.remove('hidden');
+                } else {
+                    bfErrBanner.textContent = '';
+                    bfErrBanner.classList.add('hidden');
+                }
             }
 
             // Aggregate Banner
@@ -21887,12 +22576,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const prevScroll = listEl ? listEl.scrollTop : 0;
 
             if (items.length === 0) {
+                const syncLabel = _formatBrokerSyncLabel(activeProv);
                 listEl.innerHTML = `
                     <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-1.5">
                         <div class="text-xs font-semibold text-slate-300">No ${isBuyer ? 'Open' : 'Closed'} Contracts Found</div>
                         <p class="text-[11px] text-slate-500">${isBuyer ? 'Open option positions or newly placed Option Buyer orders will appear here and track minute by minute.' : 'Completed Option Seller exits or historical closed orders will appear here.'}</p>
                     </div>`;
-                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "Sync Alpaca History" if orders were placed outside this session.</div>`;
+                detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "${syncLabel}" if orders were placed outside this session.</div>`;
                 activeOptionHistoryPoints = [];
                 window._optChartState = null;
                 window._optActiveRenderParams = null;
@@ -24620,7 +25310,13 @@ class AdminCliProvider:
             osel = os_entry.get("router")
 
             position_monitor_report = {
+                "provider": (
+                    pm.transaction_provider if pm else OPTION_TRANSACTION_PROVIDER
+                ),
                 "status": pm.last_status if pm else "not_loaded",
+                "last_error_detail": (
+                    getattr(pm, "last_error_detail", None) if pm else None
+                ),
                 "last_poll_utc": pm.last_poll_utc if pm else None,
                 "active_equity_positions": pm.equity_count if pm else 0,
                 "active_option_positions": pm.option_count if pm else 0,
@@ -25405,6 +26101,10 @@ async def main():
                 name="OPTION_HISTORY_BACKFILL",
             )
         )
+    else:
+        coordinator.option_history.mark_client_disabled(
+            diagnose_trading_client_config(keys) or "missing_trading_client"
+        )
 
     chart_capture = ChartCaptureManager(coordinator)
     cc_task = asyncio.create_task(
@@ -25511,6 +26211,11 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        if hasattr(coordinator, "option_history") and coordinator.option_history is not None:
+            try:
+                coordinator.option_history._persist_option_prices_cache(force=True)
+            except Exception:
+                pass
         for task in tasks:
             if not task.done():
                 task.cancel()
