@@ -144,6 +144,7 @@ TASTYTRADE_SANDBOX_BASE_URL = os.getenv(
 TASTYTRADE_USER_AGENT = os.getenv("TASTYTRADE_USER_AGENT", "multiStreamRSI/1.0")
 
 DISPLAY_TIMEZONE_SETTING = os.getenv("DISPLAY_TIMEZONE", "PST").strip() or "PST"
+INSTANCE_OWNER = os.getenv("INSTANCE_OWNER", "").strip()
 _TIMEZONE_ALIASES = {
     "PST": "America/Los_Angeles",
     "PDT": "America/Los_Angeles",
@@ -1744,6 +1745,364 @@ class TastytradeClient:
         except Exception as exc:
             logging.debug("TASTYTRADE_DXLINK_GREEKS_SKIP detail=%s", exc)
             return {}
+
+    @staticmethod
+    def _parse_dxlink_candle_payload(data, field_order):
+        """Parse DXLink COMPACT/FULL Candle FEED_DATA payloads into (eventSymbol, time, close, high, flags)."""
+        order = list(field_order or ("eventSymbol", "time", "close", "high", "eventFlags"))
+        results = []
+
+        def _extract_dict(obj):
+            if not isinstance(obj, dict):
+                return None
+            ev_sym = obj.get("eventSymbol") or obj.get("symbol")
+            raw_time = obj.get("time")
+            raw_close = obj.get("close")
+            raw_high = obj.get("high")
+            raw_flags = obj.get("eventFlags", 0)
+            if ev_sym is None or raw_time is None:
+                return None
+            return (str(ev_sym), raw_time, raw_close, raw_high, raw_flags)
+
+        def _extract_row(row_vals):
+            if not isinstance(row_vals, (list, tuple)) or len(row_vals) < len(order):
+                return None
+            mapping = {field: row_vals[idx] for idx, field in enumerate(order)}
+            return _extract_dict(mapping)
+
+        if not isinstance(data, list):
+            return results
+
+        if data and all(isinstance(item, dict) for item in data):
+            for item in data:
+                if str(item.get("eventType") or "Candle") != "Candle":
+                    continue
+                parsed = _extract_dict(item)
+                if parsed:
+                    results.append(parsed)
+            return results
+
+        idx = 0
+        n = len(data)
+        while idx < n:
+            head = data[idx]
+            if isinstance(head, str):
+                ev_name = head
+                idx += 1
+                while idx < n and not isinstance(data[idx], str):
+                    chunk = data[idx]
+                    idx += 1
+                    if ev_name != "Candle" or not isinstance(chunk, list) or not chunk:
+                        continue
+                    if isinstance(chunk[0], list):
+                        for sub in chunk:
+                            parsed = _extract_row(sub)
+                            if parsed:
+                                results.append(parsed)
+                    elif isinstance(chunk[0], dict):
+                        for sub in chunk:
+                            parsed = _extract_dict(sub)
+                            if parsed:
+                                results.append(parsed)
+                    else:
+                        step = len(order)
+                        if step > 0:
+                            for pos in range(0, len(chunk) - step + 1, step):
+                                parsed = _extract_row(chunk[pos : pos + step])
+                                if parsed:
+                                    results.append(parsed)
+                continue
+            elif isinstance(head, dict):
+                if str(head.get("eventType") or "Candle") == "Candle":
+                    parsed = _extract_dict(head)
+                    if parsed:
+                        results.append(parsed)
+            idx += 1
+        return results
+
+    def get_historical_bars_batch(
+        self,
+        symbol_ranges,
+        is_option=False,
+        idle_timeout=1.5,
+        overall_timeout=15.0,
+        chunk_size=15,
+    ):
+        """Fetch historical 1m bars via Tastytrade Prod DXLink Candle{=1m}.
+
+        Args:
+            symbol_ranges: dict mapping symbol (equity ticker or compact OCC option) -> (start_dt, end_dt).
+            is_option: when True, converts OCC option symbols to dxFeed streamer symbols (.AAPL261218C250).
+        Returns:
+            dict {sym_upper: {minute_dt_utc: {"c": float, "h": float}}}
+        """
+        out = {
+            str(sym or "").strip().upper(): {}
+            for sym in (symbol_ranges or {}).keys()
+            if str(sym or "").strip()
+        }
+        if not out or not self.has_env_credentials("prod"):
+            return out
+
+        normalized_items = []
+        for raw_sym, rng in (symbol_ranges or {}).items():
+            sym_u = str(raw_sym or "").strip().upper()
+            if not sym_u or not isinstance(rng, (list, tuple)) or len(rng) != 2:
+                continue
+            try:
+                s_min = minute_utc(as_utc(rng[0]))
+                e_min = minute_utc(as_utc(rng[1]))
+            except Exception:
+                continue
+            if e_min < s_min:
+                e_min = s_min
+            dx_sym = (
+                _to_dxlink_option_symbol(sym_u)
+                if (is_option or bool(OPTION_CONTRACT_SYMBOL_RE.match(sym_u)))
+                else sym_u
+            )
+            normalized_items.append((sym_u, dx_sym, s_min, e_min))
+
+        if not normalized_items:
+            return out
+
+        eff_chunk = max(1, int(chunk_size or 15))
+        chunks = [
+            normalized_items[i : i + eff_chunk]
+            for i in range(0, len(normalized_items), eff_chunk)
+        ]
+
+        async def _fetch_chunk(dxlink_url, quote_token, chunk_items):
+            dx_to_meta = {}
+            sub_adds = []
+            for sym_u, dx_sym, s_min, e_min in chunk_items:
+                dx_key = dx_sym.upper()
+                dx_to_meta[dx_key] = (sym_u, s_min, e_min)
+                sub_adds.append(
+                    {
+                        "type": "Candle",
+                        "symbol": f"{dx_sym}{{=1m}}",
+                        "fromTime": int(s_min.timestamp() * 1000),
+                    }
+                )
+            target_dx = set(dx_to_meta.keys())
+            completed_dx = set()
+            chunk_out = {sym_u: {} for sym_u, _, _, _ in chunk_items}
+            field_order = ["eventSymbol", "time", "close", "high", "eventFlags"]
+            deadline = time.monotonic() + max(2.0, float(overall_timeout or 15.0))
+            last_activity = time.monotonic()
+            timeout = aiohttp.ClientTimeout(
+                total=max(5.0, float(overall_timeout or 15.0) + 3.0),
+                connect=10,
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(
+                    dxlink_url, heartbeat=20, max_msg_size=16 * 1024 * 1024
+                ) as ws:
+                    await ws.send_json(
+                        {
+                            "type": "SETUP",
+                            "channel": 0,
+                            "version": "0.1-DXF-JS/0.3.0",
+                            "keepaliveTimeout": 60,
+                            "acceptKeepaliveTimeout": 60,
+                        }
+                    )
+                    channel_opened = False
+                    subscribed = False
+                    while time.monotonic() < deadline:
+                        wait_for = min(
+                            float(idle_timeout or 1.5),
+                            max(0.05, deadline - time.monotonic()),
+                        )
+                        try:
+                            msg = await ws.receive(timeout=wait_for)
+                        except asyncio.TimeoutError:
+                            if (
+                                subscribed
+                                and (time.monotonic() - last_activity)
+                                >= float(idle_timeout or 1.5)
+                            ):
+                                break
+                            continue
+                        if msg.type in {
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            break
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        for line in msg.data.splitlines():
+                            if not line.strip():
+                                continue
+                            try:
+                                frame = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(frame, dict):
+                                continue
+                            ftype = str(frame.get("type") or "").upper()
+                            if ftype == "AUTH_STATE":
+                                st = str(frame.get("state") or "").upper()
+                                if st == "UNAUTHORIZED":
+                                    await ws.send_json(
+                                        {"type": "AUTH", "channel": 0, "token": quote_token}
+                                    )
+                                elif st == "AUTHORIZED" and not channel_opened:
+                                    await ws.send_json(
+                                        {
+                                            "type": "CHANNEL_REQUEST",
+                                            "channel": 1,
+                                            "service": "FEED",
+                                            "parameters": {"contract": "AUTO"},
+                                        }
+                                    )
+                            elif ftype == "CHANNEL_OPENED" and frame.get("channel") == 1:
+                                channel_opened = True
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SETUP",
+                                        "channel": 1,
+                                        "acceptAggregationPeriod": 0.0,
+                                        "acceptDataFormat": "COMPACT",
+                                        "acceptEventFields": {"Candle": field_order},
+                                    }
+                                )
+                                await ws.send_json(
+                                    {
+                                        "type": "FEED_SUBSCRIPTION",
+                                        "channel": 1,
+                                        "add": sub_adds,
+                                    }
+                                )
+                                subscribed = True
+                                last_activity = time.monotonic()
+                            elif ftype == "FEED_CONFIG" and frame.get("channel") == 1:
+                                ev_fields = frame.get("eventFields") or {}
+                                if isinstance(ev_fields, dict) and isinstance(
+                                    ev_fields.get("Candle"), list
+                                ):
+                                    field_order = list(ev_fields["Candle"])
+                            elif ftype == "ERROR":
+                                err_msg = str(
+                                    frame.get("message") or frame.get("error") or ""
+                                )
+                                if any(
+                                    tok in err_msg.lower()
+                                    for tok in ("token", "auth", "unauth")
+                                ):
+                                    with self._lock:
+                                        self._quote_token_cache = None
+                                raise RuntimeError(
+                                    f"DXLink historical bars error: {err_msg[:120]}"
+                                )
+                            elif ftype == "FEED_DATA" and frame.get("channel") == 1:
+                                last_activity = time.monotonic()
+                                rows = self._parse_dxlink_candle_payload(
+                                    frame.get("data"), field_order
+                                )
+                                for raw_sym, raw_time, raw_close, raw_high, raw_flags in rows:
+                                    base_dx = (
+                                        str(raw_sym or "").split("{", 1)[0].strip().upper()
+                                    )
+                                    meta = dx_to_meta.get(base_dx)
+                                    if meta is None:
+                                        continue
+                                    sym_u, s_min, e_min = meta
+                                    try:
+                                        flags = (
+                                            int(raw_flags or 0)
+                                            if not isinstance(raw_flags, bool)
+                                            else 0
+                                        )
+                                    except (TypeError, ValueError):
+                                        flags = 0
+                                    if not (flags & 0x02):
+                                        close_p = _opt_safe_float(raw_close, None)
+                                        high_p = _opt_safe_float(raw_high, None)
+                                        epoch_ms = _opt_safe_float(raw_time, None)
+                                        if (
+                                            close_p is not None
+                                            and close_p > 0
+                                            and epoch_ms is not None
+                                            and epoch_ms > 0
+                                        ):
+                                            try:
+                                                mk = minute_utc(
+                                                    datetime.fromtimestamp(
+                                                        epoch_ms / 1000.0, UTC
+                                                    )
+                                                )
+                                                if s_min <= mk <= e_min:
+                                                    h_eff = (
+                                                        high_p
+                                                        if (
+                                                            high_p is not None
+                                                            and high_p >= close_p
+                                                        )
+                                                        else close_p
+                                                    )
+                                                    chunk_out[sym_u][mk] = {
+                                                        "c": round(float(close_p), 4),
+                                                        "h": round(float(h_eff), 4),
+                                                    }
+                                            except (ValueError, OverflowError, OSError):
+                                                pass
+                                    if flags & 0x18:
+                                        completed_dx.add(base_dx)
+                                if completed_dx >= target_dx:
+                                    return chunk_out
+            return chunk_out
+
+        async def _fetch_all(dxlink_url, quote_token):
+            merged = {k: {} for k in out.keys()}
+            for chunk_items in chunks:
+                part = await _fetch_chunk(dxlink_url, quote_token, chunk_items)
+                for sym_u, bars_map in part.items():
+                    merged.setdefault(sym_u, {}).update(bars_map)
+            return merged
+
+        def _run_sync(dxlink_url, quote_token):
+            try:
+                asyncio.get_running_loop()
+                in_running_loop = True
+            except RuntimeError:
+                in_running_loop = False
+            per_call_timeout = max(
+                10.0, float(overall_timeout or 15.0) * len(chunks) + 5.0
+            )
+            if in_running_loop:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(
+                        lambda: asyncio.run(_fetch_all(dxlink_url, quote_token))
+                    ).result(timeout=per_call_timeout)
+            return asyncio.run(_fetch_all(dxlink_url, quote_token))
+
+        for attempt in range(2):
+            try:
+                dxlink_url, quote_token = self._get_quote_token(
+                    force_refresh=(attempt > 0)
+                )
+                return _run_sync(dxlink_url, quote_token)
+            except Exception as exc:
+                if attempt == 0 and any(
+                    tok in str(exc).lower() for tok in ("token", "auth", "unauth")
+                ):
+                    with self._lock:
+                        self._quote_token_cache = None
+                    continue
+                logging.warning(
+                    "TASTYTRADE_DXLINK_HISTORICAL_BARS_FAILED is_option=%s symbols=%d error_type=%s detail=%s",
+                    bool(is_option),
+                    len(normalized_items),
+                    type(exc).__name__,
+                    exc,
+                )
+                return out
+        return out
 
     def get_account_number(self):
         with self._lock:
@@ -4208,6 +4567,35 @@ class OptionContractHistoryTracker:
         if not symbol_ranges:
             return result
         if isinstance(self._trading_client, TastytradeClient):
+            tt_hist_client = (
+                self._trading_client
+                if self._trading_client.has_env_credentials("prod")
+                else _build_tastytrade_quote_client(self._credentials)
+            )
+            if tt_hist_client is None:
+                return result
+            try:
+                bars_ch = tt_hist_client.get_historical_bars_batch(
+                    symbol_ranges, is_option=True
+                )
+                for sym_u, per_min in (bars_ch or {}).items():
+                    if not isinstance(per_min, dict):
+                        continue
+                    out_min = result.setdefault(sym_u, {})
+                    for mk, bval in per_min.items():
+                        cp = (
+                            _opt_safe_float(bval.get("c"), None)
+                            if isinstance(bval, dict)
+                            else _opt_safe_float(bval, None)
+                        )
+                        if cp is not None and cp > 0:
+                            out_min[mk] = float(cp)
+            except Exception as exc:
+                logging.warning(
+                    "OPTION_HISTORY_TASTYTRADE_OPTION_BARS_FAILED error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
             return result
         if self._option_data_client is None:
             key = self._credentials.get("alpaca_key")
@@ -4357,6 +4745,36 @@ class OptionContractHistoryTracker:
             cur_map = result.get(und, {})
             if len(cur_map) < max(5, int((as_utc(e_dt) - as_utc(s_dt)).total_seconds() // 180)):
                 missing_ranges[und] = (s_dt, e_dt)
+
+        if missing_ranges and isinstance(self._trading_client, TastytradeClient):
+            tt_und_client = (
+                self._trading_client
+                if self._trading_client.has_env_credentials("prod")
+                else _build_tastytrade_quote_client(self._credentials)
+            )
+            if tt_und_client is not None:
+                try:
+                    tt_bars = tt_und_client.get_historical_bars_batch(
+                        missing_ranges, is_option=False
+                    )
+                    for und, per_min in (tt_bars or {}).items():
+                        if not isinstance(per_min, dict):
+                            continue
+                        out_min = result.setdefault(und, {})
+                        for mk, bval in per_min.items():
+                            cp = (
+                                _opt_safe_float(bval.get("c"), None)
+                                if isinstance(bval, dict)
+                                else _opt_safe_float(bval, None)
+                            )
+                            if cp is not None and cp > 0:
+                                out_min[mk] = float(cp)
+                except Exception as exc:
+                    logging.warning(
+                        "OPTION_HISTORY_TASTYTRADE_UNDERLYING_BARS_FAILED error_type=%s detail=%s",
+                        type(exc).__name__,
+                        exc,
+                    )
 
         if missing_ranges and not isinstance(self._trading_client, TastytradeClient):
             client = self._stock_data_client
@@ -8002,6 +8420,7 @@ _INI_FEATURE_SECTIONS = frozenset(
         "option_seller",
         "chart_capture",
         "dashboard",
+        "webhook",
         "feature_toggles",
         "tastytrade_api",
     }
@@ -8349,10 +8768,12 @@ def _provider_priority_score(provider):
 
 
 def _apply_ini_feature_settings(cfg):
-    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [feature_toggles], and [tastytrade_api] overrides from lib/parms.ini."""
-    global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA
+    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], [feature_toggles], and [tastytrade_api] overrides from lib/parms.ini."""
+    global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA, INSTANCE_OWNER
     global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
+    global OPTION_CHAIN_RSI_COOLDOWN_SECONDS, OPTION_CHAIN_PACING_SECONDS
+    global OPTION_CHAIN_429_BACKOFF_SECONDS, OPTION_CHAIN_INCLUDE_GREEKS
     global TASTYTRADE_TRANSACTION_ENV, TASTYTRADE_ACCOUNT_NUMBER
     global TASTYTRADE_PROD_ACCOUNT_NUMBER, TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
@@ -8387,6 +8808,8 @@ def _apply_ini_feature_settings(cfg):
     global CHART_CAPTURE_ENABLED, CHART_CAPTURE_DIR, CHART_CAPTURE_HISTORY_BARS
     global CHART_CAPTURE_WIDTH, CHART_CAPTURE_HEIGHT
     global CHART_CAPTURE_ONLY_UPDATED, CHART_CAPTURE_WRITE_LATEST, CHART_CAPTURE_STALE_AFTER_SECONDS
+    global DASHBOARD_HOST, DASHBOARD_PORT
+    global WEBHOOK_HOST, WEBHOOK_PORT, WEBHOOK_TOKEN
     global DASHBOARD_SSL_ENABLED, DASHBOARD_SSL_MODE, DASHBOARD_SSL_CERT
     global DASHBOARD_SSL_KEY, DASHBOARD_SSL_AUTO_SELF_SIGNED
     global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
@@ -8398,10 +8821,28 @@ def _apply_ini_feature_settings(cfg):
     DISPLAY_TIMEZONE_SETTING = tz_setting
     DISPLAY_TZ, DISPLAY_TZ_IANA = _resolve_display_timezone(tz_setting)
     _reconfigure_logging_timezone()
+    INSTANCE_OWNER = _ini_str(cfg, "general", "owner", "INSTANCE_OWNER", "").strip()
 
     raw_prio = _ini_str(cfg, "providers", "priority", "PROVIDER_PRIORITY", "")
     PROVIDER_PRIORITY = _parse_provider_priority(raw_prio)
     logging.info("PROVIDER_PRIORITY order=%s", list(PROVIDER_PRIORITY))
+
+    # When neither [option_trading] nor env explicitly pins a provider, align default
+    # option chain & transaction provider with single-broker [providers] configuration
+    # (e.g. TASTYTRADE.enabled=true with ALPACA.enabled=false -> default "tastytrade").
+    _inferred_broker_default = "alpaca"
+    try:
+        if cfg.has_section("providers"):
+            _tt_on = parse_provider_enabled(
+                cfg.get("providers", "TASTYTRADE.enabled", fallback=None), "TASTYTRADE"
+            )
+            _alp_on = parse_provider_enabled(
+                cfg.get("providers", "ALPACA.enabled", fallback=None), "ALPACA"
+            )
+            if _tt_on and not _alp_on:
+                _inferred_broker_default = "tastytrade"
+    except Exception:
+        _inferred_broker_default = "alpaca"
 
     chain_prov = (
         _ini_str(
@@ -8409,7 +8850,7 @@ def _apply_ini_feature_settings(cfg):
             "option_trading",
             "optionchainprovider",
             "OPTION_CHAIN_PROVIDER",
-            "alpaca",
+            _inferred_broker_default,
         )
         .strip()
         .lower()
@@ -8426,7 +8867,7 @@ def _apply_ini_feature_settings(cfg):
             "option_trading",
             "transactionprovider",
             "OPTION_TRANSACTION_PROVIDER",
-            "alpaca",
+            _inferred_broker_default,
         )
         .strip()
         .lower()
@@ -8436,6 +8877,42 @@ def _apply_ini_feature_settings(cfg):
             f"[option_trading] transactionprovider must be alpaca or tastytrade; got {tx_prov!r}"
         )
     OPTION_TRANSACTION_PROVIDER = tx_prov
+
+    OPTION_CHAIN_RSI_COOLDOWN_SECONDS = _ini_int(
+        cfg,
+        "option_trading",
+        "chain_cooldown_seconds",
+        "OPTION_CHAIN_RSI_COOLDOWN_SECONDS",
+        0,
+        minimum=0,
+    )
+    OPTION_CHAIN_PACING_SECONDS = max(
+        0.0,
+        _ini_float(
+            cfg,
+            "option_trading",
+            "chain_pacing_seconds",
+            "OPTION_CHAIN_PACING_SECONDS",
+            0.20,
+        ),
+    )
+    OPTION_CHAIN_429_BACKOFF_SECONDS = max(
+        5.0,
+        _ini_float(
+            cfg,
+            "option_trading",
+            "chain_429_backoff_seconds",
+            "OPTION_CHAIN_429_BACKOFF_SECONDS",
+            20.0,
+        ),
+    )
+    OPTION_CHAIN_INCLUDE_GREEKS = _ini_bool(
+        cfg,
+        "option_trading",
+        "chain_include_greeks",
+        "OPTION_CHAIN_INCLUDE_GREEKS",
+        True,
+    )
 
     tt_env = (
         _ini_str(
@@ -8957,6 +9434,39 @@ def _apply_ini_feature_settings(cfg):
         minimum=0,
     )
 
+    _env_dash_host = (
+        os.getenv("DASHBOARD_HOST", os.getenv("ADMIN_HOST", "0.0.0.0")).strip()
+        or "0.0.0.0"
+    )
+    DASHBOARD_HOST = (
+        _ini_str(cfg, "dashboard", "host", "DASHBOARD_HOST", _env_dash_host).strip()
+        or _env_dash_host
+    )
+    try:
+        _env_dash_port = int(
+            os.getenv("DASHBOARD_PORT", os.getenv("ADMIN_PORT", "5001"))
+        )
+    except ValueError:
+        _env_dash_port = 5001
+    DASHBOARD_PORT = _ini_int(
+        cfg, "dashboard", "port", "DASHBOARD_PORT", _env_dash_port, minimum=1
+    )
+    if DASHBOARD_PORT > 65535:
+        raise ValueError(
+            f"[dashboard] port must be between 1 and 65535; got {DASHBOARD_PORT}"
+        )
+
+    WEBHOOK_HOST = (
+        _ini_str(cfg, "webhook", "host", "WEBHOOK_HOST", "127.0.0.1").strip()
+        or "127.0.0.1"
+    )
+    WEBHOOK_PORT = _ini_int(cfg, "webhook", "port", "WEBHOOK_PORT", 5000, minimum=1)
+    if WEBHOOK_PORT > 65535:
+        raise ValueError(
+            f"[webhook] port must be between 1 and 65535; got {WEBHOOK_PORT}"
+        )
+    WEBHOOK_TOKEN = _ini_str(cfg, "webhook", "token", "WEBHOOK_TOKEN", "").strip()
+
     DASHBOARD_SSL_ENABLED = _ini_bool(
         cfg, "dashboard", "ssl_enabled", "DASHBOARD_SSL_ENABLED", True
     )
@@ -9036,8 +9546,9 @@ def _apply_ini_feature_settings(cfg):
     )
 
     logging.info(
-        "FEATURE_CONFIG tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
-        "opt_chain=%s opt_tx=%s tt_tx_env=%s "
+        "FEATURE_CONFIG owner=%s tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
+        "opt_chain=%s opt_tx=%s tt_tx_env=%s chain_cd=%ds chain_pace=%.2fs chain_greeks=%s "
+        "dashboard=%s:%d webhook=%s:%d "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d sell_full=%s "
@@ -9045,6 +9556,7 @@ def _apply_ini_feature_settings(cfg):
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
         "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s",
+        INSTANCE_OWNER or "unset",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
         RSI_SESSION_MODE,
@@ -9053,6 +9565,13 @@ def _apply_ini_feature_settings(cfg):
         OPTION_CHAIN_PROVIDER,
         OPTION_TRANSACTION_PROVIDER,
         TASTYTRADE_TRANSACTION_ENV,
+        OPTION_CHAIN_RSI_COOLDOWN_SECONDS,
+        OPTION_CHAIN_PACING_SECONDS,
+        OPTION_CHAIN_INCLUDE_GREEKS,
+        DASHBOARD_HOST,
+        DASHBOARD_PORT,
+        WEBHOOK_HOST,
+        WEBHOOK_PORT,
         KINEMATICS_SMOOTH_METHOD,
         KINEMATICS_SMOOTH_PERIOD,
         KINEMATICS_RSI_OVERBOUGHT,
@@ -9401,6 +9920,9 @@ OPTION_CHAIN_PACING_SECONDS = max(
 OPTION_CHAIN_429_BACKOFF_SECONDS = max(
     5.0, float(os.getenv("OPTION_CHAIN_429_BACKOFF_SECONDS", "20.0"))
 )
+OPTION_CHAIN_INCLUDE_GREEKS = os.getenv(
+    "OPTION_CHAIN_INCLUDE_GREEKS", "true"
+).strip().lower() in {"1", "true", "yes"}
 OPTION_BUY_FETCH_IF_MISSING = os.getenv(
     "OPTION_BUY_FETCH_IF_MISSING", "true"
 ).strip().lower() in {"1", "true", "yes"}
@@ -10410,20 +10932,22 @@ class TradingviewProvider:
         self,
         symbols,
         coordinator,
-        host=WEBHOOK_HOST,
-        port=WEBHOOK_PORT,
+        host=None,
+        port=None,
         credentials=None,
         option_client=None,
     ):
         import queue
         import threading
 
-        if not WEBHOOK_TOKEN and host not in {"127.0.0.1", "localhost", "::1"}:
+        eff_host = WEBHOOK_HOST if host is None else host
+        eff_port = int(WEBHOOK_PORT if port is None else port)
+        if not WEBHOOK_TOKEN and eff_host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Set WEBHOOK_TOKEN before binding a non-loopback host")
         self.provider = "TRADINGVIEW"
         self.symbols = set(symbols)
         self.coordinator = coordinator
-        self.host, self.port = host, port
+        self.host, self.port = eff_host, eff_port
         self.credentials = dict(credentials or {})
         self.option_client = option_client
         self.option_chain_lock = asyncio.Lock()
@@ -11190,8 +11714,8 @@ class RsiOptionChainCollector:
                             self.option_client,
                             right="CALL",
                             spot_hint=entry.get("close"),
-                            include_greeks=False,
-                            prefer_spot_hint=True,
+                            include_greeks=OPTION_CHAIN_INCLUDE_GREEKS,
+                            prefer_spot_hint=False,
                         )
                     else:
                         raw_chain_res = await asyncio.to_thread(
@@ -11306,11 +11830,12 @@ class RsiOptionChainCollector:
     async def run(self):
         minute_event = self.coordinator.subscribe_minute_finalized()
         self.logger.info(
-            "OPTION_CHAIN_COLLECTOR_START chain_provider=%s priority=%s cooldown_s=%.0f pacing_s=%.2f",
+            "OPTION_CHAIN_COLLECTOR_START chain_provider=%s priority=%s cooldown_s=%.0f pacing_s=%.2f include_greeks=%s",
             str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower(),
             ",".join(_provider_priority_order()),
             self.effective_cooldown_seconds(),
             OPTION_CHAIN_PACING_SECONDS,
+            OPTION_CHAIN_INCLUDE_GREEKS,
         )
         while True:
             await minute_event.wait()
@@ -12512,14 +13037,28 @@ class AlpacaOptionBuyer:
                             tt_chain_client,
                             right=desired_right,
                             spot_hint=entry.get("close"),
+                            include_greeks=OPTION_CHAIN_INCLUDE_GREEKS,
+                            prefer_spot_hint=False,
                         )
                     else:
+                        try:
+                            _alp_sig_params = inspect.signature(
+                                get_pruned_option_chain
+                            ).parameters
+                        except (TypeError, ValueError):
+                            _alp_sig_params = {}
+                        _alp_kwargs = {}
+                        if "option_type" in _alp_sig_params:
+                            _alp_kwargs["option_type"] = str(
+                                desired_right or "CALL"
+                            ).strip().lower()
                         raw_chain_res = await asyncio.to_thread(
                             get_pruned_option_chain,
                             symbol,
                             self.credentials["alpaca_key"],
                             self.credentials["alpaca_secret"],
                             self.option_chain_client,
+                            **_alp_kwargs,
                         )
                     contract, clean_payload = _unpack_pruned_option_chain_result(
                         raw_chain_res
@@ -13221,6 +13760,7 @@ class AlpacaOptionSeller:
                 chain_client,
                 right=eff_right,
                 expiration_date=parsed_expiry,
+                include_greeks=OPTION_CHAIN_INCLUDE_GREEKS,
             )
         else:
             api_key = self.credentials.get("alpaca_key")
@@ -17714,12 +18254,103 @@ class ChartCaptureManager:
 PROVIDER_REGISTRY = {}
 
 
+_INSTANCE_OWNER_THEMES = (
+    {
+        "stripe": "from-cyan-500 via-sky-400 to-indigo-500",
+        "header_badge": "bg-cyan-500/15 text-cyan-200 border-cyan-400/40 shadow-sm shadow-cyan-500/10",
+        "panel_chip": "bg-cyan-500/10 text-cyan-300 border-cyan-500/30",
+        "dot": "bg-cyan-400",
+    },
+    {
+        "stripe": "from-amber-500 via-yellow-400 to-orange-500",
+        "header_badge": "bg-amber-500/15 text-amber-200 border-amber-400/40 shadow-sm shadow-amber-500/10",
+        "panel_chip": "bg-amber-500/10 text-amber-300 border-amber-500/30",
+        "dot": "bg-amber-400",
+    },
+    {
+        "stripe": "from-emerald-500 via-teal-400 to-cyan-500",
+        "header_badge": "bg-emerald-500/15 text-emerald-200 border-emerald-400/40 shadow-sm shadow-emerald-500/10",
+        "panel_chip": "bg-emerald-500/10 text-emerald-300 border-emerald-500/30",
+        "dot": "bg-emerald-400",
+    },
+    {
+        "stripe": "from-fuchsia-500 via-purple-400 to-indigo-500",
+        "header_badge": "bg-fuchsia-500/15 text-fuchsia-200 border-fuchsia-400/40 shadow-sm shadow-fuchsia-500/10",
+        "panel_chip": "bg-fuchsia-500/10 text-fuchsia-300 border-fuchsia-500/30",
+        "dot": "bg-fuchsia-400",
+    },
+    {
+        "stripe": "from-violet-500 via-indigo-400 to-blue-500",
+        "header_badge": "bg-violet-500/15 text-violet-200 border-violet-400/40 shadow-sm shadow-violet-500/10",
+        "panel_chip": "bg-violet-500/10 text-violet-300 border-violet-500/30",
+        "dot": "bg-violet-400",
+    },
+    {
+        "stripe": "from-sky-500 via-blue-400 to-cyan-500",
+        "header_badge": "bg-sky-500/15 text-sky-200 border-sky-400/40 shadow-sm shadow-sky-500/10",
+        "panel_chip": "bg-sky-500/10 text-sky-300 border-sky-500/30",
+        "dot": "bg-sky-400",
+    },
+)
+
+
+def _build_instance_owner_template_vars(owner, transaction_provider=""):
+    """Build HTML-escaped, color-accented '<owner> - <transactionprovider>' UI fragments."""
+    import html as _html
+
+    clean_owner = str(owner or "").strip()
+    clean_provider = str(transaction_provider or "").strip()
+    parts = [p for p in (clean_owner, clean_provider) if p]
+    if not parts:
+        return {
+            "__INSTANCE_OWNER_TITLE_PREFIX__": "",
+            "__INSTANCE_OWNER_STRIPE_HTML__": "",
+            "__INSTANCE_OWNER_HEADER_BADGE_HTML__": "",
+            "__INSTANCE_OWNER_LOGIN_BADGE_HTML__": "",
+            "__INSTANCE_OWNER_PANEL_TAG_HTML__": "",
+        }
+    label = " - ".join(parts)
+    escaped = _html.escape(label, quote=True)
+    digest = hashlib.sha256(label.lower().encode("utf-8")).digest()
+    theme = _INSTANCE_OWNER_THEMES[digest[0] % len(_INSTANCE_OWNER_THEMES)]
+    stripe_html = f'<div class="h-1 w-full bg-gradient-to-r {theme["stripe"]}"></div>'
+    header_badge_html = (
+        f'<span id="instanceOwnerHeaderBadge" '
+        f'class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-semibold border {theme["header_badge"]}" '
+        f'title="Instance owner ([general] owner) &amp; transaction provider ([option_trading] transactionprovider)">'
+        f'<span class="w-1.5 h-1.5 rounded-full {theme["dot"]} shrink-0"></span>'
+        f'<span class="mono font-bold">{escaped}</span>'
+        f"</span>"
+    )
+    login_badge_html = (
+        f'<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border {theme["header_badge"]} shrink-0" '
+        f'title="Instance owner &amp; transaction provider">'
+        f'<span class="w-1.5 h-1.5 rounded-full {theme["dot"]}"></span>'
+        f'<span class="mono font-bold">{escaped}</span>'
+        f"</span>"
+    )
+    panel_tag_html = (
+        f'<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium normal-case tracking-normal border {theme["panel_chip"]} shrink-0" '
+        f'title="Instance owner &amp; transaction provider">'
+        f'<span class="w-1.5 h-1.5 rounded-full {theme["dot"]} shrink-0"></span>'
+        f'<span class="mono font-semibold">{escaped}</span>'
+        f"</span>"
+    )
+    return {
+        "__INSTANCE_OWNER_TITLE_PREFIX__": f"[{escaped}] ",
+        "__INSTANCE_OWNER_STRIPE_HTML__": stripe_html,
+        "__INSTANCE_OWNER_HEADER_BADGE_HTML__": header_badge_html,
+        "__INSTANCE_OWNER_LOGIN_BADGE_HTML__": login_badge_html,
+        "__INSTANCE_OWNER_PANEL_TAG_HTML__": panel_tag_html,
+    }
+
+
 LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign In &mdash; RSI &amp; Price Kinematics Engine</title>
+    <title>__INSTANCE_OWNER_TITLE_PREFIX__Sign In &mdash; RSI &amp; Price Kinematics Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17731,6 +18362,7 @@ LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body class="bg-[#080d19] text-slate-100 min-h-screen flex items-center justify-center p-4 antialiased selection:bg-indigo-500 selection:text-white">
     <div class="w-full max-w-md bg-slate-900/90 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden">
+        __INSTANCE_OWNER_STRIPE_HTML__
         <div class="px-6 py-5 bg-slate-950/80 border-b border-slate-800 flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0">
                 <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center text-white shadow-md shadow-indigo-500/20 shrink-0">
@@ -17743,7 +18375,10 @@ LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <p class="text-[11px] text-slate-400">Protected Access &bull; Enter password to continue</p>
                 </div>
             </div>
-            <span class="px-2 py-0.5 rounded-md bg-slate-800 border border-slate-700 text-[10px] mono text-cyan-300 shrink-0">__DISPLAY_TZ_LABEL__</span>
+            <div class="flex items-center gap-1.5 shrink-0">
+                __INSTANCE_OWNER_LOGIN_BADGE_HTML__
+                <span class="px-2 py-0.5 rounded-md bg-slate-800 border border-slate-700 text-[10px] mono text-cyan-300 shrink-0">__DISPLAY_TZ_LABEL__</span>
+            </div>
         </div>
 
         <form id="loginForm" method="POST" action="/auth/login" class="p-6 space-y-4">
@@ -17880,7 +18515,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RSI & Price Kinematics Engine</title>
+    <title>__INSTANCE_OWNER_TITLE_PREFIX__RSI & Price Kinematics Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17898,18 +18533,20 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- Top Navigation Bar -->
     <header class="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur sticky top-0 z-40">
+        __INSTANCE_OWNER_STRIPE_HTML__
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
                 <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center font-black text-white text-lg shadow-md shadow-indigo-500/20">
                     K
                 </div>
                 <div>
-                    <div class="flex items-center gap-2">
+                    <div class="flex flex-wrap items-center gap-2">
                         <h1 class="text-sm sm:text-base font-bold tracking-tight text-white">RSI & Price Kinematics Engine</h1>
                         <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                             ACTIVE
                         </span>
+                        __INSTANCE_OWNER_HEADER_BADGE_HTML__
                     </div>
                     <p class="text-[11px] text-slate-400">Multi-Stream Aggregation &bull; 1m Velocities &bull; Accelerations &bull; Dynamic Phase Regimes</p>
                 </div>
@@ -18026,9 +18663,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-4">
             <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <div>
-                    <h2 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                    <h2 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                         <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
                         Kinematics 4-Quadrant Phase Matrix
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </h2>
                     <p class="text-[11px] text-slate-400">Velocity (v) vs Acceleration (a) regime classification. Click any symbol to inspect below.</p>
                 </div>
@@ -18216,9 +18854,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </div>
                         <div>
                             <div class="flex items-center gap-2">
-                                <h3 class="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+                                <h3 class="text-sm font-bold text-white tracking-tight flex flex-wrap items-center gap-2">
                                     <span id="detailSymbolTitle">Symbol Multi-Stream Inspector</span>
                                     <span id="detailRegimeBadge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold border bg-slate-800 text-slate-300 border-slate-700">Neutral</span>
+                                    __INSTANCE_OWNER_PANEL_TAG_HTML__
                                 </h3>
                             </div>
                             <p class="text-[11px] text-slate-400" id="detailSymbolSubtitle">Select any symbol in table above or dropdown to inspect cross-provider consensus</p>
@@ -18382,9 +19021,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="lg:col-span-2 bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 space-y-3">
                     <div class="flex items-center justify-between">
                         <div>
-                            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                            <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                                 <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
                                 Emitted Minute Summaries Log Feed
+                                __INSTANCE_OWNER_PANEL_TAG_HTML__
                             </h3>
                             <p class="text-[11px] text-slate-400">Records from <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
                         </div>
@@ -18402,7 +19042,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <!-- Position Monitor & Engine Heartbeat (1 col) -->
                 <div class="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4 space-y-3">
                     <div>
-                        <h3 class="text-xs font-bold text-white uppercase tracking-wider">Engine Diagnostic Telemetry</h3>
+                        <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
+                            <span>Engine Diagnostic Telemetry</span>
+                            __INSTANCE_OWNER_PANEL_TAG_HTML__
+                        </h3>
                         <p class="text-[11px] text-slate-400">Positions monitor &amp; feed heartbeat</p>
                     </div>
 
@@ -18534,9 +19177,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="injectModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
         <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
             <div class="flex items-center justify-between">
-                <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <h3 class="text-base font-bold text-white flex flex-wrap items-center gap-2">
                     <span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span>
                     Inject Live Test Bar
+                    __INSTANCE_OWNER_PANEL_TAG_HTML__
                 </h3>
                 <button onclick="toggleInjectModal()" class="text-slate-400 hover:text-white">&times;</button>
             </div>
@@ -18582,9 +19226,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
                 <div class="flex flex-wrap items-center gap-3">
                     <div>
-                        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                        <h3 class="text-sm font-bold text-white flex flex-wrap items-center gap-2">
                             <span id="optModalDot" class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
                             <span id="optModalTitle">Option Buyer — Open Contracts</span>
+                            __INSTANCE_OWNER_PANEL_TAG_HTML__
                         </h3>
                         <p id="optModalSubtitle" class="text-[11px] text-slate-400">Minute-by-minute contract valuation, price history, and P/L ($ &amp; %)</p>
                     </div>
@@ -18663,10 +19308,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-7xl w-full h-[88vh] flex flex-col shadow-2xl overflow-hidden">
             <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
                 <div class="min-w-0">
-                    <div class="flex items-center gap-2">
+                    <div class="flex flex-wrap items-center gap-2">
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</h3>
                         <span id="optLogsRowBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 rows</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="optLogsFileSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Minute-by-minute Option Buyer &amp; Option Seller evaluations</p>
                 </div>
@@ -18692,6 +19338,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-indigo-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Option Chain Strike Selection &amp; Exit Horizon Analyzer</h3>
                         <span id="strikeModalBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 BUY signals</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="strikeModalSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Compares -2 ITM through +4 OTM strikes captured at BUY signals across +5m, +10m, +15m, +30m, +60m, Actual Exit &amp; Peak</p>
                 </div>
@@ -24068,8 +24715,76 @@ def _resolve_alpaca_option_data_client_for_analysis(coordinator=None):
     return None
 
 
+def _resolve_tastytrade_option_data_client_for_analysis(coordinator=None):
+    """Return a Tastytrade Prod TastytradeClient if credentials are configured, else None."""
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    if oh is not None:
+        tc = getattr(oh, "_trading_client", None)
+        if isinstance(tc, TastytradeClient) and tc.has_env_credentials("prod"):
+            return tc
+        creds = getattr(oh, "_credentials", None) or {}
+        if creds.get("tastytrade_prod_client_secret") and creds.get(
+            "tastytrade_prod_refresh_token"
+        ):
+            try:
+                client = _build_tastytrade_quote_client(creds)
+                if client is not None:
+                    return client
+            except Exception:
+                pass
+
+    for reg_key in (
+        "OPTION_CHAIN_COLLECTOR",
+        "OPTION_BUYER",
+        "OPTION_SELLER",
+        "POSITIONS_MONITOR",
+        "TRADINGVIEW",
+    ):
+        router = (PROVIDER_REGISTRY.get(reg_key) or {}).get("router")
+        if router is None:
+            continue
+        for attr in ("option_client", "option_chain_client", "_exit_chain_client", "client"):
+            cand = getattr(router, attr, None)
+            if isinstance(cand, TastytradeClient) and cand.has_env_credentials("prod"):
+                return cand
+        rc = getattr(router, "credentials", None) or {}
+        if rc.get("tastytrade_prod_client_secret") and rc.get(
+            "tastytrade_prod_refresh_token"
+        ):
+            try:
+                client = _build_tastytrade_quote_client(rc)
+                if client is not None:
+                    return client
+            except Exception:
+                pass
+
+    env_creds = {
+        "tastytrade_prod_client_id": os.getenv("TASTYTRADE_PROD_CLIENT_ID", "").strip(),
+        "tastytrade_prod_client_secret": os.getenv(
+            "TASTYTRADE_PROD_CLIENT_SECRET", ""
+        ).strip(),
+        "tastytrade_prod_refresh_token": os.getenv(
+            "TASTYTRADE_PROD_REFRESH_TOKEN", ""
+        ).strip(),
+    }
+    if env_creds["tastytrade_prod_client_secret"] and env_creds[
+        "tastytrade_prod_refresh_token"
+    ]:
+        try:
+            return _build_tastytrade_quote_client(env_creds)
+        except Exception:
+            pass
+    try:
+        loaded_keys, _ = load_settings()
+        if isinstance(loaded_keys, dict):
+            return _build_tastytrade_quote_client(loaded_keys)
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_strike_option_bars_cached(symbol_ranges, coordinator=None, force_refresh=False):
-    """Fetch {contract: {minute_dt: {"c": float, "h": float}}} from Alpaca with TTL cache."""
+    """Fetch {contract: {minute_dt: {"c": float, "h": float}}} from Alpaca or Tastytrade Prod DXLink with TTL cache."""
     bars_out = {sym: {} for sym in symbol_ranges.keys()}
     if not symbol_ranges:
         return bars_out, True, None
@@ -24127,68 +24842,101 @@ def _fetch_strike_option_bars_cached(symbol_ranges, coordinator=None, force_refr
     if not to_fetch:
         return bars_out, True, None
 
-    client = _resolve_alpaca_option_data_client_for_analysis(coordinator)
-    if client is None:
-        return bars_out, False, "Alpaca option bar credentials unavailable (showing snapshot quotes & trades only)"
-
-    try:
-        from alpaca.data.requests import OptionBarsRequest
-    except Exception:
-        return bars_out, False, "alpaca.data.requests.OptionBarsRequest unavailable"
-
-    def _parse_bar_list(sym_u, raw_bars):
-        per_min = {}
-        for b in raw_bars or []:
-            ts = _opt_parse_utc(b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None))
-            close_p = _opt_safe_float(b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None)
-            high_p = _opt_safe_float(b.get("high") if isinstance(b, dict) else getattr(b, "high", None), None)
-            if ts is not None and close_p is not None and close_p > 0:
-                mk = minute_utc(ts)
-                h_eff = high_p if (high_p is not None and high_p >= close_p) else close_p
-                per_min[mk] = {"c": round(float(close_p), 4), "h": round(float(h_eff), 4)}
-        return per_min
-
-    items = list(to_fetch.items())
-    chunk_size = 10
+    preferred_prov = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
     fetched_map = {}
-    for i in range(0, len(items), chunk_size):
-        chunk = items[i : i + chunk_size]
-        chunk_syms = [s for s, _ in chunk]
-        min_start = min(r[0] for _, r in chunk)
-        max_end = max(r[1] for _, r in chunk) + MINUTE
-        try:
-            req = OptionBarsRequest(
-                symbol_or_symbols=chunk_syms,
-                timeframe=TimeFrame.Minute,
-                start=min_start,
-                end=max_end,
+    used_provider_label = None
+
+    if preferred_prov == "tastytrade":
+        tt_client = _resolve_tastytrade_option_data_client_for_analysis(coordinator)
+        if tt_client is not None:
+            fetched_map = tt_client.get_historical_bars_batch(to_fetch, is_option=True) or {}
+            used_provider_label = "Tastytrade DXLink"
+        else:
+            return (
+                bars_out,
+                False,
+                "Tastytrade Prod option bar credentials unavailable (showing snapshot quotes & trades only)",
             )
-            resp = client.get_option_bars(req)
-            raw_dict = getattr(resp, "data", resp)
-            if isinstance(raw_dict, dict):
-                for raw_sym, b_list in raw_dict.items():
-                    s_u = str(raw_sym).strip().upper()
-                    fetched_map[s_u] = _parse_bar_list(s_u, b_list)
-            for s_u in chunk_syms:
-                fetched_map.setdefault(s_u, {})
-        except Exception:
-            for s_u, (s_min, e_min) in chunk:
+    else:
+        client = _resolve_alpaca_option_data_client_for_analysis(coordinator)
+        if client is None:
+            tt_client = _resolve_tastytrade_option_data_client_for_analysis(coordinator)
+            if tt_client is not None:
+                fetched_map = tt_client.get_historical_bars_batch(to_fetch, is_option=True) or {}
+                used_provider_label = "Tastytrade DXLink"
+            else:
+                return (
+                    bars_out,
+                    False,
+                    "Alpaca/Tastytrade option bar credentials unavailable (showing snapshot quotes & trades only)",
+                )
+        else:
+            try:
+                from alpaca.data.requests import OptionBarsRequest
+            except Exception:
+                return bars_out, False, "alpaca.data.requests.OptionBarsRequest unavailable"
+
+            def _parse_bar_list(sym_u, raw_bars):
+                per_min = {}
+                for b in raw_bars or []:
+                    ts = _opt_parse_utc(
+                        b.get("timestamp") if isinstance(b, dict) else getattr(b, "timestamp", None)
+                    )
+                    close_p = _opt_safe_float(
+                        b.get("close") if isinstance(b, dict) else getattr(b, "close", None), None
+                    )
+                    high_p = _opt_safe_float(
+                        b.get("high") if isinstance(b, dict) else getattr(b, "high", None), None
+                    )
+                    if ts is not None and close_p is not None and close_p > 0:
+                        mk = minute_utc(ts)
+                        h_eff = high_p if (high_p is not None and high_p >= close_p) else close_p
+                        per_min[mk] = {"c": round(float(close_p), 4), "h": round(float(h_eff), 4)}
+                return per_min
+
+            items = list(to_fetch.items())
+            chunk_size = 10
+            for i in range(0, len(items), chunk_size):
+                chunk = items[i : i + chunk_size]
+                chunk_syms = [s for s, _ in chunk]
+                min_start = min(r[0] for _, r in chunk)
+                max_end = max(r[1] for _, r in chunk) + MINUTE
                 try:
                     req = OptionBarsRequest(
-                        symbol_or_symbols=s_u,
+                        symbol_or_symbols=chunk_syms,
                         timeframe=TimeFrame.Minute,
-                        start=s_min,
-                        end=e_min + MINUTE,
+                        start=min_start,
+                        end=max_end,
                     )
                     resp = client.get_option_bars(req)
                     raw_dict = getattr(resp, "data", resp)
                     if isinstance(raw_dict, dict):
-                        b_list = raw_dict.get(s_u) or (next(iter(raw_dict.values()), []) if raw_dict else [])
-                        fetched_map[s_u] = _parse_bar_list(s_u, b_list)
-                    else:
-                        fetched_map[s_u] = {}
+                        for raw_sym, b_list in raw_dict.items():
+                            s_u = str(raw_sym).strip().upper()
+                            fetched_map[s_u] = _parse_bar_list(s_u, b_list)
+                    for s_u in chunk_syms:
+                        fetched_map.setdefault(s_u, {})
                 except Exception:
-                    fetched_map[s_u] = {}
+                    for s_u, (s_min, e_min) in chunk:
+                        try:
+                            req = OptionBarsRequest(
+                                symbol_or_symbols=s_u,
+                                timeframe=TimeFrame.Minute,
+                                start=s_min,
+                                end=e_min + MINUTE,
+                            )
+                            resp = client.get_option_bars(req)
+                            raw_dict = getattr(resp, "data", resp)
+                            if isinstance(raw_dict, dict):
+                                b_list = raw_dict.get(s_u) or (
+                                    next(iter(raw_dict.values()), []) if raw_dict else []
+                                )
+                                fetched_map[s_u] = _parse_bar_list(s_u, b_list)
+                            else:
+                                fetched_map[s_u] = {}
+                        except Exception:
+                            fetched_map[s_u] = {}
+            used_provider_label = "Alpaca"
 
     with _STRIKE_BAR_CACHE_LOCK:
         for s_u, (s_min, e_min) in to_fetch.items():
@@ -24213,7 +24961,7 @@ def _fetch_strike_option_bars_cached(symbol_ranges, coordinator=None, force_refr
                 if s_min <= mk <= e_min:
                     bars_out[s_u][mk] = dict(bval)
 
-    return bars_out, True, f"Alpaca 1m bars fetched for {len(bars_out)} strike contracts"
+    return bars_out, True, f"{used_provider_label or 'Option'} 1m bars fetched for {len(bars_out)} strike contracts"
 
 
 def analyze_option_chain_strikes(
@@ -24699,7 +25447,8 @@ class AdminCliProvider:
 
         self.coordinator = coordinator
         self.host = host or DASHBOARD_HOST
-        self.port = port or DASHBOARD_PORT
+        self.port = int(port or DASHBOARD_PORT)
+        self._auth_cookie_name = f"{self._AUTH_COOKIE_NAME}_{self.port}"
         self.loop = asyncio.get_running_loop()
         self.stop = threading.Event()
         self.server = None
@@ -24900,7 +25649,7 @@ class AdminCliProvider:
         hdr_pwd = req.headers.get("X-Dashboard-Password")
         if hdr_pwd and self._verify_password(hdr_pwd):
             return True, None
-        token = req.cookies.get(self._AUTH_COOKIE_NAME)
+        token = req.cookies.get(self._auth_cookie_name)
         return self._validate_auth_token(token, touch_activity=touch_activity)
 
     def _is_request_authenticated(self, req, touch_activity=False):
@@ -24921,6 +25670,9 @@ class AdminCliProvider:
             safe_next = self._safe_next_url(next_url)
             err_cls = "" if error_msg else "hidden"
             notice_cls = "" if notice_msg else "hidden"
+            owner_vars = _build_instance_owner_template_vars(
+                INSTANCE_OWNER, OPTION_TRANSACTION_PROVIDER
+            )
             page = (
                 LOGIN_HTML_TEMPLATE.replace("__RUN_ID__", _html.escape(str(RUN_ID)))
                 .replace("__DISPLAY_TZ_LABEL__", _html.escape(str(display_tz_abbr())))
@@ -24930,6 +25682,8 @@ class AdminCliProvider:
                 .replace("__ERROR_CLASS__", err_cls)
                 .replace("__INITIAL_ERROR__", _html.escape(str(error_msg or "")))
             )
+            for _k, _v in owner_vars.items():
+                page = page.replace(_k, _v)
             resp = make_response(page, status_code)
             resp.headers["Content-Type"] = "text/html; charset=utf-8"
             resp.headers["Cache-Control"] = (
@@ -24969,7 +25723,7 @@ class AdminCliProvider:
                     ),
                     401,
                 )
-                resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+                resp.delete_cookie(self._auth_cookie_name, path="/")
                 resp.headers["Cache-Control"] = "no-store"
                 return resp
             raw_next = request.full_path.rstrip("?")
@@ -24981,7 +25735,7 @@ class AdminCliProvider:
                 params.append(f"next={urllib.parse.quote(safe_next, safe='/')}")
             target = f"/login?{'&'.join(params)}" if params else "/login"
             resp = make_response(redirect(target, code=302))
-            resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+            resp.delete_cookie(self._auth_cookie_name, path="/")
             return resp
 
         @app.get("/login")
@@ -25054,7 +25808,7 @@ class AdminCliProvider:
             else:
                 resp = make_response(redirect(safe_next, code=302))
             resp.set_cookie(
-                self._AUTH_COOKIE_NAME,
+                self._auth_cookie_name,
                 token,
                 max_age=ttl_seconds,
                 httponly=True,
@@ -25081,7 +25835,7 @@ class AdminCliProvider:
 
         @app.route("/auth/logout", methods=["GET", "POST"])
         def auth_logout():
-            self._revoke_auth_token(request.cookies.get(self._AUTH_COOKIE_NAME))
+            self._revoke_auth_token(request.cookies.get(self._auth_cookie_name))
             wants_json = (
                 request.method == "POST"
                 or "application/json" in (request.headers.get("Accept") or "").lower()
@@ -25090,7 +25844,7 @@ class AdminCliProvider:
                 resp = make_response(jsonify(status="ok", redirect="/login"), 200)
             else:
                 resp = make_response(redirect("/login", code=302))
-            resp.delete_cookie(self._AUTH_COOKIE_NAME, path="/")
+            resp.delete_cookie(self._auth_cookie_name, path="/")
             resp.headers["Cache-Control"] = "no-store"
             return resp
 
@@ -25098,6 +25852,9 @@ class AdminCliProvider:
         @app.route("/dashboard", methods=["GET"])
         @app.route("/kinematics", methods=["GET"])
         def index():
+            owner_vars = _build_instance_owner_template_vars(
+                INSTANCE_OWNER, OPTION_TRANSACTION_PROVIDER
+            )
             html = (
                 DASHBOARD_HTML_TEMPLATE.replace("__RUN_ID__", RUN_ID)
                 .replace("__DISPLAY_TZ_LABEL__", display_tz_abbr())
@@ -25115,6 +25872,8 @@ class AdminCliProvider:
                     "true" if STRIKE_ANALYZER_ENABLED else "false",
                 )
             )
+            for _k, _v in owner_vars.items():
+                html = html.replace(_k, _v)
             headers = {"Content-Type": "text/html; charset=utf-8"}
             if self._is_auth_active():
                 headers["Cache-Control"] = "no-store"
@@ -25443,6 +26202,7 @@ class AdminCliProvider:
 
             status_report = {
                 "run_id": RUN_ID,
+                "instance_owner": INSTANCE_OWNER,
                 "display_timezone": {
                     "setting": DISPLAY_TIMEZONE_SETTING,
                     "iana": DISPLAY_TZ_IANA,
@@ -25452,6 +26212,17 @@ class AdminCliProvider:
                     "optionchainprovider": OPTION_CHAIN_PROVIDER,
                     "transactionprovider": OPTION_TRANSACTION_PROVIDER,
                     "tastytrade_transaction_env": TASTYTRADE_TRANSACTION_ENV,
+                    "chain_cooldown_seconds": OPTION_CHAIN_RSI_COOLDOWN_SECONDS,
+                    "chain_pacing_seconds": OPTION_CHAIN_PACING_SECONDS,
+                    "chain_include_greeks": OPTION_CHAIN_INCLUDE_GREEKS,
+                },
+                "dashboard_server": {
+                    "host": self.host,
+                    "port": int(self.port),
+                },
+                "webhook_server": {
+                    "host": WEBHOOK_HOST,
+                    "port": int(WEBHOOK_PORT),
                 },
                 "provider_priority": list(_provider_priority_order()),
                 "dashboard_ssl": {
@@ -25462,6 +26233,7 @@ class AdminCliProvider:
                 },
                 "dashboard_auth": {
                     "enabled": self._is_auth_active(),
+                    "cookie_name": self._auth_cookie_name,
                     "session_ttl_hours": DASHBOARD_SESSION_TTL_HOURS,
                     "inactivity_timeout_minutes": DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
                 },
@@ -25995,6 +26767,8 @@ async def main():
             router_instance = TradingviewProvider(
                 symbols,
                 coordinator,
+                host=WEBHOOK_HOST,
+                port=WEBHOOK_PORT,
                 credentials=keys,
                 option_client=shared_option_chain_client,
             )
@@ -26246,16 +27020,35 @@ def _read_dashboard_password_from_ini(ini_path=None):
     return os.getenv("DASHBOARD_PASSWORD", DASHBOARD_PASSWORD or "")
 
 
+def _read_dashboard_port_from_ini(ini_path=None):
+    cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
+    if cfg_path.is_file():
+        try:
+            raw_text = cfg_path.read_text(encoding="utf-8-sig")
+            cfg = configparser.ConfigParser(interpolation=None)
+            cfg.read_string(raw_text)
+            if cfg.has_option("dashboard", "port"):
+                port_val = _ini_int(
+                    cfg, "dashboard", "port", "DASHBOARD_PORT", DASHBOARD_PORT, minimum=1
+                )
+                if 1 <= port_val <= 65535:
+                    return port_val
+        except Exception:
+            pass
+    return int(DASHBOARD_PORT)
+
+
 def _call_running_chart_capture_cli(
-    action, port=DASHBOARD_PORT, timeout=2.0, ini_path=None
+    action, port=None, timeout=2.0, ini_path=None
 ):
     import urllib.error
     import urllib.request
 
+    eff_port = int(port) if port is not None else _read_dashboard_port_from_ini(ini_path=ini_path)
     dash_pwd = _read_dashboard_password_from_ini(ini_path=ini_path)
     last_exc = None
     for scheme in ("http", "https"):
-        url = f"{scheme}://127.0.0.1:{int(port)}/cli/chart-capture"
+        url = f"{scheme}://127.0.0.1:{eff_port}/cli/chart-capture"
         ctx = ssl._create_unverified_context() if scheme == "https" else None
         try:
             headers = {}
@@ -26312,8 +27105,8 @@ def handle_cli_command(argv=None):
     parser.add_argument(
         "--port",
         type=int,
-        default=DASHBOARD_PORT,
-        help="Running Admin/CLI HTTP port for live thread signaling (default 5001).",
+        default=None,
+        help="Running Admin/CLI HTTP port for live thread signaling (defaults to [dashboard] port in lib/parms.ini or 5001).",
     )
     subparsers = parser.add_subparsers(dest="subcommand")
     cc_parser = subparsers.add_parser(
@@ -26324,7 +27117,7 @@ def handle_cli_command(argv=None):
     cc_parser.add_argument(
         "--ini", dest="sub_ini", default=None, help="Optional path to parms.ini."
     )
-    cc_parser.add_argument("--port", dest="sub_port", type=int, default=DASHBOARD_PORT)
+    cc_parser.add_argument("--port", dest="sub_port", type=int, default=None)
 
     args = parser.parse_args(raw_args)
     action = (
@@ -26336,7 +27129,11 @@ def handle_cli_command(argv=None):
         return None
 
     ini_path = getattr(args, "sub_ini", None) or args.ini
-    port = getattr(args, "sub_port", None) or args.port
+    port = (
+        getattr(args, "sub_port", None)
+        or args.port
+        or _read_dashboard_port_from_ini(ini_path=ini_path)
+    )
 
     if action in {"start", "stop"}:
         target_enabled = action == "start"
