@@ -128,6 +128,8 @@ Usage Examples
 ./run_dual_instances.sh --run2  run only jboa (Tastytrade, ports 6000/6001)
 ./run_dual_instances.sh --run-only  run both concurrently in one window
 ./run_dual_instances.sh --clean2  interactively confirm and remove all Instance 2 artifacts under /home/jboa (add --yes to skip prompt)
+Added independent daemon/background controls: Supports --run1 --bg, --run2 --bg, --run-only --bg, --stop1, --stop2, --stop-all, and --status using PID/log files in /tmp/ (so /home/billt/jboa-1 is never written to or modified).
+Safe process targeting & startup check: Background starts verify the process stays alive after launch (printing log tail on early crash), and --stop1/--stop2 confirm the PID belongs to the expected user running multiStreamRSI.py before sending SIGTERM.
 
 
 

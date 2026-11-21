@@ -7298,47 +7298,62 @@ class ProviderRouter:
 
         try:
             if self.provider == "TASTYTRADE":
-                grouped = None
-                for attempt in range(2):
-                    try:
-                        async with self.history_lock:
-                            grouped = await self._dxlink_fetch_candles_batch(
-                                list(self.symbols),
-                                fetch_start,
-                                seed_end,
-                                overall_timeout=max(25.0, len(self.symbols) * 1.5),
+                grouped = {}
+                sym_list = list(self.symbols)
+                chunk_size = 10
+                for start_idx in range(0, len(sym_list), chunk_size):
+                    chunk = sym_list[start_idx : start_idx + chunk_size]
+                    chunk_res = None
+                    for attempt in range(2):
+                        try:
+                            async with self.history_lock:
+                                chunk_res = await self._dxlink_fetch_candles_batch(
+                                    chunk,
+                                    fetch_start,
+                                    seed_end,
+                                    idle_timeout=4.0,
+                                    overall_timeout=max(30.0, len(chunk) * 3.5),
+                                )
+                            break
+                        except FatalProviderError:
+                            raise
+                        except Exception as exc:
+                            if attempt == 0:
+                                await asyncio.sleep(1.0)
+                                continue
+                            self.logger.warning(
+                                "RSI_WARMUP_SKIP provider=%s symbols=%s error_type=%s",
+                                self.provider,
+                                ",".join(chunk),
+                                type(exc).__name__,
                             )
-                        break
-                    except FatalProviderError:
-                        raise
-                    except Exception as exc:
-                        if attempt == 0:
-                            await asyncio.sleep(1.0)
-                            continue
-                        self.logger.warning(
-                            "RSI_WARMUP_SKIP provider=%s symbol=ALL error_type=%s",
-                            self.provider,
-                            type(exc).__name__,
-                        )
-                        return
+                    if isinstance(chunk_res, dict):
+                        grouped.update(chunk_res)
                 for symbol in self.symbols:
                     bars = [
                         b
-                        for b in (grouped or {}).get(symbol, [])
-                        if b.timestamp < seed_end and session_allowed(b.timestamp)
+                        for b in grouped.get(symbol, [])
+                        if fetch_start <= as_utc(b.timestamp) < seed_end
+                        and session_allowed(b.timestamp)
                     ]
                     applied_total = (
                         self.coordinator.seed_history(self.provider, symbol, bars)
                         if bars
                         else 0
                     )
+                    last_bar_str = (
+                        bars[-1].timestamp.astimezone(MARKET_TZ).strftime("%Y-%m-%d %H:%M ET")
+                        if bars
+                        else "none"
+                    )
                     self.logger.info(
-                        "RSI_WARMUP_DONE provider=%s symbol=%s mode=%s sessions=%d bars_applied=%d",
+                        "RSI_WARMUP_DONE provider=%s symbol=%s mode=%s sessions=%d bars_applied=%d last_bar=%s",
                         self.provider,
                         symbol,
                         RSI_SESSION_MODE,
                         len(sessions),
                         applied_total,
+                        last_bar_str,
                     )
                 self._initial_warmup_done = True
                 return
@@ -7379,13 +7394,25 @@ class ProviderRouter:
                     if valid_bars
                     else 0
                 )
+                last_bar_str = (
+                    valid_bars[-1].timestamp.astimezone(MARKET_TZ).strftime("%Y-%m-%d %H:%M ET")
+                    if valid_bars
+                    else "none"
+                )
+                feed_tag = (
+                    f" feed={'sip' if FEED == DataFeed.SIP else 'iex'}"
+                    if self.provider == "ALPACA"
+                    else ""
+                )
                 self.logger.info(
-                    "RSI_WARMUP_DONE provider=%s symbol=%s mode=%s sessions=%d bars_applied=%d",
+                    "RSI_WARMUP_DONE provider=%s%s symbol=%s mode=%s sessions=%d bars_applied=%d last_bar=%s",
                     self.provider,
+                    feed_tag,
                     symbol,
                     RSI_SESSION_MODE,
                     len(sessions),
                     applied_total,
+                    last_bar_str,
                 )
             self._initial_warmup_done = True
         finally:
@@ -7986,7 +8013,7 @@ class ProviderRouter:
             await ws.send_json({"type": "KEEPALIVE", "channel": 0})
 
     async def _dxlink_fetch_candles_batch(
-        self, symbols, start, end, idle_timeout=1.5, overall_timeout=20.0
+        self, symbols, start, end, idle_timeout=3.5, overall_timeout=30.0
     ):
         """Dedicated aiohttp DXLink #1 client for historical 1m Candle snapshots (warmup/recovery)."""
         start_utc = as_utc(start)
@@ -8071,7 +8098,7 @@ class ProviderRouter:
                         {
                             "type": "FEED_SETUP",
                             "channel": 1,
-                            "acceptAggregationPeriod": 60.0,
+                            "acceptAggregationPeriod": 0.0,
                             "acceptDataFormat": "COMPACT",
                             "acceptEventFields": {
                                 "Candle": ["eventSymbol", "time", "close", "eventFlags"]
@@ -8128,6 +8155,15 @@ class ProviderRouter:
                             completed_syms.add(base_sym)
                     if completed_syms >= target_set:
                         break
+
+        missing_end = sorted(target_set - completed_syms)
+        if missing_end:
+            self.logger.warning(
+                "DXLINK_HISTORY_INCOMPLETE completed=%d/%d missing_snapshot_end=%s",
+                len(completed_syms),
+                len(target_set),
+                ",".join(missing_end[:10]),
+            )
 
         return {
             sym: [Bar(ts, px) for ts, px in sorted(candles.items())]
