@@ -2204,33 +2204,29 @@ class TastytradeClient:
             )
             or 0.0
         )
-        long_mv = (
-            _opt_safe_float(
-                (
-                    data.get("long-derivative-value")
-                    if data.get("long-derivative-value") is not None
-                    else data.get("long-equity-value")
-                ),
-                0.0,
-            )
-            or 0.0
-        )
-        short_mv = (
-            _opt_safe_float(
-                (
-                    data.get("short-derivative-value")
-                    if data.get("short-derivative-value") is not None
-                    else data.get("short-equity-value")
-                ),
-                0.0,
-            )
-            or 0.0
-        )
+        long_deriv = _opt_safe_float(data.get("long-derivative-value"), 0.0) or 0.0
+        long_eq = _opt_safe_float(data.get("long-equity-value"), 0.0) or 0.0
+        long_mv = round(abs(long_deriv) + abs(long_eq), 2)
+        short_deriv = _opt_safe_float(data.get("short-derivative-value"), 0.0) or 0.0
+        short_eq = _opt_safe_float(data.get("short-equity-value"), 0.0) or 0.0
+        short_mv = round(abs(short_deriv) + abs(short_eq), 2)
+        options_bp = _opt_safe_float(data.get("derivative-buying-power"), None)
+        equity_bp = _opt_safe_float(data.get("equity-buying-power"), None)
+        cash_avail = _opt_safe_float(data.get("cash-available-to-withdraw"), None)
+        realized_day_gain = _opt_safe_float(data.get("realized-day-gain"), None)
+        if realized_day_gain is not None:
+            rdg_eff = str(data.get("realized-day-gain-effect") or "").strip().lower()
+            if rdg_eff == "debit" and realized_day_gain > 0:
+                realized_day_gain = -realized_day_gain
         return SimpleNamespace(
             account_number=acct,
             equity=equity,
             cash=cash,
             buying_power=buying_power,
+            options_buying_power=options_bp if options_bp is not None else buying_power,
+            equity_buying_power=equity_bp if equity_bp is not None else buying_power,
+            cash_available_to_withdraw=cash_avail,
+            realized_day_gain=realized_day_gain,
             long_market_value=long_mv,
             short_market_value=short_mv,
             raw=data,
@@ -2338,6 +2334,12 @@ class TastytradeClient:
                 if (avg_e > 0 and cur_price is not None)
                 else 0.0
             )
+            prev_close = entry["close_price"]
+            intraday_pl = (
+                round(((cur_price or 0.0) - prev_close) * qty_f * mult * sign, 2)
+                if (prev_close is not None and prev_close > 0 and cur_price is not None)
+                else None
+            )
             out.append(
                 SimpleNamespace(
                     symbol=sym,
@@ -2353,6 +2355,7 @@ class TastytradeClient:
                     market_value=mkt_val,
                     unrealized_pl=upl,
                     unrealized_plpc=upl_pc,
+                    unrealized_intraday_pl=intraday_pl,
                     multiplier=mult,
                     raw=entry["raw"],
                 )
@@ -8486,7 +8489,6 @@ _INI_FEATURE_SECTIONS = frozenset(
         "chart_capture",
         "dashboard",
         "webhook",
-        "feature_toggles",
         "tastytrade_api",
     }
 )
@@ -8902,7 +8904,7 @@ def _provider_priority_score(provider):
 
 
 def _apply_ini_feature_settings(cfg):
-    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], [feature_toggles], and [tastytrade_api] overrides from lib/parms.ini."""
+    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA, INSTANCE_OWNER
     global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
@@ -8925,6 +8927,7 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_BUY_ALLOWED_FORECASTS, OPTION_BUY_REQUIRE_POSITIVE_VELOCITY
     global OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES, OPTION_BUY_BOUNCE_RSI_MAX
     global OPTION_BUY_MAX_SPREAD_PCT, OPTION_BUY_LIMIT_AGGRESSION, OPTION_BUY_MAX_BUYS_PER_MINUTE
+    global OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS, OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT
     global OPTION_SELL_ENABLED, OPTION_SELL_DRY_RUN, OPTION_SELL_PAPER
     global OPTION_SELL_QTY, OPTION_SELL_CLOSE_FULL_POSITION
     global OPTION_SELL_ORDER_TYPE, OPTION_SELL_COOLDOWN_MINUTES
@@ -9312,6 +9315,29 @@ def _apply_ini_feature_settings(cfg):
         1,
         minimum=0,
     )
+    OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS = max(
+        0.0,
+        _ini_float(
+            cfg,
+            "option_buyer",
+            "max_single_trade_dollars",
+            "OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS",
+            8000.0,
+        ),
+    )
+    OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT = min(
+        100.0,
+        max(
+            0.0,
+            _ini_float(
+                cfg,
+                "option_buyer",
+                "invest_buffer_withhold_pct",
+                "OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT",
+                10.0,
+            ),
+        ),
+    )
     raw_forecasts = _ini_str(
         cfg,
         "option_buyer",
@@ -9676,7 +9702,7 @@ def _apply_ini_feature_settings(cfg):
         )
 
     STRIKE_ANALYZER_ENABLED = _ini_bool(
-        cfg, "feature_toggles", "strike_analyzer_enabled", "STRIKE_ANALYZER_ENABLED", False
+        cfg, "dashboard", "strike_analyzer_enabled", "STRIKE_ANALYZER_ENABLED", False
     )
 
     logging.info(
@@ -9685,7 +9711,8 @@ def _apply_ini_feature_settings(cfg):
         "dashboard=%s:%d webhook=%s:%d "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
-        "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d sell_full=%s "
+        "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d "
+        "max_single_trade=$%.2f invest_buf=%.1f%% sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
@@ -9725,6 +9752,8 @@ def _apply_ini_feature_settings(cfg):
         OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
         OPTION_BUY_BOUNCE_RSI_MAX,
         OPTION_BUY_QTY,
+        OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+        OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
         OPTION_SELL_CLOSE_FULL_POSITION,
         OPTION_SELL_LIMIT_DISCOUNT_PCT,
         OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT,
@@ -10108,6 +10137,12 @@ OPTION_BUY_LIMIT_AGGRESSION = min(
 )
 OPTION_BUY_MAX_BUYS_PER_MINUTE = max(
     0, int(os.getenv("OPTION_BUY_MAX_BUYS_PER_MINUTE", "1"))
+)
+OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS = max(
+    0.0, float(os.getenv("OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS", "8000.0"))
+)
+OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT = min(
+    100.0, max(0.0, float(os.getenv("OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT", "10.0")))
 )
 OPTION_BUY_ALLOWED_FORECASTS = {
     s.strip().lower()
@@ -12008,6 +12043,351 @@ class RsiOptionChainCollector:
                 )
 
 
+def _extract_account_field_num(obj, *attrs, default=None):
+    """Safely extract the first finite float from an account object, dict, or .raw dict."""
+    raw_map = getattr(obj, "raw", None)
+    if not isinstance(raw_map, dict):
+        raw_map = obj if isinstance(obj, dict) else {}
+    for attr in attrs:
+        val = obj.get(attr) if isinstance(obj, dict) else getattr(obj, attr, None)
+        if val is None and isinstance(raw_map, dict):
+            val = raw_map.get(attr)
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fval):
+            return fval
+    return default
+
+
+def extract_account_snapshot(
+    account,
+    positions=None,
+    provider=None,
+    env_label=None,
+    coordinator=None,
+    day_baseline_map=None,
+    now_utc=None,
+):
+    """Normalize account balances & P/L across Alpaca and Tastytrade providers."""
+    prov = str(provider or OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
+    if env_label is None:
+        if prov == "tastytrade":
+            env_label = str(TASTYTRADE_TRANSACTION_ENV or "sandbox").strip().lower()
+        else:
+            env_label = "paper" if ALPACA_PAPER else "live"
+    poll_dt = now_utc or datetime.now(timezone.utc)
+    raw_map = getattr(account, "raw", None)
+    if not isinstance(raw_map, dict):
+        raw_map = account if isinstance(account, dict) else {}
+
+    acct_num = ""
+    for k in ("account_number", "account-number", "id"):
+        v = account.get(k) if isinstance(account, dict) else getattr(account, k, None)
+        if v is None and isinstance(raw_map, dict):
+            v = raw_map.get(k)
+        if v is not None and str(v).strip():
+            acct_num = str(v).strip()
+            break
+
+    equity = round(
+        _extract_account_field_num(
+            account, "equity", "net-liquidating-value", default=0.0
+        )
+        or 0.0,
+        2,
+    )
+    cash = round(
+        _extract_account_field_num(account, "cash", "cash-balance", default=0.0) or 0.0,
+        2,
+    )
+    buying_power = round(
+        _extract_account_field_num(
+            account,
+            "buying_power",
+            "derivative-buying-power",
+            "equity-buying-power",
+            default=0.0,
+        )
+        or 0.0,
+        2,
+    )
+    if prov == "tastytrade":
+        avail_raw = _extract_account_field_num(
+            account,
+            "options_buying_power",
+            "derivative-buying-power",
+            "buying_power",
+            "equity-buying-power",
+            "cash",
+            "cash-balance",
+            default=0.0,
+        )
+    else:
+        avail_raw = _extract_account_field_num(
+            account,
+            "options_buying_power",
+            "non_marginable_buying_power",
+            "cash",
+            "buying_power",
+            default=0.0,
+        )
+    available_to_invest = round(max(0.0, avail_raw or 0.0), 2)
+
+    long_mv = abs(
+        _extract_account_field_num(account, "long_market_value", default=0.0) or 0.0
+    )
+    short_mv = abs(
+        _extract_account_field_num(account, "short_market_value", default=0.0) or 0.0
+    )
+    acct_invested = round(long_mv + short_mv, 2)
+
+    pos_list = list(positions or [])
+    pos_invested = 0.0
+    open_unrealized_pl = 0.0
+    open_cost_basis = 0.0
+    intraday_pl_vals = []
+    for p in pos_list:
+        mv = abs(_extract_account_field_num(p, "market_value", default=0.0) or 0.0)
+        cb = abs(_extract_account_field_num(p, "cost_basis", default=0.0) or 0.0)
+        pos_invested += mv if mv > 0 else cb
+        open_unrealized_pl += (
+            _extract_account_field_num(p, "unrealized_pl", default=0.0) or 0.0
+        )
+        open_cost_basis += cb
+        ipl = _extract_account_field_num(p, "unrealized_intraday_pl", default=None)
+        if ipl is not None:
+            intraday_pl_vals.append(ipl)
+    pos_invested = round(pos_invested, 2)
+    open_unrealized_pl = round(open_unrealized_pl, 2)
+    open_cost_basis = round(open_cost_basis, 2)
+
+    balance_invested = acct_invested if acct_invested > 0 else pos_invested
+
+    # Buffer / investable capital calculations
+    withhold_pct = min(100.0, max(0.0, float(OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT)))
+    single_trade_cap = max(0.0, float(OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS))
+    investable_total_base = round(available_to_invest + balance_invested, 2)
+    max_investable_balance = round(
+        investable_total_base * (1.0 - withhold_pct / 100.0), 2
+    )
+    remaining_investable_budget = round(
+        max(0.0, min(available_to_invest, max_investable_balance - balance_invested)),
+        2,
+    )
+
+    # Closed option history P/L (for Overall P/L and Today's P/L fallback)
+    closed_realized_pl = 0.0
+    closed_cost_basis = 0.0
+    closed_today_pl = 0.0
+    et_today = poll_dt.astimezone(MARKET_TZ).date()
+    if coordinator is not None and hasattr(coordinator, "option_history"):
+        try:
+            seller_sum = coordinator.option_history.get_seller_summary() or {}
+            closed_realized_pl = round(
+                _opt_safe_float(seller_sum.get("total_pnl_dollars"), 0.0) or 0.0, 2
+            )
+            closed_cost_basis = round(
+                abs(_opt_safe_float(seller_sum.get("total_cost_basis"), 0.0) or 0.0), 2
+            )
+            with coordinator.option_history._lock:
+                for rec in list(coordinator.option_history.closed_contracts):
+                    s_dt = _opt_parse_utc(rec.get("sold_at_utc"))
+                    if s_dt is not None and s_dt.astimezone(MARKET_TZ).date() == et_today:
+                        closed_today_pl += (
+                            _opt_safe_float(rec.get("total_pnl_dollars"), 0.0) or 0.0
+                        )
+            closed_today_pl = round(closed_today_pl, 2)
+        except Exception:
+            pass
+
+    # Today's P/L (broker equity delta -> Tastytrade realized day gain + intraday -> intraday/baseline)
+    today_pl = None
+    today_pl_pct = None
+    today_pl_source = "unavailable"
+    last_equity = _extract_account_field_num(account, "last_equity", default=None)
+    if last_equity is not None and last_equity > 0:
+        today_pl = round(equity - last_equity, 2)
+        today_pl_pct = round((today_pl / last_equity) * 100.0, 2)
+        today_pl_source = "broker_equity"
+    else:
+        realized_day_gain = _extract_account_field_num(
+            account, "realized_day_gain", "realized-day-gain", default=None
+        )
+        if realized_day_gain is not None or intraday_pl_vals:
+            day_open_pl = round(sum(intraday_pl_vals), 2)
+            day_real_pl = (
+                round(realized_day_gain, 2)
+                if realized_day_gain is not None
+                else closed_today_pl
+            )
+            today_pl = round(day_real_pl + day_open_pl, 2)
+            prior_eq = equity - today_pl
+            today_pl_pct = (
+                round((today_pl / prior_eq) * 100.0, 2) if prior_eq > 0 else 0.0
+            )
+            today_pl_source = (
+                "broker_day_gain" if realized_day_gain is not None else "positions_intraday"
+            )
+        elif closed_today_pl != 0.0:
+            today_pl = closed_today_pl
+            prior_eq = equity - today_pl
+            today_pl_pct = (
+                round((today_pl / prior_eq) * 100.0, 2) if prior_eq > 0 else 0.0
+            )
+            today_pl_source = "closed_today"
+        elif day_baseline_map is not None and equity > 0:
+            base_key = (prov, acct_num or "default", et_today.isoformat())
+            if base_key not in day_baseline_map:
+                day_baseline_map[base_key] = equity
+            base_eq = day_baseline_map[base_key]
+            today_pl = round(equity - base_eq, 2)
+            today_pl_pct = (
+                round((today_pl / base_eq) * 100.0, 2) if base_eq > 0 else 0.0
+            )
+            today_pl_source = "session_baseline"
+
+    overall_pl = round(open_unrealized_pl + closed_realized_pl, 2)
+    total_basis = round(open_cost_basis + closed_cost_basis, 2)
+    overall_pl_pct = (
+        round((overall_pl / total_basis) * 100.0, 2) if total_basis > 0 else 0.0
+    )
+
+    return {
+        "provider": prov,
+        "env": env_label,
+        "account_number": acct_num or "--",
+        "equity": equity,
+        "cash": cash,
+        "buying_power": buying_power,
+        "available_to_invest": available_to_invest,
+        "balance_invested": balance_invested,
+        "investable_total_base": investable_total_base,
+        "max_single_trade_dollars": single_trade_cap,
+        "invest_buffer_withhold_pct": withhold_pct,
+        "max_investable_balance": max_investable_balance,
+        "remaining_investable_budget": remaining_investable_budget,
+        "today_pl": today_pl,
+        "today_pl_pct": today_pl_pct,
+        "today_pl_source": today_pl_source,
+        "overall_pl": overall_pl,
+        "overall_pl_pct": overall_pl_pct,
+        "open_unrealized_pl": open_unrealized_pl,
+        "closed_realized_pl": closed_realized_pl,
+        "updated_utc": poll_dt.isoformat(),
+    }
+
+
+def _calculate_budget_scaled_qty(
+    desired_qty,
+    unit_price,
+    *,
+    max_single_trade_dollars=0.0,
+    invest_buffer_withhold_pct=0.0,
+    available_to_invest=None,
+    balance_invested=None,
+    spent_this_cycle=0.0,
+    multiplier=100.0,
+):
+    """Auto-scale option contract qty (whole integer >= 1) to stay within both
+    max_single_trade_dollars and the invest_buffer_withhold_pct capital ceiling.
+
+    Returns (effective_qty, reject_reason, details_dict).
+    If even 1 contract exceeds a configured limit, returns (0, reason, details_dict).
+    """
+    orig_qty = max(1, int(desired_qty or 1))
+    cap_single = max(0.0, float(max_single_trade_dollars or 0.0))
+    withhold_pct = min(100.0, max(0.0, float(invest_buffer_withhold_pct or 0.0)))
+    spent = max(0.0, float(spent_this_cycle or 0.0))
+    details = {
+        "original_qty": orig_qty,
+        "scaled_qty": orig_qty,
+        "scaled_down": False,
+        "scale_reason": None,
+        "contract_cost": None,
+        "max_single_trade_dollars": cap_single,
+        "invest_buffer_withhold_pct": withhold_pct,
+        "max_investable_balance": None,
+        "remaining_investable_budget": None,
+        "single_trade_max_qty": orig_qty,
+        "buffer_max_qty": orig_qty,
+    }
+
+    if unit_price is None or isinstance(unit_price, bool):
+        if cap_single > 0 or withhold_pct > 0:
+            return 0, "missing_price_for_budget_check", details
+        return orig_qty, None, details
+    try:
+        up = float(unit_price)
+    except (TypeError, ValueError):
+        if cap_single > 0 or withhold_pct > 0:
+            return 0, "missing_price_for_budget_check", details
+        return orig_qty, None, details
+    if not math.isfinite(up) or up <= 0:
+        if cap_single > 0 or withhold_pct > 0:
+            return 0, "missing_price_for_budget_check", details
+        return orig_qty, None, details
+
+    contract_cost = round(up * float(multiplier), 2)
+    details["contract_cost"] = contract_cost
+    if contract_cost <= 0:
+        return 0, "missing_price_for_budget_check", details
+
+    # 1) Single-trade dollar cap
+    if cap_single > 0:
+        s_qty = int(math.floor((cap_single + 1e-9) / contract_cost))
+        while s_qty > 0 and round(s_qty * contract_cost, 2) > round(cap_single, 2):
+            s_qty -= 1
+        single_max_qty = max(0, s_qty)
+    else:
+        single_max_qty = orig_qty
+    details["single_trade_max_qty"] = single_max_qty
+
+    # 2) Investable balance buffer ceiling (available + invested) * (1 - withhold_pct/100)
+    if available_to_invest is not None and balance_invested is not None:
+        adj_avail = max(0.0, float(available_to_invest) - spent)
+        adj_inv = max(0.0, float(balance_invested) + spent)
+        total_base = round(adj_avail + adj_inv, 2)
+        max_investable = round(total_base * (1.0 - withhold_pct / 100.0), 2)
+        remaining_budget = round(
+            max(0.0, min(adj_avail, max_investable - adj_inv)), 2
+        )
+        details["max_investable_balance"] = max_investable
+        details["remaining_investable_budget"] = remaining_budget
+        b_qty = int(math.floor((remaining_budget + 1e-9) / contract_cost))
+        while b_qty > 0 and round(b_qty * contract_cost, 2) > remaining_budget:
+            b_qty -= 1
+        buffer_max_qty = max(0, b_qty)
+    elif withhold_pct > 0:
+        return 0, "account_balance_unavailable", details
+    else:
+        buffer_max_qty = orig_qty
+    details["buffer_max_qty"] = buffer_max_qty
+
+    effective_qty = int(min(orig_qty, single_max_qty, buffer_max_qty))
+    details["scaled_qty"] = effective_qty
+
+    if effective_qty < 1:
+        if single_max_qty < 1 and (cap_single > 0):
+            return 0, "max_single_trade_exceeded", details
+        return 0, "invest_buffer_exceeded", details
+
+    if effective_qty < orig_qty:
+        details["scaled_down"] = True
+        hit_single = cap_single > 0 and single_max_qty < orig_qty and single_max_qty <= buffer_max_qty
+        hit_buffer = buffer_max_qty < orig_qty and buffer_max_qty <= single_max_qty
+        if hit_single and hit_buffer:
+            details["scale_reason"] = "max_single_trade_and_invest_buffer"
+        elif hit_single:
+            details["scale_reason"] = "max_single_trade_cap"
+        else:
+            details["scale_reason"] = "invest_buffer_cap"
+    return effective_qty, None, details
+
+
 class AlpacaPositionMonitor:
     """Poll account positions every minute and log option holdings."""
 
@@ -12020,7 +12400,7 @@ class AlpacaPositionMonitor:
         )
         self.logger = make_logger("POSITIONS", self.transaction_provider.upper())
         self.client = build_trading_client(self.credentials)
-        # --- NEW: Status Tracking State Variables ---
+        # --- Status & Account Telemetry State Variables ---
         self.last_poll_utc = None
         self.last_status = "uninitialized"
         self.last_error_detail = (
@@ -12031,6 +12411,13 @@ class AlpacaPositionMonitor:
         self.position_count = 0
         self.equity_count = 0
         self.option_count = 0
+        self.poll_count = 0
+        self.last_poll_duration_ms = None
+        self.poll_interval_seconds = max(
+            5, min(60, int(OPTION_POSITION_POLL_SECONDS or 15))
+        )
+        self.account_snapshot = None
+        self._day_equity_baselines = {}
         self._last_logged_minute = None
         self._last_logged_sig = None
 
@@ -12109,8 +12496,8 @@ class AlpacaPositionMonitor:
 
     def poll(self):
         """Fetch account + positions and log the snapshot (blocking)."""
-        # --- NEW: Set active state flag ---
         self.last_status = "polling"
+        t0 = time.monotonic()
         account = self.client.get_account()
         positions = list(self.client.get_all_positions() or [])
         options = [p for p in positions if self._is_option(p)]
@@ -12121,6 +12508,34 @@ class AlpacaPositionMonitor:
         self.equity_count = len(equities)
         self.option_count = len(options)
         self.last_poll_utc = poll_now_dt.isoformat()
+        self.poll_count += 1
+        self.poll_interval_seconds = max(
+            5, min(60, int(OPTION_POSITION_POLL_SECONDS or 15))
+        )
+
+        if self.coordinator is not None and hasattr(self.coordinator, "option_history"):
+            self.coordinator.option_history.record_positions_snapshot(
+                positions, timestamp=self.last_poll_utc
+            )
+
+        try:
+            self.account_snapshot = extract_account_snapshot(
+                account,
+                positions=positions,
+                provider=self.transaction_provider,
+                coordinator=self.coordinator,
+                day_baseline_map=self._day_equity_baselines,
+                now_utc=poll_now_dt,
+            )
+        except Exception as acct_exc:
+            self.logger.warning(
+                "ACCOUNT_SNAPSHOT_WARN provider=%s error_type=%s detail=%s",
+                self.transaction_provider,
+                type(acct_exc).__name__,
+                acct_exc,
+            )
+
+        self.last_poll_duration_ms = int(round((time.monotonic() - t0) * 1000.0))
         self.last_status = "healthy"
         self.last_error_detail = None
 
@@ -12144,17 +12559,25 @@ class AlpacaPositionMonitor:
         if should_log:
             self._last_logged_minute = cur_min
             self._last_logged_sig = cur_sig
+            snap = self.account_snapshot or {}
             self.logger.info(
-                "POSITIONS_SNAPSHOT provider=%s equity=%.2f cash=%.2f buying_power=%.2f "
-                "long_market_value=%.2f short_market_value=%.2f positions=%d options=%d",
+                "POSITIONS_SNAPSHOT provider=%s account=%s equity=%.2f cash=%.2f buying_power=%.2f "
+                "available=%.2f invested=%.2f today_pl=%s overall_pl=%s "
+                "long_market_value=%.2f short_market_value=%.2f positions=%d options=%d duration_ms=%s",
                 self.transaction_provider,
+                snap.get("account_number", "--"),
                 self._num(account, "equity", 0.0),
                 self._num(account, "cash", 0.0),
                 self._num(account, "buying_power", 0.0),
+                float(snap.get("available_to_invest", 0.0) or 0.0),
+                float(snap.get("balance_invested", 0.0) or 0.0),
+                f"{snap['today_pl']:.2f}" if snap.get("today_pl") is not None else "n/a",
+                f"{snap['overall_pl']:.2f}" if snap.get("overall_pl") is not None else "n/a",
                 self._num(account, "long_market_value", 0.0),
                 self._num(account, "short_market_value", 0.0),
                 len(positions),
                 len(options),
+                self.last_poll_duration_ms,
             )
 
             for position in positions:
@@ -12179,11 +12602,6 @@ class AlpacaPositionMonitor:
 
             if not options:
                 self.logger.info("OPTIONS_POSITIONS none")
-
-        if self.coordinator is not None and hasattr(self.coordinator, "option_history"):
-            self.coordinator.option_history.record_positions_snapshot(
-                positions, timestamp=self.last_poll_utc
-            )
 
     @staticmethod
     def _next_poll_target_utc(now_utc, interval_seconds):
@@ -12968,18 +13386,23 @@ class AlpacaOptionBuyer:
             self.attempted_minutes.clear()
 
         positions_loaded = False
+        loaded_positions = []
         open_contracts = set()
         open_underlyings = set()
         open_option_count = 0
         buys_this_cycle = 0
+        spent_this_cycle = 0.0
+        account_snapshot_cache = None
+        account_snapshot_loaded = False
 
         async def ensure_open_positions():
-            nonlocal positions_loaded, open_contracts, open_underlyings, open_option_count
+            nonlocal positions_loaded, loaded_positions, open_contracts, open_underlyings, open_option_count
             if positions_loaded:
                 return
             positions = list(
                 await asyncio.to_thread(self.client.get_all_positions) or []
             )
+            loaded_positions = positions
             for pos in positions:
                 if AlpacaPositionMonitor._is_option(pos):
                     open_option_count += 1
@@ -12995,6 +13418,34 @@ class AlpacaOptionBuyer:
                         if und:
                             open_underlyings.add(und)
             positions_loaded = True
+
+        async def ensure_account_snapshot():
+            nonlocal account_snapshot_cache, account_snapshot_loaded
+            if account_snapshot_loaded:
+                return account_snapshot_cache
+            pm_router = (
+                (PROVIDER_REGISTRY.get("POSITIONS_MONITOR") or {}).get("router")
+                if "PROVIDER_REGISTRY" in globals()
+                else None
+            )
+            pm_snap = getattr(pm_router, "account_snapshot", None) if pm_router else None
+            if isinstance(pm_snap, dict) and pm_snap.get("updated_utc"):
+                upd_dt = _opt_parse_utc(pm_snap.get("updated_utc"))
+                if upd_dt is not None and (now - upd_dt).total_seconds() <= 60.0:
+                    account_snapshot_cache = pm_snap
+                    account_snapshot_loaded = True
+                    return account_snapshot_cache
+            if self.client is not None:
+                acct_obj = await asyncio.to_thread(self.client.get_account)
+                account_snapshot_cache = extract_account_snapshot(
+                    acct_obj,
+                    positions=loaded_positions,
+                    provider=self.transaction_provider,
+                    coordinator=self.coordinator,
+                    now_utc=now,
+                )
+            account_snapshot_loaded = True
+            return account_snapshot_cache
 
         cap_logged = False
         for symbol in self.coordinator.symbols:
@@ -13459,8 +13910,97 @@ class AlpacaOptionBuyer:
                     else (contract_bid if contract_bid is not None else limit_price)
                 )
             )
+            acct_snap = None
+            if (
+                OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS > 0
+                or OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT > 0
+            ):
+                try:
+                    acct_snap = await ensure_account_snapshot()
+                except Exception as acct_exc:
+                    self.logger.warning(
+                        "OPTION_BUY_ACCOUNT_CHECK_FAILED symbol=%s contract=%s error_type=%s detail=%s",
+                        symbol,
+                        contract_symbol,
+                        type(acct_exc).__name__,
+                        acct_exc,
+                    )
+                    acct_snap = None
+
+            order_qty, budget_reject, budget_info = _calculate_budget_scaled_qty(
+                OPTION_BUY_QTY,
+                est_unit_price,
+                max_single_trade_dollars=OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                invest_buffer_withhold_pct=OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                available_to_invest=(
+                    acct_snap.get("available_to_invest")
+                    if isinstance(acct_snap, dict)
+                    else None
+                ),
+                balance_invested=(
+                    acct_snap.get("balance_invested")
+                    if isinstance(acct_snap, dict)
+                    else None
+                ),
+                spent_this_cycle=spent_this_cycle,
+                multiplier=100.0,
+            )
+            if budget_reject or order_qty < 1:
+                c_cost = budget_info.get("contract_cost")
+                rem_b = budget_info.get("remaining_investable_budget")
+                reject_detail = (
+                    f"{budget_reject}("
+                    f"1ct=${c_cost:.2f}" if c_cost is not None else f"{budget_reject}(1ct=n/a"
+                )
+                if OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS > 0:
+                    reject_detail += f",single_cap=${OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS:.2f}"
+                if rem_b is not None:
+                    reject_detail += f",rem_budget=${rem_b:.2f},withhold={OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT:.1f}%"
+                reject_detail += ")"
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    reject_detail,
+                    contract_symbol=contract_symbol,
+                )
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=%s desired_qty=%d "
+                    "contract_cost=%s single_cap=%.2f remaining_budget=%s withhold_pct=%.1f%%",
+                    symbol,
+                    contract_symbol,
+                    budget_reject or "budget_limit",
+                    OPTION_BUY_QTY,
+                    _fmt_log_total(c_cost),
+                    OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                    _fmt_log_total(rem_b),
+                    OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                )
+                continue
+
+            if budget_info.get("scaled_down"):
+                reason = f"{reason}|qty_scaled({OPTION_BUY_QTY}->{order_qty}:{budget_info.get('scale_reason')})"
+                self.logger.info(
+                    "OPTION_BUY_QTY_SCALED_DOWN symbol=%s contract=%s orig_qty=%d scaled_qty=%d "
+                    "unit_price=%s contract_cost=%s total_purchase=%s single_cap=%.2f "
+                    "remaining_budget=%s withhold_pct=%.1f%% reason=%s",
+                    symbol,
+                    contract_symbol,
+                    OPTION_BUY_QTY,
+                    order_qty,
+                    _fmt_log_price(est_unit_price),
+                    _fmt_log_total(budget_info.get("contract_cost")),
+                    _fmt_log_total(_compute_order_total(est_unit_price, order_qty, is_option=True)),
+                    OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                    _fmt_log_total(budget_info.get("remaining_investable_budget")),
+                    OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                    budget_info.get("scale_reason"),
+                )
+
             total_purchase = _compute_order_total(
-                est_unit_price, OPTION_BUY_QTY, is_option=True
+                est_unit_price, order_qty, is_option=True
             )
 
             if OPTION_BUY_DRY_RUN:
@@ -13470,7 +14010,7 @@ class AlpacaOptionBuyer:
                         tt_dry_res = await asyncio.to_thread(
                             self.client.dry_run_order,
                             contract_symbol,
-                            OPTION_BUY_QTY,
+                            order_qty,
                             "buy",
                             OPTION_BUY_ORDER_TYPE,
                             limit_price if OPTION_BUY_ORDER_TYPE == "limit" else None,
@@ -13489,6 +14029,8 @@ class AlpacaOptionBuyer:
                         )
                 self.dry_run_orders += 1
                 buys_this_cycle += 1
+                if total_purchase is not None and total_purchase > 0:
+                    spent_this_cycle += float(total_purchase)
                 self.last_buy_by_symbol[symbol] = now
                 self.last_order_utc = now.isoformat()
                 self.last_order_contract = contract_symbol
@@ -13512,7 +14054,7 @@ class AlpacaOptionBuyer:
                     provider,
                     symbol,
                     contract_symbol,
-                    OPTION_BUY_QTY,
+                    order_qty,
                     OPTION_BUY_ORDER_TYPE,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
@@ -13535,7 +14077,7 @@ class AlpacaOptionBuyer:
                     tt_dry_info,
                     symbol,
                     contract_symbol,
-                    OPTION_BUY_QTY,
+                    order_qty,
                     OPTION_BUY_ORDER_TYPE,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
@@ -13551,7 +14093,7 @@ class AlpacaOptionBuyer:
                     order = await asyncio.to_thread(
                         self._submit_option_order,
                         contract_symbol,
-                        OPTION_BUY_QTY,
+                        order_qty,
                         eff_buy_limit,
                         False,
                     )
@@ -13579,23 +14121,47 @@ class AlpacaOptionBuyer:
                         )
                         if fallback_lp is None:
                             raise
+                        fb_qty, fb_reject, _ = _calculate_budget_scaled_qty(
+                            order_qty,
+                            fallback_lp,
+                            max_single_trade_dollars=OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                            invest_buffer_withhold_pct=OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                            available_to_invest=(
+                                acct_snap.get("available_to_invest")
+                                if isinstance(acct_snap, dict)
+                                else None
+                            ),
+                            balance_invested=(
+                                acct_snap.get("balance_invested")
+                                if isinstance(acct_snap, dict)
+                                else None
+                            ),
+                            spent_this_cycle=spent_this_cycle,
+                            multiplier=100.0,
+                        )
+                        if fb_reject or fb_qty < 1:
+                            raise ValueError(
+                                f"fallback_limit_exceeds_budget:{fb_reject or 'budget_limit'}@limit={fallback_lp:.2f}"
+                            )
+                        order_qty = fb_qty
                         eff_buy_order_type = "limit"
                         eff_buy_limit = fallback_lp
                         est_unit_price = fallback_lp
                         total_purchase = _compute_order_total(
-                            est_unit_price, OPTION_BUY_QTY, is_option=True
+                            est_unit_price, order_qty, is_option=True
                         )
                         self.logger.warning(
                             "OPTION_BUY_MARKET_FALLBACK_TO_LIMIT symbol=%s contract=%s "
-                            "limit_price=%.2f reason=no_available_quote",
+                            "qty=%d limit_price=%.2f reason=no_available_quote",
                             symbol,
                             contract_symbol,
+                            order_qty,
                             fallback_lp,
                         )
                         order = await asyncio.to_thread(
                             self._submit_option_order,
                             contract_symbol,
-                            OPTION_BUY_QTY,
+                            order_qty,
                             fallback_lp,
                             True,
                         )
@@ -13609,7 +14175,7 @@ class AlpacaOptionBuyer:
                     filled_avg if filled_avg is not None else est_unit_price
                 )
                 actual_total_purchase = _compute_order_total(
-                    actual_unit_price, OPTION_BUY_QTY, is_option=True
+                    actual_unit_price, order_qty, is_option=True
                 )
                 exec_at = datetime.now(UTC)
                 raw_submitted = getattr(order, "submitted_at", None) or getattr(
@@ -13632,6 +14198,13 @@ class AlpacaOptionBuyer:
 
                 self.orders_submitted += 1
                 buys_this_cycle += 1
+                committed_amt = (
+                    actual_total_purchase
+                    if actual_total_purchase is not None
+                    else total_purchase
+                )
+                if committed_amt is not None and committed_amt > 0:
+                    spent_this_cycle += float(committed_amt)
                 self.last_error_detail = None
                 open_option_count += 1
                 open_contracts.add(contract_symbol)
@@ -13645,7 +14218,7 @@ class AlpacaOptionBuyer:
                     symbol=symbol,
                     executed_at=exec_at,
                     contract=contract_symbol,
-                    qty=OPTION_BUY_QTY,
+                    qty=order_qty,
                     order_id=order_id,
                     trigger_minute=minute_key,
                     reason=reason,
@@ -13661,7 +14234,7 @@ class AlpacaOptionBuyer:
                     self.coordinator.option_history.record_buy(
                         contract=contract_symbol,
                         underlying=symbol,
-                        qty=OPTION_BUY_QTY,
+                        qty=order_qty,
                         entry_price=actual_unit_price,
                         executed_at=exec_at,
                         order_id=order_id,
@@ -13691,7 +14264,7 @@ class AlpacaOptionBuyer:
                     provider,
                     symbol,
                     contract_symbol,
-                    OPTION_BUY_QTY,
+                    order_qty,
                     eff_buy_order_type,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
@@ -13713,7 +14286,7 @@ class AlpacaOptionBuyer:
                     order_id,
                     symbol,
                     contract_symbol,
-                    OPTION_BUY_QTY,
+                    order_qty,
                     eff_buy_order_type,
                     _fmt_log_price(contract_bid),
                     _fmt_log_price(contract_ask),
@@ -18734,6 +19307,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     Inject Bar
                 </button>
 
+                <button id="btnOpenDocs" onclick="openDocsModal()" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 rounded-lg text-xs font-semibold transition flex items-center gap-1" title="View Project Documentation (.md)">
+                    <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+                    Docs
+                </button>
+
                 <button id="btnRefresh" onclick="fetchAllData()" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
                     <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                 </button>
@@ -19220,12 +19798,44 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="posMonitorOption" class="mono font-semibold text-slate-200">0</span>
                         </div>
 
-                        <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
-                            <span class="text-slate-400">Last Telemetry Poll</span>
-                            <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-400">--</span>
+                        <div class="flex justify-between items-center gap-2 p-2 rounded-xl bg-slate-950/50 border border-slate-800/80">
+                            <span class="text-slate-400 shrink-0">Last Telemetry Poll</span>
+                            <span id="posMonitorLastPoll" class="mono text-[11px] text-slate-300 text-right truncate">--</span>
                         </div>
 
                         <div id="posMonitorErrorRow" class="hidden px-2.5 py-1.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-[10px] font-mono text-rose-300 break-words"></div>
+
+                        <div id="tradingAccountCard" class="p-2.5 rounded-xl bg-slate-950/50 border border-slate-800/80 space-y-1.5">
+                            <div class="flex justify-between items-center gap-2 pb-1 border-b border-slate-800/70">
+                                <span class="text-slate-300 font-medium flex items-center gap-1.5">
+                                    <span>Trading Account</span>
+                                    <span id="acctProviderBadge" class="text-[9px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-semibold uppercase tracking-wide">--</span>
+                                </span>
+                                <span id="acctNumberVal" class="mono text-[11px] font-semibold text-slate-200 truncate text-right">--</span>
+                            </div>
+                            <div class="space-y-1 text-[11px] mono">
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-400 font-sans">Available to Invest</span>
+                                    <span id="acctAvailableVal" class="font-semibold text-cyan-300">--</span>
+                                </div>
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-400 font-sans">Balance Invested</span>
+                                    <span id="acctInvestedVal" class="font-semibold text-slate-200">--</span>
+                                </div>
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-400 font-sans">Today's P/L</span>
+                                    <span id="acctTodayPlVal" class="font-semibold text-slate-400">--</span>
+                                </div>
+                                <div class="flex justify-between items-center gap-2">
+                                    <span class="text-slate-400 font-sans">Overall P/L</span>
+                                    <span id="acctOverallPlVal" class="font-semibold text-slate-400">--</span>
+                                </div>
+                            </div>
+                            <div id="acctBudgetFoot" class="pt-1 border-t border-slate-800/70 text-[10px] mono text-slate-500 flex justify-between items-center gap-2">
+                                <span id="acctTradeCapFoot">Trade Cap --</span>
+                                <span id="acctBufferFoot">Buf --</span>
+                            </div>
+                        </div>
 
                         <div onclick="openOptionDrilldown('buyer')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openOptionDrilldown('buyer');}" class="group cursor-pointer p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-cyan-500/50 hover:bg-slate-900/80 transition space-y-1">
                             <div class="flex justify-between items-center gap-2">
@@ -19517,6 +20127,46 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Project Documentation (.md) Viewer Modal -->
+    <div id="docsModal" onclick="if(event.target===this) closeDocsModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-7xl w-full h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-cyan-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">System Documentation</h3>
+                        <span id="docsActiveFileBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-cyan-300 border border-slate-700">--</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
+                    </div>
+                    <p id="docsRootSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Loading documentation directory...</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="btnDocsToggleRaw" type="button" onclick="toggleDocsRawMode()" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-[11px] font-semibold transition">
+                        Raw MD
+                    </button>
+                    <button type="button" onclick="refreshDocsModal()" class="px-2.5 py-1 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/35 text-cyan-300 border border-cyan-500/40 text-[11px] font-semibold transition">
+                        Refresh
+                    </button>
+                    <button type="button" onclick="closeDocsModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div class="flex-1 min-h-0 flex flex-col lg:flex-row overflow-hidden">
+                <aside class="w-full lg:w-72 shrink-0 border-b lg:border-b-0 lg:border-r border-slate-800 bg-slate-950/40 flex flex-col max-h-48 lg:max-h-full overflow-hidden">
+                    <div class="px-3.5 py-2 border-b border-slate-800 text-[10px] font-bold uppercase tracking-wider text-slate-400 flex justify-between items-center">
+                        <span>Markdown Files</span>
+                        <span id="docsCountBadge" class="mono text-slate-500">0</span>
+                    </div>
+                    <div id="docsFileList" class="flex-1 overflow-y-auto p-2 space-y-1">
+                        <div class="text-xs text-slate-500 p-3 text-center mono">Loading files...</div>
+                    </div>
+                </aside>
+                <div id="docsContentPane" class="flex-1 min-w-0 overflow-y-auto p-5 sm:p-7 bg-[#0a1020]">
+                    <div class="text-xs text-slate-500 text-center py-12 mono">Select a documentation file to view...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- JavaScript Application Engine -->
     <script>
         const DASHBOARD_AUTH_ENABLED = ('__DASHBOARD_AUTH_ENABLED__' === 'true');
@@ -19715,6 +20365,39 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 // fallback to browser local time if timezone string unsupported
             }
             return d.toLocaleTimeString([], fmtOpts);
+        }
+
+        function fmtTzDateShort(raw) {
+            if (!raw) return '';
+            const d = raw instanceof Date ? raw : new Date(raw);
+            if (Number.isNaN(d.getTime())) return '';
+            const fmtOpts = { month: 'short', day: '2-digit' };
+            try {
+                if (displayTzIana) {
+                    return new Intl.DateTimeFormat('en-US', { ...fmtOpts, timeZone: displayTzIana }).format(d);
+                }
+            } catch (_) {
+                // fallback
+            }
+            return d.toLocaleDateString('en-US', fmtOpts);
+        }
+
+        function fmtCurrency(v) {
+            const n = safeNum(v);
+            if (n === null) return '--';
+            const sign = n < 0 ? '-' : '';
+            return sign + '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function fmtSignedPl(dollars, pct) {
+            const d = safeNum(dollars);
+            if (d === null) return { text: '--', cls: 'font-semibold text-slate-400' };
+            const sign = d >= 0 ? '+' : '-';
+            const absStr = Math.abs(d).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const p = safeNum(pct);
+            const pctStr = p !== null ? ` (${p >= 0 ? '+' : ''}${p.toFixed(2)}%)` : '';
+            const cls = d > 0 ? 'font-semibold text-emerald-400' : (d < 0 ? 'font-semibold text-rose-400' : 'font-semibold text-slate-300');
+            return { text: `${sign}$${absStr}${pctStr}`, cls };
         }
 
         const REGIME_CONFIG = {
@@ -20092,7 +20775,21 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }`;
                 document.getElementById('posMonitorEquity').textContent = pm.active_equity_positions ?? 0;
                 document.getElementById('posMonitorOption').textContent = pm.active_option_positions ?? 0;
-                document.getElementById('posMonitorLastPoll').textContent = pm.last_poll_utc ? `${fmtTzClock(pm.last_poll_utc, { second: '2-digit' })} ${displayTzAbbr}` : '--';
+                const pollEl = document.getElementById('posMonitorLastPoll');
+                if (pm.last_poll_utc) {
+                    const dStr = fmtTzDateShort(pm.last_poll_utc);
+                    const tStr = fmtTzClock(pm.last_poll_utc, { second: '2-digit' });
+                    const metaParts = [];
+                    if (safeNum(pm.poll_count) !== null && pm.poll_count > 0) metaParts.push(`#${pm.poll_count}`);
+                    if (safeNum(pm.poll_interval_seconds) !== null) metaParts.push(`${pm.poll_interval_seconds}s`);
+                    if (safeNum(pm.last_poll_duration_ms) !== null) metaParts.push(`${pm.last_poll_duration_ms}ms`);
+                    const suffix = metaParts.length ? ` · ${metaParts.join(' · ')}` : '';
+                    pollEl.textContent = `${dStr ? dStr + ' ' : ''}${tStr} ${displayTzAbbr}${suffix}`;
+                    pollEl.title = `Provider: ${String(pm.provider || '--').toUpperCase()} | Poll #${pm.poll_count ?? 0} | Cadence: ${pm.poll_interval_seconds ?? '--'}s | Latency: ${pm.last_poll_duration_ms ?? '--'}ms | UTC: ${pm.last_poll_utc}`;
+                } else {
+                    pollEl.textContent = '--';
+                    pollEl.title = '';
+                }
                 const pmErrEl = document.getElementById('posMonitorErrorRow');
                 if (pmErrEl) {
                     const errTxt = pm.last_error_detail || (pm.provider && (pmSt === 'disabled' || String(pmSt).includes('error')) ? `${pm.provider}: ${pmSt}` : '');
@@ -20103,6 +20800,62 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         pmErrEl.textContent = '';
                         pmErrEl.classList.add('hidden');
                     }
+                }
+                const acct = pm.account || null;
+                const badgeEl = document.getElementById('acctProviderBadge');
+                const numEl = document.getElementById('acctNumberVal');
+                const availEl = document.getElementById('acctAvailableVal');
+                const invEl = document.getElementById('acctInvestedVal');
+                const todayPlEl = document.getElementById('acctTodayPlVal');
+                const overallPlEl = document.getElementById('acctOverallPlVal');
+                const capFootEl = document.getElementById('acctTradeCapFoot');
+                const bufFootEl = document.getElementById('acctBufferFoot');
+                if (badgeEl) {
+                    const provLbl = String((acct && acct.provider) || pm.provider || '--').toUpperCase();
+                    const envLbl = acct && acct.env ? ` · ${String(acct.env).toUpperCase()}` : '';
+                    badgeEl.textContent = `${provLbl}${envLbl}`;
+                }
+                if (acct) {
+                    if (numEl) {
+                        numEl.textContent = acct.account_number || '--';
+                        numEl.title = `Account: ${acct.account_number || '--'} | Equity: ${fmtCurrency(acct.equity)} | Cash: ${fmtCurrency(acct.cash)} | Buying Power: ${fmtCurrency(acct.buying_power)}`;
+                    }
+                    if (availEl) {
+                        availEl.textContent = fmtCurrency(acct.available_to_invest);
+                        availEl.title = `Available to invest: ${fmtCurrency(acct.available_to_invest)} | Cash: ${fmtCurrency(acct.cash)} | Buying Power: ${fmtCurrency(acct.buying_power)}`;
+                    }
+                    if (invEl) {
+                        invEl.textContent = fmtCurrency(acct.balance_invested);
+                        invEl.title = `Balance invested: ${fmtCurrency(acct.balance_invested)} | Max allowed (${Number(acct.invest_buffer_withhold_pct ?? 0).toFixed(1)}% buffer): ${fmtCurrency(acct.max_investable_balance)}`;
+                    }
+                    if (todayPlEl) {
+                        const tFmt = fmtSignedPl(acct.today_pl, acct.today_pl_pct);
+                        todayPlEl.textContent = tFmt.text;
+                        todayPlEl.className = tFmt.cls;
+                        todayPlEl.title = `Today's P/L source: ${acct.today_pl_source || 'broker'}`;
+                    }
+                    if (overallPlEl) {
+                        const oFmt = fmtSignedPl(acct.overall_pl, acct.overall_pl_pct);
+                        overallPlEl.textContent = oFmt.text;
+                        overallPlEl.className = oFmt.cls;
+                        overallPlEl.title = `Open Unrealized: ${fmtCurrency(acct.open_unrealized_pl)} | Closed Realized: ${fmtCurrency(acct.closed_realized_pl)}`;
+                    }
+                    if (capFootEl) {
+                        const cap = safeNum(acct.max_single_trade_dollars);
+                        capFootEl.textContent = cap !== null && cap > 0 ? `Trade Cap ${fmtCurrency(cap)}` : 'Trade Cap Off';
+                    }
+                    if (bufFootEl) {
+                        const wp = safeNum(acct.invest_buffer_withhold_pct);
+                        const rem = safeNum(acct.remaining_investable_budget);
+                        bufFootEl.textContent = `Buf ${wp !== null ? wp.toFixed(0) : 0}% · Left ${fmtCurrency(rem)}`;
+                        bufFootEl.title = `Max Investable: ${fmtCurrency(acct.max_investable_balance)} | Remaining Budget: ${fmtCurrency(rem)}`;
+                    }
+                } else {
+                    if (numEl) numEl.textContent = '--';
+                    if (availEl) availEl.textContent = '--';
+                    if (invEl) invEl.textContent = '--';
+                    if (todayPlEl) { todayPlEl.textContent = '--'; todayPlEl.className = 'font-semibold text-slate-400'; }
+                    if (overallPlEl) { overallPlEl.textContent = '--'; overallPlEl.className = 'font-semibold text-slate-400'; }
                 }
             }
             if (m.option_buyer) {
@@ -24004,8 +24757,367 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             `;
         }
 
+        // --- Documentation (.md) Viewer Modal (Escape-First Safe Markdown Renderer) ---
+        let _docsFilesList = [];
+        let _docsActiveId = null;
+        let _docsActiveContent = '';
+        let _docsRawMode = false;
+        let _docsRootPath = '';
+
+        function _docEsc(s) {
+            return String(s ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function _docSlug(text) {
+            return String(text || '')
+                .toLowerCase()
+                .replace(/`([^`]+)`/g, '$1')
+                .replace(/[^\w\s-]/g, '')
+                .trim()
+                .replace(/\s+/g, '-');
+        }
+
+        function _renderInlineMd(rawText) {
+            const codeSpans = [];
+            let s = String(rawText || '').replace(/`([^`]+)`/g, (_, code) => {
+                const idx = codeSpans.length;
+                codeSpans.push(`<code class="px-1.5 py-0.5 rounded bg-slate-800/90 text-cyan-300 border border-slate-700/70 mono text-[11px]">${_docEsc(code)}</code>`);
+                return `\u0000CODE${idx}\u0000`;
+            });
+            s = _docEsc(s);
+            // Links: [label](url) - validate schemes strictly and route local .md / #anchor safely
+            s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, rawHref) => {
+                const href = rawHref.replace(/&amp;/g, '&').trim();
+                if (href.startsWith('#')) {
+                    const anchor = href.slice(1);
+                    return `<button type="button" data-doc-anchor="${_docEsc(anchor)}" class="text-cyan-400 hover:text-cyan-300 underline decoration-cyan-500/40 underline-offset-2 cursor-pointer">${label}</button>`;
+                }
+                const mdMatch = href.match(/^([./A-Za-z0-9_-]+\.md)(#[^#]*)?$/i);
+                if (mdMatch) {
+                    const targetPath = mdMatch[1];
+                    const anchor = (mdMatch[2] || '').replace(/^#/, '');
+                    return `<button type="button" data-doc-link="${_docEsc(targetPath)}" data-doc-anchor="${_docEsc(anchor)}" class="text-indigo-300 hover:text-indigo-200 underline decoration-indigo-400/50 underline-offset-2 cursor-pointer">${label}</button>`;
+                }
+                if (/^https?:\/\//i.test(href)) {
+                    return `<a href="${_docEsc(href)}" target="_blank" rel="noopener noreferrer" class="text-cyan-400 hover:text-cyan-300 underline decoration-cyan-500/40 underline-offset-2">${label}</a>`;
+                }
+                return label;
+            });
+            s = s.replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold text-white">$1</strong>');
+            s = s.replace(/\*([^*]+)\*/g, '<em class="italic text-slate-200">$1</em>');
+            s = s.replace(/\u0000CODE(\d+)\u0000/g, (_, idx) => codeSpans[Number(idx)] || '');
+            return s;
+        }
+
+        function renderSafeMarkdown(mdText) {
+            const lines = String(mdText || '').replace(/\r\n/g, '\n').split('\n');
+            const out = [];
+            let i = 0;
+            const slugCounts = {};
+            const nextSlug = (rawHeading) => {
+                const base = _docSlug(rawHeading) || 'section';
+                const n = slugCounts[base] || 0;
+                slugCounts[base] = n + 1;
+                return n === 0 ? base : `${base}-${n}`;
+            };
+
+            while (i < lines.length) {
+                const line = lines[i];
+                const trimmed = line.trim();
+
+                // Fenced code blocks
+                const fenceMatch = trimmed.match(/^```([A-Za-z0-9_+-]*)/);
+                if (fenceMatch) {
+                    const lang = fenceMatch[1] || '';
+                    i += 1;
+                    const codeLines = [];
+                    while (i < lines.length && !lines[i].trim().startsWith('```')) {
+                        codeLines.push(lines[i]);
+                        i += 1;
+                    }
+                    if (i < lines.length) i += 1;
+                    out.push(
+                        `<div class="my-3 rounded-xl border border-slate-800 bg-slate-950/90 overflow-hidden">` +
+                        (lang ? `<div class="px-3 py-1 bg-slate-900/90 border-b border-slate-800 text-[10px] mono uppercase tracking-wider text-slate-400">${_docEsc(lang)}</div>` : '') +
+                        `<pre class="p-3.5 overflow-x-auto text-[11.5px] leading-relaxed mono text-slate-200"><code>${_docEsc(codeLines.join('\n'))}</code></pre></div>`
+                    );
+                    continue;
+                }
+
+                // Blank line
+                if (!trimmed) {
+                    i += 1;
+                    continue;
+                }
+
+                // Horizontal rule
+                if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+                    out.push('<hr class="my-5 border-slate-800/90" />');
+                    i += 1;
+                    continue;
+                }
+
+                // Headings
+                const hMatch = line.match(/^(#{1,6})\s+(.*)$/);
+                if (hMatch) {
+                    const level = hMatch[1].length;
+                    const text = hMatch[2].replace(/\s+#+\s*$/, '').trim();
+                    const slug = nextSlug(text);
+                    const clsMap = {
+                        1: 'text-xl font-extrabold text-white mt-2 mb-3 pb-2 border-b border-slate-800',
+                        2: 'text-base font-bold text-indigo-200 mt-6 mb-2.5 pb-1.5 border-b border-slate-800/80',
+                        3: 'text-sm font-bold text-cyan-200 mt-4 mb-2',
+                        4: 'text-xs font-bold uppercase tracking-wider text-slate-300 mt-3.5 mb-1.5',
+                        5: 'text-xs font-semibold text-slate-300 mt-3 mb-1',
+                        6: 'text-xs font-semibold text-slate-400 mt-2.5 mb-1',
+                    };
+                    out.push(`<h${level} id="doc-h-${_docEsc(slug)}" class="${clsMap[level] || clsMap[4]}">${_renderInlineMd(text)}</h${level}>`);
+                    i += 1;
+                    continue;
+                }
+
+                // Markdown tables
+                if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+                    const splitRow = (r) => r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+                    const headers = splitRow(line);
+                    i += 2;
+                    const rows = [];
+                    while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+                        rows.push(splitRow(lines[i]));
+                        i += 1;
+                    }
+                    const thHtml = headers.map((h) => `<th class="px-3 py-2 text-left text-[11px] font-semibold text-slate-200 bg-slate-900/90 border-b border-slate-800">${_renderInlineMd(h)}</th>`).join('');
+                    const tbHtml = rows.map((r) => `<tr class="border-b border-slate-800/60 hover:bg-slate-900/40">${headers.map((_, ci) => `<td class="px-3 py-2 text-[11.5px] text-slate-300 align-top">${_renderInlineMd(r[ci] || '')}</td>`).join('')}</tr>`).join('');
+                    out.push(`<div class="my-3 overflow-x-auto rounded-xl border border-slate-800/90"><table class="w-full border-collapse">${`<thead><tr>${thHtml}</tr></thead><tbody>${tbHtml}</tbody>`}</table></div>`);
+                    continue;
+                }
+
+                // Blockquotes
+                if (trimmed.startsWith('>')) {
+                    const qLines = [];
+                    while (i < lines.length && lines[i].trim().startsWith('>')) {
+                        qLines.push(lines[i].trim().replace(/^>\s?/, ''));
+                        i += 1;
+                    }
+                    out.push(`<blockquote class="my-3 pl-3.5 pr-3 py-2 border-l-2 border-cyan-500/70 bg-slate-900/60 rounded-r-lg text-xs text-slate-300 space-y-1">${qLines.map((q) => `<p>${_renderInlineMd(q)}</p>`).join('')}</blockquote>`);
+                    continue;
+                }
+
+                // Unordered / ordered lists
+                if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+                    const isOrdered = /^\s*\d+\.\s+/.test(line);
+                    const tag = isOrdered ? 'ol' : 'ul';
+                    const listCls = isOrdered ? 'list-decimal' : 'list-disc';
+                    const items = [];
+                    while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+                        items.push(lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, ''));
+                        i += 1;
+                    }
+                    out.push(`<${tag} class="my-2.5 pl-5 ${listCls} space-y-1 text-xs text-slate-300 leading-relaxed">${items.map((it) => `<li>${_renderInlineMd(it)}</li>`).join('')}</${tag}>`);
+                    continue;
+                }
+
+                // Paragraph
+                const pLines = [];
+                while (
+                    i < lines.length &&
+                    lines[i].trim() &&
+                    !lines[i].trim().startsWith('```') &&
+                    !/^(#{1,6})\s+/.test(lines[i]) &&
+                    !lines[i].trim().startsWith('>') &&
+                    !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
+                    !/^(-{3,}|\*{3,}|_{3,})$/.test(lines[i].trim())
+                ) {
+                    pLines.push(lines[i].trim());
+                    i += 1;
+                }
+                out.push(`<p class="my-2 text-xs sm:text-[13px] text-slate-300 leading-relaxed">${_renderInlineMd(pLines.join(' '))}</p>`);
+            }
+            return `<article class="max-w-4xl mx-auto pb-8">${out.join('\n')}</article>`;
+        }
+
+        function _resolveRelativeDocId(rawLink) {
+            const clean = String(rawLink || '').trim().replace(/^\.\//, '').replace(/^\.\.\//, '');
+            const byExact = _docsFilesList.find((f) => f.id.toLowerCase() === clean.toLowerCase());
+            if (byExact) return byExact.id;
+            const base = clean.split('/').pop().toLowerCase();
+            const byBase = _docsFilesList.find((f) => f.filename.toLowerCase() === base);
+            return byBase ? byBase.id : null;
+        }
+
+        function _scrollDocsToAnchor(anchor) {
+            if (!anchor) return;
+            const pane = document.getElementById('docsContentPane');
+            if (!pane) return;
+            const target = pane.querySelector(`#doc-h-${CSS.escape(_docSlug(anchor))}`) || pane.querySelector(`#doc-h-${CSS.escape(anchor)}`);
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function renderDocsFileList() {
+            const listEl = document.getElementById('docsFileList');
+            const countEl = document.getElementById('docsCountBadge');
+            if (countEl) countEl.textContent = String(_docsFilesList.length);
+            if (!listEl) return;
+            if (!_docsFilesList.length) {
+                listEl.innerHTML = `<div class="text-[11px] text-slate-500 p-3 text-center mono">No .md files found</div>`;
+                return;
+            }
+            listEl.innerHTML = _docsFilesList.map((f) => {
+                const active = f.id === _docsActiveId;
+                const kb = Math.max(0.1, (Number(f.size_bytes || 0) / 1024)).toFixed(1);
+                return `<button type="button" data-doc-select="${_docEsc(f.id)}" class="w-full text-left px-3 py-2 rounded-xl border transition ${
+                    active
+                        ? 'bg-cyan-500/15 border-cyan-500/40 text-white'
+                        : 'bg-slate-900/50 border-slate-800/70 text-slate-300 hover:bg-slate-800/70 hover:text-white'
+                }">
+                    <div class="text-xs font-semibold truncate">${_docEsc(f.title || f.filename)}</div>
+                    <div class="flex justify-between items-center gap-2 mt-0.5 text-[10px] mono text-slate-400">
+                        <span class="truncate">${_docEsc(f.id)}</span>
+                        <span class="shrink-0">${kb} KB</span>
+                    </div>
+                </button>`;
+            }).join('');
+        }
+
+        function renderDocsContent(anchorToScroll = '') {
+            const pane = document.getElementById('docsContentPane');
+            const badge = document.getElementById('docsActiveFileBadge');
+            const rawBtn = document.getElementById('btnDocsToggleRaw');
+            if (badge) badge.textContent = _docsActiveId || '--';
+            if (rawBtn) {
+                rawBtn.textContent = _docsRawMode ? 'Rendered' : 'Raw MD';
+                rawBtn.className = _docsRawMode
+                    ? 'px-2.5 py-1 rounded-lg bg-indigo-600/30 text-indigo-200 border border-indigo-500/50 text-[11px] font-semibold transition'
+                    : 'px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-[11px] font-semibold transition';
+            }
+            if (!pane) return;
+            if (!_docsActiveId) {
+                pane.innerHTML = `<div class="max-w-2xl mx-auto py-10 text-center space-y-2">
+                    <div class="text-sm font-semibold text-slate-200">No Markdown documentation files found</div>
+                    <p class="text-xs text-slate-400">Place <span class="mono text-cyan-300">README.md</span> and <span class="mono text-cyan-300">docs/*.md</span> inside the application directory on the server running <span class="mono text-slate-200">multiStreamRSI.py</span>:</p>
+                    <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 mono text-[11px] text-cyan-300 break-all">${_docEsc(_docsRootPath || '(unresolved)')}</div>
+                </div>`;
+                return;
+            }
+            if (_docsRawMode) {
+                pane.innerHTML = `<pre class="max-w-5xl mx-auto p-4 rounded-xl bg-slate-950 border border-slate-800 text-[11.5px] leading-relaxed mono text-slate-200 whitespace-pre-wrap break-words">${_docEsc(_docsActiveContent)}</pre>`;
+            } else {
+                pane.innerHTML = renderSafeMarkdown(_docsActiveContent);
+            }
+            if (anchorToScroll && !_docsRawMode) {
+                requestAnimationFrame(() => _scrollDocsToAnchor(anchorToScroll));
+            } else {
+                pane.scrollTop = 0;
+            }
+        }
+
+        async function loadDocFile(docId, anchorToScroll = '') {
+            const pane = document.getElementById('docsContentPane');
+            if (pane) {
+                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Loading ${_docEsc(docId)}...</div>`;
+            }
+            try {
+                const res = await fetch(`/api/docs?file=${encodeURIComponent(docId)}`, { cache: 'no-store' });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'ok') {
+                    throw new Error(data.message || `HTTP ${res.status}`);
+                }
+                if (Array.isArray(data.files)) _docsFilesList = data.files;
+                if (data.docs_root) _docsRootPath = data.docs_root;
+                _docsActiveId = (data.file && data.file.id) || docId;
+                _docsActiveContent = String(data.content || '');
+                const sub = document.getElementById('docsRootSubtitle');
+                if (sub) sub.textContent = `Server docs directory: ${_docsRootPath}`;
+                renderDocsFileList();
+                renderDocsContent(anchorToScroll);
+            } catch (err) {
+                if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-300 text-center py-12 mono">Failed to load document: ${_docEsc(err.message || err)}</div>`;
+                }
+            }
+        }
+
+        async function openDocsModal(initialDocId = '') {
+            const modal = document.getElementById('docsModal');
+            if (modal) modal.classList.remove('hidden');
+            await refreshDocsModal(initialDocId);
+        }
+
+        async function refreshDocsModal(preferredDocId = '') {
+            const pane = document.getElementById('docsContentPane');
+            try {
+                const res = await fetch('/api/docs', { cache: 'no-store' });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'ok') {
+                    throw new Error(data.message || `HTTP ${res.status}`);
+                }
+                _docsFilesList = Array.isArray(data.files) ? data.files : [];
+                _docsRootPath = data.docs_root || '';
+                const sub = document.getElementById('docsRootSubtitle');
+                if (sub) sub.textContent = `Server docs directory: ${_docsRootPath || '(not found)'}`;
+                renderDocsFileList();
+                const targetId = preferredDocId || (_docsFilesList.some((f) => f.id === _docsActiveId) ? _docsActiveId : (_docsFilesList[0] ? _docsFilesList[0].id : ''));
+                if (targetId) {
+                    await loadDocFile(targetId);
+                } else {
+                    _docsActiveId = null;
+                    _docsActiveContent = '';
+                    renderDocsContent();
+                }
+            } catch (err) {
+                if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-300 text-center py-12 mono">Unable to fetch documentation catalog: ${_docEsc(err.message || err)}</div>`;
+                }
+            }
+        }
+
+        function toggleDocsRawMode() {
+            _docsRawMode = !_docsRawMode;
+            renderDocsContent();
+        }
+
+        function closeDocsModal() {
+            const modal = document.getElementById('docsModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        document.getElementById('docsFileList')?.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-doc-select]');
+            if (btn) {
+                const id = btn.getAttribute('data-doc-select');
+                if (id) loadDocFile(id);
+            }
+        });
+
+        document.getElementById('docsContentPane')?.addEventListener('click', (e) => {
+            const linkBtn = e.target.closest('[data-doc-link]');
+            if (linkBtn) {
+                const targetId = _resolveRelativeDocId(linkBtn.getAttribute('data-doc-link'));
+                const anchor = linkBtn.getAttribute('data-doc-anchor') || '';
+                if (targetId) {
+                    loadDocFile(targetId, anchor);
+                } else {
+                    showToast(`Document not found on server: ${linkBtn.getAttribute('data-doc-link')}`, 'error');
+                }
+                return;
+            }
+            const anchorBtn = e.target.closest('[data-doc-anchor]');
+            if (anchorBtn) {
+                _scrollDocsToAnchor(anchorBtn.getAttribute('data-doc-anchor') || '');
+            }
+        });
+
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
+                const docsModal = document.getElementById('docsModal');
+                if (docsModal && !docsModal.classList.contains('hidden')) {
+                    closeDocsModal();
+                }
                 const strikeModal = document.getElementById('strikeAnalysisModal');
                 if (strikeModal && !strikeModal.classList.contains('hidden')) {
                     closeStrikeAnalysisModal();
@@ -25591,6 +26703,145 @@ def analyze_option_chain_strikes(
     }
 
 
+_DOCS_PREFERRED_ORDER = (
+    "README.md",
+    "docs/TRADING_ALGORITHMS_AND_RISK.md",
+    "docs/FRONTEND_DASHBOARD.md",
+    "docs/DEPLOYMENT_AND_OPERATIONS.md",
+    "docs/CONFIGURATION_AND_API_REFERENCE.md",
+)
+_DOCS_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+
+def _resolve_docs_catalog():
+    """Discover allowlisted Markdown documentation files (README.md and docs/*.md)
+    using strict root-directory path confinement."""
+    candidates = []
+    env_dir = os.getenv("DOCS_DIR", "").strip()
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+    base_dir = _get_app_base_dir()
+    candidates.append(base_dir)
+    if base_dir.parent != base_dir:
+        candidates.append(base_dir.parent)
+
+    checked_paths = []
+    chosen_root = None
+    discovered = {}
+
+    def _scan_root(root_dir, include_direct_md=False):
+        found = {}
+        try:
+            root_resolved = root_dir.resolve()
+        except Exception:
+            return None, found
+        if not root_resolved.is_dir():
+            return root_resolved, found
+        root_prefix = str(root_resolved) + os.sep
+
+        # 1) Top-level README.md
+        readme_p = root_resolved / "README.md"
+        try:
+            if readme_p.is_file():
+                r_res = readme_p.resolve()
+                if str(r_res).startswith(root_prefix) and r_res.suffix.lower() == ".md":
+                    found["README.md"] = r_res
+        except Exception:
+            pass
+
+        # 2) docs/*.md
+        docs_sub = root_resolved / "docs"
+        try:
+            if docs_sub.is_dir():
+                sub_res = docs_sub.resolve()
+                sub_prefix = str(sub_res) + os.sep
+                if str(sub_res).startswith(root_prefix):
+                    for child in sorted(sub_res.iterdir(), key=lambda p: p.name.lower()):
+                        if (
+                            child.name.startswith(".")
+                            or not child.is_file()
+                            or child.suffix.lower() != ".md"
+                        ):
+                            continue
+                        c_res = child.resolve()
+                        if str(c_res).startswith(sub_prefix):
+                            found[f"docs/{child.name}"] = c_res
+        except Exception:
+            pass
+
+        # 3) If DOCS_DIR points directly to a folder of .md files, include them safely
+        if include_direct_md and not found:
+            try:
+                for child in sorted(root_resolved.iterdir(), key=lambda p: p.name.lower()):
+                    if (
+                        child.name.startswith(".")
+                        or not child.is_file()
+                        or child.suffix.lower() != ".md"
+                    ):
+                        continue
+                    c_res = child.resolve()
+                    if str(c_res).startswith(root_prefix):
+                        found[child.name] = c_res
+            except Exception:
+                pass
+        return root_resolved, found
+
+    for idx_c, cand in enumerate(candidates):
+        r_res, found = _scan_root(cand, include_direct_md=bool(env_dir and idx_c == 0))
+        if r_res is not None:
+            checked_paths.append(str(r_res))
+        if found:
+            chosen_root = r_res
+            discovered = found
+            break
+
+    if chosen_root is None:
+        chosen_root = base_dir.resolve() if base_dir.exists() else base_dir
+
+    order_index = {doc_id: idx for idx, doc_id in enumerate(_DOCS_PREFERRED_ORDER)}
+    sorted_ids = sorted(
+        discovered.keys(),
+        key=lambda k: (order_index.get(k, 999), k.lower()),
+    )
+
+    items = []
+    by_id = {}
+    for doc_id in sorted_ids:
+        fpath = discovered[doc_id]
+        try:
+            st = fpath.stat()
+            if st.st_size > _DOCS_MAX_FILE_BYTES:
+                continue
+            title = fpath.stem.replace("_", " ").title()
+            with fpath.open("r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(25):
+                    ln = fh.readline()
+                    if not ln:
+                        break
+                    s_ln = ln.strip()
+                    if s_ln.startswith("# "):
+                        title = s_ln[2:].strip()
+                        break
+            meta = {
+                "id": doc_id,
+                "filename": fpath.name,
+                "title": title,
+                "size_bytes": int(st.st_size),
+                "modified_utc": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
+            }
+            items.append(meta)
+            by_id[doc_id] = (fpath, meta)
+        except Exception as exc:
+            logging.warning("DOCS_CATALOG_SKIP file=%s detail=%s", doc_id, exc)
+
+    return {
+        "docs_root": str(chosen_root),
+        "search_paths": checked_paths,
+        "items": items,
+        "by_id": by_id,
+    }
+
+
 class AdminCliProvider:
     _AUTH_COOKIE_NAME = "msi_dashboard_auth"
     _AUTH_MAX_FAILURES = 10
@@ -26151,7 +27402,7 @@ class AdminCliProvider:
                 return (
                     jsonify(
                         status="error",
-                        message="Strike Analyzer is disabled ([feature_toggles] strike_analyzer_enabled=false)",
+                        message="Strike Analyzer is disabled ([dashboard] strike_analyzer_enabled=false)",
                     ),
                     403,
                 )
@@ -26171,6 +27422,65 @@ class AdminCliProvider:
                 return jsonify(status="ok", run_id=RUN_ID, **result), 200
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
+
+        @app.get("/api/docs")
+        def get_project_docs():
+            try:
+                catalog = _resolve_docs_catalog()
+                req_file = str(request.args.get("file") or "").strip()
+                if not req_file:
+                    return (
+                        jsonify(
+                            status="ok",
+                            docs_root=catalog["docs_root"],
+                            search_paths=catalog["search_paths"],
+                            files=catalog["items"],
+                        ),
+                        200,
+                    )
+                # Strict allowlist lookup only (blocks path traversal and non-.md reads)
+                clean_key = req_file.replace("\\", "/").lstrip("./")
+                match_entry = catalog["by_id"].get(clean_key)
+                if match_entry is None:
+                    # Case-insensitive exact match against allowlisted IDs only
+                    low = clean_key.lower()
+                    for k, v in catalog["by_id"].items():
+                        if k.lower() == low:
+                            match_entry = v
+                            break
+                if match_entry is None:
+                    return (
+                        jsonify(
+                            status="error",
+                            message="Documentation file not found",
+                            docs_root=catalog["docs_root"],
+                            files=catalog["items"],
+                        ),
+                        404,
+                    )
+                fpath, meta = match_entry
+                root_prefix = str(Path(catalog["docs_root"]).resolve()) + os.sep
+                resolved = fpath.resolve()
+                if (
+                    not resolved.is_file()
+                    or resolved.suffix.lower() != ".md"
+                    or not str(resolved).startswith(root_prefix)
+                ):
+                    return jsonify(status="error", message="Invalid documentation path"), 403
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+                return (
+                    jsonify(
+                        status="ok",
+                        docs_root=catalog["docs_root"],
+                        file=meta,
+                        content=content,
+                        files=catalog["items"],
+                    ),
+                    200,
+                )
+            except Exception as exc:
+                logging.warning("DOCS_API_ERROR error_type=%s detail=%s", type(exc).__name__, exc)
+                return jsonify(status="error", message="Failed to load documentation"), 500
 
         @app.post("/api/option-history/refresh")
         def refresh_option_history():
@@ -26232,9 +27542,23 @@ class AdminCliProvider:
                     getattr(pm, "last_error_detail", None) if pm else None
                 ),
                 "last_poll_utc": pm.last_poll_utc if pm else None,
+                "poll_count": getattr(pm, "poll_count", 0) if pm else 0,
+                "last_poll_duration_ms": (
+                    getattr(pm, "last_poll_duration_ms", None) if pm else None
+                ),
+                "poll_interval_seconds": (
+                    getattr(pm, "poll_interval_seconds", OPTION_POSITION_POLL_SECONDS)
+                    if pm
+                    else OPTION_POSITION_POLL_SECONDS
+                ),
                 "active_equity_positions": pm.equity_count if pm else 0,
                 "active_option_positions": pm.option_count if pm else 0,
                 "active_total_positions": pm.position_count if pm else 0,
+                "account": (
+                    dict(pm.account_snapshot)
+                    if (pm and isinstance(getattr(pm, "account_snapshot", None), dict))
+                    else None
+                ),
             }
             option_buyer_report = {
                 "status": ob.last_status if ob else "not_loaded",
@@ -26250,6 +27574,8 @@ class AdminCliProvider:
                 "cached_contracts": len(self.coordinator.option_chain_cache),
                 "oversold_lookback_minutes": OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
                 "bounce_rsi_max": OPTION_BUY_BOUNCE_RSI_MAX,
+                "max_single_trade_dollars": OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                "invest_buffer_withhold_pct": OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
                 "history_summary": (
                     self.coordinator.option_history.get_buyer_summary()
                     if hasattr(self.coordinator, "option_history")

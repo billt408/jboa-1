@@ -357,7 +357,8 @@ setup_instance2() {
         "${INST2_DIR}/logs/optionchains" \
         "${INST2_DIR}/logs/positions" \
         "${INST2_DIR}/logs/charts" \
-        "${INST2_DIR}/certs"
+        "${INST2_DIR}/certs" \
+        "${INST2_DIR}/docs"
 
     ${SUDO} cp -f "${INST1_DIR}/multiStreamRSI.py" "${INST2_DIR}/multiStreamRSI.py"
     if [[ -f "${INST1_DIR}/findthewinners.py" ]]; then
