@@ -124,7 +124,7 @@ QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
 # Semantic version: major.minor.build — increment build on every multiStreamRSI.py edit;
 # change major/minor only when explicitly requested.
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 def _get_app_base_dir():
     """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
@@ -159,6 +159,12 @@ LOG_ROOT = _resolve_log_root()
 MINUTE = timedelta(minutes=1)
 UTC = timezone.utc
 SUMMARY_DELAY_SECONDS = float(os.getenv("SUMMARY_DELAY_SECONDS", "45"))
+EARLY_FINALIZE_ON_COMPLETE = os.getenv(
+    "EARLY_FINALIZE_ON_COMPLETE", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+EARLY_FINALIZE_MIN_DELAY_SECONDS = float(
+    os.getenv("EARLY_FINALIZE_MIN_DELAY_SECONDS", "2.0")
+)
 SUMMARY_TO_CONSOLE = os.getenv("SUMMARY_TO_CONSOLE", "true").lower() in {
     "1",
     "true",
@@ -5946,15 +5952,40 @@ class MinuteCoordinator:
     """
 
     def __init__(
-        self, providers, symbols, start=None, delay=SUMMARY_DELAY_SECONDS, emit=None
+        self,
+        providers,
+        symbols,
+        start=None,
+        delay=None,
+        emit=None,
+        early_finalize_on_complete=None,
+        early_finalize_min_delay=None,
     ):
-        if not math.isfinite(delay) or not 0 <= delay <= 3600:
+        delay_val = SUMMARY_DELAY_SECONDS if delay is None else float(delay)
+        if not math.isfinite(delay_val) or not 0 <= delay_val <= 3600:
             raise ValueError("SUMMARY_DELAY_SECONDS must be between 0 and 3600")
+        early_flag = (
+            EARLY_FINALIZE_ON_COMPLETE
+            if early_finalize_on_complete is None
+            else bool(early_finalize_on_complete)
+        )
+        early_min_val = (
+            EARLY_FINALIZE_MIN_DELAY_SECONDS
+            if early_finalize_min_delay is None
+            else float(early_finalize_min_delay)
+        )
+        if not math.isfinite(early_min_val) or early_min_val < 0:
+            early_min_val = 0.0
+        early_min_val = min(early_min_val, delay_val)
         self.providers = tuple(dict.fromkeys(providers))
         self.symbols = tuple(dict.fromkeys(symbols))
         if not self.providers or not self.symbols:
             raise ValueError("Coordinator requires providers and symbols")
-        self.delay = timedelta(seconds=delay)
+        self.delay = timedelta(seconds=delay_val)
+        self.early_finalize_on_complete = bool(early_flag)
+        self.early_finalize_min_delay = timedelta(seconds=early_min_val)
+        self.early_finalized_count = 0
+        self.last_finalize_latency_seconds = None
         self.started_at = as_utc(start or datetime.now(UTC))
         self.report_start = next_session_minute(self.started_at)
         self.next_minute = self.report_start
@@ -6774,11 +6805,52 @@ class MinuteCoordinator:
 
         return base
 
+    def _can_finalize_early(self, minute, now):
+        """Return True when early finalization is enabled, the minimum settling
+        floor after minute close has elapsed, at least one active connected
+        provider applies to this minute, and every connected provider has a
+        completed candidate for every configured symbol.
+
+        For bar/webhook feeds (Alpaca, TradingView, Yahoo, etc.) a candidate
+        with kind in {'bar', 'webhook'} proves closure. For streaming tick
+        feeds (e.g., Tastytrade DXLink developing candles), either a post-close
+        'bar' or a subsequent-minute (minute + 1m) tick/bar proves closure.
+        """
+        if not self.early_finalize_on_complete:
+            return False
+        if now < minute + MINUTE + self.early_finalize_min_delay:
+            return False
+        is_rth = regular_session(minute)
+        required_providers = [
+            p
+            for p in self.providers
+            if self.connected.get(p) and (p != "TRADINGVIEW" or is_rth)
+        ]
+        if not required_providers:
+            return False
+        next_min = minute + MINUTE
+        for provider in required_providers:
+            for symbol in self.symbols:
+                cand = self.pending.get((provider, symbol, minute))
+                if cand is None:
+                    return False
+                if cand.kind in {"bar", "webhook"}:
+                    continue
+                if (provider, symbol, next_min) not in self.pending:
+                    return False
+        return True
+
     def finalize_due(self, now=None):
         now = as_utc(now or datetime.now(UTC))
         emitted = 0
-        while now >= self.next_minute + MINUTE + self.delay:
+        while True:
             minute = self.next_minute
+            due_by_deadline = now >= minute + MINUTE + self.delay
+            due_by_early = (not due_by_deadline) and self._can_finalize_early(
+                minute, now
+            )
+            if not due_by_deadline and not due_by_early:
+                break
             local = minute.astimezone(MARKET_TZ)
             for provider in self.providers:
                 symbols_data = {
@@ -6864,6 +6936,7 @@ class MinuteCoordinator:
                     "minute_end_utc": (minute + MINUTE).isoformat(),
                     "deadline_utc": (minute + MINUTE + self.delay).isoformat(),
                     "emitted_at_utc": now.isoformat(),
+                    "finalized_early": bool(due_by_early),
                     "connection_at_emission": (
                         "connected" if self.connected[provider] else "disconnected"
                     ),
@@ -6874,6 +6947,11 @@ class MinuteCoordinator:
                 self.emit(record)
                 self.late_counts[provider] = 0
                 emitted += 1
+            if due_by_early:
+                self.early_finalized_count += 1
+            self.last_finalize_latency_seconds = round(
+                max(0.0, (now - (minute + MINUTE)).total_seconds()), 2
+            )
             self.last_finalized = minute
             if hasattr(self, "option_history") and self.option_history is not None:
                 self.option_history.refresh_stock_prices_for_minute(minute)
@@ -8921,6 +8999,7 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_HISTORY_MAX_BARS, OPTION_HISTORY_PRE_ENTRY_MINUTES
     global OPTION_POSITION_POLL_SECONDS
     global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
+    global SUMMARY_DELAY_SECONDS, EARLY_FINALIZE_ON_COMPLETE, EARLY_FINALIZE_MIN_DELAY_SECONDS
     global OPTION_CHAIN_RSI_LOW, OPTION_CHAIN_RSI_HIGH
     global ALPACA_PAPER, OPTION_BUY_ENABLED, OPTION_BUY_DRY_RUN
     global OPTION_BUY_QTY, OPTION_BUY_ORDER_TYPE, OPTION_BUY_COOLDOWN_MINUTES
@@ -9171,6 +9250,80 @@ def _apply_ini_feature_settings(cfg):
             f"[kinematics] rsi_session must be extended or regular; got {rsi_sess!r}"
         )
     RSI_SESSION_MODE = rsi_sess
+
+    if cfg.has_option("kinematics", "summary_delay_seconds"):
+        summary_delay = _ini_float(
+            cfg, "kinematics", "summary_delay_seconds", "SUMMARY_DELAY_SECONDS", 45.0
+        )
+    elif cfg.has_option("general", "summary_delay_seconds"):
+        summary_delay = _ini_float(
+            cfg, "general", "summary_delay_seconds", "SUMMARY_DELAY_SECONDS", 45.0
+        )
+    else:
+        summary_delay = _ini_float(
+            cfg, "kinematics", "summary_delay_seconds", "SUMMARY_DELAY_SECONDS", 45.0
+        )
+    if not math.isfinite(summary_delay) or not 0.0 <= summary_delay <= 3600.0:
+        raise ValueError(
+            f"[kinematics] summary_delay_seconds must be between 0 and 3600; got {summary_delay!r}"
+        )
+    SUMMARY_DELAY_SECONDS = float(summary_delay)
+
+    if cfg.has_option("kinematics", "early_finalize_on_complete"):
+        early_fin = _ini_bool(
+            cfg,
+            "kinematics",
+            "early_finalize_on_complete",
+            "EARLY_FINALIZE_ON_COMPLETE",
+            False,
+        )
+    elif cfg.has_option("general", "early_finalize_on_complete"):
+        early_fin = _ini_bool(
+            cfg,
+            "general",
+            "early_finalize_on_complete",
+            "EARLY_FINALIZE_ON_COMPLETE",
+            False,
+        )
+    else:
+        early_fin = _ini_bool(
+            cfg,
+            "kinematics",
+            "early_finalize_on_complete",
+            "EARLY_FINALIZE_ON_COMPLETE",
+            False,
+        )
+    EARLY_FINALIZE_ON_COMPLETE = bool(early_fin)
+
+    if cfg.has_option("kinematics", "early_finalize_min_delay_seconds"):
+        early_min = _ini_float(
+            cfg,
+            "kinematics",
+            "early_finalize_min_delay_seconds",
+            "EARLY_FINALIZE_MIN_DELAY_SECONDS",
+            2.0,
+        )
+    elif cfg.has_option("general", "early_finalize_min_delay_seconds"):
+        early_min = _ini_float(
+            cfg,
+            "general",
+            "early_finalize_min_delay_seconds",
+            "EARLY_FINALIZE_MIN_DELAY_SECONDS",
+            2.0,
+        )
+    else:
+        early_min = _ini_float(
+            cfg,
+            "kinematics",
+            "early_finalize_min_delay_seconds",
+            "EARLY_FINALIZE_MIN_DELAY_SECONDS",
+            2.0,
+        )
+    if not math.isfinite(early_min) or early_min < 0.0:
+        raise ValueError(
+            f"[kinematics] early_finalize_min_delay_seconds must be >= 0; got {early_min!r}"
+        )
+    EARLY_FINALIZE_MIN_DELAY_SECONDS = min(float(early_min), SUMMARY_DELAY_SECONDS)
 
     if cfg.has_option("alpaca_api", "feed"):
         alpaca_feed_raw = (
@@ -9851,7 +10004,7 @@ def _apply_ini_feature_settings(cfg):
         "FEATURE_CONFIG owner=%s tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s chain_cd=%ds chain_pace=%.2fs chain_greeks=%s "
         "dashboard=%s:%d webhook=%s:%d "
-        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
+        "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d summary_delay=%.1fs early_finalize=%s(min=%.1fs) opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d "
         "max_single_trade=$%.2f invest_buf=%.1f%% buy_entry_mode=%s buy_sel_mode=%s buy_delta=%.2f[%.2f..%.2f] "
@@ -9881,6 +10034,9 @@ def _apply_ini_feature_settings(cfg):
         KINEMATICS_RSI_OVERBOUGHT,
         KINEMATICS_RSI_OVERSOLD,
         KINEMATICS_HISTORY_MAX_BARS,
+        SUMMARY_DELAY_SECONDS,
+        EARLY_FINALIZE_ON_COMPLETE,
+        EARLY_FINALIZE_MIN_DELAY_SECONDS,
         OPTION_HISTORY_MAX_BARS,
         OPTION_HISTORY_PRE_ENTRY_MINUTES,
         OPTION_POSITION_POLL_SECONDS,
@@ -29210,6 +29366,15 @@ class AdminCliProvider:
                 "next_finalize_utc": (
                     self.coordinator.next_minute + MINUTE + self.coordinator.delay
                 ).isoformat(),
+                "summary_delay_seconds": float(self.coordinator.delay.total_seconds()),
+                "early_finalize_on_complete": bool(
+                    self.coordinator.early_finalize_on_complete
+                ),
+                "early_finalize_min_delay_seconds": float(
+                    self.coordinator.early_finalize_min_delay.total_seconds()
+                ),
+                "early_finalized_count": int(self.coordinator.early_finalized_count),
+                "last_finalize_latency_seconds": self.coordinator.last_finalize_latency_seconds,
                 "server_time_utc": datetime.now(UTC).isoformat(),
                 "pending_queue_size": len(self.coordinator.pending),
                 "loaded_providers": [
@@ -29718,11 +29883,13 @@ async def main():
     cli_admin = AdminCliProvider(coordinator, host=DASHBOARD_HOST, port=DASHBOARD_PORT)
 
     logging.info(
-        "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s",
+        "STARTUP providers=%s symbols=%s first_minute=%s delay_seconds=%s early_finalize=%s early_min_delay_s=%s",
         selected,
         symbols,
         coordinator.report_start.isoformat(),
         SUMMARY_DELAY_SECONDS,
+        EARLY_FINALIZE_ON_COMPLETE,
+        EARLY_FINALIZE_MIN_DELAY_SECONDS,
     )
 
     # 3. Initialize background providers (share one option-chain client so nested-chain & OAuth caches are reused)

@@ -69,7 +69,7 @@ flowchart TB
     end
 
     subgraph Core["Central State & Quant Engine"]
-        MC["MinuteCoordinator<br/>Single Event-Loop Owner<br/>SessionRSI · HMA/EMA · v & a · P̂(t+1)<br/>finalizes at minute + 45s delay"]
+        MC["MinuteCoordinator<br/>Single Event-Loop Owner<br/>SessionRSI · HMA/EMA · v & a · P̂(t+1)<br/>finalizes at summary_delay_seconds (45s) or early on complete"]
         OHT["OptionContractHistoryTracker<br/>Open/Closed Contracts · 1m Marks · P/L<br/>Disk Cache & Broker Startup Backfill"]
     end
 

@@ -17,6 +17,13 @@
 
 ---
 
+## `v0.1.11` — 2026-11-22
+- **Configurable Finalization Delay (`[kinematics] summary_delay_seconds`):** Exposed `SUMMARY_DELAY_SECONDS` (default `45.0`s, range `0`–`3600`s) in `lib/parms.ini` under `[kinematics]` (with `[general]` and env fallbacks) and fixed `MinuteCoordinator.__init__()` to read the runtime INI-loaded value rather than the import-time default.
+- **Optional Early Finalization (`early_finalize_on_complete`):** Added `[kinematics] early_finalize_on_complete` (default `false`) and `early_finalize_min_delay_seconds` (default `2.0`s) in `MinuteCoordinator._can_finalize_early()`, allowing streaming feeds (Alpaca / Tastytrade DXLink) to finalize in ~2–3 seconds once every connected provider reports every configured symbol while preserving `summary_delay_seconds` as a safety deadline.
+- **Telemetry & Docs Updated:** Added `finalized_early` to `MINUTE_SUMMARY` JSONL records, exposed early-finalization metrics (`summary_delay_seconds`, `early_finalize_on_complete`, `early_finalized_count`, `last_finalize_latency_seconds`) in `/cli/status`, and updated `README.md`, `docs/CONFIGURATION_AND_API_REFERENCE.md`, and `docs/TRADING_ALGORITHMS_AND_RISK.md`.
+
+---
+
 ## `v0.1.10` — 2026-11-22
 - **Broker-Agnostic Task & Class Rename (`multiStreamRSI.py`):** Renamed `AlpacaPositionMonitor` → `PositionMonitor`, `AlpacaOptionBuyer` → `OptionBuyer`, and `AlpacaOptionSeller` → `OptionSeller` (plus asyncio task names `POSITION_MONITOR`, `OPTION_BUYER`, `OPTION_SELLER`) to accurately reflect shared Alpaca and Tastytrade execution via `build_trading_client()`.
 - **Backwards-Compatible Aliases:** Retained module-level aliases (`AlpacaPositionMonitor`, `AlpacaOptionBuyer`, `AlpacaOptionSeller`) so any external script importing the legacy names continues to work without changes.

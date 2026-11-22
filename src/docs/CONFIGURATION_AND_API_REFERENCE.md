@@ -126,6 +126,9 @@ flowchart LR
 | `history_max_bars` | `KINEMATICS_HISTORY_MAX_BARS` | Int (min `60`) | `2400` | Maximum 1-minute kinematic bars retained in RAM per `(provider, symbol)` feed (~6.15 regular trading days). |
 | `rsi_warmup_sessions` | `RSI_WARMUP_SESSIONS` | Int (min `0`) | `5` | Number of prior trading sessions fetched at startup to converge Wilder RSI(14) before emitting live minutes (`0` disables pre-warmup). |
 | `rsi_session` | `RSI_SESSION_MODE` | `extended` (`eth`,`ext`,`all`) \| `regular` (`rth`,`reg`) | `extended` | Controls whether RSI warmup & live updates include Extended Trading Hours (04:00–20:00 ET) or restrict strictly to Regular Trading Hours (09:30–16:00 ET). |
+| `summary_delay_seconds` | `SUMMARY_DELAY_SECONDS` | Float (`0`–`3600`) | `45.0` | Maximum safety-deadline delay (in seconds) after a 1-minute bar closes before `MinuteCoordinator` finalizes the minute and triggers `RsiOptionChainCollector`, `OptionBuyer`, and `OptionSeller` (also accepted in `[general]`). For streaming-only feeds (Alpaca/Tastytrade), `10`–`15`s is typical; keep `40`–`45`s if `YAHOOFINANCE` is enabled. |
+| `early_finalize_on_complete` | `EARLY_FINALIZE_ON_COMPLETE` | Bool | `false` | When `true`, finalizes the minute as soon as `early_finalize_min_delay_seconds` has elapsed **and** every currently connected provider has reported a completed candle for every tracked symbol (falling back to `summary_delay_seconds` if any symbol is missing or slow). |
+| `early_finalize_min_delay_seconds` | `EARLY_FINALIZE_MIN_DELAY_SECONDS` | Float (`>= 0`, clamped to `<= summary_delay_seconds`) | `2.0` | Minimum settling delay after `:00` minute close before `early_finalize_on_complete` is permitted to fire (e.g., `2.0`–`3.0`s so late ticks/revisions settle cleanly). |
 
 ### 2.7 Section `option_history`: Ledger and Position Polling
 
@@ -310,6 +313,9 @@ rsi_oversold = 30.0
 history_max_bars = 2400
 rsi_warmup_sessions = 5
 rsi_session = extended
+summary_delay_seconds = 45
+early_finalize_on_complete = false
+early_finalize_min_delay_seconds = 2.0
 
 [option_history]
 history_max_bars = 2400
