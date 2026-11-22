@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Manage and run 2 concurrent JBOA-RSI instances from one terminal window:
-#   1) user=billt | root=/home/billt/jboa-1/src | ports=5000/5001 | provider=alpaca   (READ-ONLY  NEVER modified)
+#   1) user=billt | root=/home/billt/jboa-1/src | ports=5000/5001 | provider=alpaca   (READ-ONLY — NEVER modified)
 #   2) user=jboa  | root=/home/jboa             | ports=6000/6001 | provider=tastytrade
 #
 # Usage:
@@ -11,14 +11,14 @@
 #   ./sh/run_dual_instances.sh --run2 [--bg]         # run ONLY instance 2 (jboa, 6000/6001)
 #   ./sh/run_dual_instances.sh --stop1               # stop ONLY instance 1
 #   ./sh/run_dual_instances.sh --stop2               # stop ONLY instance 2
-#   ./sh/run_dual_instances.sh --stop-all            # stop both instances
+#   ./sh/run_dual_instances.sh --stop-all            # stop both instances (loops until fully stopped)
 #   ./sh/run_dual_instances.sh --status              # show running status, PIDs, ports & logs
 #   ./sh/run_dual_instances.sh --clean2 [--yes]      # remove all instance 2 artifacts under /home/jboa
 #   Add --skip-firewall-check to bypass firewalld dashboard-port validation.
 
 set -euo pipefail
 
-# --- Instance 1 (existing Alpaca config  NEVER modified or cleaned by this script) ---
+# --- Instance 1 (existing Alpaca config — NEVER modified or cleaned by this script) ---
 readonly INST1_USER="billt"
 readonly INST1_DIR="/home/billt/jboa-1/src"
 readonly INST1_WEBHOOK_PORT=5000
@@ -225,27 +225,48 @@ pid_matches_instance() {
     [[ "${puser}" == "${expected_user}" && "${cmdline}" == *"multiStreamRSI.py"* ]]
 }
 
-# Find active PID for an instance (PID file first, then pgrep fallback)
-find_instance_pid() {
+# Find all active PIDs for an instance (PID file + pgrep, deduplicated)
+find_instance_pids() {
     local user="$1"
     local pid_file="$2"
+    local -a pids=()
+    local -A seen=()
 
     if [[ -f "${pid_file}" ]]; then
         local fpid
         fpid="$(tr -d '[:space:]' < "${pid_file}" 2>/dev/null || true)"
         if pid_matches_instance "${fpid}" "${user}"; then
-            echo "${fpid}"
-            return 0
+            pids+=("${fpid}")
+            seen["${fpid}"]=1
         fi
     fi
 
     if id "${user}" &>/dev/null; then
         local gpid
-        gpid="$(pgrep -u "${user}" -f "multiStreamRSI\.py" 2>/dev/null | head -n 1 || true)"
-        if [[ -n "${gpid}" ]]; then
-            echo "${gpid}"
-            return 0
-        fi
+        while IFS= read -r gpid; do
+            [[ -n "${gpid}" ]] || continue
+            if [[ -z "${seen["${gpid}"]:-}" ]] && pid_matches_instance "${gpid}" "${user}"; then
+                pids+=("${gpid}")
+                seen["${gpid}"]=1
+            fi
+        done < <(pgrep -u "${user}" -f "multiStreamRSI\.py" 2>/dev/null || true)
+    fi
+
+    if [[ "${#pids[@]}" -eq 0 ]]; then
+        return 1
+    fi
+    printf '%s\n' "${pids[@]}"
+}
+
+# Find first active PID for an instance (PID file first, then pgrep fallback)
+find_instance_pid() {
+    local user="$1"
+    local pid_file="$2"
+    local first_pid=""
+    first_pid="$(find_instance_pids "${user}" "${pid_file}" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${first_pid}" ]]; then
+        echo "${first_pid}"
+        return 0
     fi
     return 1
 }
@@ -255,9 +276,12 @@ stop_instance() {
     local user="$2"
     local pid_file="$3"
 
-    local pid=""
-    pid="$(find_instance_pid "${user}" "${pid_file}" || true)"
-    if [[ -z "${pid}" ]]; then
+    local -a pids=()
+    while IFS= read -r p; do
+        [[ -n "${p}" ]] && pids+=("${p}")
+    done < <(find_instance_pids "${user}" "${pid_file}" 2>/dev/null || true)
+
+    if [[ "${#pids[@]}" -eq 0 ]]; then
         log "${label} (${user}) is not running."
         rm -f "${pid_file}" 2>/dev/null || ${SUDO:+${SUDO} rm -f "${pid_file}" 2>/dev/null} || true
         return 0
@@ -269,26 +293,101 @@ stop_instance() {
         kill_prefix="${SUDO}"
     fi
 
-    log "Stopping ${label} (${user}, PID=${pid})..."
-    ${kill_prefix} kill -TERM "${pid}" 2>/dev/null || true
+    log "Stopping ${label} (${user}, PID(s)=${pids[*]})..."
+    for pid in "${pids[@]}"; do
+        ${kill_prefix} kill -TERM "${pid}" 2>/dev/null || true
+    done
 
     local waited=0
     while [[ "${waited}" -lt 20 ]]; do
-        if ! ps -p "${pid}" >/dev/null 2>&1; then
-            break
-        fi
+        local any_alive=0
+        for pid in "${pids[@]}"; do
+            if ps -p "${pid}" >/dev/null 2>&1; then
+                any_alive=1
+                break
+            fi
+        done
+        [[ "${any_alive}" -eq 0 ]] && break
         sleep 0.5
         waited=$((waited + 1))
     done
 
-    if ps -p "${pid}" >/dev/null 2>&1; then
-        log "${label} (PID=${pid}) did not exit after 10s; sending SIGKILL..."
-        ${kill_prefix} kill -KILL "${pid}" 2>/dev/null || true
+    local -a stubborn=()
+    for pid in "${pids[@]}"; do
+        if ps -p "${pid}" >/dev/null 2>&1; then
+            stubborn+=("${pid}")
+        fi
+    done
+
+    if [[ "${#stubborn[@]}" -gt 0 ]]; then
+        log "${label} (PID(s)=${stubborn[*]}) did not exit after 10s; sending SIGKILL..."
+        for pid in "${stubborn[@]}"; do
+            ${kill_prefix} kill -KILL "${pid}" 2>/dev/null || true
+        done
         sleep 0.5
     fi
 
     ${kill_prefix} rm -f "${pid_file}" 2>/dev/null || rm -f "${pid_file}" 2>/dev/null || true
-    log "${label} (${user}) stopped."
+    log "${label} (${user}) stop signal sequence complete."
+}
+
+instance_is_stopped() {
+    local user="$1"
+    local pid_file="$2"
+    local wport="$3"
+    local dport="$4"
+
+    if find_instance_pids "${user}" "${pid_file}" >/dev/null 2>&1; then
+        return 1
+    fi
+    if port_is_listening "${wport}" || port_is_listening "${dport}"; then
+        return 1
+    fi
+    return 0
+}
+
+stop_all_instances() {
+    local pass=0
+    while true; do
+        pass=$((pass + 1))
+
+        if find_instance_pids "${INST1_USER}" "${INST1_PID_FILE}" >/dev/null 2>&1; then
+            stop_instance "Instance 1" "${INST1_USER}" "${INST1_PID_FILE}"
+        elif [[ "${pass}" -eq 1 ]]; then
+            log "Instance 1 (${INST1_USER}) is not running."
+            rm -f "${INST1_PID_FILE}" 2>/dev/null || ${SUDO:+${SUDO} rm -f "${INST1_PID_FILE}" 2>/dev/null} || true
+        fi
+
+        if find_instance_pids "${INST2_USER}" "${INST2_PID_FILE}" >/dev/null 2>&1; then
+            stop_instance "Instance 2" "${INST2_USER}" "${INST2_PID_FILE}"
+        elif [[ "${pass}" -eq 1 ]]; then
+            log "Instance 2 (${INST2_USER}) is not running."
+            rm -f "${INST2_PID_FILE}" 2>/dev/null || ${SUDO:+${SUDO} rm -f "${INST2_PID_FILE}" 2>/dev/null} || true
+        fi
+
+        if instance_is_stopped "${INST1_USER}" "${INST1_PID_FILE}" "${INST1_WEBHOOK_PORT}" "${INST1_DASH_PORT}" \
+            && instance_is_stopped "${INST2_USER}" "${INST2_PID_FILE}" "${INST2_WEBHOOK_PORT}" "${INST2_DASH_PORT}"; then
+            rm -f "${INST1_PID_FILE}" "${INST2_PID_FILE}" 2>/dev/null \
+                || ${SUDO:+${SUDO} rm -f "${INST1_PID_FILE}" "${INST2_PID_FILE}" 2>/dev/null} || true
+            log "All instances confirmed stopped (no processes running; ports ${INST1_WEBHOOK_PORT}/${INST1_DASH_PORT}/${INST2_WEBHOOK_PORT}/${INST2_DASH_PORT} closed)."
+            return 0
+        fi
+
+        local -a pending=()
+        local p1 p2
+        p1="$(find_instance_pids "${INST1_USER}" "${INST1_PID_FILE}" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+        p2="$(find_instance_pids "${INST2_USER}" "${INST2_PID_FILE}" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+        [[ -n "${p1}" ]] && pending+=("inst1_pids=${p1}")
+        [[ -n "${p2}" ]] && pending+=("inst2_pids=${p2}")
+        for pt in "${INST1_WEBHOOK_PORT}" "${INST1_DASH_PORT}" "${INST2_WEBHOOK_PORT}" "${INST2_DASH_PORT}"; do
+            if port_is_listening "${pt}"; then
+                pending+=("port:${pt}")
+            fi
+        done
+
+        log "stop-all pass ${pass}: still stopping (${pending[*]:-verifying}) — retrying in 1s..."
+        sleep 1
+    done
 }
 
 show_status() {
@@ -364,6 +463,12 @@ setup_instance2() {
     if [[ -f "${INST1_DIR}/findthewinners.py" ]]; then
         ${SUDO} cp -f "${INST1_DIR}/findthewinners.py" "${INST2_DIR}/findthewinners.py"
     fi
+    if [[ -f "${INST1_DIR}/README.md" ]]; then
+        ${SUDO} cp -f "${INST1_DIR}/README.md" "${INST2_DIR}/README.md"
+    fi
+    for docfile in "${INST1_DIR}"/docs/*.md; do
+        [[ -e "${docfile}" ]] && ${SUDO} cp -f "${docfile}" "${INST2_DIR}/docs/"
+    done
     for pyfile in "${INST1_DIR}"/lib/*.py; do
         [[ -e "${pyfile}" ]] && ${SUDO} cp -f "${pyfile}" "${INST2_DIR}/lib/"
     done
@@ -448,7 +553,7 @@ for sec, k, v in updates:
 ini_path.write_text(text, encoding="utf-8")
 PYEOF
         ${SUDO} chmod 600 "${INST2_DIR}/lib/parms.ini"
-        log "Created ${INST2_DIR}/lib/parms.ini  verify [tastytrade_api] credentials before live trading."
+        log "Created ${INST2_DIR}/lib/parms.ini — verify [tastytrade_api] credentials before live trading."
     else
         log "Keeping existing ${INST2_DIR}/lib/parms.ini (already present)."
     fi
@@ -706,7 +811,7 @@ run_instance1() {
     fi
     pid1=$!
 
-    log "Instance 1 running (PID=${pid1}). Dashboard: https://localhost:${INST1_DASH_PORT}  Press Ctrl+C to stop."
+    log "Instance 1 running (PID=${pid1}). Dashboard: https://localhost:${INST1_DASH_PORT} — Press Ctrl+C to stop."
     wait "${pid1}" || true
 }
 
@@ -744,7 +849,7 @@ run_instance2() {
         2> >(sed -u $'s/^/\033[33m[jboa:6001]\033[0m /' >&2) &
     pid2=$!
 
-    log "Instance 2 running (PID=${pid2}). Dashboard: https://localhost:${INST2_DASH_PORT}  Press Ctrl+C to stop."
+    log "Instance 2 running (PID=${pid2}). Dashboard: https://localhost:${INST2_DASH_PORT} — Press Ctrl+C to stop."
     wait "${pid2}" || true
 }
 
@@ -810,10 +915,7 @@ case "${MODE}" in
     run2)     run_instance2 ;;
     stop1)    stop_instance "Instance 1" "${INST1_USER}" "${INST1_PID_FILE}" ;;
     stop2)    stop_instance "Instance 2" "${INST2_USER}" "${INST2_PID_FILE}" ;;
-    stop_all)
-        stop_instance "Instance 1" "${INST1_USER}" "${INST1_PID_FILE}"
-        stop_instance "Instance 2" "${INST2_USER}" "${INST2_PID_FILE}"
-        ;;
+    stop_all) stop_all_instances ;;
     status)   show_status ;;
     clean2)   clean_instance2 ;;
     all)

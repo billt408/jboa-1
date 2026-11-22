@@ -11,7 +11,7 @@
 
 </div>
 
-**Navigation:** [Overview (`README.md`)](../README.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · **Configuration & API Reference**
+**Navigation:** [Overview (`README.md`)](../README.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · **Configuration & API Reference**
 
 ---
 
@@ -21,7 +21,7 @@
 2. [Complete `lib/parms.ini` and Environment Variable Reference](#2-complete-libparmsini-and-environment-variable-reference)
    - [2.1 Section `general`: Timezone and Instance Ownership](#21-section-general-timezone-and-instance-ownership)
    - [2.2 Section `symbols`: Tracked Equity Universe](#22-section-symbols-tracked-equity-universe)
-   - [2.3 Section `providers`: Market Data Feeds and Consensus Priority](#23-section-providers-market-data-feeds-and-consensus-priority)
+   - [2.3 Section `market_signal_providers`: Market Signal Feeds and Consensus Priority](#23-section-market_signal_providers-market-signal-feeds-and-consensus-priority)
    - [2.4 Sections `CREDENTIALS`, `alpaca_api`, `twelvedata_api`, `tastytrade_api`: Broker and Data Auth](#24-sections-credentials-alpaca_api-twelvedata_api-tastytrade_api-broker-and-data-auth)
    - [2.5 Section `option_trading`: Broker Routing and Chain Pacing](#25-section-option_trading-broker-routing-and-chain-pacing)
    - [2.6 Section `kinematics`: Smoothing, RSI Session Mode and Warmup](#26-section-kinematics-smoothing-rsi-session-mode-and-warmup)
@@ -76,7 +76,7 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | `target_symbols` | `TARGET_SYMBOLS` | CSV string (`AAPL,NVDA,TSLA`) or JSON array (`["AAPL","NVDA"]`) | Built-in default list | Defines the exact ticker universe subscribed across all enabled streams, warmed up at startup, and tracked in `MinuteCoordinator`. Normalized to uppercase. |
 
-### 2.3 Section `providers`: Market Data Feeds and Consensus Priority
+### 2.3 Section `market_signal_providers`: Market Signal Feeds and Consensus Priority
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -109,7 +109,7 @@ flowchart LR
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
 | `optionchainprovider` | `OPTION_CHAIN_PROVIDER` | `alpaca` \| `tastytrade` | `alpaca` | Strictly selects the option-chain data source. **Zero silent cross-broker fallback.** |
-| `transactionprovider` | `OPTION_TRANSACTION_PROVIDER` | `alpaca` \| `tastytrade` | `alpaca` | Strictly selects the execution broker for `AlpacaPositionMonitor`, `AlpacaOptionBuyer`, and `AlpacaOptionSeller`. **Zero silent cross-broker fallback.** |
+| `transactionprovider` | `OPTION_TRANSACTION_PROVIDER` | `alpaca` \| `tastytrade` | `alpaca` | Strictly selects the execution broker for `PositionMonitor`, `OptionBuyer`, and `OptionSeller`. **Zero silent cross-broker fallback.** |
 | `chain_cooldown_seconds` | `OPTION_CHAIN_RSI_COOLDOWN_SECONDS` | Float ($\ge 0$) | `0` | Per-symbol cooldown between RSI-triggered option chain JSON captures in `RsiOptionChainCollector`. |
 | `chain_pacing_seconds` | `OPTION_CHAIN_PACING_SECONDS` | Float ($\ge 0$) | `0.20` | Minimum inter-request spacing between option-chain HTTP fetches to avoid broker rate limits. |
 | `chain_429_backoff_seconds` | `OPTION_CHAIN_429_BACKOFF_SECONDS` | Float (min `5.0`) | `20.0` | Cooldown pause applied globally to option-chain fetches after receiving an HTTP `429 Too Many Requests`. |
@@ -133,13 +133,13 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | `history_max_bars` | `OPTION_HISTORY_MAX_BARS` | Int (min `60`) | `KINEMATICS_HISTORY_MAX_BARS` (`2400`) | Max 1-minute option price bars kept per contract in `OptionContractHistoryTracker`. |
 | `pre_entry_lookback_minutes` | `OPTION_HISTORY_PRE_ENTRY_LOOKBACK_MINUTES` | Int (min `0`) | `390` | Minutes of historical option prices backfilled *prior* to contract entry for drilldown chart context (`390` = 1 full RTH day). |
-| `position_poll_seconds` | `POSITION_POLL_SECONDS` | Int (clamped `5`–`60`) | `15` | Broker account position polling interval in `AlpacaPositionMonitor`. |
+| `position_poll_seconds` | `POSITION_POLL_SECONDS` | Int (clamped `5`–`60`) | `15` | Broker account position polling interval in `PositionMonitor`. |
 
 ### 2.8 Section `option_buyer`: Entry Guardrails, Sizing and Pricing
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
-| `enabled` | `OPTION_BUY_ENABLED` | Bool | `true` | Master enable switch for `AlpacaOptionBuyer`. |
+| `enabled` | `OPTION_BUY_ENABLED` | Bool | `true` | Master enable switch for `OptionBuyer`. |
 | `dry_run` | `OPTION_BUY_DRY_RUN` | Bool | `true` | When `true`, evaluates all filters and logs simulated `BUY` fills into `OptionContractHistoryTracker` without sending broker orders. |
 | `paper` | `ALPACA_PAPER` | Bool | `true` | Selects Alpaca Paper (`true`) vs. Live (`false`) endpoint when `transactionprovider = alpaca`. |
 | `rsi_low` | `OPTION_BUY_RSI_LOW` | Float | `35.0` | Oversold RSI threshold triggering option-chain capture and qualifying a symbol's oversold lookback window. |
@@ -161,13 +161,23 @@ flowchart LR
 | `max_buys_per_minute` | `OPTION_BUY_MAX_BUYS_PER_MINUTE` | Int | `1` | Hard rate limit on maximum buy orders submitted in a single minute boundary. |
 | `max_single_trade_dollars` | `OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS` | Float (min `0.0`) | `8000.0` | Maximum dollar value of a single buy trade (`unit_price × qty × 100`); auto-scales whole contract `qty` down (min `1`) or rejects if even 1 contract exceeds the cap (`0` disables). |
 | `invest_buffer_withhold_pct` | `OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT` | Float (`0.0`–`100.0`) | `10.0` | Reserve buffer percentage withheld from total investable capital (`available + invested`); auto-scales whole contract `qty` down (min `1`) or rejects so invested balance never exceeds `(1 - withhold_pct/100)` of total investable balance. |
-| `allowed_forecasts` | `OPTION_BUY_ALLOWED_FORECASTS` | CSV of forecast codes | `bullish_reversal,bullish_continuation,bullish_momentum` | Whitelist of Forecast Matrix signals permitted to enter long Call positions. |
+| `allowed_forecasts` | `OPTION_BUY_ALLOWED_FORECASTS` | CSV of forecast codes | `bullish_reversal,bullish_continuation,bullish_momentum` | Whitelist of Forecast Matrix signals permitted to enter long Call positions (used in `entry_mode = kinematics_forecast`). |
+| `entry_mode` | `OPTION_BUY_ENTRY_MODE` | `kinematics_forecast` \| `rsi_ex_ante` | `kinematics_forecast` | `kinematics_forecast` preserves the default RSI + acceleration/crossover/forecast + Taylor $\Delta\hat{P}$ gate. `rsi_ex_ante` qualifies strictly on live oversold RSI (or bounce lookback) without requiring `forecast_direction` or 1-minute Taylor `projected_delta > 0`, while still respecting `require_positive_velocity`, bounce velocity `v > 0`, and blocking accelerating drops (`v < 0` and `a <= 0`). |
+| `entry_window_start_et` | `OPTION_BUY_ENTRY_WINDOW_START_ET` | `HH:MM` (24h US/Eastern) or empty | `""` | Optional earliest US/Eastern time-of-day allowed for new option buys (e.g., `09:45` to skip opening volatility). Empty disables the lower time bound. |
+| `entry_window_end_et` | `OPTION_BUY_ENTRY_WINDOW_END_ET` | `HH:MM` (24h US/Eastern) or empty | `""` | Optional latest US/Eastern time-of-day allowed for new option buys (e.g., `15:30` to avoid late-day theta burn). Empty disables the upper time bound. |
+| `contract_selection_mode` | `OPTION_BUY_CONTRACT_SELECTION_MODE` | `plus2_otm` \| `atm` \| `itm1` \| `itm2` \| `otm1` \| `atm_itm_low_spread` \| `delta_mid` \| `delta_itm_low_spread` \| `composite_score` | `plus2_otm` | Selects which strike to buy from the already-fetched pruned `chain_snapshot` using strictly live, zero-hindsight buy-time data (mirrors `findthewinners.py :: _pick_ex_ante_candidate()`). `plus2_otm` keeps legacy +2 OTM selection untouched. |
+| `contract_target_delta` | `OPTION_BUY_CONTRACT_TARGET_DELTA` | Float (clamped `0.05`–`0.95`) | `0.55` | Target absolute delta ($\|\Delta\|$) used by `delta_mid`, `delta_itm_low_spread`, and `composite_score` modes. |
+| `contract_delta_min` | `OPTION_BUY_CONTRACT_DELTA_MIN` | Float (clamped `0.0`–`1.0`) | `0.45` | Minimum $\|\Delta\|$ bound for `delta_mid` (and lower floor `max(0.55, contract_delta_min)` for `delta_itm_low_spread`). |
+| `contract_delta_max` | `OPTION_BUY_CONTRACT_DELTA_MAX` | Float (clamped `contract_delta_min`–`1.0`) | `0.70` | Maximum $\|\Delta\|$ bound for `delta_mid` (and upper bound `max(0.85, contract_delta_max)` for `delta_itm_low_spread`). |
+| `contract_min_open_interest` | `OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST` | Int (min `0`) | `0` | Hard minimum contract `open_interest` required during ex-ante strike selection (`0` disables; when `> 0`, contracts missing OI are excluded). |
+| `contract_min_volume` | `OPTION_BUY_CONTRACT_MIN_VOLUME` | Int (min `0`) | `0` | Hard minimum contract session `volume` required during ex-ante strike selection (`0` disables; when `> 0`, contracts missing volume are excluded). |
+| `contract_budget_stepdown` | `OPTION_BUY_CONTRACT_BUDGET_STEPDOWN` | Bool | `true` | When `true` and `contract_selection_mode != plus2_otm`, filters candidates against the active 1-contract budget (`min(max_single_trade_dollars, remaining_investable_budget)`) and automatically steps outward from an over-budget ITM/ATM strike to the nearest affordable strike instead of rejecting. |
 
 ### 2.9 Section `option_seller`: 4-Tier Exit Waterfall and Risk Controls
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
-| `enabled` | `OPTION_SELL_ENABLED` | Bool | `true` | Master enable switch for `AlpacaOptionSeller`. |
+| `enabled` | `OPTION_SELL_ENABLED` | Bool | `true` | Master enable switch for `OptionSeller`. |
 | `dry_run` | `OPTION_SELL_DRY_RUN` | Bool | `true` | Simulates exits and records closed trades in `OptionContractHistoryTracker` without sending live close orders. |
 | `paper` | `OPTION_SELL_PAPER` | Bool | Inherits `ALPACA_PAPER` (`true`) | Alpaca Paper vs. Live override for seller client. |
 | `rsi_high` | `OPTION_SELL_RSI_HIGH` | Float | Inherits `[option_buyer] rsi_high` (`65.0`) | Overbought RSI threshold for Tier 4 kinematic exit evaluation. |
@@ -240,6 +250,7 @@ flowchart LR
 | `YAHOO_POLL_SECONDS` *(env)* | Int | `30` | Polling cadence for `YAHOOFINANCE` provider. |
 | `TASTYTRADE_PROD_BASE_URL` / `TASTYTRADE_SANDBOX_BASE_URL` *(env)* | URL | `https://api.tastyworks.com` / `https://api.cert.tastyworks.com` | Base REST URL overrides for `TastytradeClient`. |
 | `TASTYTRADE_USER_AGENT` *(env)* | String | Built-in UA | Custom `User-Agent` header sent to Tastytrade REST APIs. |
+| `DOCS_DIR` *(env)* | Path string | Auto (`APP_ROOT`, `APP_ROOT/docs`, and parent fallback) | Optional directory override containing `.md` documentation files served by `GET /api/docs` in the dashboard Docs viewer modal. |
 
 ---
 
@@ -253,7 +264,7 @@ owner = billt
 [symbols]
 target_symbols = AAPL,AMD,AMZN,CRWV,DELL,GOOG,INTC,ISRG,KLAC,LITE,LLY,MCD,META,MSFT,MU,NOC,NVDA,ROK,SNDK,SPCX,SQQQ,STX,SURE,TMO,TSLA,TSM,V,VRTX
 
-[providers]
+[market_signal_providers]
 ALPACA.enabled = true
 TASTYTRADE.enabled = false
 TRADINGVIEW.enabled = false
@@ -329,6 +340,26 @@ max_buys_per_minute = 1
 max_single_trade_dollars = 8000.0
 invest_buffer_withhold_pct = 10.0
 allowed_forecasts = bullish_reversal,bullish_continuation,bullish_momentum
+; --- Ex-Ante Entry & Contract Selection (opt-in; defaults preserve legacy +2 OTM & forecast gate) ---
+entry_mode = kinematics_forecast
+entry_window_start_et =
+entry_window_end_et =
+contract_selection_mode = plus2_otm
+contract_target_delta = 0.55
+contract_delta_min = 0.45
+contract_delta_max = 0.70
+contract_min_open_interest = 0
+contract_min_volume = 0
+contract_budget_stepdown = true
+; Example forecast-independent ex-ante preset (matches findthewinners.py zero-hindsight logic):
+;   entry_mode = rsi_ex_ante
+;   entry_window_start_et = 09:45
+;   entry_window_end_et = 15:30
+;   contract_selection_mode = atm_itm_low_spread   ; or delta_mid / delta_itm_low_spread / composite_score
+;   max_spread_pct = 3.0
+;   contract_min_open_interest = 100
+;   contract_min_volume = 10
+;   contract_budget_stepdown = true
 
 [option_seller]
 enabled = true
@@ -440,7 +471,8 @@ When `[dashboard] auth_enabled = true` and a password is set:
 | `POST /api/option-history/refresh` | L26056 | Yes | — | `200` executes `OptionContractHistoryTracker.startup_backfill()` (20s timeout) and returns updated snapshot; `500`/`503` on failure. |
 | `GET /api/option-logs` | L25977 | Yes | `?stream=all\|buy\|sell&decision=all&q=<SYM>&limit=40000&limit_per_file=50000` | `200` parsed Buy/Sell decision log entries from `logs/option_buyer/` and `logs/option_seller/`. |
 | `GET /api/strike-analysis` | L26029 | Yes | `?symbol=AAPL&limit=25&force=false` (`limit` `1`–`100`) | `200` multi-strike (`-2 ITM` to `+4 OTM`) forward-horizon performance table; `403` when `strike_analyzer_enabled = false`; `500` on error. |
-| `GET\|POST /cli/status` | L26098 | Yes | — | `200` comprehensive engine telemetry: providers, timezone, TLS/auth state, `position_monitor`, `option_buyer`, `option_seller` (including `stop_loss_watches` & `peak_profit_watches`), `chart_capture`, `tradingview_webhook`, and `latest_kinematics`. |
+| `GET /api/docs` | — | Yes | Optional `?file=<relative_md_path>` | `200` lists discovered `.md` files (when `file` omitted) or returns Markdown content for the requested path-confined `.md` file (`400`/`404` on invalid/missing path). |
+| `GET\|POST /cli/status` | L26098 | Yes | — | `200` comprehensive engine telemetry: `app_version`, providers, timezone, TLS/auth state, `position_monitor` (including poll cadence/latency and `account` snapshot with `available_to_invest`, `available_to_invest_source`, `remaining_investable_budget`, `today_pl`/`today_pl_source`/`last_session_pl`, `overall_pl`/`overall_pl_source`/`overall_base_value`), `option_buyer`, `option_seller` (including `stop_loss_watches` & `peak_profit_watches`), `chart_capture`, `tradingview_webhook`, and `latest_kinematics`. |
 | `GET\|POST /cli/chart-capture` | L26307 | Yes | `POST` JSON: `{"action": "start"\|"stop"\|"toggle"\|"status"}` | `200` returns updated `chart_capture` status and persists `lib/parms.ini`; `400` invalid action; `503` manager not loaded. |
 | `POST /cli/finalize` | L26357 | Yes | — | `200` forces `MinuteCoordinator.finalize_due()` (5s timeout) and reports emitted summary count. |
 | `POST /cli/inject` | L26373 | Yes | JSON: `{"provider": "ALPACA", "symbol": "AAPL", "price": 231.5, "timestamp": "..."}` | `200` injects synthetic bar (`source="CLI_MANUAL_INJECT"`); `400` on missing/invalid params. |
@@ -476,9 +508,11 @@ curl -s -X POST http://127.0.0.1:5000/webhook \
 | **`WEBHOOK_TOKEN` startup failure on non-loopback host** | `[webhook] host` is set to `0.0.0.0` or a LAN IP with an empty `[webhook] token`. | Keep `[webhook] host = 127.0.0.1` or configure a non-empty `[webhook] token`. |
 | **`HTTP 426 Upgrade Required` on port 5001** | Plaintext `http://` client connected while `[dashboard] ssl_mode = https`. | Connect via `https://` or set `ssl_mode = auto` in `[dashboard]`. |
 | **Small RSI / kinematic drift between Alpaca and Tastytrade instances** | Different feed aggregation (`iex` vs. DXLink consolidated tape) or mismatched `[kinematics] rsi_session` (`extended` vs. `regular`) / `rsi_warmup_sessions`. | Verify both instances log identical `RSI_WARMUP_DONE ... mode=<mode> sessions=<N> bars_applied=<M>` in `logs/<provider>/_STREAM-*.log` and align `rsi_session` + `alpaca_api.feed`. |
-| **`REJECTED` with `kinematics_unfavorable`, `no_upward_accel`, or `confirmed_bearish`** | Ex-ante risk filter in `AlpacaOptionBuyer` blocked entry because velocity $v_t \le 0$, acceleration $a_t \le 0$, or forecast is not in `allowed_forecasts`. | Working as designed — inspect the symbol's 3-panel crossover chart (`v`/`a` panel) to confirm inflection timing. |
+| **`REJECTED` with `kinematics_unfavorable`, `no_upward_accel`, or `confirmed_bearish`** | Ex-ante risk filter in `OptionBuyer` blocked entry because velocity $v_t \le 0$, acceleration $a_t \le 0$, or forecast is not in `allowed_forecasts`. | Working as designed — inspect the symbol's 3-panel crossover chart (`v`/`a` panel) to confirm inflection timing. |
 | **`REJECTED` with `spread_too_wide`** | Option bid-ask spread `(ask - bid) / mid * 100` exceeded `[option_buyer] max_spread_pct` (default `5.0%`). | Working as designed to prevent slippage on illiquid contracts; inspect contract spread in `logs/optionchains/*.json`. |
 | **`SKIPPED` with `hold_grace`** | Open position age is below `[option_seller] min_hold_minutes` (default `5m`) during a Tier 4 RSI exit check. | Working as designed to avoid whipsaw exits immediately after entry; Tiers 1–3 profit target / hard stop operate independently. |
 | **HTTP `429` option chain pause (`chain_429_backoff_seconds`)** | Broker option-chain API throttled rapid consecutive requests. | Increase `[option_trading] chain_pacing_seconds` (e.g., `0.35`) or set `chain_cooldown_seconds` (`> 0`). |
 | **`PROVIDER_DISABLED` in logs (`FatalProviderError`)** | Broker/stream credentials invalid, expired refresh token, or unauthorized SIP feed on a free Alpaca tier. | Fix credentials or change `[alpaca_api] feed = iex`, then call `POST /cli/reconnect` or restart the service. |
+| **`REJECTED` with `exceeds_max_single_trade` or `insufficient_investable_budget`** | Even `1` option contract (`unit_price × 100`) exceeds `[option_buyer] max_single_trade_dollars` (default `$8,000`) or the buffer-withheld investable balance (`(available + invested) × (1 - invest_buffer_withhold_pct/100) - invested`). | Working as designed — when `qty > 1` the engine automatically scales down to the largest whole integer `>= 1` that fits; adjust `max_single_trade_dollars` or `invest_buffer_withhold_pct` in `[option_buyer]` if appropriate. |
+| **Tastytrade Sandbox/Cash shows `buying_power=0.00` in logs** | Tastytrade sandbox and cash accounts often return `"derivative-buying-power": "0.0"` even when `"cash-balance"` is funded (e.g., `$100,000.00`). | Handled automatically in `extract_account_snapshot()` by selecting the first strictly positive field (`derivative-buying-power` → `equity-buying-power` → `cash-available-to-withdraw` → `cash-balance` → `buying_power`); check `available_to_invest_source` in the UI hover tooltip. |
 | **Zero-fallback broker error (`OPTION_CHAIN_PROVIDER` / `OPTION_TRANSACTION_PROVIDER`)** | Configured broker lacks valid credentials; engine intentionally refuses to silently route orders to a different broker. | Supply the missing credentials for the configured broker in `lib/parms.ini` (`[CREDENTIALS]` or `[tastytrade_api]`). |

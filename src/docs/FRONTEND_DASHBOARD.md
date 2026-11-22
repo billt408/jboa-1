@@ -11,7 +11,7 @@
 
 </div>
 
-**Navigation:** [Overview (`README.md`)](../README.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · **Frontend Dashboard** · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
+**Navigation:** [Overview (`README.md`)](../README.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · **Frontend Dashboard** · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
 
 ---
 
@@ -36,6 +36,7 @@
    - [4.2 Option Buyer and Seller Drilldown Modal (`optionDrilldownModal`)](#42-option-buyer-and-seller-drilldown-modal-optiondrilldownmodal)
    - [4.3 Live Option Buy and Sell Decision Log Modal (`optionLogsModal`)](#43-live-option-buy-and-sell-decision-log-modal-optionlogsmodal)
    - [4.4 Option Chain Strike Analyzer Modal (`strikeAnalysisModal`)](#44-option-chain-strike-analyzer-modal-strikeanalysismodal)
+   - [4.5 Documentation Viewer Modal (`docsModal`)](#45-documentation-viewer-modal-docsmodal)
 5. [Profit and Loss Calculation and Position Tracking Formulas](#5-profit-and-loss-calculation-and-position-tracking-formulas)
 6. [Client Polling Cadence, API Synchronization and Error States](#6-client-polling-cadence-api-synchronization-and-error-states)
 7. [React and TypeScript Companion Application (`src/`, Vite Port 3000)](#7-react-and-typescript-companion-application-src-vite-port-3000)
@@ -99,6 +100,7 @@ When `[dashboard] auth_enabled = true` and a non-empty `[dashboard] password` is
 | **Error Banner (Rose)** | Rendered on `401` / `429` | Displays `"Invalid password. Check [dashboard] password in parms.ini."` or `"Too many failed attempts. Try again in Xs."` (rate-limited per client IP). |
 | **Password Input** | `<input type="password" name="password" autofocus>` | Accepts the dashboard password. Submitted via `POST /auth/login`. |
 | **Unlock Dashboard Button** | Submit button (`POST /auth/login`) | Issues an `HttpOnly`, `SameSite=Lax` session cookie (`secure=True` when over HTTPS) with TTL `max(3600, DASHBOARD_SESSION_TTL_HOURS * 3600)` seconds, then redirects to `safe_next` (default `/`). |
+| **App Version Label** | `v__APP_VERSION__` | Displays the running `multiStreamRSI.py` semantic build version (`major.minor.build`, e.g., `v0.1.4`). |
 
 ### 2.2 Multi-Instance Owner Visual Branding
 
@@ -126,9 +128,11 @@ Located at the top of `DASHBOARD_HTML_TEMPLATE` (L18575–18635). Always visible
 | Control / Field | Element ID | Type | Detailed Description & Action |
 | :--- | :--- | :--- | :--- |
 | **Engine Title & Live Status Pill** | — | Badge | Shows `RSI & Price Kinematics Engine`, live `ACTIVE` indicator pill, and the instance owner badge (`owner - transactionprovider`). |
+| **App Version Badge** | `appVersionBadge` | Button (`openDocsModal('docs/CHANGELOG.md')`) | Displays the running `APP_VERSION` (`major.minor.build`, e.g., `v0.1.8`), kept synchronized with `/cli/status` (`metrics.app_version`). Clicking the badge opens `docs/CHANGELOG.md` directly inside the Docs viewer modal. |
 | **Run ID Badge** | `runIdBadge` | Readout | Displays the unique `RUN_ID` (`YYYYMMDD-HHMMSS-<pid>-<hex>`) identifying the current process's log files (`minute-summary-<RUN_ID>.jsonl`, etc.). |
 | **Display Timezone Badge** | `displayTzBadge` | Readout | Active display timezone abbreviation configured via `[general] timezone` (default `PST`/`PDT`, mapped via `DISPLAY_TZ_IANA`). All chart axes, timestamps, and log times render in this zone. |
 | **Next Minute Countdown** | `minuteCountdown` | Live Timer | Counts down (1s tick via `updateCountdown()`, L19880) to `next_finalize_utc` (`next_minute + 60s + SUMMARY_DELAY_SECONDS`), synchronized against `server_time_utc` via `serverClockOffsetMs`. |
+| **`Docs` Button** | `btnOpenDocs` | Button (`openDocsModal()`) | Opens the two-pane **Documentation Viewer Modal** (`docsModal`) backed by `GET /api/docs` to browse `README.md` and `docs/*.md` (including `docs/CHANGELOG.md`) directly from the host. |
 | **`Flush Minute` Button** | `btnFlush` | Button (`forceFinalize()`) | Sends `POST /cli/finalize` to force `MinuteCoordinator.finalize_due()` immediately. Used during testing or after manual bar injection to emit pending minute summaries without waiting for the 45-second delay window. |
 | **`+ Inject Bar` Button** | `btnToggleInject` | Button (`toggleInjectModal()`) | Opens the **Manual Bar Injection Modal** (`injectModal`) to submit a synthetic 1-minute close price for any provider/symbol. |
 | **Refresh Icon Button** | `btnRefresh` | Icon Button (`fetchAllData()`) | Immediately triggers a full refresh of `/api/kinematics`, `/cli/status`, and (if open) `/api/option-history`. |
@@ -172,7 +176,7 @@ A 2×2 interactive phase-space grid (`multiStreamRSI.py`, L18720–18765) groupi
 | :--- | :--- | :--- |
 | **Symbol Filter Input** | `symbolSearch` | Case-insensitive live substring filter across ticker symbols (e.g., type `NVDA` or `AA`). |
 | **Clear Search (`×`)** | `btnClearSearch` | Clears `symbolSearch` and restores the full table. |
-| **`Consolidated Symbols (N)` Button** | `btnViewConsolidated` (`setViewMode('consolidated')`) | Displays **one consensus row per symbol**, synthesized across all reporting providers according to `[providers] priority`. Default operational view. |
+| **`Consolidated Symbols (N)` Button** | `btnViewConsolidated` (`setViewMode('consolidated')`) | Displays **one consensus row per symbol**, synthesized across all reporting providers according to `[market_signal_providers] priority`. Default operational view. |
 | **`All Provider Feeds (N)` Button** | `btnViewStreams` (`setViewMode('streams')`) | Expands the grid into **one row per `(provider, symbol)` stream**, useful for comparing raw Alpaca vs. Tastytrade vs. TradingView values side-by-side. |
 | **Regime Filter Pills** | `All`, `Acc Bull`, `Dec Bull`, `Acc Bear`, `Dec Bear`, `Neutral` (`setRegimeFilter()`) | Filters the table to symbols currently in the chosen kinematic quadrant. |
 
@@ -250,7 +254,7 @@ Rendered as a high-DPI inline SVG inside `detailCrossoverChart` (L18960–19030)
 
 Below the 3-panel chart inside `bottomInspectorSection`:
 - **Provider Comparison Table (`detailProvidersTableBody`):** Lists every enabled provider reporting on the selected symbol with individual `Provider`, `Status`, `Close`, `v`, `a`, `RSI`, `Regime`, and `Last Update` timestamp. Essential for diagnosing cross-provider discrepancies (e.g., Alpaca IEX vs. Tastytrade DXLink).
-- **TradingView Webhook Diagnostic Banner (`detailTvDiagnosticBanner`):** Automatically shown when `TRADINGVIEW` is enabled in `[providers]` but no webhook bar has arrived yet for the currently inspected symbol; shows webhook counters and provides one-click jump buttons to symbols that *do* have live TradingView data.
+- **TradingView Webhook Diagnostic Banner (`detailTvDiagnosticBanner`):** Automatically shown when `TRADINGVIEW` is enabled in `[market_signal_providers]` but no webhook bar has arrived yet for the currently inspected symbol; shows webhook counters and provides one-click jump buttons to symbols that *do* have live TradingView data.
 - **Kinematic Diagnosis Banner (`detailPhaseExplanation`):** Plain-English summary of the selected symbol's current quadrant, RSI zone, and alignment state, paired with a **`Test Inject This Symbol`** button that opens `injectModal` pre-populated with `selectedSymbol`.
 
 ---
@@ -271,7 +275,7 @@ Split into a 2-column left log feed and a 1-column right telemetry stack (L19075
 | **Active Equity Positions** | `position_monitor.active_equity_positions` | Live count of open stock/ETF positions on the broker account. |
 | **Active Option Positions** | `position_monitor.active_option_positions` | Live count of open option contracts on the broker account. |
 | **Last Telemetry Poll** | `position_monitor.last_poll_utc`, `poll_count`, `poll_interval_seconds`, `last_poll_duration_ms` | Displays date, time, poll sequence number (`#N`), cadence (`15s`), and broker round-trip latency (`ms`) of the latest snapshot. |
-| **Trading Account Card** | `position_monitor.account` | Displays active `transactionprovider` / environment badge, Account ID/Number, Available to Invest, Balance Invested, Today's P/L (`$ / %`), Overall P/L (`$ / %`), and single-trade cap / withhold buffer budget footer. |
+| **Trading Account Card** | `position_monitor.account` | Displays active `transactionprovider` / environment badge, Account ID/Number, **Available to Invest (Available - Reserve %)** (buffer-adjusted `remaining_investable_budget` across all providers, with raw broker balance/cash/source in tooltip; on Tastytrade, falls through zero `derivative-buying-power` to the first positive balance field), **Balance Invested**, **Today's P/L** (`$ / %`; displays `$0.00 (0.00%)` in neutral slate on weekends, NYSE holidays via Alpaca `get_clock()`, and pre-04:00 ET pre-reset with prior session P/L in tooltip), **Overall P/L** (`$ / %`; computed from Alpaca `GET /v2/account/portfolio/history` `base_value` on Alpaca or open+closed ledger fallback on Tastytrade), and a footer showing `Trade Cap $...` and `Buf N%`. |
 | **Option Buyer (1m Sync) Card** *(Clickable)* | `option_buyer` + `history_summary` | Displays buyer mode (`LIVE` / `DRY_RUN` / `DISABLED`), open contract count, aggregate unrealized dollar/percent change, and **Overall vs. This Run** order counts. **Clicking this card opens `optionDrilldownModal` on the `Open Contracts` tab.** |
 | **Last Option Order** | `option_buyer.last_order_contract`, `last_order_utc`, `last_order_reason` | Most recently submitted (or dry-run simulated) entry contract and trigger reason. |
 | **Option Seller (1m Sync) Card** *(Clickable)* | `option_seller` + `history_summary` | Displays seller mode, closed contract count, aggregate realized dollar/percent P/L, Win/Loss tally, and **Overall vs. This Run** exit counts. **Clicking this card opens `optionDrilldownModal` on the `Closed Contracts` tab.** |
@@ -331,6 +335,17 @@ Feature-gated by `[dashboard] strike_analyzer_enabled = true` (`renderStrikeAnal
 - **Controls:** Symbol filter input, Lookback limit selector (`15`, `25`, `50`, `100` recent option-chain captures), and **`Re-analyze`** button (`force=true` bypasses cache).
 - **Output:** For each historical entry capture in `logs/optionchains/`, compares surrounding strikes from **`-2 ITM` through `+4 OTM`** across forward holding horizons (**`+5m`**, **`+10m`**, **`+15m`**, **`+30m`**, **`+60m`**, **Actual Exit**, and **Peak**) so quants can verify whether the 2nd-OTM selection rule (`get_pruned_option_chain_*`) is capturing optimal risk-adjusted delta/gamma return.
 
+### 4.5 Documentation Viewer Modal (`docsModal`)
+
+Opened via the **`Docs`** button in the top navigation bar (`openDocsModal()`). Backed by the authenticated, path-confined `GET /api/docs` endpoint.
+
+- **Document Discovery (`_resolve_docs_catalog()`):** Scans `DOCS_DIR` (if set via env), `APP_ROOT`, `APP_ROOT/docs`, and parent directory fallbacks (`APP_ROOT/..` and `APP_ROOT/../docs`) for allowlisted `.md` files (`README.md` and `docs/*.md`, including `docs/CHANGELOG.md`), preventing path traversal outside allowed roots. Clicking the header **`vX.Y.Z`** version badge opens `docs/CHANGELOG.md` directly.
+- **Two-Pane Interface:** Left sidebar lists discovered Markdown files; right pane renders the selected document safely via an escape-first Markdown renderer (`renderSafeMarkdown`) supporting headings, tables, fenced code blocks, lists, blockquotes, and links.
+- **Built-In Mermaid Diagram Rendering with Pan & Zoom (`renderDocsMermaidDiagrams()`, `_attachMermaidPanZoom()`):** Fenced ```` ```mermaid ```` blocks lazily load `mermaid.js` (v11 via jsDelivr with unpkg fallback, `securityLevel: 'strict'`, dark-slate theme) and render crisp vector SVGs inside an interactive pan-and-zoom canvas:
+  - **Mouse & Touch Controls:** Click-and-drag to pan, scroll wheel to zoom smoothly around the cursor (`12%`–`800%`), double-click to zoom in (or reset to Fit when deeply zoomed), and two-finger touch pinch-to-zoom.
+  - **Header Toolbar:** Per-diagram **`-`**, live **`%`** readout, **`+`**, **`1:1`** (actual 100% readable font size), **`Fit`** (center and fit full diagram), **`Expand` / `Collapse`** (near-fullscreen overlay with `+`/`-`/`0`/`1`/`Esc` keyboard shortcuts), and **`Source` / `Diagram`** toggle button.
+  - **Offline & Error Fallback:** When the browser is offline or a diagram fails to parse, the viewer automatically falls back to displaying the raw escaped Mermaid code block cleanly.
+
 ---
 
 ## 5. Profit and Loss Calculation and Position Tracking Formulas
@@ -359,6 +374,12 @@ $$\text{total\_cost} = \sum_{j \in \text{closed}} \text{cost\_basis}_j, \qquad \
 $$\text{total\_pnl} = \sum_{j \in \text{closed}} \text{total\_pnl\_dollars}_j, \qquad \text{total\_pct} = \text{round}\!\left(\frac{\text{total\_pnl}}{\text{total\_cost}} \times 100.0,\; 2\right)$$
 
 $$\text{wins} = \left|\{j : \text{pnl}_j > 0\}\right|, \qquad \text{losses} = \left|\{j : \text{pnl}_j < 0\}\right|$$
+
+### Trading Account Card Formulas (`extract_account_snapshot`)
+- **Buffer-Adjusted Available to Invest (`Available to Invest (Available - Reserve %)` on UI for all providers):** Let $A_{\text{raw}}$ be the broker's raw available balance (on Tastytrade, the first strictly positive field in `derivative-buying-power` → `equity-buying-power` → `cash-available-to-withdraw` → `cash-balance` → `buying_power`), $I$ be `balance_invested`, and $w$ be `[option_buyer] invest_buffer_withhold_pct`:
+  $$\text{max\_investable} = (A_{\text{raw}} + I)\cdot\left(1 - \frac{w}{100}\right), \qquad \text{Available to Invest (UI)} = \max\!\left(0,\; \min\!\left(A_{\text{raw}},\; \text{max\_investable} - I\right)\right)$$
+- **Today's P/L:** Uses broker `equity - last_equity` during active US/Eastern trading sessions. On weekends (`Sat`/`Sun`), NYSE holidays (via Alpaca `get_clock()`, cached 60s), and weekdays prior to `04:00 ET` before broker reset (when no closed trades occurred today), displays `$0.00 (0.00%)` in neutral slate while preserving `last_session_pl` in the hover tooltip.
+- **Overall P/L:** On Alpaca, fetches `GET /v2/account/portfolio/history?period=all&timeframe=1D` (cached 300s) and computes `equity - base_value` and `((equity - base_value) / base_value) * 100`. On Tastytrade (or if portfolio history is unavailable), falls back to `open_unrealized_pl + closed_realized_pl`.
 
 ---
 

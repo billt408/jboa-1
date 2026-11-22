@@ -23,11 +23,11 @@ option-chain collection via lib.getOptionsContracts; the full clean payload is
 written to logs/optionchains/ with provider, symbol, BUY/SELL signal, RSI and
 timestamp in the filename. Every option-chain log line and each TRADINGVIEW
 minute-summary record carries the signal label and kinematics metrics.
-An AlpacaPositionMonitor thread polls the account's positions every minute,
+A PositionMonitor thread polls the configured broker account's positions every minute,
 writes them to its own log file under logs/positions/ and prints each current
 option position.
 Deduplication is in-memory only and does not survive process restarts.
-Provider startup is controlled exclusively by [providers] NAME.enabled in lib/parms.ini.
+Provider startup is controlled exclusively by [market_signal_providers] NAME.enabled in lib/parms.ini.
 load_settings populates module globals selected and required; disabled providers
 are not instantiated or included in minute summaries.
 """
@@ -122,6 +122,9 @@ PROVIDER_PRIORITY: tuple[str, ...] = DEFAULT_PROVIDER_PRIORITY
 FINALIZE_GRACE_SECONDS = 2.0
 QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
+# Semantic version: major.minor.build — increment build on every multiStreamRSI.py edit;
+# change major/minor only when explicitly requested.
+APP_VERSION = "0.1.10"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 def _get_app_base_dir():
     """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
@@ -8480,7 +8483,7 @@ _INI_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:[;#].*)?$")
 _INI_FEATURE_SECTIONS = frozenset(
     {
         "general",
-        "providers",
+        "market_signal_providers",
         "kinematics",
         "option_history",
         "option_trading",
@@ -8538,7 +8541,7 @@ def _strip_trailing_json_comment(raw_val):
 def _sanitize_parms_for_json_ini(raw_text):
     """Prepare parms.ini text for JsonIniParser without altering line numbers.
 
-    Sections read directly via configparser ([providers], [kinematics],
+    Sections read directly via configparser ([market_signal_providers], [kinematics],
     [option_buyer], [option_seller]) support standard INI inline comments and
     unquoted strings, which would otherwise raise JSONDecodeError inside
     lib.utils.JsonIniParser. Replacing option lines in those sections with
@@ -8793,7 +8796,7 @@ def parse_provider_enabled(value, provider):
     if isinstance(value, bool):
         return value
     if not isinstance(value, str):
-        raise ValueError(f"[providers] {provider}.enabled must be True or False")
+        raise ValueError(f"[market_signal_providers] {provider}.enabled must be True or False")
     flag = _strip_inline_ini_comment(value)
     if len(flag) >= 2 and flag[0] == flag[-1] and flag[0] in {"'", '"'}:
         flag = flag[1:-1].strip()
@@ -8803,7 +8806,7 @@ def parse_provider_enabled(value, provider):
     if flag == "false":
         return False
     raise ValueError(
-        f"[providers] {provider}.enabled must be True or False; got {value!r}"
+        f"[market_signal_providers] {provider}.enabled must be True or False; got {value!r}"
     )
 
 
@@ -8861,7 +8864,7 @@ _KNOWN_PROVIDERS = frozenset(DEFAULT_PROVIDER_PRIORITY)
 
 
 def _parse_provider_priority(raw_value):
-    """Parse comma-separated [providers] priority list and append unspecified known providers."""
+    """Parse comma-separated [market_signal_providers] priority list and append unspecified known providers."""
     if not raw_value or not str(raw_value).strip():
         return DEFAULT_PROVIDER_PRIORITY
     ordered = []
@@ -8872,7 +8875,7 @@ def _parse_provider_priority(raw_value):
             continue
         if name not in _KNOWN_PROVIDERS:
             raise ValueError(
-                f"Unknown provider in [providers] priority: {name!r}; "
+                f"Unknown provider in [market_signal_providers] priority: {name!r}; "
                 f"expected one of {sorted(_KNOWN_PROVIDERS)}"
             )
         if name not in seen:
@@ -8904,7 +8907,7 @@ def _provider_priority_score(provider):
 
 
 def _apply_ini_feature_settings(cfg):
-    """Load [general], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], and [tastytrade_api] overrides from lib/parms.ini."""
+    """Load [general], [market_signal_providers], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA, INSTANCE_OWNER
     global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
@@ -8928,6 +8931,11 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES, OPTION_BUY_BOUNCE_RSI_MAX
     global OPTION_BUY_MAX_SPREAD_PCT, OPTION_BUY_LIMIT_AGGRESSION, OPTION_BUY_MAX_BUYS_PER_MINUTE
     global OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS, OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT
+    global OPTION_BUY_CONTRACT_SELECTION_MODE, OPTION_BUY_CONTRACT_TARGET_DELTA
+    global OPTION_BUY_CONTRACT_DELTA_MIN, OPTION_BUY_CONTRACT_DELTA_MAX
+    global OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST, OPTION_BUY_CONTRACT_MIN_VOLUME
+    global OPTION_BUY_CONTRACT_BUDGET_STEPDOWN, OPTION_BUY_ENTRY_MODE
+    global OPTION_BUY_ENTRY_WINDOW_START_ET, OPTION_BUY_ENTRY_WINDOW_END_ET
     global OPTION_SELL_ENABLED, OPTION_SELL_DRY_RUN, OPTION_SELL_PAPER
     global OPTION_SELL_QTY, OPTION_SELL_CLOSE_FULL_POSITION
     global OPTION_SELL_ORDER_TYPE, OPTION_SELL_COOLDOWN_MINUTES
@@ -8960,21 +8968,21 @@ def _apply_ini_feature_settings(cfg):
     _reconfigure_logging_timezone()
     INSTANCE_OWNER = _ini_str(cfg, "general", "owner", "INSTANCE_OWNER", "").strip()
 
-    raw_prio = _ini_str(cfg, "providers", "priority", "PROVIDER_PRIORITY", "")
+    raw_prio = _ini_str(cfg, "market_signal_providers", "priority", "PROVIDER_PRIORITY", "")
     PROVIDER_PRIORITY = _parse_provider_priority(raw_prio)
     logging.info("PROVIDER_PRIORITY order=%s", list(PROVIDER_PRIORITY))
 
     # When neither [option_trading] nor env explicitly pins a provider, align default
-    # option chain & transaction provider with single-broker [providers] configuration
+    # option chain & transaction provider with single-broker [market_signal_providers] configuration
     # (e.g. TASTYTRADE.enabled=true with ALPACA.enabled=false -> default "tastytrade").
     _inferred_broker_default = "alpaca"
     try:
-        if cfg.has_section("providers"):
+        if cfg.has_section("market_signal_providers"):
             _tt_on = parse_provider_enabled(
-                cfg.get("providers", "TASTYTRADE.enabled", fallback=None), "TASTYTRADE"
+                cfg.get("market_signal_providers", "TASTYTRADE.enabled", fallback=None), "TASTYTRADE"
             )
             _alp_on = parse_provider_enabled(
-                cfg.get("providers", "ALPACA.enabled", fallback=None), "ALPACA"
+                cfg.get("market_signal_providers", "ALPACA.enabled", fallback=None), "ALPACA"
             )
             if _tt_on and not _alp_on:
                 _inferred_broker_default = "tastytrade"
@@ -9348,6 +9356,140 @@ def _apply_ini_feature_settings(cfg):
     OPTION_BUY_ALLOWED_FORECASTS = {
         s.strip().lower() for s in raw_forecasts.split(",") if s.strip()
     }
+    raw_sel_mode = (
+        _ini_str(
+            cfg,
+            "option_buyer",
+            "contract_selection_mode",
+            "OPTION_BUY_CONTRACT_SELECTION_MODE",
+            "plus2_otm",
+        )
+        .strip()
+        .lower()
+    )
+    if raw_sel_mode not in VALID_OPTION_BUY_CONTRACT_SELECTION_MODES:
+        logging.warning(
+            "INVALID_OPTION_BUY_CONTRACT_SELECTION_MODE value=%r valid=%s; falling back to plus2_otm",
+            raw_sel_mode,
+            sorted(VALID_OPTION_BUY_CONTRACT_SELECTION_MODES),
+        )
+        raw_sel_mode = "plus2_otm"
+    OPTION_BUY_CONTRACT_SELECTION_MODE = raw_sel_mode
+    OPTION_BUY_CONTRACT_TARGET_DELTA = min(
+        0.95,
+        max(
+            0.05,
+            abs(
+                _ini_float(
+                    cfg,
+                    "option_buyer",
+                    "contract_target_delta",
+                    "OPTION_BUY_CONTRACT_TARGET_DELTA",
+                    0.55,
+                )
+            ),
+        ),
+    )
+    OPTION_BUY_CONTRACT_DELTA_MIN = min(
+        1.0,
+        max(
+            0.0,
+            abs(
+                _ini_float(
+                    cfg,
+                    "option_buyer",
+                    "contract_delta_min",
+                    "OPTION_BUY_CONTRACT_DELTA_MIN",
+                    0.45,
+                )
+            ),
+        ),
+    )
+    OPTION_BUY_CONTRACT_DELTA_MAX = min(
+        1.0,
+        max(
+            OPTION_BUY_CONTRACT_DELTA_MIN,
+            abs(
+                _ini_float(
+                    cfg,
+                    "option_buyer",
+                    "contract_delta_max",
+                    "OPTION_BUY_CONTRACT_DELTA_MAX",
+                    0.70,
+                )
+            ),
+        ),
+    )
+    OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST = _ini_int(
+        cfg,
+        "option_buyer",
+        "contract_min_open_interest",
+        "OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST",
+        0,
+        minimum=0,
+    )
+    OPTION_BUY_CONTRACT_MIN_VOLUME = _ini_int(
+        cfg,
+        "option_buyer",
+        "contract_min_volume",
+        "OPTION_BUY_CONTRACT_MIN_VOLUME",
+        0,
+        minimum=0,
+    )
+    OPTION_BUY_CONTRACT_BUDGET_STEPDOWN = _ini_bool(
+        cfg,
+        "option_buyer",
+        "contract_budget_stepdown",
+        "OPTION_BUY_CONTRACT_BUDGET_STEPDOWN",
+        True,
+    )
+    raw_entry_mode = (
+        _ini_str(
+            cfg,
+            "option_buyer",
+            "entry_mode",
+            "OPTION_BUY_ENTRY_MODE",
+            "kinematics_forecast",
+        )
+        .strip()
+        .lower()
+    )
+    if raw_entry_mode not in VALID_OPTION_BUY_ENTRY_MODES:
+        logging.warning(
+            "INVALID_OPTION_BUY_ENTRY_MODE value=%r valid=%s; falling back to kinematics_forecast",
+            raw_entry_mode,
+            sorted(VALID_OPTION_BUY_ENTRY_MODES),
+        )
+        raw_entry_mode = "kinematics_forecast"
+    OPTION_BUY_ENTRY_MODE = raw_entry_mode
+    raw_win_start = _ini_str(
+        cfg,
+        "option_buyer",
+        "entry_window_start_et",
+        "OPTION_BUY_ENTRY_WINDOW_START_ET",
+        "",
+    ).strip()
+    if raw_win_start and _parse_et_clock_minutes(raw_win_start) is None:
+        logging.warning(
+            "INVALID_OPTION_BUY_ENTRY_WINDOW_START_ET value=%r (expected HH:MM); ignoring",
+            raw_win_start,
+        )
+        raw_win_start = ""
+    OPTION_BUY_ENTRY_WINDOW_START_ET = raw_win_start
+    raw_win_end = _ini_str(
+        cfg,
+        "option_buyer",
+        "entry_window_end_et",
+        "OPTION_BUY_ENTRY_WINDOW_END_ET",
+        "",
+    ).strip()
+    if raw_win_end and _parse_et_clock_minutes(raw_win_end) is None:
+        logging.warning(
+            "INVALID_OPTION_BUY_ENTRY_WINDOW_END_ET value=%r (expected HH:MM); ignoring",
+            raw_win_end,
+        )
+        raw_win_end = ""
+    OPTION_BUY_ENTRY_WINDOW_END_ET = raw_win_end
 
     OPTION_SELL_PAPER = _ini_bool(
         cfg, "option_seller", "paper", "OPTION_SELL_PAPER", ALPACA_PAPER
@@ -9712,7 +9854,8 @@ def _apply_ini_feature_settings(cfg):
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
         "buy_enabled=%s buy_dry_run=%s sell_enabled=%s sell_dry_run=%s "
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d "
-        "max_single_trade=$%.2f invest_buf=%.1f%% sell_full=%s "
+        "max_single_trade=$%.2f invest_buf=%.1f%% buy_entry_mode=%s buy_sel_mode=%s buy_delta=%.2f[%.2f..%.2f] "
+        "buy_min_oi=%d buy_min_vol=%d buy_stepdown=%s buy_win_et=%s..%s sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
@@ -9754,6 +9897,16 @@ def _apply_ini_feature_settings(cfg):
         OPTION_BUY_QTY,
         OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
         OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+        OPTION_BUY_ENTRY_MODE,
+        OPTION_BUY_CONTRACT_SELECTION_MODE,
+        OPTION_BUY_CONTRACT_TARGET_DELTA,
+        OPTION_BUY_CONTRACT_DELTA_MIN,
+        OPTION_BUY_CONTRACT_DELTA_MAX,
+        OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST,
+        OPTION_BUY_CONTRACT_MIN_VOLUME,
+        OPTION_BUY_CONTRACT_BUDGET_STEPDOWN,
+        OPTION_BUY_ENTRY_WINDOW_START_ET or "*",
+        OPTION_BUY_ENTRY_WINDOW_END_ET or "*",
         OPTION_SELL_CLOSE_FULL_POSITION,
         OPTION_SELL_LIMIT_DISCOUNT_PCT,
         OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT,
@@ -9827,17 +9980,17 @@ def load_settings(ini_path=None):
 
     _apply_ini_feature_settings(provider_config)
 
-    if not provider_config.has_section("providers"):
-        raise ValueError("Configuration is missing the [providers] section")
+    if not provider_config.has_section("market_signal_providers"):
+        raise ValueError("Configuration is missing the [market_signal_providers] section")
 
     recognized = {f"{provider}.enabled".lower() for provider in required}
-    for option in provider_config.options("providers"):
+    for option in provider_config.options("market_signal_providers"):
         if option.lower().endswith(".enabled") and option.lower() not in recognized:
-            raise ValueError(f"Unknown provider flag in [providers]: {option}")
+            raise ValueError(f"Unknown provider flag in [market_signal_providers]: {option}")
 
     for provider in required:
         option = f"{provider}.enabled"
-        raw_flag = provider_config.get("providers", option, fallback=None)
+        raw_flag = provider_config.get("market_signal_providers", option, fallback=None)
         enabled = parse_provider_enabled(raw_flag, provider)
         logging.info("PROVIDER_CONFIG provider=%s enabled=%s", provider, enabled)
         if enabled:
@@ -10152,6 +10305,65 @@ OPTION_BUY_ALLOWED_FORECASTS = {
     ).split(",")
     if s.strip()
 }
+VALID_OPTION_BUY_CONTRACT_SELECTION_MODES = frozenset(
+    {
+        "plus2_otm",
+        "atm",
+        "itm1",
+        "itm2",
+        "otm1",
+        "atm_itm_low_spread",
+        "delta_mid",
+        "delta_itm_low_spread",
+        "composite_score",
+    }
+)
+VALID_OPTION_BUY_ENTRY_MODES = frozenset(
+    {
+        "kinematics_forecast",
+        "rsi_ex_ante",
+    }
+)
+_env_sel_mode = os.getenv("OPTION_BUY_CONTRACT_SELECTION_MODE", "plus2_otm").strip().lower()
+OPTION_BUY_CONTRACT_SELECTION_MODE = (
+    _env_sel_mode
+    if _env_sel_mode in VALID_OPTION_BUY_CONTRACT_SELECTION_MODES
+    else "plus2_otm"
+)
+OPTION_BUY_CONTRACT_TARGET_DELTA = min(
+    0.95, max(0.05, abs(float(os.getenv("OPTION_BUY_CONTRACT_TARGET_DELTA", "0.55"))))
+)
+OPTION_BUY_CONTRACT_DELTA_MIN = min(
+    1.0, max(0.0, abs(float(os.getenv("OPTION_BUY_CONTRACT_DELTA_MIN", "0.45"))))
+)
+OPTION_BUY_CONTRACT_DELTA_MAX = min(
+    1.0,
+    max(
+        OPTION_BUY_CONTRACT_DELTA_MIN,
+        abs(float(os.getenv("OPTION_BUY_CONTRACT_DELTA_MAX", "0.70"))),
+    ),
+)
+OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST = max(
+    0, int(os.getenv("OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST", "0"))
+)
+OPTION_BUY_CONTRACT_MIN_VOLUME = max(
+    0, int(os.getenv("OPTION_BUY_CONTRACT_MIN_VOLUME", "0"))
+)
+OPTION_BUY_CONTRACT_BUDGET_STEPDOWN = os.getenv(
+    "OPTION_BUY_CONTRACT_BUDGET_STEPDOWN", "true"
+).strip().lower() in {"1", "true", "yes"}
+_env_entry_mode = os.getenv("OPTION_BUY_ENTRY_MODE", "kinematics_forecast").strip().lower()
+OPTION_BUY_ENTRY_MODE = (
+    _env_entry_mode
+    if _env_entry_mode in VALID_OPTION_BUY_ENTRY_MODES
+    else "kinematics_forecast"
+)
+OPTION_BUY_ENTRY_WINDOW_START_ET = os.getenv(
+    "OPTION_BUY_ENTRY_WINDOW_START_ET", ""
+).strip()
+OPTION_BUY_ENTRY_WINDOW_END_ET = os.getenv(
+    "OPTION_BUY_ENTRY_WINDOW_END_ET", ""
+).strip()
 OPTION_SELL_PAPER = os.getenv(
     "OPTION_SELL_PAPER", "true" if ALPACA_PAPER else "false"
 ).strip().lower() not in {"0", "false", "no"}
@@ -11003,7 +11215,7 @@ def _has_finite_field(entry, *keys):
 
 
 def _kinematics_entry_rank(provider, entry, *, is_current=True, is_recent=True, is_connected=True):
-    """Rank kinematics entry by freshness, completeness, health, and [providers] priority."""
+    """Rank kinematics entry by freshness, completeness, health, and [market_signal_providers] priority."""
     if not isinstance(entry, dict):
         return (-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, "")
     prio_score = _provider_priority_score(provider)
@@ -11045,7 +11257,7 @@ def _kinematics_entry_rank(provider, entry, *, is_current=True, is_recent=True, 
 
 
 def _select_best_kinematics_entry(coordinator, symbol):
-    """Return (provider, latest_entry) prioritizing healthy, fresh bars in [providers] priority order."""
+    """Return (provider, latest_entry) prioritizing healthy, fresh bars in [market_signal_providers] priority order."""
     candidates = []
     for (provider, sym), hist in coordinator.kinematics_history.items():
         if sym != symbol or not hist:
@@ -11541,7 +11753,7 @@ class TradingviewProvider:
                     exc,
                 )
                 return
-            parsed_sym, _, _ = AlpacaOptionBuyer._extract_contract_details(
+            parsed_sym, _, _ = OptionBuyer._extract_contract_details(
                 contract, clean_payload
             )
             if contract is None or not parsed_sym:
@@ -11648,7 +11860,7 @@ class TradingviewProvider:
                     try:
                         self.record(event)
                         # Eager RSI-signal option-chain collection is handled centrally by
-                        # RsiOptionChainCollector on finalized minutes using [providers] priority
+                        # RsiOptionChainCollector on finalized minutes using [market_signal_providers] priority
                         # (with per-symbol cooldown, pacing, and single-call safeguards) so
                         # TradingView, Tastytrade, and Alpaca never double-fetch.
                     finally:
@@ -11681,10 +11893,10 @@ class TradingviewProvider:
 
 
 class RsiOptionChainCollector:
-    """Always-on, rate-limit-safe RSI option-chain collector driven by [providers] priority.
+    """Always-on, rate-limit-safe RSI option-chain collector driven by [market_signal_providers] priority.
 
     Listens for finalized minutes on MinuteCoordinator, selects each symbol's best
-    healthy provider according to [providers] priority (e.g. TRADINGVIEW first or
+    healthy provider according to [market_signal_providers] priority (e.g. TRADINGVIEW first or
     TASTYTRADE first, with automatic failover), and collects pruned option-chain
     snapshots whenever RSI crosses OPTION_CHAIN_RSI_LOW (BUY) or OPTION_CHAIN_RSI_HIGH (SELL).
 
@@ -11779,7 +11991,7 @@ class RsiOptionChainCollector:
         return path
 
     async def collect_for_finalized_minute(self, finalized_minute=None):
-        """Evaluate all symbols for the finalized minute using [providers] priority."""
+        """Evaluate all symbols for the finalized minute using [market_signal_providers] priority."""
         target_minute = (
             minute_utc(finalized_minute)
             if finalized_minute is not None
@@ -11969,7 +12181,7 @@ class RsiOptionChainCollector:
                     )
                     continue
 
-                parsed_sym, _, _ = AlpacaOptionBuyer._extract_contract_details(
+                parsed_sym, _, _ = OptionBuyer._extract_contract_details(
                     contract, clean_payload
                 )
                 if contract is None or not parsed_sym:
@@ -12063,6 +12275,51 @@ def _extract_account_field_num(obj, *attrs, default=None):
     return default
 
 
+def _fetch_alpaca_portfolio_history(credentials, paper=None, timeout=8.0):
+    """Fetch Alpaca account portfolio history (period=all, timeframe=1D) via
+    GET /v2/account/portfolio/history to determine true account base_value for Overall P/L."""
+    keys = credentials if isinstance(credentials, dict) else {}
+    api_key = str(keys.get("alpaca_key") or "").strip()
+    api_secret = str(keys.get("alpaca_secret") or "").strip()
+    if not api_key or not api_secret:
+        return None
+    use_paper = ALPACA_PAPER if paper is None else bool(paper)
+    base_url = (
+        "https://paper-api.alpaca.markets"
+        if use_paper
+        else "https://api.alpaca.markets"
+    )
+    url = f"{base_url}/v2/account/portfolio/history?period=all&timeframe=1D"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+            "Accept": "application/json",
+            "User-Agent": "JBOA-RSI/1.0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+        raw_body = resp.read().decode("utf-8", errors="replace")
+    data = json.loads(raw_body)
+    if not isinstance(data, dict):
+        return None
+    base_val = _opt_safe_float(data.get("base_value"), None)
+    if base_val is None or base_val <= 0:
+        eq_list = data.get("equity") or []
+        for eq_item in eq_list:
+            ev = _opt_safe_float(eq_item, None)
+            if ev is not None and ev > 0:
+                base_val = ev
+                break
+    return {
+        "base_value": round(base_val, 2) if (base_val is not None and base_val > 0) else None,
+        "timeframe": data.get("timeframe"),
+        "fetched_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def extract_account_snapshot(
     account,
     positions=None,
@@ -12071,6 +12328,8 @@ def extract_account_snapshot(
     coordinator=None,
     day_baseline_map=None,
     now_utc=None,
+    portfolio_history=None,
+    market_clock=None,
 ):
     """Normalize account balances & P/L across Alpaca and Tastytrade providers."""
     prov = str(provider or OPTION_TRANSACTION_PROVIDER or "alpaca").strip().lower()
@@ -12115,17 +12374,26 @@ def extract_account_snapshot(
         or 0.0,
         2,
     )
+    available_to_invest_source = "broker"
     if prov == "tastytrade":
-        avail_raw = _extract_account_field_num(
-            account,
-            "options_buying_power",
-            "derivative-buying-power",
-            "buying_power",
-            "equity-buying-power",
-            "cash",
-            "cash-balance",
-            default=0.0,
+        # Tastytrade cash & sandbox accounts frequently report derivative-buying-power=0.0
+        # even when cash-balance / equity-buying-power is funded (e.g., $100,000.00).
+        # Select the first strictly positive field in priority order rather than short-circuiting on 0.0.
+        tt_avail_candidates = (
+            ("derivative_buying_power", ("options_buying_power", "derivative-buying-power")),
+            ("equity_buying_power", ("equity_buying_power", "equity-buying-power")),
+            ("cash_available_to_withdraw", ("cash_available_to_withdraw", "cash-available-to-withdraw")),
+            ("cash_balance", ("cash", "cash-balance")),
+            ("buying_power", ("buying_power",)),
         )
+        avail_raw = 0.0
+        available_to_invest_source = "zero"
+        for src_label, field_names in tt_avail_candidates:
+            cand = _extract_account_field_num(account, *field_names, default=None)
+            if cand is not None and cand > 0.0:
+                avail_raw = cand
+                available_to_invest_source = src_label
+                break
     else:
         avail_raw = _extract_account_field_num(
             account,
@@ -12135,6 +12403,7 @@ def extract_account_snapshot(
             "buying_power",
             default=0.0,
         )
+        available_to_invest_source = "alpaca_buying_power"
     available_to_invest = round(max(0.0, avail_raw or 0.0), 2)
 
     long_mv = abs(
@@ -12204,20 +12473,69 @@ def extract_account_snapshot(
         except Exception:
             pass
 
+    # Determine if US equity/options market is closed for the entire calendar day
+    # (weekend, NYSE holiday via broker clock, or weekday before 04:00 ET daily reset).
+    now_et = poll_dt.astimezone(MARKET_TZ)
+    closed_day_reason = None
+    if now_et.weekday() >= 5:
+        closed_day_reason = "weekend"
+    elif now_et.hour < 4:
+        closed_day_reason = "pre_session_reset"
+    elif market_clock is not None:
+        try:
+            clk_open = bool(
+                market_clock.get("is_open")
+                if isinstance(market_clock, dict)
+                else getattr(market_clock, "is_open", False)
+            )
+            clk_next_open = (
+                market_clock.get("next_open")
+                if isinstance(market_clock, dict)
+                else getattr(market_clock, "next_open", None)
+            )
+            if not clk_open and clk_next_open is not None and now_et.hour < 16:
+                next_dt = (
+                    clk_next_open
+                    if isinstance(clk_next_open, datetime)
+                    else _opt_parse_utc(str(clk_next_open))
+                )
+                if next_dt is not None:
+                    if next_dt.tzinfo is None:
+                        next_dt = next_dt.replace(tzinfo=UTC)
+                    if next_dt.astimezone(MARKET_TZ).date() > now_et.date():
+                        closed_day_reason = "market_holiday"
+        except Exception:
+            pass
+
     # Today's P/L (broker equity delta -> Tastytrade realized day gain + intraday -> intraday/baseline)
     today_pl = None
     today_pl_pct = None
     today_pl_source = "unavailable"
+    last_session_pl = None
+    last_session_pl_pct = None
     last_equity = _extract_account_field_num(account, "last_equity", default=None)
     if last_equity is not None and last_equity > 0:
-        today_pl = round(equity - last_equity, 2)
-        today_pl_pct = round((today_pl / last_equity) * 100.0, 2)
-        today_pl_source = "broker_equity"
+        raw_sess_pl = round(equity - last_equity, 2)
+        raw_sess_pct = round((raw_sess_pl / last_equity) * 100.0, 2)
+        last_session_pl = raw_sess_pl
+        last_session_pl_pct = raw_sess_pct
+        if closed_day_reason and closed_today_pl == 0.0:
+            today_pl = 0.0
+            today_pl_pct = 0.0
+            today_pl_source = closed_day_reason
+        else:
+            today_pl = raw_sess_pl
+            today_pl_pct = raw_sess_pct
+            today_pl_source = "broker_equity"
     else:
         realized_day_gain = _extract_account_field_num(
             account, "realized_day_gain", "realized-day-gain", default=None
         )
-        if realized_day_gain is not None or intraday_pl_vals:
+        if closed_day_reason and closed_today_pl == 0.0 and not realized_day_gain:
+            today_pl = 0.0
+            today_pl_pct = 0.0
+            today_pl_source = closed_day_reason
+        elif realized_day_gain is not None or intraday_pl_vals:
             day_open_pl = round(sum(intraday_pl_vals), 2)
             day_real_pl = (
                 round(realized_day_gain, 2)
@@ -12250,11 +12568,24 @@ def extract_account_snapshot(
             )
             today_pl_source = "session_baseline"
 
-    overall_pl = round(open_unrealized_pl + closed_realized_pl, 2)
-    total_basis = round(open_cost_basis + closed_cost_basis, 2)
-    overall_pl_pct = (
-        round((overall_pl / total_basis) * 100.0, 2) if total_basis > 0 else 0.0
-    )
+    # Overall P/L: prefer Alpaca GET /v2/account/portfolio/history base_value when available;
+    # otherwise fall back to open unrealized + closed option ledger realized P/L.
+    pf_base = None
+    if isinstance(portfolio_history, dict):
+        pf_base = _opt_safe_float(portfolio_history.get("base_value"), None)
+    if pf_base is not None and pf_base > 0 and equity > 0:
+        overall_pl = round(equity - pf_base, 2)
+        overall_pl_pct = round((overall_pl / pf_base) * 100.0, 2)
+        overall_pl_source = "alpaca_portfolio_history"
+        overall_base_value = round(pf_base, 2)
+    else:
+        overall_pl = round(open_unrealized_pl + closed_realized_pl, 2)
+        total_basis = round(open_cost_basis + closed_cost_basis, 2)
+        overall_pl_pct = (
+            round((overall_pl / total_basis) * 100.0, 2) if total_basis > 0 else 0.0
+        )
+        overall_pl_source = "ledger_open_plus_closed"
+        overall_base_value = total_basis if total_basis > 0 else None
 
     return {
         "provider": prov,
@@ -12264,6 +12595,7 @@ def extract_account_snapshot(
         "cash": cash,
         "buying_power": buying_power,
         "available_to_invest": available_to_invest,
+        "available_to_invest_source": available_to_invest_source,
         "balance_invested": balance_invested,
         "investable_total_base": investable_total_base,
         "max_single_trade_dollars": single_trade_cap,
@@ -12273,8 +12605,12 @@ def extract_account_snapshot(
         "today_pl": today_pl,
         "today_pl_pct": today_pl_pct,
         "today_pl_source": today_pl_source,
+        "last_session_pl": last_session_pl,
+        "last_session_pl_pct": last_session_pl_pct,
         "overall_pl": overall_pl,
         "overall_pl_pct": overall_pl_pct,
+        "overall_pl_source": overall_pl_source,
+        "overall_base_value": overall_base_value,
         "open_unrealized_pl": open_unrealized_pl,
         "closed_realized_pl": closed_realized_pl,
         "updated_utc": poll_dt.isoformat(),
@@ -12388,7 +12724,493 @@ def _calculate_budget_scaled_qty(
     return effective_qty, None, details
 
 
-class AlpacaPositionMonitor:
+def _parse_et_clock_minutes(hhmm_str):
+    """Parse an HH:MM 24-hour ET clock string into minutes since midnight (0..1439)."""
+    text = str(hhmm_str or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return hh * 60 + mm
+    return None
+
+
+def _is_within_entry_window_et(ts_value, start_et, end_et):
+    """Check whether ts_value (datetime or ISO string, UTC/aware) falls within [start_et, end_et] ET.
+
+    Returns (allowed: bool, detail: Optional[str]).
+    Empty start_et/end_et disables the corresponding bound.
+    """
+    start_mins = _parse_et_clock_minutes(start_et)
+    end_mins = _parse_et_clock_minutes(end_et)
+    if start_mins is None and end_mins is None:
+        return True, None
+    dt = None
+    if isinstance(ts_value, datetime):
+        dt = ts_value if ts_value.tzinfo is not None else ts_value.replace(tzinfo=UTC)
+    elif ts_value is not None:
+        dt = _opt_parse_utc(ts_value)
+    if dt is None:
+        dt = datetime.now(UTC)
+    et_dt = dt.astimezone(MARKET_TZ)
+    et_mins = et_dt.hour * 60 + et_dt.minute
+    et_label = et_dt.strftime("%H:%M")
+    win_label = f"{start_et or '*'}-{end_et or '*'}"
+    if start_mins is not None and end_mins is not None and start_mins > end_mins:
+        # Overnight wraparound safety (unlikely for RTH, handled defensively)
+        if not (et_mins >= start_mins or et_mins <= end_mins):
+            return False, f"outside_entry_window_et(et={et_label},window={win_label})"
+        return True, None
+    if start_mins is not None and et_mins < start_mins:
+        return False, f"outside_entry_window_et(et={et_label},window={win_label})"
+    if end_mins is not None and et_mins > end_mins:
+        return False, f"outside_entry_window_et(et={et_label},window={win_label})"
+    return True, None
+
+
+def _compute_max_single_contract_budget(
+    *,
+    max_single_trade_dollars=0.0,
+    invest_buffer_withhold_pct=0.0,
+    available_to_invest=None,
+    balance_invested=None,
+    spent_this_cycle=0.0,
+):
+    """Compute the maximum dollar budget available for a single 1-contract option purchase.
+
+    Matches the exact capital math in _calculate_budget_scaled_qty().
+    Returns None when no budget ceiling is active.
+    """
+    cap_single = max(0.0, _opt_safe_float(max_single_trade_dollars, 0.0) or 0.0)
+    withhold_pct = min(
+        100.0, max(0.0, _opt_safe_float(invest_buffer_withhold_pct, 0.0) or 0.0)
+    )
+    spent = max(0.0, _opt_safe_float(spent_this_cycle, 0.0) or 0.0)
+
+    bounds = []
+    if cap_single > 0.0:
+        bounds.append(cap_single)
+    raw_avail = _opt_safe_float(available_to_invest, None)
+    raw_inv = _opt_safe_float(balance_invested, None)
+    if withhold_pct > 0.0 and raw_avail is not None and raw_inv is not None:
+        raw_avail = max(0.0, raw_avail)
+        raw_inv = max(0.0, raw_inv)
+        total_investable = raw_avail + raw_inv
+        max_allowed_invested = total_investable * max(0.0, (100.0 - withhold_pct) / 100.0)
+        rem_budget = max(0.0, min(raw_avail, max_allowed_invested - raw_inv)) - spent
+        bounds.append(max(0.0, rem_budget))
+    if not bounds:
+        return None
+    return min(bounds)
+
+
+def _assign_chain_otm_ranks(chain_snapshot, spot_price, desired_right="CALL"):
+    """Assign exact findthewinners.py OTM ranks to a pruned chain_snapshot list.
+
+    For CALL: strike <= spot sorted descending gets 0 (ATM), -1 (1 ITM), -2 (2 ITM), ...
+              strike > spot sorted ascending gets +1 (1 OTM), +2 (2 OTM), +3, +4, ...
+    For PUT:  strike >= spot sorted ascending gets 0 (ATM), -1 (1 ITM), -2 (2 ITM), ...
+              strike < spot sorted descending gets +1 (1 OTM), +2 (2 OTM), +3, +4, ...
+    Returns a list of normalized candidate dicts sorted by otm_rank ascending.
+    """
+    right_norm = str(desired_right or "CALL").strip().upper()
+    if right_norm not in {"CALL", "PUT"}:
+        right_norm = "CALL"
+    spot = _opt_safe_float(spot_price, None)
+    if not isinstance(chain_snapshot, list) or not chain_snapshot or spot is None or spot <= 0:
+        return []
+
+    valid_rows = []
+    for raw in chain_snapshot:
+        if not isinstance(raw, dict):
+            continue
+        con = str(raw.get("contract") or raw.get("symbol") or "").strip().upper()
+        if not con:
+            continue
+        is_occ, _, parsed_right, parsed_strike, _ = _parse_occ_contract(con)
+        strike = _opt_safe_float(raw.get("strike"), parsed_strike)
+        if strike is None or strike <= 0:
+            continue
+        item_right = parsed_right if (is_occ and parsed_right in {"CALL", "PUT"}) else None
+        bid = _opt_safe_float(raw.get("bid"), None)
+        ask = _opt_safe_float(raw.get("ask"), None)
+        if bid is not None and bid <= 0:
+            bid = None
+        if ask is not None and ask <= 0:
+            ask = None
+        mid = _opt_safe_float(raw.get("mid"), None)
+        if (mid is None or mid <= 0) and bid is not None and ask is not None and ask >= bid:
+            mid = round((bid + ask) / 2.0, 4)
+        spread_pct = _opt_safe_float(raw.get("spread_pct"), None)
+        if spread_pct is None and bid is not None and ask is not None and mid is not None and mid > 0 and ask >= bid:
+            spread_pct = round(((ask - bid) / mid) * 100.0, 2)
+        delta = _opt_safe_float(raw.get("delta"), None)
+        theta = _opt_safe_float(raw.get("theta"), None)
+        iv = _opt_safe_float(raw.get("iv"), None)
+        oi_raw = _opt_safe_float(raw.get("open_interest"), None)
+        vol_raw = _opt_safe_float(raw.get("volume"), None)
+        valid_rows.append(
+            {
+                "raw": raw,
+                "contract": con,
+                "right": item_right,
+                "strike": float(strike),
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread_pct": spread_pct,
+                "delta": delta,
+                "abs_delta": abs(delta) if delta is not None else None,
+                "theta": theta,
+                "iv": iv,
+                "open_interest": int(oi_raw) if oi_raw is not None and oi_raw >= 0 else None,
+                "volume": int(vol_raw) if vol_raw is not None and vol_raw >= 0 else None,
+            }
+        )
+
+    if right_norm == "CALL":
+        itm_atm = sorted(
+            [c for c in valid_rows if c["strike"] <= spot],
+            key=lambda c: c["strike"],
+            reverse=True,
+        )
+        otm = sorted(
+            [c for c in valid_rows if c["strike"] > spot],
+            key=lambda c: c["strike"],
+        )
+    else:
+        itm_atm = sorted(
+            [c for c in valid_rows if c["strike"] >= spot],
+            key=lambda c: c["strike"],
+        )
+        otm = sorted(
+            [c for c in valid_rows if c["strike"] < spot],
+            key=lambda c: c["strike"],
+            reverse=True,
+        )
+
+    ranked = []
+    for idx, c in enumerate(itm_atm):
+        row = dict(c)
+        row["otm_rank"] = -idx
+        ranked.append(row)
+    for idx, c in enumerate(otm, start=1):
+        row = dict(c)
+        row["otm_rank"] = idx
+        ranked.append(row)
+    ranked.sort(key=lambda c: c["otm_rank"])
+    return ranked
+
+
+def _select_ex_ante_option_contract(
+    clean_payload,
+    *,
+    mode="atm_itm_low_spread",
+    desired_right="CALL",
+    spot_hint=None,
+    max_spread_pct=5.0,
+    target_delta=0.55,
+    delta_min=0.45,
+    delta_max=0.70,
+    min_open_interest=0,
+    min_volume=0,
+    max_contract_dollars=None,
+    budget_stepdown=True,
+    limit_aggression=0.25,
+    order_type="limit",
+    open_contracts=None,
+    require_right_match=True,
+):
+    """Select an option contract from clean_payload using strictly live, zero-hindsight ex-ante rules.
+
+    Mirrors findthewinners.py :: _pick_ex_ante_candidate() plus live liquidity and budget step-down.
+    Returns (selected_raw_dict_or_None, metadata_dict, reject_reason_or_None).
+    """
+    sel_mode = str(mode or "plus2_otm").strip().lower()
+    right_norm = str(desired_right or "CALL").strip().upper()
+    held_set = {str(s).strip().upper() for s in (open_contracts or ())}
+
+    payload = None
+    if isinstance(clean_payload, dict):
+        payload = clean_payload
+    elif isinstance(clean_payload, str) and clean_payload.strip():
+        try:
+            parsed = json.loads(clean_payload)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = None
+
+    if not isinstance(payload, dict):
+        return None, {"mode": sel_mode}, f"no_candidate_matched(mode={sel_mode},reason=no_chain_payload)"
+
+    chain = payload.get("chain_snapshot")
+    if not isinstance(chain, list) or not chain:
+        return None, {"mode": sel_mode}, f"no_candidate_matched(mode={sel_mode},reason=empty_chain_snapshot)"
+
+    spot = _opt_safe_float(payload.get("spot_ask_price"), None)
+    if spot is None or spot <= 0:
+        spot = _opt_safe_float(spot_hint, None)
+    if spot is None or spot <= 0:
+        return None, {"mode": sel_mode}, f"no_candidate_matched(mode={sel_mode},reason=no_spot_price)"
+
+    ranked = _assign_chain_otm_ranks(chain, spot, desired_right=right_norm)
+    if not ranked:
+        return None, {"mode": sel_mode}, f"no_candidate_matched(mode={sel_mode},reason=no_rankable_strikes)"
+
+    # Helper to estimate 1-contract cost using the exact same pricing rule as evaluate_and_buy()
+    def _est_1ct_cost(cand):
+        b, a = cand.get("bid"), cand.get("ask")
+        if b is None or a is None or b <= 0 or a < b:
+            return None
+        if str(order_type or "limit").strip().lower() == "limit":
+            raw_lp = b + (a - b) * min(1.0, max(0.0, float(limit_aggression)))
+            px = round(max(0.01, min(a, max(b, raw_lp))), 2)
+        else:
+            px = a
+        return px * 100.0
+
+    # Stage 1: Hard ex-ante quality & liquidity filters (pre-budget)
+    pre_budget_pool = []
+    counts = {
+        "total": len(ranked),
+        "right": 0,
+        "held": 0,
+        "quote": 0,
+        "spread": 0,
+        "oi": 0,
+        "vol": 0,
+        "budget": 0,
+    }
+    max_spr = max(0.0, float(max_spread_pct or 0.0))
+    min_oi = max(0, int(min_open_interest or 0))
+    min_vol = max(0, int(min_volume or 0))
+
+    for c in ranked:
+        if require_right_match and c["right"] is not None and c["right"] != right_norm:
+            counts["right"] += 1
+            continue
+        if c["contract"] in held_set:
+            counts["held"] += 1
+            continue
+        if c["bid"] is None or c["ask"] is None or c["bid"] <= 0 or c["ask"] < c["bid"]:
+            counts["quote"] += 1
+            continue
+        if max_spr > 0 and (c["spread_pct"] is None or c["spread_pct"] > max_spr):
+            counts["spread"] += 1
+            continue
+        if min_oi > 0 and (c["open_interest"] is None or c["open_interest"] < min_oi):
+            counts["oi"] += 1
+            continue
+        if min_vol > 0 and (c["volume"] is None or c["volume"] < min_vol):
+            counts["vol"] += 1
+            continue
+        c["est_1ct_cost"] = _est_1ct_cost(c)
+        pre_budget_pool.append(c)
+
+    if not pre_budget_pool:
+        return (
+            None,
+            {"mode": sel_mode, "counts": counts},
+            (
+                f"no_candidate_matched(mode={sel_mode},total={counts['total']},"
+                f"bad_quote={counts['quote']},wide_spr={counts['spread']},"
+                f"low_oi={counts['oi']},low_vol={counts['vol']},held={counts['held']})"
+            ),
+        )
+
+    # Stage 2: Budget filter (when budget_stepdown is True and max_contract_dollars is active)
+    budget_cap = _opt_safe_float(max_contract_dollars, None)
+    if budget_stepdown and budget_cap is not None:
+        pool = []
+        for c in pre_budget_pool:
+            cost = c.get("est_1ct_cost")
+            if cost is not None and cost <= budget_cap + 1e-6:
+                pool.append(c)
+            else:
+                counts["budget"] += 1
+    else:
+        pool = list(pre_budget_pool)
+
+    if not pool:
+        return (
+            None,
+            {"mode": sel_mode, "counts": counts, "budget_cap": budget_cap},
+            (
+                f"no_candidate_matched(mode={sel_mode},reason=all_over_budget,"
+                f"pre_budget={len(pre_budget_pool)},budget_cap=${budget_cap:.2f})"
+                if budget_cap is not None
+                else f"no_candidate_matched(mode={sel_mode},reason=empty_pool)"
+            ),
+        )
+
+    def _spr_key(c):
+        return c["spread_pct"] if c["spread_pct"] is not None else 999.0
+
+    def _near_window(cands):
+        w = [c for c in cands if -2 <= c["otm_rank"] <= 4]
+        return w if w else cands
+
+    chosen = None
+    stepped_down = False
+    score_val = None
+
+    fixed_rank_map = {
+        "itm2": -2,
+        "itm1": -1,
+        "atm": 0,
+        "otm1": 1,
+        "plus2_otm": 2,
+    }
+    if sel_mode in fixed_rank_map:
+        target_rk = fixed_rank_map[sel_mode]
+        chosen = next((c for c in pool if c["otm_rank"] == target_rk), None)
+        if chosen is None and budget_stepdown and budget_cap is not None:
+            # Step down outward only if the target rank existed pre-budget and was dropped for cost
+            had_pre_budget = any(c["otm_rank"] == target_rk for c in pre_budget_pool)
+            if had_pre_budget:
+                cheaper = [c for c in pool if target_rk < c["otm_rank"] <= 4]
+                if cheaper:
+                    chosen = min(cheaper, key=lambda c: (c["otm_rank"], _spr_key(c)))
+                    stepped_down = True
+
+    elif sel_mode == "atm_itm_low_spread":
+        primary = [c for c in pool if c["otm_rank"] in (-1, 0)]
+        if primary:
+            chosen = min(primary, key=lambda c: (_spr_key(c), abs(c["otm_rank"])))
+        elif budget_stepdown and budget_cap is not None:
+            had_pre_budget = any(c["otm_rank"] in (-1, 0) for c in pre_budget_pool)
+            if had_pre_budget:
+                cheaper = [c for c in pool if 1 <= c["otm_rank"] <= 4]
+                if cheaper:
+                    chosen = min(cheaper, key=lambda c: (c["otm_rank"], _spr_key(c)))
+                    stepped_down = True
+
+    elif sel_mode == "delta_mid":
+        d_lo = min(float(delta_min), float(delta_max))
+        d_hi = max(float(delta_min), float(delta_max))
+        t_d = float(target_delta)
+        in_band = [
+            c for c in pool if c["abs_delta"] is not None and d_lo <= c["abs_delta"] <= d_hi
+        ]
+        if in_band:
+            chosen = min(
+                in_band,
+                key=lambda c: (abs(c["abs_delta"] - t_d), _spr_key(c), abs(c["otm_rank"])),
+            )
+        else:
+            with_delta = [c for c in _near_window(pool) if c["abs_delta"] is not None]
+            if with_delta:
+                chosen = min(
+                    with_delta,
+                    key=lambda c: (abs(c["abs_delta"] - t_d), _spr_key(c), abs(c["otm_rank"])),
+                )
+                if budget_stepdown and budget_cap is not None:
+                    had_pre_band = any(
+                        c["abs_delta"] is not None and d_lo <= c["abs_delta"] <= d_hi
+                        for c in pre_budget_pool
+                    )
+                    if had_pre_band:
+                        stepped_down = True
+
+    elif sel_mode == "delta_itm_low_spread":
+        d_floor = max(0.55, float(delta_min))
+        d_ceil = max(0.85, float(delta_max))
+        t_d = float(target_delta)
+        itm_delta = [
+            c
+            for c in pool
+            if c["abs_delta"] is not None and d_floor <= c["abs_delta"] <= d_ceil
+        ]
+        if itm_delta:
+            chosen = min(
+                itm_delta,
+                key=lambda c: (_spr_key(c), abs(c["abs_delta"] - t_d), abs(c["otm_rank"])),
+            )
+        elif budget_stepdown and budget_cap is not None:
+            had_pre_itm = any(
+                c["abs_delta"] is not None and d_floor <= c["abs_delta"] <= d_ceil
+                for c in pre_budget_pool
+            )
+            if had_pre_itm:
+                fallback_d = [
+                    c for c in _near_window(pool) if c["abs_delta"] is not None and c["abs_delta"] >= 0.35
+                ]
+                if fallback_d:
+                    chosen = min(
+                        fallback_d,
+                        key=lambda c: (abs(c["abs_delta"] - t_d), _spr_key(c), abs(c["otm_rank"])),
+                    )
+                    stepped_down = True
+
+    elif sel_mode == "composite_score":
+        near = _near_window(pool)
+        t_d = float(target_delta)
+        spr_scale = max(max_spr, 5.0)
+        best_pair = None
+        for c in near:
+            spr = _spr_key(c)
+            spread_score = max(0.0, 1.0 - (spr / spr_scale))
+            if c["abs_delta"] is not None:
+                delta_score = max(0.0, 1.0 - (abs(c["abs_delta"] - t_d) / 0.35))
+            else:
+                delta_score = max(0.0, 1.0 - (abs(c["otm_rank"] + 0.5) / 4.0))
+            if c["volume"] is not None or c["open_interest"] is not None:
+                liq_raw = float(c["volume"] or 0) + 0.25 * float(c["open_interest"] or 0)
+                liq_score = min(1.0, math.log1p(max(0.0, liq_raw)) / math.log1p(1000.0))
+            else:
+                liq_score = 0.5
+            if c["theta"] is not None and c["mid"] is not None and c["mid"] > 0:
+                theta_ratio = abs(c["theta"]) / c["mid"]
+                theta_score = max(0.0, 1.0 - (theta_ratio / 0.15))
+            else:
+                theta_score = 0.5
+            comp = (
+                0.45 * spread_score
+                + 0.35 * delta_score
+                + 0.15 * liq_score
+                + 0.05 * theta_score
+            )
+            # Higher composite score wins; tie-break by lower spread, then closer to ATM
+            sort_key = (round(comp, 6), -spr, -abs(c["otm_rank"]))
+            if best_pair is None or sort_key > best_pair[0]:
+                best_pair = (sort_key, c, comp)
+        if best_pair is not None:
+            chosen = best_pair[1]
+            score_val = round(best_pair[2], 3)
+
+    if chosen is None:
+        return (
+            None,
+            {"mode": sel_mode, "counts": counts, "pool_size": len(pool)},
+            f"no_candidate_matched(mode={sel_mode},pool={len(pool)},wide_spr={counts['spread']},over_budget={counts['budget']})",
+        )
+
+    meta = {
+        "mode": sel_mode,
+        "contract": chosen["contract"],
+        "strike": chosen["strike"],
+        "otm_rank": chosen["otm_rank"],
+        "spread_pct": chosen["spread_pct"],
+        "delta": chosen["delta"],
+        "open_interest": chosen["open_interest"],
+        "volume": chosen["volume"],
+        "est_1ct_cost": chosen.get("est_1ct_cost"),
+        "stepped_down": stepped_down,
+        "score": score_val,
+        "pool_size": len(pool),
+    }
+    return dict(chosen["raw"]), meta, None
+
+
+class PositionMonitor:
     """Poll account positions every minute and log option holdings."""
 
     def __init__(self, keys, coordinator=None):
@@ -12418,6 +13240,10 @@ class AlpacaPositionMonitor:
         )
         self.account_snapshot = None
         self._day_equity_baselines = {}
+        self._portfolio_history_cache = None
+        self._portfolio_history_fetched_mono = 0.0
+        self._market_clock_cache = None
+        self._market_clock_fetched_mono = 0.0
         self._last_logged_minute = None
         self._last_logged_sig = None
 
@@ -12518,6 +13344,41 @@ class AlpacaPositionMonitor:
                 positions, timestamp=self.last_poll_utc
             )
 
+        # Refresh Alpaca portfolio history (5m cache) and broker market clock (60s cache)
+        now_mono = time.monotonic()
+        if self.transaction_provider == "alpaca":
+            if (
+                self._portfolio_history_cache is None
+                or (now_mono - self._portfolio_history_fetched_mono) >= 300.0
+            ):
+                self._portfolio_history_fetched_mono = now_mono
+                try:
+                    pf_hist = _fetch_alpaca_portfolio_history(
+                        self.credentials, paper=ALPACA_PAPER
+                    )
+                    if isinstance(pf_hist, dict):
+                        self._portfolio_history_cache = pf_hist
+                except Exception as pf_exc:
+                    self.logger.warning(
+                        "ALPACA_PORTFOLIO_HISTORY_WARN error_type=%s detail=%s",
+                        type(pf_exc).__name__,
+                        pf_exc,
+                    )
+            if (
+                self._market_clock_cache is None
+                or (now_mono - self._market_clock_fetched_mono) >= 60.0
+            ):
+                self._market_clock_fetched_mono = now_mono
+                try:
+                    if hasattr(self.client, "get_clock"):
+                        self._market_clock_cache = self.client.get_clock()
+                except Exception as clk_exc:
+                    self.logger.warning(
+                        "ALPACA_CLOCK_WARN error_type=%s detail=%s",
+                        type(clk_exc).__name__,
+                        clk_exc,
+                    )
+
         try:
             self.account_snapshot = extract_account_snapshot(
                 account,
@@ -12526,6 +13387,8 @@ class AlpacaPositionMonitor:
                 coordinator=self.coordinator,
                 day_baseline_map=self._day_equity_baselines,
                 now_utc=poll_now_dt,
+                portfolio_history=self._portfolio_history_cache,
+                market_clock=self._market_clock_cache,
             )
         except Exception as acct_exc:
             self.logger.warning(
@@ -12737,7 +13600,7 @@ def _extract_analysis_metrics(entry):
     )
 
 
-class AlpacaOptionBuyer:
+class OptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
 
@@ -13127,6 +13990,14 @@ class AlpacaOptionBuyer:
         if not entry:
             return False, None, "no_entry"
 
+        win_ok, win_reject = _is_within_entry_window_et(
+            entry.get("timestamp"),
+            OPTION_BUY_ENTRY_WINDOW_START_ET,
+            OPTION_BUY_ENTRY_WINDOW_END_ET,
+        )
+        if not win_ok:
+            return False, None, win_reject
+
         raw_rsi = entry.get("rsi")
         if raw_rsi is None or isinstance(raw_rsi, bool):
             return False, None, _format_rsi_unavailable_reason(entry)
@@ -13144,7 +14015,7 @@ class AlpacaOptionBuyer:
         if rsi <= OPTION_CHAIN_RSI_LOW:
             rsi_tag = f"rsi={rsi:.2f}<=low"
         elif OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES > 0 and rsi <= bounce_rsi_cap:
-            lb_match = AlpacaOptionBuyer._find_recent_oversold_entry(
+            lb_match = OptionBuyer._find_recent_oversold_entry(
                 entry,
                 recent_history,
                 OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
@@ -13180,6 +14051,44 @@ class AlpacaOptionBuyer:
             if entry.get("smoothed_acceleration") is not None
             else entry.get("price_acceleration")
         )
+
+        # Opt-in forecast-independent entry mode (rsi_ex_ante):
+        # Qualifies on RSI oversold / bounce lookback without requiring 1-minute Taylor
+        # forecast_direction or projected_delta > 0, while still enforcing positive velocity
+        # on bounces (or when require_positive_velocity=true) and blocking accelerating freefalls.
+        if OPTION_BUY_ENTRY_MODE == "rsi_ex_ante":
+            vel = _opt_safe_float(raw_vel, None)
+            acc = _opt_safe_float(raw_acc, None)
+            if used_lookback:
+                if vel is None:
+                    return False, None, "kinematics_unavailable(v=n/a)"
+                if vel <= 0:
+                    return (
+                        False,
+                        None,
+                        f"bounce_velocity_not_positive(rsi={rsi:.2f},prev_rsi={lb_rsi:.2f}@{lb_mins}m,"
+                        f"v={vel:+.4f},a={f'{acc:+.4f}' if acc is not None else 'n/a'})",
+                    )
+            if OPTION_BUY_REQUIRE_POSITIVE_VELOCITY:
+                if vel is None:
+                    return False, None, "kinematics_unavailable(v=n/a)"
+                if vel <= 0:
+                    return (
+                        False,
+                        None,
+                        f"velocity_not_positive(rsi={rsi:.2f},v={vel:+.4f},a={f'{acc:+.4f}' if acc is not None else 'n/a'})",
+                    )
+            elif vel is not None and acc is not None and vel < 0 and acc <= 0:
+                return (
+                    False,
+                    None,
+                    f"kinematics_unfavorable[v={vel:+.4f}<0,a={acc:+.4f}<=0(accelerating_drop)]"
+                    f"(rsi={rsi:.2f},v={vel:+.4f},a={acc:+.4f})",
+                )
+            v_str = f"{vel:+.4f}" if vel is not None else "n/a"
+            a_str = f"{acc:+.4f}" if acc is not None else "n/a"
+            return True, "CALL", f"{rsi_tag}&rsi_ex_ante(v={v_str},a={a_str})"
+
         if raw_vel is None and raw_acc is None:
             return False, None, "kinematics_unavailable(no_v_or_a)"
         if raw_vel is not None and raw_acc is None:
@@ -13404,7 +14313,7 @@ class AlpacaOptionBuyer:
             )
             loaded_positions = positions
             for pos in positions:
-                if AlpacaPositionMonitor._is_option(pos):
+                if PositionMonitor._is_option(pos):
                     open_option_count += 1
                     raw_psym = (
                         pos.get("symbol")
@@ -13733,6 +14642,85 @@ class AlpacaOptionBuyer:
                 )
                 continue
 
+            acct_snap = None
+            if OPTION_BUY_CONTRACT_SELECTION_MODE != "plus2_otm":
+                max_1ct_budget = None
+                if OPTION_BUY_CONTRACT_BUDGET_STEPDOWN and (
+                    OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS > 0
+                    or OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT > 0
+                ):
+                    try:
+                        acct_snap = await ensure_account_snapshot()
+                    except Exception as acct_exc:
+                        self.logger.warning(
+                            "OPTION_BUY_ACCOUNT_CHECK_FAILED symbol=%s stage=contract_selection error_type=%s detail=%s",
+                            symbol,
+                            type(acct_exc).__name__,
+                            acct_exc,
+                        )
+                        acct_snap = None
+                    max_1ct_budget = _compute_max_single_contract_budget(
+                        max_single_trade_dollars=OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
+                        invest_buffer_withhold_pct=OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                        available_to_invest=(
+                            acct_snap.get("available_to_invest")
+                            if isinstance(acct_snap, dict)
+                            else None
+                        ),
+                        balance_invested=(
+                            acct_snap.get("balance_invested")
+                            if isinstance(acct_snap, dict)
+                            else None
+                        ),
+                        spent_this_cycle=spent_this_cycle,
+                    )
+                sel_contract, sel_meta, sel_reject = _select_ex_ante_option_contract(
+                    clean_payload,
+                    mode=OPTION_BUY_CONTRACT_SELECTION_MODE,
+                    desired_right=desired_right,
+                    spot_hint=entry.get("close"),
+                    max_spread_pct=OPTION_BUY_MAX_SPREAD_PCT,
+                    target_delta=OPTION_BUY_CONTRACT_TARGET_DELTA,
+                    delta_min=OPTION_BUY_CONTRACT_DELTA_MIN,
+                    delta_max=OPTION_BUY_CONTRACT_DELTA_MAX,
+                    min_open_interest=OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST,
+                    min_volume=OPTION_BUY_CONTRACT_MIN_VOLUME,
+                    max_contract_dollars=max_1ct_budget,
+                    budget_stepdown=OPTION_BUY_CONTRACT_BUDGET_STEPDOWN,
+                    limit_aggression=OPTION_BUY_LIMIT_AGGRESSION,
+                    order_type=OPTION_BUY_ORDER_TYPE,
+                    open_contracts=open_contracts,
+                    require_right_match=OPTION_BUY_REQUIRE_RIGHT_MATCH,
+                )
+                if sel_contract is None:
+                    reject_reason = sel_reject or f"no_candidate_matched(mode={OPTION_BUY_CONTRACT_SELECTION_MODE})"
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        reject_reason,
+                    )
+                    self.logger.info(
+                        "OPTION_BUY_SKIPPED symbol=%s reason=%s mode=%s",
+                        symbol,
+                        reject_reason,
+                        OPTION_BUY_CONTRACT_SELECTION_MODE,
+                    )
+                    continue
+                contract = sel_contract
+                sel_parts = [f"rank={sel_meta.get('otm_rank'):+d}"]
+                if sel_meta.get("spread_pct") is not None:
+                    sel_parts.append(f"spr={sel_meta['spread_pct']:.2f}%")
+                if sel_meta.get("delta") is not None:
+                    sel_parts.append(f"d={abs(float(sel_meta['delta'])):.2f}")
+                if sel_meta.get("score") is not None:
+                    sel_parts.append(f"score={sel_meta['score']:.2f}")
+                if sel_meta.get("stepped_down"):
+                    sel_parts.append("stepdown")
+                reason = f"{reason}|sel={OPTION_BUY_CONTRACT_SELECTION_MODE}({','.join(sel_parts)})"
+
             contract_symbol, limit_price, inferred_right = (
                 self._extract_contract_details(
                     contract, clean_payload, desired_right=desired_right
@@ -13910,8 +14898,7 @@ class AlpacaOptionBuyer:
                     else (contract_bid if contract_bid is not None else limit_price)
                 )
             )
-            acct_snap = None
-            if (
+            if acct_snap is None and (
                 OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS > 0
                 or OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT > 0
             ):
@@ -14337,9 +15324,13 @@ class AlpacaOptionBuyer:
 
         self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
         self.logger.info(
-            "OPTION_BUYER_START mode=%s rsi_low<=%.2f lookback=%dm bounce_rsi<=%.2f qty=%d order_type=%s aggr=%.2f "
+            "OPTION_BUYER_START mode=%s entry_mode=%s sel_mode=%s win_et=%s..%s rsi_low<=%.2f lookback=%dm bounce_rsi<=%.2f qty=%d order_type=%s aggr=%.2f "
             "max_spread=%.2f%% pos_vel=%s max_per_min=%d cooldown_min=%d max_open=%d allowed=%s",
             self.mode,
+            OPTION_BUY_ENTRY_MODE,
+            OPTION_BUY_CONTRACT_SELECTION_MODE,
+            OPTION_BUY_ENTRY_WINDOW_START_ET or "*",
+            OPTION_BUY_ENTRY_WINDOW_END_ET or "*",
             OPTION_CHAIN_RSI_LOW,
             OPTION_BUY_OVERSOLD_LOOKBACK_MINUTES,
             OPTION_BUY_BOUNCE_RSI_MAX,
@@ -14387,10 +15378,10 @@ class AlpacaOptionBuyer:
                 await asyncio.sleep(2.0)
 
 
-class AlpacaOptionSeller:
+class OptionSeller:
     """Async task synced to 1-minute finalization that inspects all held positions
-    in the Alpaca account and submits SELL orders when underlying RSI >= OPTION_CHAIN_RSI_HIGH
-    and kinematic metrics are favorable for selling."""
+    in the configured broker account (Alpaca or Tastytrade) and submits SELL orders
+    when underlying RSI >= OPTION_CHAIN_RSI_HIGH and kinematic metrics are favorable."""
 
     def __init__(
         self,
@@ -14601,7 +15592,7 @@ class AlpacaOptionSeller:
         if isinstance(raw_und, str) and raw_und.strip():
             return raw_und.strip().upper()
         if is_option:
-            inferred = AlpacaOptionBuyer._infer_occ_underlying(pos_sym)
+            inferred = OptionBuyer._infer_occ_underlying(pos_sym)
             if inferred:
                 return inferred
         return pos_sym
@@ -14728,11 +15719,11 @@ class AlpacaOptionSeller:
     @staticmethod
     def _position_pnl_pct(pos):
         """Return position unrealized return as a percentage (e.g., -4.5 for -4.5%)."""
-        plpc = AlpacaPositionMonitor._num(pos, "unrealized_plpc", None)
+        plpc = PositionMonitor._num(pos, "unrealized_plpc", None)
         if plpc is not None:
             return plpc * 100.0
-        avg_entry = AlpacaPositionMonitor._num(pos, "avg_entry_price", None)
-        cur_price = AlpacaPositionMonitor._num(pos, "current_price", None)
+        avg_entry = PositionMonitor._num(pos, "avg_entry_price", None)
+        cur_price = PositionMonitor._num(pos, "current_price", None)
         if (
             avg_entry is not None
             and cur_price is not None
@@ -14740,8 +15731,8 @@ class AlpacaOptionSeller:
             and cur_price > 0
         ):
             return ((cur_price - avg_entry) / avg_entry) * 100.0
-        upl = AlpacaPositionMonitor._num(pos, "unrealized_pl", None)
-        cost_basis = AlpacaPositionMonitor._num(pos, "cost_basis", None)
+        upl = PositionMonitor._num(pos, "unrealized_pl", None)
+        cost_basis = PositionMonitor._num(pos, "cost_basis", None)
         if upl is not None and cost_basis is not None and cost_basis > 0:
             return (upl / cost_basis) * 100.0
         return None
@@ -14857,7 +15848,7 @@ class AlpacaOptionSeller:
     def _is_call_contract(pos_sym, is_option):
         if not is_option:
             return False
-        return AlpacaOptionBuyer._infer_occ_right(pos_sym) == "CALL"
+        return OptionBuyer._infer_occ_right(pos_sym) == "CALL"
 
     def _update_peak_profit_state(self, pos_sym, pnl_pct, now_iso):
         """Update session high-water mark return and compute drawdown from peak (%)."""
@@ -14978,12 +15969,12 @@ class AlpacaOptionSeller:
                 if tt_client is None:
                     return None, None
                 q = tt_client.get_quote(pos_sym, is_option=is_option)
-                bid = AlpacaPositionMonitor._num(q, "bid_price", None)
+                bid = PositionMonitor._num(q, "bid_price", None)
                 if bid is None:
-                    bid = AlpacaPositionMonitor._num(q, "bid", None)
-                ask = AlpacaPositionMonitor._num(q, "ask_price", None)
+                    bid = PositionMonitor._num(q, "bid", None)
+                ask = PositionMonitor._num(q, "ask_price", None)
                 if ask is None:
-                    ask = AlpacaPositionMonitor._num(q, "ask", None)
+                    ask = PositionMonitor._num(q, "ask", None)
                 valid_bid = (
                     bid
                     if (bid is not None and math.isfinite(bid) and bid > 0)
@@ -15051,12 +16042,12 @@ class AlpacaOptionSeller:
             quote = next(iter(quotes.values()), None)
         if quote is None:
             return None, None
-        bid = AlpacaPositionMonitor._num(quote, "bid_price", None)
+        bid = PositionMonitor._num(quote, "bid_price", None)
         if bid is None:
-            bid = AlpacaPositionMonitor._num(quote, "bid", None)
-        ask = AlpacaPositionMonitor._num(quote, "ask_price", None)
+            bid = PositionMonitor._num(quote, "bid", None)
+        ask = PositionMonitor._num(quote, "ask_price", None)
         if ask is None:
-            ask = AlpacaPositionMonitor._num(quote, "ask", None)
+            ask = PositionMonitor._num(quote, "ask", None)
         valid_bid = (
             bid if (bid is not None and math.isfinite(bid) and bid > 0) else None
         )
@@ -15076,8 +16067,8 @@ class AlpacaOptionSeller:
         candidates = [
             live_bid,
             cur_price,
-            AlpacaPositionMonitor._num(pos, "lastday_price", None),
-            AlpacaPositionMonitor._num(pos, "avg_entry_price", None),
+            PositionMonitor._num(pos, "lastday_price", None),
+            PositionMonitor._num(pos, "avg_entry_price", None),
         ]
         try:
             q = float(raw_qty or 0.0)
@@ -15085,8 +16076,8 @@ class AlpacaOptionSeller:
             q = 0.0
         if q > 0:
             mult = 100.0 if is_option else 1.0
-            mkt_val = AlpacaPositionMonitor._num(pos, "market_value", None)
-            cost_basis = AlpacaPositionMonitor._num(pos, "cost_basis", None)
+            mkt_val = PositionMonitor._num(pos, "market_value", None)
+            cost_basis = PositionMonitor._num(pos, "cost_basis", None)
             if mkt_val is not None and mkt_val > 0:
                 candidates.append(mkt_val / (q * mult))
             if cost_basis is not None and cost_basis > 0:
@@ -15167,7 +16158,7 @@ class AlpacaOptionSeller:
         if self.transaction_provider == "tastytrade" or isinstance(
             self.client, TastytradeClient
         ):
-            is_opt = AlpacaPositionMonitor._is_option({"symbol": contract_or_symbol})
+            is_opt = PositionMonitor._is_option({"symbol": contract_or_symbol})
             return self.client.submit_order(
                 symbol=contract_or_symbol,
                 qty=qty,
@@ -15177,7 +16168,7 @@ class AlpacaOptionSeller:
                 time_in_force="Day",
                 is_option=is_opt,
                 underlying_symbol=(
-                    AlpacaOptionBuyer._infer_occ_underlying(contract_or_symbol)
+                    OptionBuyer._infer_occ_underlying(contract_or_symbol)
                     if is_opt
                     else contract_or_symbol
                 ),
@@ -15287,7 +16278,7 @@ class AlpacaOptionSeller:
             if not pos_sym:
                 continue
 
-            raw_qty = AlpacaPositionMonitor._num(pos, "qty", 0.0)
+            raw_qty = PositionMonitor._num(pos, "qty", 0.0)
             raw_side = (
                 pos.get("side") if isinstance(pos, dict) else getattr(pos, "side", None)
             )
@@ -15305,7 +16296,7 @@ class AlpacaOptionSeller:
                 )
                 continue
 
-            is_option = AlpacaPositionMonitor._is_option(pos)
+            is_option = PositionMonitor._is_option(pos)
             underlying = self._extract_underlying(pos, pos_sym, is_option)
             if OPTION_SELL_OPTIONS_ONLY and not is_option:
                 self._log_sell_analysis(
@@ -15375,7 +16366,7 @@ class AlpacaOptionSeller:
 
             provider, entry = self._select_kinematics_entry(underlying)
 
-            qty_avail = AlpacaPositionMonitor._num(pos, "qty_available", None)
+            qty_avail = PositionMonitor._num(pos, "qty_available", None)
             if qty_avail is not None and qty_avail <= 0:
                 self._log_sell_analysis(
                     minute_key,
@@ -15645,7 +16636,7 @@ class AlpacaOptionSeller:
             else:
                 order_qty = round(target_qty, 6)
 
-            cur_price = AlpacaPositionMonitor._num(pos, "current_price", 0.0)
+            cur_price = PositionMonitor._num(pos, "current_price", 0.0)
             eff_order_type, live_bid, live_ask, limit_price = (
                 await self._resolve_sell_order_params(
                     pos_sym, cur_price, is_option, trigger_kind
@@ -15818,7 +16809,7 @@ class AlpacaOptionSeller:
 
                 order_id = getattr(order, "id", None)
                 order_status = getattr(order, "status", "submitted")
-                filled_avg = AlpacaPositionMonitor._num(order, "filled_avg_price", None)
+                filled_avg = PositionMonitor._num(order, "filled_avg_price", None)
                 actual_sell_unit = (
                     filled_avg
                     if (
@@ -15892,10 +16883,10 @@ class AlpacaOptionSeller:
                         sold_at=exec_at,
                         order_id=order_id,
                         reason=reason,
-                        entry_price=AlpacaPositionMonitor._num(
+                        entry_price=PositionMonitor._num(
                             pos, "avg_entry_price", None
                         ),
-                        cost_basis=AlpacaPositionMonitor._num(pos, "cost_basis", None),
+                        cost_basis=PositionMonitor._num(pos, "cost_basis", None),
                         purchased_at=self.first_seen_at_by_symbol.get(pos_sym),
                         dry_run=False,
                     )
@@ -16071,6 +17062,12 @@ class AlpacaOptionSeller:
                     exc,
                 )
                 await asyncio.sleep(2.0)
+
+
+# Backwards-compatible aliases for any external scripts importing legacy class names
+AlpacaPositionMonitor = PositionMonitor
+AlpacaOptionBuyer = OptionBuyer
+AlpacaOptionSeller = OptionSeller
 
 
 def _median_or_none(vals):
@@ -19160,7 +20157,7 @@ LOGIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
             </button>
 
             <div class="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10.5px] text-slate-500 mono">
-                <span>Run: __RUN_ID__</span>
+                <span>v__APP_VERSION__ &bull; Run: __RUN_ID__</span>
                 <span>Session-protected UI</span>
             </div>
         </form>
@@ -19255,6 +20252,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); }
         ::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); rounded: 9999px; }
         ::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.8); }
+        .doc-mermaid-viewport { position: relative; width: 100%; height: 460px; overflow: hidden; cursor: grab; user-select: none; touch-action: none; background-color: #080d19; background-image: radial-gradient(circle, rgba(148, 163, 184, 0.13) 1px, transparent 1px); background-size: 20px 20px; }
+        .doc-mermaid-viewport.is-dragging { cursor: grabbing; }
+        .doc-mermaid-stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+        .doc-mermaid-stage svg { display: block; max-width: none !important; }
+        .doc-mermaid-block.is-expanded { position: fixed !important; inset: 16px; z-index: 70; margin: 0 !important; display: flex; flex-direction: column; box-shadow: 0 25px 60px rgba(0, 0, 0, 0.78); border-color: rgba(56, 189, 248, 0.45); }
+        .doc-mermaid-block.is-expanded .doc-mermaid-diagram { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .doc-mermaid-block.is-expanded .doc-mermaid-viewport { flex: 1 1 auto; height: auto !important; min-height: 0; }
+        .doc-mermaid-block.is-expanded .doc-mermaid-source { flex: 1 1 auto; overflow: auto; }
     </style>
 </head>
 <body class="bg-[#080d19] text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
@@ -19270,6 +20275,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div>
                     <div class="flex flex-wrap items-center gap-2">
                         <h1 class="text-sm sm:text-base font-bold tracking-tight text-white">RSI & Price Kinematics Engine</h1>
+                        <button type="button" id="appVersionBadge" onclick="openDocsModal('docs/CHANGELOG.md')" class="mono text-[10px] font-semibold px-2 py-0.5 rounded-full bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 hover:text-white border border-indigo-500/30 hover:border-indigo-400/60 transition cursor-pointer" title="Application Version — Click to view Changelog (docs/CHANGELOG.md)">v__APP_VERSION__</button>
                         <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                             ACTIVE
@@ -19815,8 +20821,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                             <div class="space-y-1 text-[11px] mono">
                                 <div class="flex justify-between items-center gap-2">
-                                    <span class="text-slate-400 font-sans">Available to Invest</span>
-                                    <span id="acctAvailableVal" class="font-semibold text-cyan-300">--</span>
+                                    <span class="text-slate-400 font-sans">Available to Invest <span class="text-[10px] text-slate-500">(Available - Reserve %)</span></span>
+                                    <span id="acctAvailableVal" class="font-semibold text-cyan-300 shrink-0">--</span>
                                 </div>
                                 <div class="flex justify-between items-center gap-2">
                                     <span class="text-slate-400 font-sans">Balance Invested</span>
@@ -20748,6 +21754,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function renderStatusMetrics(m) {
             document.getElementById('runIdBadge').textContent = m.run_id || '__RUN_ID__';
+            const verEl = document.getElementById('appVersionBadge');
+            if (verEl && m.app_version) verEl.textContent = `v${m.app_version}`;
             if (m.display_timezone) syncDisplayTimezoneMeta(m.display_timezone);
             document.getElementById('pendingQueueSize').textContent = m.pending_queue_size ?? 0;
 
@@ -20821,8 +21829,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         numEl.title = `Account: ${acct.account_number || '--'} | Equity: ${fmtCurrency(acct.equity)} | Cash: ${fmtCurrency(acct.cash)} | Buying Power: ${fmtCurrency(acct.buying_power)}`;
                     }
                     if (availEl) {
-                        availEl.textContent = fmtCurrency(acct.available_to_invest);
-                        availEl.title = `Available to invest: ${fmtCurrency(acct.available_to_invest)} | Cash: ${fmtCurrency(acct.cash)} | Buying Power: ${fmtCurrency(acct.buying_power)}`;
+                        const remAvail = safeNum(acct.remaining_investable_budget);
+                        const netAvail = remAvail !== null ? remAvail : acct.available_to_invest;
+                        const wpLbl = safeNum(acct.invest_buffer_withhold_pct);
+                        availEl.textContent = fmtCurrency(netAvail);
+                        const availSrc = acct.available_to_invest_source ? ` | Source: ${acct.available_to_invest_source}` : '';
+                        availEl.title = `Available to invest (${wpLbl !== null ? wpLbl.toFixed(0) : 0}% buffer applied): ${fmtCurrency(netAvail)} | Raw Available: ${fmtCurrency(acct.available_to_invest)} | Cash: ${fmtCurrency(acct.cash)} | Buying Power: ${fmtCurrency(acct.buying_power)}${availSrc}`;
                     }
                     if (invEl) {
                         invEl.textContent = fmtCurrency(acct.balance_invested);
@@ -20830,15 +21842,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                     if (todayPlEl) {
                         const tFmt = fmtSignedPl(acct.today_pl, acct.today_pl_pct);
+                        const closedSources = new Set(['weekend', 'market_holiday', 'pre_session_reset']);
+                        const isClosedSrc = closedSources.has(String(acct.today_pl_source || ''));
                         todayPlEl.textContent = tFmt.text;
-                        todayPlEl.className = tFmt.cls;
-                        todayPlEl.title = `Today's P/L source: ${acct.today_pl_source || 'broker'}`;
+                        todayPlEl.className = isClosedSrc ? 'font-semibold text-slate-300' : tFmt.cls;
+                        let tTip = `Today's P/L source: ${acct.today_pl_source || 'broker'}`;
+                        if (isClosedSrc && safeNum(acct.last_session_pl) !== null) {
+                            const lsFmt = fmtSignedPl(acct.last_session_pl, acct.last_session_pl_pct);
+                            tTip = `Market closed (${acct.today_pl_source}) | Last trading session: ${lsFmt.text}`;
+                        }
+                        todayPlEl.title = tTip;
                     }
                     if (overallPlEl) {
                         const oFmt = fmtSignedPl(acct.overall_pl, acct.overall_pl_pct);
                         overallPlEl.textContent = oFmt.text;
                         overallPlEl.className = oFmt.cls;
-                        overallPlEl.title = `Open Unrealized: ${fmtCurrency(acct.open_unrealized_pl)} | Closed Realized: ${fmtCurrency(acct.closed_realized_pl)}`;
+                        if (acct.overall_pl_source === 'alpaca_portfolio_history') {
+                            overallPlEl.title = `Alpaca Portfolio History | Base: ${fmtCurrency(acct.overall_base_value)} | Equity: ${fmtCurrency(acct.equity)} | Open Unrealized: ${fmtCurrency(acct.open_unrealized_pl)}`;
+                        } else {
+                            overallPlEl.title = `Open Unrealized: ${fmtCurrency(acct.open_unrealized_pl)} | Closed Realized: ${fmtCurrency(acct.closed_realized_pl)}`;
+                        }
                     }
                     if (capFootEl) {
                         const cap = safeNum(acct.max_single_trade_dollars);
@@ -20847,8 +21870,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     if (bufFootEl) {
                         const wp = safeNum(acct.invest_buffer_withhold_pct);
                         const rem = safeNum(acct.remaining_investable_budget);
-                        bufFootEl.textContent = `Buf ${wp !== null ? wp.toFixed(0) : 0}% · Left ${fmtCurrency(rem)}`;
-                        bufFootEl.title = `Max Investable: ${fmtCurrency(acct.max_investable_balance)} | Remaining Budget: ${fmtCurrency(rem)}`;
+                        bufFootEl.textContent = `Buf ${wp !== null ? wp.toFixed(0) : 0}%`;
+                        bufFootEl.title = `Buffer withhold: ${wp !== null ? wp.toFixed(1) : '0.0'}% | Max Investable: ${fmtCurrency(acct.max_investable_balance)} | Available to Invest: ${fmtCurrency(rem)}`;
                     }
                 } else {
                     if (numEl) numEl.textContent = '--';
@@ -24841,11 +25864,39 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         i += 1;
                     }
                     if (i < lines.length) i += 1;
-                    out.push(
-                        `<div class="my-3 rounded-xl border border-slate-800 bg-slate-950/90 overflow-hidden">` +
-                        (lang ? `<div class="px-3 py-1 bg-slate-900/90 border-b border-slate-800 text-[10px] mono uppercase tracking-wider text-slate-400">${_docEsc(lang)}</div>` : '') +
-                        `<pre class="p-3.5 overflow-x-auto text-[11.5px] leading-relaxed mono text-slate-200"><code>${_docEsc(codeLines.join('\n'))}</code></pre></div>`
-                    );
+                    const rawCode = codeLines.join('\n');
+                    if (lang.toLowerCase() === 'mermaid') {
+                        out.push(
+                            `<div class="doc-mermaid-block my-3 rounded-xl border border-slate-800 bg-slate-950/90 overflow-hidden">` +
+                            `<div class="px-3 py-1.5 bg-slate-900/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">` +
+                            `<div class="flex items-center gap-2"><span class="text-[10px] mono uppercase tracking-wider text-cyan-300 font-semibold">MERMAID</span>` +
+                            `<span class="doc-mermaid-status text-[10px] mono text-slate-500">rendering diagram...</span></div>` +
+                            `<div class="flex flex-wrap items-center gap-1">` +
+                            `<div class="doc-mermaid-controls hidden items-center gap-1 mr-1">` +
+                            `<button type="button" data-mermaid-zoom="out" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] mono leading-none transition" title="Zoom Out (-)">&minus;</button>` +
+                            `<span class="doc-mermaid-zoom-label min-w-[42px] text-center text-[10px] mono text-cyan-300 select-none">100%</span>` +
+                            `<button type="button" data-mermaid-zoom="in" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[11px] mono leading-none transition" title="Zoom In (+)">+</button>` +
+                            `<button type="button" data-mermaid-zoom="100" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-[10px] mono transition" title="Actual Size (100%)">1:1</button>` +
+                            `<button type="button" data-mermaid-zoom="fit" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-[10px] mono transition" title="Fit Diagram to View">Fit</button>` +
+                            `<button type="button" data-mermaid-expand="1" class="doc-mermaid-expand px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 hover:text-white border border-slate-700 text-[10px] mono transition" title="Toggle Fullscreen Diagram">Expand</button>` +
+                            `</div>` +
+                            `<button type="button" data-mermaid-toggle="1" class="doc-mermaid-toggle hidden px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-[10px] mono transition">Source</button>` +
+                            `</div>` +
+                            `</div>` +
+                            `<div class="doc-mermaid-diagram hidden">` +
+                            `<div class="doc-mermaid-viewport">` +
+                            `<div class="doc-mermaid-stage"></div>` +
+                            `<div class="pointer-events-none absolute bottom-2 right-2.5 px-2 py-0.5 rounded-md bg-slate-950/75 border border-slate-800/80 text-[9.5px] mono text-slate-400">Drag to pan &bull; Wheel to zoom &bull; Double-click to zoom in</div>` +
+                            `</div></div>` +
+                            `<pre class="doc-mermaid-source p-3.5 overflow-x-auto text-[11.5px] leading-relaxed mono text-slate-200"><code>${_docEsc(rawCode)}</code></pre></div>`
+                        );
+                    } else {
+                        out.push(
+                            `<div class="my-3 rounded-xl border border-slate-800 bg-slate-950/90 overflow-hidden">` +
+                            (lang ? `<div class="px-3 py-1 bg-slate-900/90 border-b border-slate-800 text-[10px] mono uppercase tracking-wider text-slate-400">${_docEsc(lang)}</div>` : '') +
+                            `<pre class="p-3.5 overflow-x-auto text-[11.5px] leading-relaxed mono text-slate-200"><code>${_docEsc(rawCode)}</code></pre></div>`
+                        );
+                    }
                     continue;
                 }
 
@@ -24984,6 +26035,347 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }).join('');
         }
 
+        let _docsMermaidLoadPromise = null;
+        let _docsMermaidInitialized = false;
+        let _docsMermaidRenderSeq = 0;
+
+        function _loadScriptWithTimeout(url, timeoutMs = 6000) {
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                let settled = false;
+                const done = (ok, err) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    if (ok) resolve();
+                    else {
+                        try { script.remove(); } catch (_) {}
+                        reject(err || new Error('Script load failed'));
+                    }
+                };
+                const timer = setTimeout(() => done(false, new Error('Timed out loading script')), timeoutMs);
+                script.src = url;
+                script.async = true;
+                script.crossOrigin = 'anonymous';
+                script.onload = () => done(true);
+                script.onerror = () => done(false, new Error('Network error loading script'));
+                document.head.appendChild(script);
+            });
+        }
+
+        function _ensureMermaidLoaded() {
+            if (window.mermaid && typeof window.mermaid.render === 'function') {
+                if (!_docsMermaidInitialized) {
+                    window.mermaid.initialize({
+                        startOnLoad: false,
+                        securityLevel: 'strict',
+                        theme: 'dark',
+                        flowchart: { htmlLabels: true, useMaxWidth: false, curve: 'basis' },
+                        themeVariables: {
+                            darkMode: true,
+                            background: '#080d19',
+                            primaryColor: '#1e293b',
+                            primaryTextColor: '#f1f5f9',
+                            primaryBorderColor: '#38bdf8',
+                            lineColor: '#94a3b8',
+                            secondaryColor: '#0f172a',
+                            tertiaryColor: '#1e1b4b',
+                            clusterBkg: '#0f172a',
+                            clusterBorder: '#334155',
+                            edgeLabelBackground: '#0f172a',
+                            fontFamily: 'Plus Jakarta Sans, sans-serif',
+                        },
+                    });
+                    _docsMermaidInitialized = true;
+                }
+                return Promise.resolve(window.mermaid);
+            }
+            if (_docsMermaidLoadPromise) return _docsMermaidLoadPromise;
+            const cdns = [
+                'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js',
+                'https://unpkg.com/mermaid@11/dist/mermaid.min.js',
+            ];
+            _docsMermaidLoadPromise = (async () => {
+                for (const url of cdns) {
+                    try {
+                        await _loadScriptWithTimeout(url, 6000);
+                        if (window.mermaid && typeof window.mermaid.render === 'function') {
+                            return await _ensureMermaidLoaded();
+                        }
+                    } catch (_) {
+                        // Try next CDN or gracefully fall back to raw source
+                    }
+                }
+                _docsMermaidLoadPromise = null;
+                return null;
+            })();
+            return _docsMermaidLoadPromise;
+        }
+
+        function _attachMermaidPanZoom(blk, viewportEl, stageEl) {
+            if (!blk || !viewportEl || !stageEl) return null;
+            const svg = stageEl.querySelector('svg');
+            if (!svg) return null;
+            const zoomLabel = blk.querySelector('.doc-mermaid-zoom-label');
+
+            // Resolve intrinsic natural SVG dimensions so zooming stays razor-sharp
+            let natW = 0;
+            let natH = 0;
+            try {
+                if (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width > 0 && svg.viewBox.baseVal.height > 0) {
+                    natW = svg.viewBox.baseVal.width;
+                    natH = svg.viewBox.baseVal.height;
+                } else {
+                    const vbAttr = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+                    if (vbAttr.length === 4 && vbAttr[2] > 0 && vbAttr[3] > 0) {
+                        natW = vbAttr[2];
+                        natH = vbAttr[3];
+                    }
+                }
+            } catch (_) {}
+            if (!natW || !natH) {
+                const bbox = svg.getBoundingClientRect();
+                natW = parseFloat(svg.getAttribute('width')) || bbox.width || 800;
+                natH = parseFloat(svg.getAttribute('height')) || bbox.height || 400;
+            }
+
+            svg.setAttribute('width', String(natW));
+            svg.setAttribute('height', String(natH));
+            svg.style.width = `${natW}px`;
+            svg.style.height = `${natH}px`;
+            svg.style.maxWidth = 'none';
+
+            // Size inline viewport comfortably for the diagram's aspect ratio
+            const initialRect = viewportEl.getBoundingClientRect();
+            const availW = Math.max(320, initialRect.width || 820);
+            const approxFitH = Math.ceil((availW - 48) * (natH / natW)) + 48;
+            const inlineHeight = Math.max(280, Math.min(540, approxFitH));
+            viewportEl.style.height = `${inlineHeight}px`;
+
+            const state = { scale: 1, tx: 0, ty: 0, minScale: 0.12, maxScale: 8.0, fitScale: 1 };
+
+            const apply = () => {
+                stageEl.style.transform = `translate(${state.tx.toFixed(2)}px, ${state.ty.toFixed(2)}px) scale(${state.scale.toFixed(4)})`;
+                if (zoomLabel) zoomLabel.textContent = `${Math.round(state.scale * 100)}%`;
+            };
+
+            const getVpSize = () => {
+                const r = viewportEl.getBoundingClientRect();
+                return { w: Math.max(100, r.width || availW), h: Math.max(100, r.height || inlineHeight) };
+            };
+
+            const fit = () => {
+                const { w, h } = getVpSize();
+                const pad = 24;
+                const sx = (w - pad * 2) / natW;
+                const sy = (h - pad * 2) / natH;
+                const s = Math.max(0.12, Math.min(1.5, Math.min(sx, sy)));
+                state.fitScale = s;
+                state.minScale = Math.min(0.15, s * 0.5);
+                state.scale = s;
+                state.tx = (w - natW * s) / 2;
+                state.ty = (h - natH * s) / 2;
+                apply();
+            };
+
+            const setNative100 = () => {
+                const { w, h } = getVpSize();
+                state.scale = 1.0;
+                state.tx = natW <= w ? (w - natW) / 2 : 24;
+                state.ty = natH <= h ? (h - natH) / 2 : 24;
+                apply();
+            };
+
+            const zoomAt = (factor, clientX, clientY) => {
+                const rect = viewportEl.getBoundingClientRect();
+                const px = typeof clientX === 'number' ? (clientX - rect.left) : rect.width / 2;
+                const py = typeof clientY === 'number' ? (clientY - rect.top) : rect.height / 2;
+                const nextScale = Math.max(state.minScale, Math.min(state.maxScale, state.scale * factor));
+                if (Math.abs(nextScale - state.scale) < 1e-5) return;
+                const cx = (px - state.tx) / state.scale;
+                const cy = (py - state.ty) / state.scale;
+                state.scale = nextScale;
+                state.tx = px - cx * nextScale;
+                state.ty = py - cy * nextScale;
+                apply();
+            };
+
+            // Mouse wheel / trackpad pinch zoom centered on cursor
+            viewportEl.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const clampedDelta = Math.max(-180, Math.min(180, e.deltaY));
+                const factor = Math.exp(-clampedDelta * 0.0022);
+                zoomAt(factor, e.clientX, e.clientY);
+            }, { passive: false });
+
+            // Double-click to zoom in around cursor (or reset to Fit when deeply zoomed)
+            viewportEl.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                if (state.scale >= 3.0) {
+                    fit();
+                } else {
+                    const targetFactor = state.scale < 0.85 ? (1.15 / state.scale) : 1.65;
+                    zoomAt(targetFactor, e.clientX, e.clientY);
+                }
+            });
+
+            // Unified Pointer Events for click-drag panning and 2-finger pinch zoom
+            const pointers = new Map();
+            let lastPanX = 0;
+            let lastPanY = 0;
+            let lastPinchDist = 0;
+
+            const getPinchInfo = () => {
+                const pts = Array.from(pointers.values());
+                const dx = pts[1].x - pts[0].x;
+                const dy = pts[1].y - pts[0].y;
+                return {
+                    dist: Math.hypot(dx, dy),
+                    midX: (pts[0].x + pts[1].x) / 2,
+                    midY: (pts[0].y + pts[1].y) / 2,
+                };
+            };
+
+            viewportEl.addEventListener('pointerdown', (e) => {
+                if (e.pointerType === 'mouse' && e.button !== 0) return;
+                viewportEl.setPointerCapture(e.pointerId);
+                pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                if (pointers.size === 1) {
+                    lastPanX = e.clientX;
+                    lastPanY = e.clientY;
+                    viewportEl.classList.add('is-dragging');
+                } else if (pointers.size === 2) {
+                    const info = getPinchInfo();
+                    lastPinchDist = info.dist;
+                    lastPanX = info.midX;
+                    lastPanY = info.midY;
+                }
+            });
+
+            viewportEl.addEventListener('pointermove', (e) => {
+                if (!pointers.has(e.pointerId)) return;
+                pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                if (pointers.size === 1) {
+                    const dx = e.clientX - lastPanX;
+                    const dy = e.clientY - lastPanY;
+                    lastPanX = e.clientX;
+                    lastPanY = e.clientY;
+                    state.tx += dx;
+                    state.ty += dy;
+                    apply();
+                } else if (pointers.size === 2) {
+                    const info = getPinchInfo();
+                    const dx = info.midX - lastPanX;
+                    const dy = info.midY - lastPanY;
+                    state.tx += dx;
+                    state.ty += dy;
+                    if (lastPinchDist > 5 && info.dist > 5) {
+                        zoomAt(info.dist / lastPinchDist, info.midX, info.midY);
+                    } else {
+                        apply();
+                    }
+                    lastPinchDist = info.dist;
+                    lastPanX = info.midX;
+                    lastPanY = info.midY;
+                }
+            });
+
+            const releasePointer = (e) => {
+                if (!pointers.has(e.pointerId)) return;
+                pointers.delete(e.pointerId);
+                try { viewportEl.releasePointerCapture(e.pointerId); } catch (_) {}
+                if (pointers.size === 1) {
+                    const remaining = Array.from(pointers.values())[0];
+                    lastPanX = remaining.x;
+                    lastPanY = remaining.y;
+                    lastPinchDist = 0;
+                } else if (pointers.size === 0) {
+                    lastPinchDist = 0;
+                    viewportEl.classList.remove('is-dragging');
+                }
+            };
+            viewportEl.addEventListener('pointerup', releasePointer);
+            viewportEl.addEventListener('pointercancel', releasePointer);
+
+            const api = {
+                fit,
+                setNative100,
+                zoomIn: () => zoomAt(1.25),
+                zoomOut: () => zoomAt(0.8),
+            };
+            blk._mermaidPZ = api;
+            requestAnimationFrame(() => fit());
+            return api;
+        }
+
+        async function renderDocsMermaidDiagrams(pane) {
+            if (!pane) return;
+            const blocks = Array.from(pane.querySelectorAll('.doc-mermaid-block'));
+            if (!blocks.length) return;
+            const seq = ++_docsMermaidRenderSeq;
+            const mermaidLib = await _ensureMermaidLoaded();
+            if (seq !== _docsMermaidRenderSeq) return;
+            if (!mermaidLib) {
+                for (const blk of blocks) {
+                    const st = blk.querySelector('.doc-mermaid-status');
+                    if (st) st.textContent = 'offline — raw source';
+                }
+                return;
+            }
+            for (let idx = 0; idx < blocks.length; idx++) {
+                if (seq !== _docsMermaidRenderSeq) return;
+                const blk = blocks[idx];
+                const srcEl = blk.querySelector('.doc-mermaid-source');
+                const codeEl = srcEl ? srcEl.querySelector('code') : null;
+                const diagEl = blk.querySelector('.doc-mermaid-diagram');
+                const viewportEl = blk.querySelector('.doc-mermaid-viewport');
+                const stageEl = blk.querySelector('.doc-mermaid-stage');
+                const statusEl = blk.querySelector('.doc-mermaid-status');
+                const controlsEl = blk.querySelector('.doc-mermaid-controls');
+                const toggleBtn = blk.querySelector('.doc-mermaid-toggle');
+                const sourceText = codeEl ? codeEl.textContent.trim() : '';
+                if (!sourceText || !diagEl || !viewportEl || !stageEl) continue;
+                try {
+                    const renderId = `jboa-mermaid-${seq}-${idx}`;
+                    const rendered = await mermaidLib.render(renderId, sourceText);
+                    if (seq !== _docsMermaidRenderSeq) return;
+                    const svgHtml = typeof rendered === 'string' ? rendered : (rendered && rendered.svg ? rendered.svg : '');
+                    if (!svgHtml) throw new Error('Empty SVG output');
+                    stageEl.innerHTML = svgHtml;
+                    if (typeof rendered === 'object' && typeof rendered.bindFunctions === 'function') {
+                        try { rendered.bindFunctions(stageEl); } catch (_) {}
+                    }
+                    diagEl.classList.remove('hidden');
+                    if (srcEl) srcEl.classList.add('hidden');
+                    if (statusEl) {
+                        statusEl.textContent = 'diagram';
+                        statusEl.className = 'doc-mermaid-status text-[10px] mono text-emerald-400/90';
+                    }
+                    if (controlsEl) {
+                        controlsEl.classList.remove('hidden');
+                        controlsEl.classList.add('flex');
+                    }
+                    if (toggleBtn) {
+                        toggleBtn.textContent = 'Source';
+                        toggleBtn.classList.remove('hidden');
+                    }
+                    _attachMermaidPanZoom(blk, viewportEl, stageEl);
+                } catch (_) {
+                    if (diagEl) diagEl.classList.add('hidden');
+                    if (controlsEl) {
+                        controlsEl.classList.add('hidden');
+                        controlsEl.classList.remove('flex');
+                    }
+                    if (srcEl) srcEl.classList.remove('hidden');
+                    if (statusEl) {
+                        statusEl.textContent = 'render fallback — raw source';
+                        statusEl.className = 'doc-mermaid-status text-[10px] mono text-amber-400/90';
+                    }
+                }
+            }
+        }
+
         function renderDocsContent(anchorToScroll = '') {
             const pane = document.getElementById('docsContentPane');
             const badge = document.getElementById('docsActiveFileBadge');
@@ -24999,15 +26391,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!_docsActiveId) {
                 pane.innerHTML = `<div class="max-w-2xl mx-auto py-10 text-center space-y-2">
                     <div class="text-sm font-semibold text-slate-200">No Markdown documentation files found</div>
-                    <p class="text-xs text-slate-400">Place <span class="mono text-cyan-300">README.md</span> and <span class="mono text-cyan-300">docs/*.md</span> inside the application directory on the server running <span class="mono text-slate-200">multiStreamRSI.py</span>:</p>
+                    <p class="text-xs text-slate-400">Place <span class="mono text-cyan-300">README.md</span> and <span class="mono text-cyan-300">docs/*.md</span> (including <span class="mono text-cyan-300">docs/CHANGELOG.md</span>) inside the application directory on the server running <span class="mono text-slate-200">multiStreamRSI.py</span>:</p>
                     <div class="p-3 rounded-xl bg-slate-950 border border-slate-800 mono text-[11px] text-cyan-300 break-all">${_docEsc(_docsRootPath || '(unresolved)')}</div>
                 </div>`;
                 return;
             }
             if (_docsRawMode) {
+                _docsMermaidRenderSeq += 1;
                 pane.innerHTML = `<pre class="max-w-5xl mx-auto p-4 rounded-xl bg-slate-950 border border-slate-800 text-[11.5px] leading-relaxed mono text-slate-200 whitespace-pre-wrap break-words">${_docEsc(_docsActiveContent)}</pre>`;
             } else {
                 pane.innerHTML = renderSafeMarkdown(_docsActiveContent);
+                renderDocsMermaidDiagrams(pane);
             }
             if (anchorToScroll && !_docsRawMode) {
                 requestAnimationFrame(() => _scrollDocsToAnchor(anchorToScroll));
@@ -25081,7 +26475,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             renderDocsContent();
         }
 
+        function _collapseExpandedMermaidBlocks() {
+            document.querySelectorAll('.doc-mermaid-block.is-expanded').forEach((blk) => {
+                blk.classList.remove('is-expanded');
+                const expBtn = blk.querySelector('.doc-mermaid-expand');
+                if (expBtn) expBtn.textContent = 'Expand';
+                if (blk._mermaidPZ) requestAnimationFrame(() => blk._mermaidPZ.fit());
+            });
+        }
+
         function closeDocsModal() {
+            _collapseExpandedMermaidBlocks();
             const modal = document.getElementById('docsModal');
             if (modal) modal.classList.add('hidden');
         }
@@ -25095,6 +26499,59 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
 
         document.getElementById('docsContentPane')?.addEventListener('click', (e) => {
+            const zoomBtn = e.target.closest('[data-mermaid-zoom]');
+            if (zoomBtn) {
+                const blk = zoomBtn.closest('.doc-mermaid-block');
+                const pz = blk && blk._mermaidPZ;
+                const action = zoomBtn.getAttribute('data-mermaid-zoom');
+                if (pz) {
+                    if (action === 'in') pz.zoomIn();
+                    else if (action === 'out') pz.zoomOut();
+                    else if (action === '100') pz.setNative100();
+                    else if (action === 'fit') pz.fit();
+                }
+                return;
+            }
+            const expandBtn = e.target.closest('[data-mermaid-expand]');
+            if (expandBtn) {
+                const blk = expandBtn.closest('.doc-mermaid-block');
+                if (blk) {
+                    const willExpand = !blk.classList.contains('is-expanded');
+                    _collapseExpandedMermaidBlocks();
+                    if (willExpand) {
+                        blk.classList.add('is-expanded');
+                        expandBtn.textContent = 'Collapse';
+                    }
+                    if (blk._mermaidPZ) requestAnimationFrame(() => blk._mermaidPZ.fit());
+                }
+                return;
+            }
+            const mermaidBtn = e.target.closest('[data-mermaid-toggle]');
+            if (mermaidBtn) {
+                const blk = mermaidBtn.closest('.doc-mermaid-block');
+                if (blk) {
+                    const diagEl = blk.querySelector('.doc-mermaid-diagram');
+                    const srcEl = blk.querySelector('.doc-mermaid-source');
+                    const controlsEl = blk.querySelector('.doc-mermaid-controls');
+                    if (diagEl && srcEl) {
+                        const showingDiagram = !diagEl.classList.contains('hidden');
+                        if (showingDiagram && blk.classList.contains('is-expanded')) {
+                            _collapseExpandedMermaidBlocks();
+                        }
+                        diagEl.classList.toggle('hidden', showingDiagram);
+                        srcEl.classList.toggle('hidden', !showingDiagram);
+                        if (controlsEl) {
+                            controlsEl.classList.toggle('hidden', showingDiagram);
+                            controlsEl.classList.toggle('flex', !showingDiagram);
+                        }
+                        mermaidBtn.textContent = showingDiagram ? 'Diagram' : 'Source';
+                        if (!showingDiagram && blk._mermaidPZ) {
+                            requestAnimationFrame(() => blk._mermaidPZ.fit());
+                        }
+                    }
+                }
+                return;
+            }
             const linkBtn = e.target.closest('[data-doc-link]');
             if (linkBtn) {
                 const targetId = _resolveRelativeDocId(linkBtn.getAttribute('data-doc-link'));
@@ -25113,6 +26570,19 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
 
         document.addEventListener('keydown', (e) => {
+            const expandedMermaid = document.querySelector('.doc-mermaid-block.is-expanded');
+            if (expandedMermaid) {
+                if (e.key === 'Escape') {
+                    _collapseExpandedMermaidBlocks();
+                    return;
+                }
+                if (expandedMermaid._mermaidPZ && !e.metaKey && !e.ctrlKey && !e.altKey) {
+                    if (e.key === '+' || e.key === '=') { e.preventDefault(); expandedMermaid._mermaidPZ.zoomIn(); return; }
+                    if (e.key === '-' || e.key === '_') { e.preventDefault(); expandedMermaid._mermaidPZ.zoomOut(); return; }
+                    if (e.key === '0') { e.preventDefault(); expandedMermaid._mermaidPZ.fit(); return; }
+                    if (e.key === '1') { e.preventDefault(); expandedMermaid._mermaidPZ.setNative100(); return; }
+                }
+            }
             if (e.key === 'Escape') {
                 const docsModal = document.getElementById('docsModal');
                 if (docsModal && !docsModal.classList.contains('hidden')) {
@@ -25836,7 +27306,7 @@ def _load_minute_summary_kinematics_index():
                         if not isinstance(prov_map, dict):
                             continue
                         sym_u = str(sym_k).strip().upper()
-                        # Follow configured [providers] priority, preferring finite RSI/close
+                        # Follow configured [market_signal_providers] priority, preferring finite RSI/close
                         best_p = None
                         best_e = None
                         for prov_name in _provider_priority_order():
@@ -26705,6 +28175,7 @@ def analyze_option_chain_strikes(
 
 _DOCS_PREFERRED_ORDER = (
     "README.md",
+    "docs/CHANGELOG.md",
     "docs/TRADING_ALGORITHMS_AND_RISK.md",
     "docs/FRONTEND_DASHBOARD.md",
     "docs/DEPLOYMENT_AND_OPERATIONS.md",
@@ -26714,8 +28185,8 @@ _DOCS_MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
 def _resolve_docs_catalog():
-    """Discover allowlisted Markdown documentation files (README.md and docs/*.md)
-    using strict root-directory path confinement."""
+    """Discover allowlisted Markdown documentation files (README.md and docs/*.md,
+    including docs/CHANGELOG.md) using strict root-directory path confinement."""
     candidates = []
     env_dir = os.getenv("DOCS_DIR", "").strip()
     if env_dir:
@@ -27081,6 +28552,7 @@ class AdminCliProvider:
             )
             page = (
                 LOGIN_HTML_TEMPLATE.replace("__RUN_ID__", _html.escape(str(RUN_ID)))
+                .replace("__APP_VERSION__", _html.escape(str(APP_VERSION)))
                 .replace("__DISPLAY_TZ_LABEL__", _html.escape(str(display_tz_abbr())))
                 .replace("__NEXT_URL__", _html.escape(safe_next, quote=True))
                 .replace("__NOTICE_CLASS__", notice_cls)
@@ -27263,6 +28735,7 @@ class AdminCliProvider:
             )
             html = (
                 DASHBOARD_HTML_TEMPLATE.replace("__RUN_ID__", RUN_ID)
+                .replace("__APP_VERSION__", APP_VERSION)
                 .replace("__DISPLAY_TZ_LABEL__", display_tz_abbr())
                 .replace("__DISPLAY_TZ_IANA__", DISPLAY_TZ_IANA)
                 .replace(
@@ -27576,6 +29049,16 @@ class AdminCliProvider:
                 "bounce_rsi_max": OPTION_BUY_BOUNCE_RSI_MAX,
                 "max_single_trade_dollars": OPTION_BUY_MAX_SINGLE_TRADE_DOLLARS,
                 "invest_buffer_withhold_pct": OPTION_BUY_INVEST_BUFFER_WITHHOLD_PCT,
+                "entry_mode": OPTION_BUY_ENTRY_MODE,
+                "contract_selection_mode": OPTION_BUY_CONTRACT_SELECTION_MODE,
+                "contract_target_delta": OPTION_BUY_CONTRACT_TARGET_DELTA,
+                "contract_delta_min": OPTION_BUY_CONTRACT_DELTA_MIN,
+                "contract_delta_max": OPTION_BUY_CONTRACT_DELTA_MAX,
+                "contract_min_open_interest": OPTION_BUY_CONTRACT_MIN_OPEN_INTEREST,
+                "contract_min_volume": OPTION_BUY_CONTRACT_MIN_VOLUME,
+                "contract_budget_stepdown": OPTION_BUY_CONTRACT_BUDGET_STEPDOWN,
+                "entry_window_start_et": OPTION_BUY_ENTRY_WINDOW_START_ET,
+                "entry_window_end_et": OPTION_BUY_ENTRY_WINDOW_END_ET,
                 "history_summary": (
                     self.coordinator.option_history.get_buyer_summary()
                     if hasattr(self.coordinator, "option_history")
@@ -27682,6 +29165,7 @@ class AdminCliProvider:
             )
 
             status_report = {
+                "app_version": APP_VERSION,
                 "run_id": RUN_ID,
                 "instance_owner": INSTANCE_OWNER,
                 "display_timezone": {
@@ -28292,34 +29776,34 @@ async def main():
         ),  # Mount server task
     ]
 
-    # Alpaca position monitor: independent of the RSI providers, polls the
-    # account every minute and prints current option positions to its own log.
-    # Starts whenever Alpaca credentials are available; otherwise it logs a
-    # single disabled warning and exits.
-    position_monitor = AlpacaPositionMonitor(keys, coordinator=coordinator)
+    # Broker position monitor: independent of the RSI providers, polls the
+    # configured transactionprovider account (Alpaca or Tastytrade) and prints
+    # current option positions to its own log. Starts whenever broker
+    # credentials are available; otherwise logs a disabled warning and exits.
+    position_monitor = PositionMonitor(keys, coordinator=coordinator)
     pm_task = asyncio.create_task(
         run_provider_isolated(position_monitor, coordinator),
-        name="ALPACA_POSITION_MONITOR",
+        name="POSITION_MONITOR",
     )
     tasks.append(pm_task)
 
-    option_buyer = AlpacaOptionBuyer(
+    option_buyer = OptionBuyer(
         keys,
         coordinator,
         option_chain_client=shared_option_chain_client,
     )
     ob_task = asyncio.create_task(
         run_provider_isolated(option_buyer, coordinator),
-        name="ALPACA_OPTION_BUYER",
+        name="OPTION_BUYER",
     )
     tasks.append(ob_task)
 
-    option_seller = AlpacaOptionSeller(keys, coordinator)
+    option_seller = OptionSeller(keys, coordinator)
     if shared_option_chain_client is not None:
         option_seller._exit_chain_client = shared_option_chain_client
     os_task = asyncio.create_task(
         run_provider_isolated(option_seller, coordinator),
-        name="ALPACA_OPTION_SELLER",
+        name="OPTION_SELLER",
     )
     tasks.append(os_task)
 

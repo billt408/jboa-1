@@ -44,7 +44,7 @@
 * **Multi-Provider 1-Minute Ingestion & Warmup:** Concurrently streams and normalizes 1-minute equity bars across up to six feeds (`TRADINGVIEW`, `ALPACA`, `TASTYTRADE`, `TRADIER`, `TWELVEDATA`, `YAHOOFINANCE`). Local providers pre-warm Wilder RSI(14) across the last `RSI_WARMUP_SESSIONS` (default `5`) NYSE sessions before the first finalized minute so values converge with TradingView's continuous series.
 * **Price & RSI Kinematics Engine:** Computes Hull Moving Average (`HMA(14)`), Exponential Moving Average (`EMA`), or raw close smoothing; 1-minute and 3-minute velocity ($v_t$) and acceleration ($a_t$); next-step kinematic price projection ($\hat{P}_{t+1} = P_t + v_t + \frac{1}{2}a_t$); leading/confirmed zero-line crossovers; and 4-quadrant phase regime classification (`accelerating_bullish`, `decelerating_bullish`, `accelerating_bearish`, `decelerating_bearish`).
 * **Strict Zero-Fallback Broker Routing:** Decouples option chain lookup (`[option_trading] optionchainprovider`) from order execution (`[option_trading] transactionprovider`), supporting **Alpaca** (Paper/Live) and **Tastytrade** (Prod market data + Sandbox or Prod order routing) with zero silent cross-broker fallback.
-* **Ex-Ante Risk Guardrails & 4-Tier Exit Engine:** `AlpacaOptionBuyer` enforces oversold RSI/bounce-lookback thresholds, positive velocity/acceleration, kinematic forecast/projection alignment, bid/ask spread caps, open-contract limits, per-minute caps, duplicate-underlying locks, and cooldowns. `AlpacaOptionSeller` monitors open positions on every finalized minute with a 4-tier exit waterfall: (1) Fixed Profit Target, (2) Overbought RSI + Bearish Kinematics, (3) Session High-Water-Mark Trailing Stop, and (4) Hard & Consecutive-Minute Stop Loss with initial hold-grace protection.
+* **Ex-Ante Risk Guardrails, Strike Selection & 4-Tier Exit Engine:** `OptionBuyer` (Alpaca or Tastytrade via `build_trading_client`) enforces oversold RSI/bounce-lookback thresholds, optional US/Eastern entry time windows, either default `kinematics_forecast` or forecast-independent `rsi_ex_ante` entry gating, configurable zero-hindsight strike selection (`plus2_otm`, `atm_itm_low_spread`, `delta_mid`, `delta_itm_low_spread`, `composite_score`, etc.) with liquidity floors and budget step-down, bid/ask spread caps, open-contract limits, per-minute caps, duplicate-underlying locks, and cooldowns. `OptionSeller` monitors open positions on every finalized minute with a 4-tier exit waterfall: (1) Fixed Profit Target, (2) Overbought RSI + Bearish Kinematics, (3) Session High-Water-Mark Trailing Stop, and (4) Hard & Consecutive-Minute Stop Loss with initial hold-grace protection.
 * **Live Operational Telemetry & Chart Capture:** Serves a password-protected, TLS-capable operational dashboard on port `5001` (`AdminCliProvider`) featuring real-time KPIs, the 4-quadrant phase matrix, interactive 3-panel synchronized crossover charts, open/closed option contract P/L drill-downs, live Buy/Sell decision log inspection, optional strike analysis, and an automated 1-minute headless PNG chart capture thread (`ChartCaptureManager`).
 
 ---
@@ -75,9 +75,9 @@ flowchart TB
 
     subgraph Execution["1-Minute Synced Trading & Collection Tasks"]
         OCC["RsiOptionChainCollector<br/>Priority-driven RSI<=35 / >=65<br/>Pruned Chain Snapshots"]
-        OB["AlpacaOptionBuyer<br/>Ex-Ante Kinematics & Spread Guards<br/>2nd OTM Call Limit/Market Orders"]
-        OS["AlpacaOptionSeller<br/>4-Tier Exit Waterfall:<br/>PT · RSI/Kin · Trailing · Stop-Loss"]
-        PM["AlpacaPositionMonitor<br/>15s Poll / 1m Position Logging"]
+        OB["OptionBuyer (Alpaca / Tastytrade)<br/>Ex-Ante Entry & Spread Guards<br/>Configurable Strike Selection (+2 OTM / ATM-ITM / Delta / Composite)"]
+        OS["OptionSeller (Alpaca / Tastytrade)<br/>4-Tier Exit Waterfall:<br/>PT · RSI/Kin · Trailing · Stop-Loss"]
+        PM["PositionMonitor (Alpaca / Tastytrade)<br/>15s Poll / 1m Position Logging"]
         CC["ChartCaptureManager<br/>Dedicated Worker Thread<br/>Pure-Python 3-Panel PNG Renderer"]
     end
 
@@ -256,6 +256,7 @@ journalctl -u jboa-rsi.service -f
 
 | Document | Scope & Highlights |
 | :--- | :--- |
+| **[`docs/CHANGELOG.md`](docs/CHANGELOG.md)** | Permanent append-only release changelog tied to `APP_VERSION` (`major.minor.build`) in `multiStreamRSI.py`, viewable directly inside the Port `5001`/`6001` dashboard Docs modal (or by clicking the header version badge). |
 | **[`docs/TRADING_ALGORITHMS_AND_RISK.md`](docs/TRADING_ALGORITHMS_AND_RISK.md)** | Complete catalog of all `.py` files, async task graph, 6-provider ingestion & DXLink architecture, information-gathering data flows, exact RSI/HMA/EMA/velocity/acceleration/$\hat{P}_{t+1}$ math, exhaustive **Ex-Ante Risk Filter & Rejection Matrix** (Buyer & Seller), 4-tier exit engine, option contract selection/sizing, and `findthewinners.py` scoring. |
 | **[`docs/FRONTEND_DASHBOARD.md`](docs/FRONTEND_DASHBOARD.md)** | Exhaustive field-by-field and button-by-button manual for the **Live Port-5001 Kinematics & P/L Dashboard** (`LOGIN_HTML_TEMPLATE`, `DASHBOARD_HTML_TEMPLATE`, 4 modals, 3-panel synchronized crossover & option P/L charts, polling & P/L formulas) **plus** the **React/TypeScript Pine Script Alert Studio** (`src/App.tsx` + all 10 components). |
 | **[`docs/DEPLOYMENT_AND_OPERATIONS.md`](docs/DEPLOYMENT_AND_OPERATIONS.md)** | Complete map of every runtime directory and log file, RHEL `.venv` / multi-instance / `firewalld` / TLS / auth operations, `ChartCaptureManager` PNG pipeline, log rotation/archiving runbook, and explicit audit of external build/systemd/container artifacts (`[Not Found in Codebase]`). |

@@ -11,7 +11,7 @@
 
 </div>
 
-**Navigation:** [Overview (`README.md`)](../README.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · **Deployment & Operations** · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
+**Navigation:** [Overview (`README.md`)](../README.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) · [Trading Algorithms & Risk](./TRADING_ALGORITHMS_AND_RISK.md) · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · **Deployment & Operations** · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
 
 ---
 
@@ -109,8 +109,8 @@ When deployed on RHEL (conventionally rooted at `/home/billt/jboa-1/src/`), `mul
 | Artifact Pattern | Written By | Read By | Persistence / Atomicity |
 | :--- | :--- | :--- | :--- |
 | `logs/minute-summary-<RUN_ID>.jsonl` | `MinuteCoordinator.finalize_due()` | `AdminCliProvider` (`GET /api/minute-summaries`) | Append-only JSON Lines; rotated per `RUN_ID`. |
-| `logs/option_buyer/*.log` & `logs/option_seller/*.log` | `AlpacaOptionBuyer`, `AlpacaOptionSeller` | `AdminCliProvider` (`GET /api/option-logs` -> `read_option_analysis_logs()`) | Structured timestamped text lines; parsed live for the Decision Audit Modal. |
-| `logs/optionchains/optionchain-*.json` | `RsiOptionChainCollector`, `TradingviewProvider`, `AlpacaOptionBuyer` | `analyze_option_chain_strikes()` (`/api/strike-analysis`), `findthewinners.py` | Immutable point-in-time JSON snapshots containing pruned call/put chains + underlying kinematics. |
+| `logs/option_buyer/*.log` & `logs/option_seller/*.log` | `OptionBuyer`, `OptionSeller` | `AdminCliProvider` (`GET /api/option-logs` -> `read_option_analysis_logs()`) | Structured timestamped text lines; parsed live for the Decision Audit Modal. |
+| `logs/optionchains/optionchain-*.json` | `RsiOptionChainCollector`, `TradingviewProvider`, `OptionBuyer` | `analyze_option_chain_strikes()` (`/api/strike-analysis`), `findthewinners.py` | Immutable point-in-time JSON snapshots containing pruned call/put chains + underlying kinematics. |
 | `logs/option_history_state_<prov>_<env>.json` | `OptionContractHistoryTracker` | `OptionContractHistoryTracker` (on startup) | Atomic write (`.tmp` + `os.replace`) scoped by `(transactionprovider, env)` so Alpaca paper/live and Tastytrade sandbox/prod never collide. |
 | `logs/option_history_prices_<prov>_<env>.json` | `OptionContractHistoryTracker` (periodic + `finally:` on shutdown, L27026) | `OptionContractHistoryTracker` (on startup) | Atomic JSON cache preserving minute-by-minute option mark prices across restarts. |
 | `logs/charts/<SYM>/*.png` | `ChartCaptureManager` (dedicated daemon thread) | Operators / external archiving | Generated on 1m boundaries when `[chart_capture] enabled = true`. |
@@ -138,7 +138,7 @@ Per `multiStreamRSI.py :: handle_cli_command()` and `resolve_parms_ini_path()`, 
    1. `load_settings()` parses `lib/parms.ini` + environment overrides and validates non-loopback webhook tokens and dashboard auth passwords.
    2. Instantiates `MinuteCoordinator`, `AdminCliProvider` (`:5001`), `shared_option_chain_client`, and all enabled stream routers.
    3. **Pre-Warmup Barrier (`RSI_PRE_WARMUP_START`):** Runs `await asyncio.gather(*(r.warmup() for r in warmup_routers))` **before** the coordinator finalizes its first minute so Wilder RSI(14) is converged prior to 09:30 ET open.
-   4. Spawns isolated tasks (`run_provider_isolated`) for `MINUTE_COORDINATOR`, `CLI_ADMIN_PANEL`, `ALPACA_POSITION_MONITOR`, `ALPACA_OPTION_BUYER`, `ALPACA_OPTION_SELLER`, `OPTION_CHAIN_COLLECTOR`, `OPTION_HISTORY_BACKFILL`, `CHART_CAPTURE`, and all enabled market-data providers.
+   4. Spawns isolated tasks (`run_provider_isolated`) for `MINUTE_COORDINATOR`, `CLI_ADMIN_PANEL`, `POSITION_MONITOR`, `OPTION_BUYER`, `OPTION_SELLER`, `OPTION_CHAIN_COLLECTOR`, `OPTION_HISTORY_BACKFILL`, `CHART_CAPTURE`, and all enabled market-data providers.
 
 2. **One-Shot Chart Capture Control CLI (signals running daemon + updates `lib/parms.ini`):**
    ```bash
@@ -294,5 +294,6 @@ In strict accordance with zero-hallucination documentation rules, the following 
 | `jboa-rsi.service` (`systemd` unit) | `[Not Found in Codebase]` | Referenced by name in `AGENTS.md` (`managed by jboa-rsi.service`, root `/home/billt/jboa-1/src`). Exact `ExecStart`, `User`, and `Restart=` directives are not stored in this repository. |
 | `build_and_package.sh` (Nuitka build script) | `[Not Found in Codebase]` | Referenced externally (not present in workspace tree). Exact Nuitka `--onefile` flags, `.build_venv` steps, and archive commands cannot be verified from this repo. |
 | `Containerfile` (Red Hat UBI 9.8 / Podman) | `[Not Found in Codebase]` | Not present in workspace tree. Exact `FROM` image digest, `USER jboa` setup, and `ENTRYPOINT` cannot be verified from this repo. |
-| `run_dual_instances.sh` / `run_windows.bat` / `rollit.sh` | `[Not Found in Codebase]` | Not present in workspace tree; dual-instance operational requirements are documented from `multiStreamRSI.py` port/owner/cache logic in Section 4. |
+| `sh/run_dual_instances.sh` | Present | Dual-instance manager for `billt` (5000/5001, Alpaca) and `jboa` (6000/6001, Tastytrade); `--stop-all` loops until all matching `multiStreamRSI.py` PIDs have exited and all four ports are closed. |
+| `run_windows.bat` / `rollit.sh` | `[Not Found in Codebase]` | Not present in workspace tree. |
 | Log rotation / cron archive scripts | `[Not Found in Codebase]` | No `logrotate` config or shell archiving script exists in this workspace. |

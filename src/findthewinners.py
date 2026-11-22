@@ -329,12 +329,12 @@ def load_standalone_config(
             ).lower()
             if val in {"alpaca", "tastytrade"}:
                 cfg_out["option_chain_provider"] = val
-        elif not cfg_out["option_chain_provider"] and parser.has_section("providers"):
+        elif not cfg_out["option_chain_provider"] and parser.has_section("market_signal_providers"):
             tt_raw = _strip_ini_value(
-                parser.get("providers", "TASTYTRADE.enabled", fallback="false")
+                parser.get("market_signal_providers", "TASTYTRADE.enabled", fallback="false")
             ).lower()
             alp_raw = _strip_ini_value(
-                parser.get("providers", "ALPACA.enabled", fallback="false")
+                parser.get("market_signal_providers", "ALPACA.enabled", fallback="false")
             ).lower()
             if tt_raw in {"1", "true", "yes"} and alp_raw not in {"1", "true", "yes"}:
                 cfg_out["option_chain_provider"] = "tastytrade"

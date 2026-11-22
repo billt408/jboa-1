@@ -244,3 +244,27 @@ Are you trying to automate a scheduled pull on RHEL (via cron or a systemd timer
 Try without personalization
 
 
+Available contract_selection_mode values:
+plus2_otm (default)  existing 2nd OTM logic (unchanged)
+atm_itm_low_spread  tightest bid/ask spread between -1 ITM and 0 ATM (mirrors findthewinners.py)
+delta_mid  strike within [contract_delta_min, contract_delta_max] closest to contract_target_delta
+delta_itm_low_spread  tightest-spread ITM strike with |delta| >= max(0.55, contract_delta_min)
+composite_score  ranks -2 ITM..+4 OTM using spread (45%), delta proximity (35%), volume/OI liquidity (15%), and theta efficiency (5%)
+Fixed strike ranks: itm2, itm1, atm, otm1
+Supporting [option_buyer] Tuning Settings
+
+[option_buyer]
+; Strike & liquidity controls
+contract_selection_mode = atm_itm_low_spread
+contract_target_delta = 0.55        ; used by delta_mid, delta_itm_low_spread, composite_score
+contract_delta_min = 0.45           ; lower |delta| bound
+contract_delta_max = 0.70           ; upper |delta| bound
+max_spread_pct = 3.0                ; hard spread cap (default 5.0; findthewinners uses 3.0)
+contract_min_open_interest = 100    ; hard OI floor (0 = disabled)
+contract_min_volume = 10            ; hard volume floor (0 = disabled)
+contract_budget_stepdown = true     ; if ITM/ATM exceeds budget cap, step outward to nearest affordable strike
+
+; Optional: also remove dependence on the 1-minute Taylor forecast & add ET clock bounds
+entry_mode = rsi_ex_ante            ; default is kinematics_forecast
+entry_window_start_et = 09:45       ; optional earliest ET buy time (empty = disabled)
+entry_window_end_et = 15:30         ; optional latest ET buy time (empty = disabled)
