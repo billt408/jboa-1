@@ -21,5 +21,7 @@ dist/multiStreamRSI
 *.tar.gz
 dist/parms.ini
 dist/windows_package/parms.ini
+src/sh/getLatest.sh
+
 
 
