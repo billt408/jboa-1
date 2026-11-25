@@ -6,7 +6,7 @@
 
 </div>
 
-**Navigation:** [Overview (`README.md`)](../README.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) · **Trading Algorithms & Risk** · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
+**Navigation:** [Overview (`README.md`)](../README.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md) · **Trading Algorithms & Risk** · [Option Buyer Guide](./OPTION_BUYER_GUIDE.md) · [Option Seller & Stop-Loss Guide](./OPTION_SELLER_AND_STOP_LOSS_GUIDE.md) · [Frontend Dashboard](./FRONTEND_DASHBOARD.md) · [Deployment & Operations](./DEPLOYMENT_AND_OPERATIONS.md) · [Configuration & API Reference](./CONFIGURATION_AND_API_REFERENCE.md)
 
 ---
 
@@ -342,7 +342,7 @@ flowchart TD
     G0 -->|Yes| R0["REJECTED: no_qty_available"]
     G0 -->|No| T1{"Tier 1: Fixed Profit Target<br/>pnl_pct >= profit_target_pct (25%)"}
     T1 -->|Yes| EXIT["QUALIFIED -> Cooldown Check -> Price & Submit SELL"]
-    T1 -->|No| T2{"Tier 2: RSI >= rsi_high (65)<br/>& Bearish Kinematics<br/>& Projected Delta < 0"}
+    T1 -->|No| T2{"Tier 2: RSI >= rsi_high (65)<br/>& Bearish Kinematics & Delta < 0<br/>& Profit Guard (pnl > 0% / >= min)"}
     T2 -->|Yes| EXIT
     T2 -->|No| T3{"Tier 3: High-Water Mark Trailing Stop<br/>peak >= 10% AND dd > 5%<br/>AND (v < 0 if required)"}
     T3 -->|Yes| EXIT
@@ -370,6 +370,7 @@ flowchart TD
 | `rsi_below_sell_threshold(rsi=X<HIGH)` *(Tier 2)* | `rsi < OPTION_CHAIN_RSI_HIGH` (default `65.0`) | `multiStreamRSI.py :: OptionSeller._evaluate_sell_kinematics()` (`L13943`) | Does not take kinematic profit before underlying reaches overbought threshold. |
 | `kinematics_unfavorable[still_accelerating_up \| downside_decelerating \| flat_or_rising_accel, ...]` *(Tier 2)* | None of: (`vel < 0 and acc < 0`), (`vel > 0 and acc < 0`), (`crossover in {leading_bearish, confirmed_bearish} and acc <= 0`), (`forecast in OPTION_SELL_ALLOWED_FORECASTS and acc < 0`) | `multiStreamRSI.py :: OptionSeller._evaluate_sell_kinematics()` (`L13984–14021`) | Lets winners run while underlying is still accelerating upward ($v > 0, a \ge 0$). |
 | `projection_misaligned(SELL,delta=X)` *(Tier 2)* | `OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT and proj_delta is not None and float(proj_delta) >= 0` | `multiStreamRSI.py :: OptionSeller._evaluate_sell_kinematics()` (`L14023–14030`) | Requires negative next-step projected price change ($\Delta\hat{P} < 0$) for kinematic sells. |
+| `take_profit_no_profit(pnl=X%<=MIN%)` / `take_profit_pnl_unavailable(...)` *(Tier 2)* | `OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT` (`true` default) AND (`pnl_pct is None` / non-finite, OR `pnl_pct <= 0.0` when `take_profit_min_pnl_pct == 0.0`, OR `pnl_pct < take_profit_min_pnl_pct` when `> 0.0`) | `multiStreamRSI.py :: OptionSeller.evaluate_and_sell()` | Ensures `kind=take_profit` never sells a losing or breakeven contract on an overbought underlying RSI rollover; falls through cleanly to Tier 3 (Trailing Stop) and Tier 4 (Stop Loss). |
 | `ts_peak=X%<ACT%` / `ts_dd=X%<=DD%` / `ts_hold(dd=X%,v>=0)` *(Tier 3)* | `peak_pnl < 10.0%` OR `drawdown_pct <= 5.0%` OR (`trailing_require_negative_velocity` and `vel >= 0`) | `multiStreamRSI.py :: OptionSeller.evaluate_and_sell()` (`L14751–14791`) | Trailing stop activates only after `+10%` peak gain, triggers when relative drawdown from peak exceeds `5%` (`((1+peak)-(1+cur))/(1+peak)*100`), and confirms underlying $v < 0$ so brief option spread blips do not shake out a rising stock. |
 | `hard_sl_hold_grace(Xm<MIN_HOLD)` *(Tier 4a)* | `pnl_pct < -hard_pct` (`-25%`) AND `hold_minutes < OPTION_SELL_MIN_HOLD_MINUTES` (`5m`) | `multiStreamRSI.py :: OptionSeller.evaluate_and_sell()` (`L14800–14818`) | Suppresses even hard stop-loss during initial 5-minute grace window to prevent immediate liquidation on wide entry Ask-to-Bid spreads. |
 | `sl_hold_grace(Xm<MIN_HOLD,streak=N)` *(Tier 4b)* | `loss_streak >= 5` AND `hold_minutes < OPTION_SELL_MIN_HOLD_MINUTES` (`5m`) | `multiStreamRSI.py :: OptionSeller.evaluate_and_sell()` (`L14826–14843`) | Same initial hold-grace protection for consecutive-minute stop-loss. |

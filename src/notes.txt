@@ -293,3 +293,41 @@ when a section & key exist in both files, write it to the lib\parms.ini.combined
 any sections and/or keys in that are in the lib/parms.ini.redacted.jboa but not in the lib/parms.ini write it them the lib\parms.ini.combined.jboa file
 the goal is to have the lib/parms.ini.combined.jboa file look identical to the lib/parms.ini file while using key values from the lib/parms.ini.redacted.jboa file
 I have redacted the sensitive data with a value like **** in parms.ini
+
+gemma3:4b
+ollama pull gemma3:4b
+python3 -m venv ~/.aider-venv
+~/.aider-venv/bin/pip install --upgrade pip aider-chat
+
+mkdir -p ~/.local/bin
+ln -sf ~/.aider-venv/bin/aider ~/.local/bin/aider
+
+cat << 'EOF' > ~/.aider.conf.yml
+# Force read-only Q&A mode globally (never proposes or applies file edits)
+chat-mode: ask
+
+# Prevent any automatic Git commits or repo changes
+auto-commits: false
+dirty-commits: false
+
+# Default to your local Ollama gemma3:4b model
+model: ollama_chat/gemma3:4b
+EOF
+
+sudo tee /etc/profile.d/aider.sh << 'EOF'
+export AIDER_CHAT_MODE=ask
+export AIDER_AUTO_COMMITS=false
+export AIDER_DIRTY_COMMITS=false
+export OLLAMA_API_BASE=http://127.0.0.1:11434
+EOF
+
+sudo chmod 644 /etc/profile.d/aider.sh
+source /etc/profile.d/aider.sh
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+sudo tee /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
+[Service]
+Environment="OLLAMA_CONTEXT_LENGTH=16384"
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart ollama

@@ -3,17 +3,14 @@
 from an existing live environment parms.ini file.
 
 Usage:
-    python3 restore_parms_secrets.py <combined_file> <old_parms_file> [--output <path>] [--dry-run] [--no-backup]
+    python3 restore_parms_secrets.py <combined_file> <old_parms_file> <output_file> [--dry-run]
 
 Examples:
-    # Update combined file in place (creates <combined_file>.bak first)
-    python3 restore_parms_secrets.py lib/parms.ini.combined.jboa /home/billt/jboa-1/src/lib/parms.ini
-
-    # Write to a separate output path without modifying either input file
-    python3 restore_parms_secrets.py lib/parms.ini.combined.jboa /home/billt/jboa-1/src/lib/parms.ini -o lib/parms.ini.ready
+    # Create a new file with restored secrets without modifying either input file
+    python3 restore_parms_secrets.py lib/parms.ini.combined.jboa /home/billt/jboa-1/src/lib/parms.ini lib/parms.ini.ready
 
     # Preview which [section] keys will be restored (never prints secret values)
-    python3 restore_parms_secrets.py lib/parms.ini.combined.jboa /home/billt/jboa-1/src/lib/parms.ini --dry-run
+    python3 restore_parms_secrets.py lib/parms.ini.combined.jboa /home/billt/jboa-1/src/lib/parms.ini lib/parms.ini.ready --dry-run
 """
 
 import argparse
@@ -21,7 +18,6 @@ import configparser
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -191,14 +187,19 @@ def validate_ini_output(content: str, label: str):
 def restore_secrets(
     combined_path: Path,
     old_parms_path: Path,
-    output_path: Path = None,
+    output_path: Path,
     dry_run: bool = False,
-    make_backup: bool = True,
 ):
     if not combined_path.is_file():
         raise FileNotFoundError(f"Combined file not found: {combined_path}")
     if not old_parms_path.is_file():
         raise FileNotFoundError(f"Old parms.ini file not found: {old_parms_path}")
+
+    out_resolved = output_path.resolve()
+    if out_resolved == combined_path.resolve():
+        raise ValueError("Output file must be different from combined_file (will not overwrite original)")
+    if out_resolved == old_parms_path.resolve():
+        raise ValueError("Output file must be different from old_parms_file (will not overwrite original)")
 
     old_values = parse_ini_values(old_parms_path)
     raw_bytes = combined_path.read_bytes()
@@ -290,16 +291,11 @@ def restore_secrets(
         out_lines.append(rebuilt)
 
     final_text = "".join(out_lines)
-    validate_ini_output(final_text, str(output_path or combined_path))
+    validate_ini_output(final_text, str(output_path))
 
-    target = output_path or combined_path
+    target = output_path
     if not dry_run:
         target.parent.mkdir(parents=True, exist_ok=True)
-        in_place = target.resolve() == combined_path.resolve()
-        if in_place and make_backup:
-            bak_path = target.with_name(target.name + ".bak")
-            shutil.copy2(combined_path, bak_path)
-
         final_bytes = (b"\xef\xbb\xbf" if has_bom else b"") + final_text.encode("utf-8")
         tmp_path = None
         try:
@@ -313,7 +309,7 @@ def restore_secrets(
                 tmp_file.write(final_bytes)
                 tmp_path = Path(tmp_file.name)
             try:
-                orig_mode = combined_path.stat().st_mode
+                orig_mode = old_parms_path.stat().st_mode
                 os.chmod(tmp_path, orig_mode & 0o777)
             except OSError:
                 pass
@@ -331,8 +327,8 @@ def restore_secrets(
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Restore redacted ('***') secret and API key values in a combined parms.ini "
-            "file using values from an existing environment parms.ini file."
+            "Restore redacted ('***') secret and API key values from old_parms_file into "
+            "combined_file and write the result to a new output_file without modifying either input."
         )
     )
     parser.add_argument(
@@ -346,21 +342,14 @@ def main(argv=None) -> int:
         help="Path to File 2: the old live parms.ini file containing real secrets/keys",
     )
     parser.add_argument(
-        "-o",
-        "--output",
+        "output_file",
         type=Path,
-        default=None,
-        help="Optional output file path (defaults to updating combined_file in place)",
+        help="Path to File 3: the new output file to create with restored secrets/keys",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Report which [section] keys would be restored without writing any files",
-    )
-    parser.add_argument(
-        "--no-backup",
-        action="store_true",
-        help="Skip creating a .bak backup when updating combined_file in place",
     )
     args = parser.parse_args(argv)
 
@@ -368,15 +357,14 @@ def main(argv=None) -> int:
         restored, unresolved, target = restore_secrets(
             combined_path=args.combined_file,
             old_parms_path=args.old_parms_file,
-            output_path=args.output,
+            output_path=args.output_file,
             dry_run=args.dry_run,
-            make_backup=not args.no_backup,
         )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    mode_tag = "DRY-RUN (no files written)" if args.dry_run else f"UPDATED -> {target}"
+    mode_tag = "DRY-RUN (no files written)" if args.dry_run else f"CREATED -> {target}"
     print(f"[{mode_tag}] Restored {len(restored)} key(s):")
     for item in restored:
         print(f"  + {item}")
