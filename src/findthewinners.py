@@ -304,7 +304,7 @@ def load_standalone_config(
     if show_input_files:
         print(f"[INPUT ini] {ini_path}", flush=True)
     raw_text = ini_path.read_text(encoding="utf-8-sig", errors="replace")
-    parser = configparser.ConfigParser(interpolation=None)
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
     try:
         parser.read_string(raw_text)
     except Exception:

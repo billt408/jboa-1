@@ -42,6 +42,7 @@ import ipaddress
 import json
 import logging
 import math
+import errno
 import os
 import queue
 import re
@@ -124,7 +125,7 @@ QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
 # Semantic version: major.minor.build — increment build on every multiStreamRSI.py edit;
 # change major/minor only when explicitly requested.
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.24"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 def _get_app_base_dir():
     """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
@@ -675,7 +676,7 @@ class SessionRSI:
         else:
             self.reset_session(day)
 
-    def process_bar(self, bar, source, warmup=False):
+    def process_bar(self, bar, source, warmup=False, rsi_30d=None):
         """Apply one completed minute close to this provider's RSI.
 
         warmup=True feeds history into the Wilder state without emitting an
@@ -788,6 +789,7 @@ class SessionRSI:
             "timestamp": timestamp,
             "close": close,
             "rsi": value,
+            "rsi_30d": rsi_30d,
             "rsi_velocity": rsi_velocity,
             "rsi_acceleration": rsi_acceleration,
             "price_velocity": price_velocity,
@@ -805,6 +807,7 @@ class SessionRSI:
                 "datetime": timestamp.isoformat(),
                 "close": close,
                 "rsi": value,
+                "rsi_30d": rsi_30d,
                 "rsi_velocity": rsi_velocity,
                 "rsi_acceleration": rsi_acceleration,
                 "price_velocity": price_velocity,
@@ -815,9 +818,8 @@ class SessionRSI:
 
         message = (
             "MINUTE provider=%s symbol=%s source=%s timestamp=%s "
-            "close=%.8f rsi=%s v_rsi=%s a_rsi=%s v_p=%s changes=%d"
+            "close=%.8f rsi=%s rsi_30d=%s v_rsi=%s a_rsi=%s v_p=%s changes=%d"
         )
-
         arguments = (
             self.provider,
             self.symbol,
@@ -825,6 +827,7 @@ class SessionRSI:
             timestamp.isoformat(),
             close,
             "warming-up" if value is None else f"{value:.2f}",
+            "n/a" if rsi_30d is None else f"{float(rsi_30d):.2f}",
             "n/a" if rsi_velocity is None else f"{rsi_velocity:+.2f}",
             "n/a" if rsi_acceleration is None else f"{rsi_acceleration:+.2f}",
             "n/a" if price_velocity is None else f"{price_velocity:+.2f}",
@@ -3139,6 +3142,21 @@ class OptionContractHistoryTracker:
             "source": source,
         }
 
+    _QUOTE_ENRICH_FIELDS = (
+        "bid",
+        "ask",
+        "mid",
+        "spread_pct",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "iv",
+        "volume",
+        "open_interest",
+        "quote_captured_utc",
+    )
+
     @classmethod
     def _upsert_point(cls, history, point):
         if not point:
@@ -3156,12 +3174,20 @@ class OptionContractHistoryTracker:
         for idx, existing in enumerate(history):
             if existing.get("minute_utc") == key:
                 old_prio = priority.get(existing.get("source"), 1)
-                if point.get("stock_price") is None and existing.get("stock_price") is not None:
-                    point = {**point, "stock_price": existing.get("stock_price")}
+                merged = dict(point)
+                if merged.get("stock_price") is None and existing.get("stock_price") is not None:
+                    merged["stock_price"] = existing.get("stock_price")
+                for qk in cls._QUOTE_ENRICH_FIELDS:
+                    if merged.get(qk) is None and existing.get(qk) is not None:
+                        merged[qk] = existing.get(qk)
                 if new_prio >= old_prio:
-                    history[idx] = point
-                elif existing.get("stock_price") is None and point.get("stock_price") is not None:
-                    existing["stock_price"] = point.get("stock_price")
+                    history[idx] = merged
+                else:
+                    if existing.get("stock_price") is None and point.get("stock_price") is not None:
+                        existing["stock_price"] = point.get("stock_price")
+                    for qk in cls._QUOTE_ENRICH_FIELDS:
+                        if existing.get(qk) is None and point.get(qk) is not None:
+                            existing[qk] = point.get(qk)
                 return
         history.append(point)
         history.sort(
@@ -3170,6 +3196,64 @@ class OptionContractHistoryTracker:
         cap = cls._history_cap()
         if len(history) > cap:
             del history[:-cap]
+
+    def enrich_minute_quotes(self, quotes_by_contract, timestamp=None):
+        """Attach live bid/ask/spread/Greeks snapshots onto open contracts' current 1m history bars."""
+        if not isinstance(quotes_by_contract, dict) or not quotes_by_contract:
+            return 0
+        cap_dt = _opt_parse_utc(timestamp) or datetime.now(UTC)
+        cap_iso = cap_dt.isoformat()
+        target_min_key = minute_utc(cap_dt).isoformat()
+        updated = 0
+        with self._lock:
+            for raw_sym, qdata in quotes_by_contract.items():
+                if not isinstance(qdata, dict):
+                    continue
+                sym = str(raw_sym or "").strip().upper()
+                rec = self.open_contracts.get(sym)
+                if not isinstance(rec, dict):
+                    continue
+                hist = rec.get("history")
+                if not isinstance(hist, list) or not hist:
+                    continue
+                target_pt = None
+                for pt in reversed(hist):
+                    if not isinstance(pt, dict) or pt.get("pre_entry"):
+                        continue
+                    if pt.get("minute_utc") == target_min_key:
+                        target_pt = pt
+                        break
+                if target_pt is None:
+                    # Fallback to latest non-pre-entry bar within 2 minutes of capture timestamp
+                    for pt in reversed(hist):
+                        if not isinstance(pt, dict) or pt.get("pre_entry"):
+                            continue
+                        pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc"))
+                        if pt_dt is not None and abs((cap_dt - pt_dt).total_seconds()) <= 125.0:
+                            target_pt = pt
+                            break
+                if target_pt is None:
+                    continue
+                changed = False
+                for qk in self._QUOTE_ENRICH_FIELDS:
+                    if qk == "quote_captured_utc":
+                        continue
+                    val = qdata.get(qk)
+                    if val is not None:
+                        target_pt[qk] = val
+                        changed = True
+                if changed:
+                    target_pt["quote_captured_utc"] = cap_iso
+                    rec["last_quote_snapshot"] = {
+                        **{qk: target_pt.get(qk) for qk in self._QUOTE_ENRICH_FIELDS if target_pt.get(qk) is not None},
+                    }
+                    updated += 1
+        if updated > 0:
+            try:
+                self._persist_state_throttled()
+            except Exception:
+                pass
+        return updated
 
     @classmethod
     def _fill_minute_gaps(
@@ -5943,6 +6027,998 @@ class OptionContractHistoryTracker:
             }
 
 
+class DailyRsi30Tracker:
+    """Computes live 30-day daily Wilder RSI in O(1) per minute bar.
+
+    Seeds prior completed daily closes (< today_ny) once on startup (and on NY
+    date rollover) using Alpaca historical daily bars with a yfinance fallback,
+    matching lib/apGetStockRSI.py :: daily_rsi(..., period=30, interval='1day').
+    On each finalized 1-minute bar close, computes today's provisional 30-day
+    Wilder RSI without blocking the event loop.
+    """
+
+    PERIOD = 30
+
+    def __init__(self, credentials=None):
+        self.credentials = dict(credentials or {})
+        self._lock = threading.RLock()
+        self._states = {}
+        self._stock_client = None
+        self._last_seed_attempt = {}
+        self.logger = logging.getLogger("daily_rsi_30d")
+
+    def set_credentials(self, credentials):
+        with self._lock:
+            self.credentials = dict(credentials or {})
+            self._stock_client = None
+
+    def _get_alpaca_stock_client(self):
+        if self._stock_client is not None:
+            return self._stock_client
+        key = str(
+            self.credentials.get("alpaca_key")
+            or self.credentials.get("api_key")
+            or os.getenv("ALPACA_API_KEY", "")
+        ).strip()
+        secret = str(
+            self.credentials.get("alpaca_secret")
+            or self.credentials.get("secret_key")
+            or os.getenv("ALPACA_SECRET_KEY", "")
+        ).strip()
+        if not key or not secret:
+            return None
+        try:
+            self._stock_client = StockHistoricalDataClient(key, secret)
+            return self._stock_client
+        except Exception as exc:
+            logging.warning(
+                "RSI_30D_ALPACA_CLIENT_ERROR error_type=%s detail=%s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    @classmethod
+    def compute_wilder_baseline(cls, prior_closes, period=None):
+        """Return (prev_close, avg_gain, avg_loss, base_rsi) from completed daily closes."""
+        p = int(period or cls.PERIOD)
+        clean = []
+        for raw in prior_closes or []:
+            try:
+                val = float(raw)
+                if math.isfinite(val) and val > 0.0:
+                    clean.append(val)
+            except (TypeError, ValueError):
+                continue
+        if len(clean) < p + 1:
+            return None
+        gains = []
+        losses = []
+        for i in range(1, len(clean)):
+            diff = clean[i] - clean[i - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
+        avg_gain = sum(gains[:p]) / float(p)
+        avg_loss = sum(losses[:p]) / float(p)
+        for i in range(p, len(gains)):
+            avg_gain = (avg_gain * (p - 1) + gains[i]) / float(p)
+            avg_loss = (avg_loss * (p - 1) + losses[i]) / float(p)
+        if avg_gain == 0.0 and avg_loss == 0.0:
+            base_rsi = 50.0
+        elif avg_loss == 0.0:
+            base_rsi = 100.0
+        else:
+            base_rsi = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+        return (clean[-1], avg_gain, avg_loss, round(base_rsi, 2))
+
+    @classmethod
+    def compute_from_state(cls, state, current_close, period=None):
+        """Apply today's provisional close to prior-day Wilder(30) state."""
+        if not isinstance(state, dict):
+            return None
+        try:
+            close = float(current_close)
+            prev_close = float(state["prev_daily_close"])
+            avg_gain = float(state["avg_gain"])
+            avg_loss = float(state["avg_loss"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (math.isfinite(close) and close > 0.0 and math.isfinite(prev_close) and prev_close > 0.0):
+            return None
+        p = int(period or cls.PERIOD)
+        delta = close - prev_close
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
+        live_avg_gain = (avg_gain * (p - 1) + gain) / float(p)
+        live_avg_loss = (avg_loss * (p - 1) + loss) / float(p)
+        if live_avg_gain == 0.0 and live_avg_loss == 0.0:
+            return 50.0
+        if live_avg_loss == 0.0:
+            return 100.0
+        return round(100.0 - 100.0 / (1.0 + live_avg_gain / live_avg_loss), 2)
+
+    def _fetch_daily_bars_sync(self, symbol, today_ny):
+        """Fetch completed daily closes strictly before today_ny (Alpaca primary, yfinance fallback)."""
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return [], None, "empty_symbol"
+
+        client = self._get_alpaca_stock_client()
+        if client is not None:
+            feed_candidates = [FEED] if FEED == DataFeed.IEX else [FEED, DataFeed.IEX]
+            for feed_cand in feed_candidates:
+                try:
+                    now_utc = datetime.now(UTC)
+                    start_dt = now_utc - timedelta(days=450)
+                    req = StockBarsRequest(
+                        symbol_or_symbols=[sym],
+                        timeframe=TimeFrame.Day,
+                        start=start_dt,
+                        end=now_utc,
+                        feed=feed_cand,
+                    )
+                    bars_resp = client.get_stock_bars(req)
+                    bar_list = []
+                    if hasattr(bars_resp, "data") and isinstance(bars_resp.data, dict):
+                        bar_list = list(bars_resp.data.get(sym) or [])
+                    elif isinstance(bars_resp, dict):
+                        bar_list = list(bars_resp.get(sym) or [])
+                    else:
+                        try:
+                            bar_list = list(bars_resp[sym] or [])
+                        except Exception:
+                            bar_list = []
+                    closes = []
+                    last_prior_date = None
+                    for b in sorted(bar_list, key=lambda x: getattr(x, "timestamp", now_utc)):
+                        ts = getattr(b, "timestamp", None)
+                        c_val = getattr(b, "close", None)
+                        if ts is None or c_val is None:
+                            continue
+                        b_date = as_utc(ts).astimezone(MARKET_TZ).date()
+                        if b_date < today_ny:
+                            closes.append(float(c_val))
+                            last_prior_date = b_date
+                    if len(closes) >= self.PERIOD + 1:
+                        return closes, last_prior_date, "alpaca_1d"
+                except Exception as exc:
+                    logging.warning(
+                        "RSI_30D_ALPACA_FETCH_FAILED symbol=%s feed=%s error_type=%s detail=%s",
+                        sym,
+                        getattr(feed_cand, "value", feed_cand),
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(sym).history(
+                period="2y", interval="1d", auto_adjust=False, timeout=15
+            )
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = []
+                last_prior_date = None
+                for idx_ts, row in hist.iterrows():
+                    try:
+                        b_date = (
+                            idx_ts.tz_convert(MARKET_TZ).date()
+                            if getattr(idx_ts, "tzinfo", None) is not None
+                            else idx_ts.date()
+                        )
+                        c_val = float(row["Close"])
+                    except Exception:
+                        continue
+                    if b_date < today_ny and math.isfinite(c_val) and c_val > 0.0:
+                        closes.append(c_val)
+                        last_prior_date = b_date
+                if len(closes) >= self.PERIOD + 1:
+                    return closes, last_prior_date, "yfinance_1d"
+        except Exception as exc:
+            logging.warning(
+                "RSI_30D_YFINANCE_FETCH_FAILED symbol=%s error_type=%s detail=%s",
+                sym,
+                type(exc).__name__,
+                exc,
+            )
+
+        return [], None, "unavailable"
+
+    def seed_symbol_sync(self, symbol, ref_dt=None):
+        """Seed or refresh prior-day Wilder(30) baseline for one symbol."""
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        today_ny = as_utc(ref_dt or datetime.now(UTC)).astimezone(MARKET_TZ).date()
+        closes, last_prior_date, source = self._fetch_daily_bars_sync(sym, today_ny)
+        baseline = self.compute_wilder_baseline(closes, period=self.PERIOD)
+        with self._lock:
+            self._last_seed_attempt[sym] = (today_ny, datetime.now(UTC))
+            if baseline is None:
+                logging.warning(
+                    "RSI_30D_SEED_INCOMPLETE symbol=%s bars=%d source=%s",
+                    sym,
+                    len(closes),
+                    source,
+                )
+                return None
+            prev_close, avg_gain, avg_loss, base_rsi = baseline
+            state = {
+                "symbol": sym,
+                "trading_date": today_ny,
+                "last_prior_date": str(last_prior_date) if last_prior_date else None,
+                "prev_daily_close": prev_close,
+                "avg_gain": avg_gain,
+                "avg_loss": avg_loss,
+                "base_rsi": base_rsi,
+                "daily_bars": len(closes),
+                "source": source,
+                "seeded_at_utc": datetime.now(UTC).isoformat(),
+            }
+            self._states[sym] = state
+        logging.info(
+            "RSI_30D_SEEDED symbol=%s prior_bars=%d last_prior_date=%s prev_close=%.4f base_rsi=%.2f source=%s",
+            sym,
+            len(closes),
+            last_prior_date,
+            prev_close,
+            base_rsi,
+            source,
+        )
+        return state
+
+    async def seed_all(self, symbols):
+        """Always pre-seed 30-day daily Wilder baselines for all configured symbols."""
+        unique_syms = list(dict.fromkeys(str(s or "").strip().upper() for s in (symbols or []) if s))
+        if not unique_syms:
+            return
+        logging.info(
+            "RSI_30D_PRE_SEED_START symbols=%d gate_enabled=%s min_gate=%.1f",
+            len(unique_syms),
+            bool(RSI_30D_ENABLED),
+            RSI_30D_MIN,
+        )
+
+        def _seed_batch():
+            ok = 0
+            for sym in unique_syms:
+                try:
+                    if self.seed_symbol_sync(sym) is not None:
+                        ok += 1
+                except Exception as exc:
+                    logging.warning(
+                        "RSI_30D_SEED_ERROR symbol=%s error_type=%s detail=%s",
+                        sym,
+                        type(exc).__name__,
+                        exc,
+                    )
+            return ok
+
+        seeded_count = await asyncio.to_thread(_seed_batch)
+        logging.info(
+            "RSI_30D_PRE_SEED_DONE seeded=%d/%d",
+            seeded_count,
+            len(unique_syms),
+        )
+
+    def _maybe_schedule_reseed(self, sym, ref_dt=None):
+        """Schedule non-blocking re-seed if a symbol is missing or NY date rolled over."""
+        now_utc = datetime.now(UTC)
+        today_ny = as_utc(ref_dt or now_utc).astimezone(MARKET_TZ).date()
+        with self._lock:
+            last_att = self._last_seed_attempt.get(sym)
+            if last_att is not None:
+                att_day, att_dt = last_att
+                if att_day == today_ny and (now_utc - att_dt).total_seconds() < 300.0:
+                    return
+            self._last_seed_attempt[sym] = (today_ny, now_utc)
+        threading.Thread(
+            target=self.seed_symbol_sync,
+            args=(sym, ref_dt),
+            name=f"RSI30-SEED-{sym}",
+            daemon=True,
+        ).start()
+
+    def compute_live_rsi30(self, symbol, current_close, ref_dt=None):
+        """Always return live 30-day Wilder RSI for symbol at current_close (or None if unseeded)."""
+        if current_close is None:
+            return None
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        today_ny = as_utc(ref_dt or datetime.now(UTC)).astimezone(MARKET_TZ).date()
+        with self._lock:
+            state = self._states.get(sym)
+        if state is None or state.get("trading_date") != today_ny:
+            self._maybe_schedule_reseed(sym, ref_dt=ref_dt)
+            if state is None:
+                return None
+        return self.compute_from_state(state, current_close, period=self.PERIOD)
+
+    def get_status(self):
+        with self._lock:
+            seeded = sorted(self._states.keys())
+        return {
+            "enabled": bool(RSI_30D_ENABLED),
+            "gate_enabled": bool(RSI_30D_ENABLED),
+            "always_collected": True,
+            "min_threshold": float(RSI_30D_MIN),
+            "period": self.PERIOD,
+            "seeded_count": len(seeded),
+            "seeded_symbols": seeded,
+        }
+
+
+class NasdaqMarketTracker:
+    """Always tracks the configured NASDAQ proxy symbol (default QQQ) at the
+    start of each trading day (09:30 ET) and every minute thereafter during RTH.
+
+    When [general] nasdaq_must_be_positive = true, OptionBuyer consults
+    evaluate_buy_gate() so buys are only permitted when (current - open) > 0.
+    """
+
+    def __init__(self, symbol=None, credentials=None, coordinator=None):
+        self.symbol = (str(symbol or NASDAQ_SYMBOL or "QQQ").strip().upper() or "QQQ")
+        self.credentials = dict(credentials or {})
+        self.coordinator = coordinator
+        self.provider = "NASDAQ_TRACKER"
+        self.logger = make_logger("nasdaq", self.symbol)
+        self.log_file = next(
+            (getattr(h, "baseFilename", None) for h in self.logger.handlers if hasattr(h, "baseFilename")),
+            None,
+        )
+        self._lock = threading.RLock()
+        self._async_lock = None
+        self._stock_client = None
+        self._tt_client = None
+        self.trading_date = None
+        self.open_price = None
+        self.open_minute_utc = None
+        self.open_source = None
+        self.current_price = None
+        self.current_minute_utc = None
+        self.current_source = None
+        self.last_refreshed_minute_key = None
+        self.last_updated_utc = None
+        self.observations_today = 0
+        self.last_error = None
+        self.session_state = "awaiting_rth"
+
+    def set_credentials(self, credentials):
+        with self._lock:
+            self.credentials = dict(credentials or {})
+            self._stock_client = None
+            self._tt_client = None
+
+    @staticmethod
+    def _get_session_bounds(day):
+        bounds = session_bounds(day)
+        if bounds is None:
+            return None, None
+        return bounds
+
+    @staticmethod
+    def _alpaca_feed_candidates():
+        return [FEED] if FEED == DataFeed.IEX else [FEED, DataFeed.IEX]
+
+    def _get_alpaca_stock_client(self):
+        if self._stock_client is not None:
+            return self._stock_client
+        key = str(
+            self.credentials.get("alpaca_key")
+            or self.credentials.get("api_key")
+            or os.getenv("ALPACA_API_KEY", "")
+        ).strip()
+        secret = str(
+            self.credentials.get("alpaca_secret")
+            or self.credentials.get("secret_key")
+            or os.getenv("ALPACA_SECRET_KEY", "")
+        ).strip()
+        if not key or not secret:
+            return None
+        try:
+            self._stock_client = StockHistoricalDataClient(key, secret)
+            return self._stock_client
+        except Exception as exc:
+            logging.warning(
+                "NASDAQ_ALPACA_CLIENT_ERROR symbol=%s error_type=%s detail=%s",
+                self.symbol,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _get_tastytrade_client(self):
+        if self._tt_client is not None:
+            return self._tt_client
+        try:
+            if "build_tastytrade_client" in globals():
+                client = build_tastytrade_client(self.credentials, env_override="prod")
+                if client is not None:
+                    self._tt_client = client
+                    return client
+        except Exception:
+            pass
+        return None
+
+    def _reset_day_locked(self, day):
+        self.trading_date = day
+        self.open_price = None
+        self.open_minute_utc = None
+        self.open_source = None
+        self.current_price = None
+        self.current_minute_utc = None
+        self.current_source = None
+        self.last_refreshed_minute_key = None
+        self.observations_today = 0
+        self.last_error = None
+        self.session_state = "awaiting_rth"
+
+    def _lookup_coordinator_price(self, day, target_min_utc=None, want_open=False):
+        """Reuse price from coordinator if nasdaq_symbol is already a tracked symbol."""
+        coord = self.coordinator
+        if coord is None:
+            return None, None, None
+        opening_utc, closing_utc = self._get_session_bounds(day)
+        if opening_utc is None or closing_utc is None:
+            return None, None, None
+        candidates = []
+        for prov in _provider_priority_order():
+            hist = coord.kinematics_history.get((prov, self.symbol))
+            if not hist:
+                continue
+            rth_points = []
+            for h in hist:
+                c_val = h.get("close")
+                m_dt = h.get("minute")
+                if c_val is None or not isinstance(m_dt, datetime):
+                    continue
+                m_u = as_utc(m_dt)
+                if opening_utc <= m_u < closing_utc:
+                    rth_points.append((m_u, float(c_val), prov))
+            if rth_points:
+                candidates.append(rth_points)
+                break
+        if not candidates:
+            return None, None, None
+        pts = candidates[0]
+        if want_open:
+            first_m, first_c, prov = pts[0]
+            if first_m <= opening_utc + timedelta(minutes=2):
+                return first_c, first_m.isoformat(), f"coordinator_{prov.lower()}_rth_open"
+            return None, None, None
+        if target_min_utc is not None:
+            for m_u, c_val, prov in reversed(pts):
+                if abs((m_u - target_min_utc).total_seconds()) <= 90.0:
+                    return c_val, m_u.isoformat(), f"coordinator_{prov.lower()}"
+        last_m, last_c, prov = pts[-1]
+        return last_c, last_m.isoformat(), f"coordinator_{prov.lower()}"
+
+    def _fetch_rth_open_sync(self, day):
+        """Fetch today's 09:30 ET start-of-day price for self.symbol."""
+        opening_utc, _ = self._get_session_bounds(day)
+        if opening_utc is None:
+            return None, None, "market_closed"
+        now_utc = datetime.now(UTC)
+        if now_utc < opening_utc:
+            return None, None, "pre_market"
+
+        # 1. Alpaca 1m bar at 09:30 ET (with SIP -> IEX fallback) and snapshot daily_bar.open
+        client = self._get_alpaca_stock_client()
+        if client is not None:
+            for feed_cand in self._alpaca_feed_candidates():
+                try:
+                    end_dt = min(now_utc, opening_utc + timedelta(minutes=15))
+                    req = StockBarsRequest(
+                        symbol_or_symbols=[self.symbol],
+                        timeframe=TimeFrame.Minute,
+                        start=opening_utc,
+                        end=end_dt,
+                        feed=feed_cand,
+                    )
+                    resp = client.get_stock_bars(req)
+                    bars = []
+                    if hasattr(resp, "data") and isinstance(resp.data, dict):
+                        bars = list(resp.data.get(self.symbol) or [])
+                    elif isinstance(resp, dict):
+                        bars = list(resp.get(self.symbol) or [])
+                    else:
+                        try:
+                            bars = list(resp[self.symbol] or [])
+                        except Exception:
+                            bars = []
+                    for b in sorted(bars, key=lambda x: getattr(x, "timestamp", now_utc)):
+                        ts = getattr(b, "timestamp", None)
+                        o_val = getattr(b, "open", None) or getattr(b, "close", None)
+                        if ts is not None and o_val is not None and as_utc(ts) >= opening_utc:
+                            px = float(o_val)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, as_utc(ts).isoformat(), "alpaca_1m_open"
+                except Exception as exc:
+                    logging.warning(
+                        "NASDAQ_OPEN_ALPACA_FAILED symbol=%s feed=%s error_type=%s detail=%s",
+                        self.symbol,
+                        getattr(feed_cand, "value", feed_cand),
+                        type(exc).__name__,
+                        exc,
+                    )
+            try:
+                from alpaca.data.requests import StockSnapshotRequest
+
+                for feed_cand in self._alpaca_feed_candidates():
+                    try:
+                        s_resp = client.get_stock_snapshot(
+                            StockSnapshotRequest(symbol_or_symbols=[self.symbol], feed=feed_cand)
+                        )
+                        snap_obj = (
+                            s_resp.get(self.symbol)
+                            if isinstance(s_resp, dict)
+                            else getattr(s_resp, "data", {}).get(self.symbol)
+                        )
+                        dbar = getattr(snap_obj, "daily_bar", None) if snap_obj is not None else None
+                        d_ts = getattr(dbar, "timestamp", None) if dbar is not None else None
+                        o_val = getattr(dbar, "open", None) if dbar is not None else None
+                        if o_val is not None and (
+                            d_ts is None or as_utc(d_ts).astimezone(MARKET_TZ).date() == day
+                        ):
+                            px = float(o_val)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, opening_utc.isoformat(), "alpaca_snapshot_open"
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # 2. yfinance 1m RTH open
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(self.symbol).history(
+                period="1d", interval="1m", prepost=False, timeout=15
+            )
+            if hist is not None and not hist.empty:
+                for idx_ts, row in hist.iterrows():
+                    try:
+                        ts_dt = idx_ts.to_pydatetime()
+                        ts_u = as_utc(ts_dt) if ts_dt.tzinfo is not None else ts_dt.replace(tzinfo=MARKET_TZ).astimezone(UTC)
+                        if ts_u.astimezone(MARKET_TZ).date() == day and ts_u >= opening_utc:
+                            o_raw = row.get("Open") if "Open" in row else row.get("Close")
+                            px = float(o_raw)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, ts_u.isoformat(), "yfinance_1m_open"
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logging.warning(
+                "NASDAQ_OPEN_YFINANCE_FAILED symbol=%s error_type=%s detail=%s",
+                self.symbol,
+                type(exc).__name__,
+                exc,
+            )
+
+        # 3. Coordinator history if symbol is already tracked
+        c_px, c_ts, c_src = self._lookup_coordinator_price(day, want_open=True)
+        if c_px is not None:
+            return c_px, c_ts, c_src
+
+        return None, None, "unavailable"
+
+    def _fetch_minute_price_sync(self, day, target_min_utc):
+        """Fetch the current/target-minute price for self.symbol during RTH."""
+        now_utc = datetime.now(UTC)
+
+        # 1. Reuse coordinator if nasdaq_symbol is already in target_symbols
+        c_px, c_ts, c_src = self._lookup_coordinator_price(
+            day, target_min_utc=target_min_utc, want_open=False
+        )
+        if c_px is not None:
+            return c_px, c_ts, c_src
+
+        # 2. Alpaca 1m bar (with SIP -> IEX fallback, then snapshot / latest trade)
+        client = self._get_alpaca_stock_client()
+        if client is not None:
+            for feed_cand in self._alpaca_feed_candidates():
+                try:
+                    start_dt = (target_min_utc or now_utc) - timedelta(minutes=15)
+                    req = StockBarsRequest(
+                        symbol_or_symbols=[self.symbol],
+                        timeframe=TimeFrame.Minute,
+                        start=start_dt,
+                        end=now_utc,
+                        feed=feed_cand,
+                    )
+                    resp = client.get_stock_bars(req)
+                    bars = []
+                    if hasattr(resp, "data") and isinstance(resp.data, dict):
+                        bars = list(resp.data.get(self.symbol) or [])
+                    elif isinstance(resp, dict):
+                        bars = list(resp.get(self.symbol) or [])
+                    else:
+                        try:
+                            bars = list(resp[self.symbol] or [])
+                        except Exception:
+                            bars = []
+                    if bars:
+                        b = sorted(bars, key=lambda x: getattr(x, "timestamp", now_utc))[-1]
+                        c_val = getattr(b, "close", None)
+                        ts = getattr(b, "timestamp", None) or now_utc
+                        if c_val is not None:
+                            px = float(c_val)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, as_utc(ts).isoformat(), "alpaca_1m_bar"
+                except Exception as exc:
+                    logging.warning(
+                        "NASDAQ_BAR_ALPACA_FAILED symbol=%s feed=%s error_type=%s detail=%s",
+                        self.symbol,
+                        getattr(feed_cand, "value", feed_cand),
+                        type(exc).__name__,
+                        exc,
+                    )
+            try:
+                from alpaca.data.requests import StockLatestTradeRequest
+
+                for feed_cand in self._alpaca_feed_candidates():
+                    try:
+                        t_resp = client.get_stock_latest_trade(
+                            StockLatestTradeRequest(symbol_or_symbols=[self.symbol], feed=feed_cand)
+                        )
+                        trade_obj = (
+                            t_resp.get(self.symbol)
+                            if isinstance(t_resp, dict)
+                            else getattr(t_resp, "data", {}).get(self.symbol)
+                        )
+                        p_raw = getattr(trade_obj, "price", None) if trade_obj is not None else None
+                        if p_raw is not None:
+                            px = float(p_raw)
+                            if math.isfinite(px) and px > 0.0:
+                                ts = getattr(trade_obj, "timestamp", None) or now_utc
+                                return px, as_utc(ts).isoformat(), "alpaca_latest_trade"
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            try:
+                from alpaca.data.requests import StockSnapshotRequest
+
+                for feed_cand in self._alpaca_feed_candidates():
+                    try:
+                        s_resp = client.get_stock_snapshot(
+                            StockSnapshotRequest(symbol_or_symbols=[self.symbol], feed=feed_cand)
+                        )
+                        snap_obj = (
+                            s_resp.get(self.symbol)
+                            if isinstance(s_resp, dict)
+                            else getattr(s_resp, "data", {}).get(self.symbol)
+                        )
+                        if snap_obj is not None:
+                            for attr, fld in (("minute_bar", "close"), ("latest_trade", "price"), ("daily_bar", "close")):
+                                part = getattr(snap_obj, attr, None)
+                                raw_p = getattr(part, fld, None) if part is not None else None
+                                if raw_p is not None:
+                                    px = float(raw_p)
+                                    if math.isfinite(px) and px > 0.0:
+                                        ts = getattr(part, "timestamp", None) or now_utc
+                                        return px, as_utc(ts).isoformat(), f"alpaca_snapshot_{attr}"
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # 3. Tastytrade equity quote if available
+        tt_client = self._get_tastytrade_client()
+        if tt_client is not None:
+            try:
+                q = tt_client.get_quote(self.symbol, is_option=False)
+                if q is not None:
+                    q_fields = (
+                        ("last_price", "mark_price", "mid_price", "ask_price", "bid_price", "last", "mark", "mid", "ask", "bid")
+                    )
+                    for fld in q_fields:
+                        raw_p = q.get(fld) if isinstance(q, dict) else getattr(q, fld, None)
+                        if raw_p is not None:
+                            px = float(raw_p)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, now_utc.isoformat(), f"tastytrade_{fld}"
+            except Exception:
+                pass
+
+        # 4. yfinance 1m fallback
+        try:
+            import yfinance as yf
+
+            hist = yf.Ticker(self.symbol).history(
+                period="1d", interval="1m", prepost=False, timeout=15
+            )
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                last_row = hist.iloc[-1]
+                px = float(last_row["Close"])
+                if math.isfinite(px) and px > 0.0:
+                    idx_ts = hist.index[-1]
+                    ts_dt = idx_ts.to_pydatetime()
+                    ts_u = as_utc(ts_dt) if ts_dt.tzinfo is not None else ts_dt.replace(tzinfo=MARKET_TZ).astimezone(UTC)
+                    return px, ts_u.isoformat(), "yfinance_1m_bar"
+        except Exception as exc:
+            logging.warning(
+                "NASDAQ_BAR_YFINANCE_FAILED symbol=%s error_type=%s detail=%s",
+                self.symbol,
+                type(exc).__name__,
+                exc,
+            )
+
+        return None, None, "unavailable"
+
+    def refresh_sync(self, target_minute=None, force=False):
+        """Synchronously collect/update day-open and current-minute NASDAQ price during RTH."""
+        now_utc = datetime.now(UTC)
+        ref_dt = as_utc(target_minute) if isinstance(target_minute, datetime) else now_utc
+        ny_dt = ref_dt.astimezone(MARKET_TZ)
+        day = ny_dt.date()
+        min_key = minute_utc(ref_dt).isoformat()
+
+        with self._lock:
+            if self.trading_date != day:
+                self._reset_day_locked(day)
+            if not force and self.last_refreshed_minute_key == min_key and self.current_price is not None and self.open_price is not None:
+                return self._build_status_locked()
+            need_open = self.open_price is None
+
+        # Only fetch intraday RTH prices on NYSE trading days during or after 09:30 ET
+        opening_utc, closing_utc = self._get_session_bounds(day)
+        if opening_utc is None or closing_utc is None or ny_dt.weekday() >= 5:
+            with self._lock:
+                self.session_state = "market_closed"
+                return self._build_status_locked()
+        if now_utc < opening_utc:
+            with self._lock:
+                self.session_state = "pre_market"
+                return self._build_status_locked()
+
+        open_px = None
+        open_ts = None
+        open_src = None
+        if need_open:
+            open_px, open_ts, open_src = self._fetch_rth_open_sync(day)
+
+        cur_px, cur_ts, cur_src = self._fetch_minute_price_sync(day, ref_dt)
+
+        # If RTH open bar couldn't be fetched independently, seed from first observed RTH price
+        if need_open and open_px is None and cur_px is not None:
+            open_px = cur_px
+            open_ts = cur_ts or ref_dt.isoformat()
+            open_src = f"first_rth_{cur_src}"
+
+        logged_new_open = False
+        with self._lock:
+            if self.trading_date != day:
+                self._reset_day_locked(day)
+            if self.open_price is None and open_px is not None:
+                self.open_price = round(float(open_px), 4)
+                self.open_minute_utc = open_ts
+                self.open_source = open_src
+                logged_new_open = True
+                self.logger.info(
+                    "NASDAQ_DAY_OPEN symbol=%s date=%s open=%.4f source=%s minute=%s",
+                    self.symbol,
+                    day,
+                    self.open_price,
+                    self.open_source,
+                    format_display_iso(open_ts or ref_dt),
+                )
+            if cur_px is not None:
+                self.current_price = round(float(cur_px), 4)
+                self.current_minute_utc = cur_ts or ref_dt.isoformat()
+                self.current_source = cur_src
+                self.last_refreshed_minute_key = min_key
+                self.last_updated_utc = now_utc.isoformat()
+                self.observations_today += 1
+                self.last_error = None
+                self.session_state = "live" if now_utc <= closing_utc else "after_hours"
+            else:
+                self.last_error = f"price_unavailable({cur_src})"
+                self.session_state = "error"
+
+            snap = self._build_status_locked()
+
+        if logged_new_open:
+            logging.info(
+                "NASDAQ_DAY_OPEN symbol=%s date=%s open=%.4f source=%s",
+                self.symbol,
+                day,
+                snap["open_price"],
+                snap["open_source"],
+            )
+
+        if cur_px is not None and snap["open_price"] is not None:
+            self.logger.info(
+                "NASDAQ_MINUTE symbol=%s date=%s minute=%s open=%.4f current=%.4f "
+                "diff=%+.4f diff_pct=%+.3f%% positive=%s gate_enabled=%s source=%s",
+                self.symbol,
+                day,
+                format_display_iso(ref_dt),
+                snap["open_price"],
+                snap["current_price"],
+                snap["diff"],
+                snap["diff_pct"],
+                snap["is_positive"],
+                bool(NASDAQ_MUST_BE_POSITIVE),
+                cur_src,
+            )
+        else:
+            self.logger.warning(
+                "NASDAQ_MINUTE_MISSING symbol=%s date=%s minute=%s open=%s current=%s detail=%s",
+                self.symbol,
+                day,
+                format_display_iso(ref_dt),
+                snap["open_price"],
+                snap["current_price"],
+                snap["last_error"],
+            )
+            logging.warning(
+                "NASDAQ_MINUTE_MISSING symbol=%s date=%s open=%s current=%s detail=%s",
+                self.symbol,
+                day,
+                snap["open_price"],
+                snap["current_price"],
+                snap["last_error"],
+            )
+        return snap
+
+    async def refresh_for_minute(self, target_minute=None, force=False):
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        async with self._async_lock:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self.refresh_sync, target_minute, force),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "NASDAQ_REFRESH_TIMEOUT symbol=%s target_minute=%s",
+                    self.symbol,
+                    target_minute,
+                )
+                logging.warning(
+                    "NASDAQ_REFRESH_TIMEOUT symbol=%s target_minute=%s",
+                    self.symbol,
+                    target_minute,
+                )
+                return self.get_status()
+
+    def _build_status_locked(self):
+        diff = None
+        diff_pct = None
+        is_positive = None
+        if self.open_price is not None and self.current_price is not None:
+            diff = round(self.current_price - self.open_price, 4)
+            if self.open_price > 0:
+                diff_pct = round((diff / self.open_price) * 100.0, 4)
+            is_positive = diff > 0.0
+        return {
+            "symbol": self.symbol,
+            "gate_enabled": bool(NASDAQ_MUST_BE_POSITIVE),
+            "status": self.session_state,
+            "trading_date": str(self.trading_date) if self.trading_date else None,
+            "open_price": self.open_price,
+            "open_minute_utc": self.open_minute_utc,
+            "open_source": self.open_source,
+            "current_price": self.current_price,
+            "current_minute_utc": self.current_minute_utc,
+            "current_source": self.current_source,
+            "diff": diff,
+            "diff_pct": diff_pct,
+            "is_positive": is_positive,
+            "observations_today": self.observations_today,
+            "samples_today": self.observations_today,
+            "last_updated_utc": self.last_updated_utc,
+            "last_error": self.last_error,
+            "log_file": self.log_file,
+        }
+
+    def get_status(self):
+        with self._lock:
+            return self._build_status_locked()
+
+    def evaluate_buy_gate(self):
+        """Return (allowed: bool, reason: str, status: dict) for OptionBuyer."""
+        snap = self.get_status()
+        if not NASDAQ_MUST_BE_POSITIVE:
+            return True, "nasdaq_gate_disabled", snap
+        o_px = snap.get("open_price")
+        c_px = snap.get("current_price")
+        diff = snap.get("diff")
+        diff_pct = snap.get("diff_pct")
+        if o_px is None or c_px is None or diff is None:
+            return (
+                False,
+                f"nasdaq_down({self.symbol}_price_unavailable:open={o_px},cur={c_px})",
+                snap,
+            )
+        pct_s = f"/{diff_pct:+.2f}%" if diff_pct is not None else ""
+        if diff > 0.0:
+            return (
+                True,
+                f"nasdaq_positive({self.symbol}:{c_px:.2f}-{o_px:.2f}={diff:+.2f}{pct_s})",
+                snap,
+            )
+        return (
+            False,
+            f"nasdaq_down({self.symbol}:{c_px:.2f}-{o_px:.2f}={diff:+.2f}{pct_s}<=0)",
+            snap,
+        )
+
+    async def run(self):
+        """Background 1-minute collector synced to MinuteCoordinator finalization.
+
+        Always collects day-open and 1-minute prices during RTH regardless of
+        whether nasdaq_must_be_positive is true or false.
+        """
+        self.logger.info(
+            "NASDAQ_TRACKER_START symbol=%s gate_enabled=%s",
+            self.symbol,
+            bool(NASDAQ_MUST_BE_POSITIVE),
+        )
+        logging.info(
+            "NASDAQ_TRACKER_START symbol=%s gate_enabled=%s log=%s",
+            self.symbol,
+            bool(NASDAQ_MUST_BE_POSITIVE),
+            self.log_file or "--",
+        )
+        try:
+            await self.refresh_for_minute(datetime.now(UTC))
+        except Exception as exc:
+            self.logger.warning(
+                "NASDAQ_TRACKER_INIT_ERROR symbol=%s error_type=%s detail=%s",
+                self.symbol,
+                type(exc).__name__,
+                exc,
+            )
+            logging.warning(
+                "NASDAQ_TRACKER_INIT_ERROR symbol=%s error_type=%s detail=%s",
+                self.symbol,
+                type(exc).__name__,
+                exc,
+            )
+
+        evt = (
+            self.coordinator.subscribe_minute_finalized()
+            if self.coordinator is not None
+            else None
+        )
+        while True:
+            try:
+                if evt is not None:
+                    try:
+                        await asyncio.wait_for(evt.wait(), timeout=65.0)
+                        evt.clear()
+                        target_min = getattr(self.coordinator, "last_finalized", None) or datetime.now(UTC)
+                    except asyncio.TimeoutError:
+                        target_min = datetime.now(UTC)
+                else:
+                    await asyncio.sleep(60.0)
+                    target_min = datetime.now(UTC)
+
+                ref_ny = as_utc(target_min).astimezone(MARKET_TZ)
+                opening_utc, closing_utc = self._get_session_bounds(ref_ny.date())
+                if regular_session(ref_ny) or (
+                    opening_utc is not None
+                    and closing_utc is not None
+                    and ref_ny.weekday() < 5
+                    and opening_utc <= as_utc(target_min) <= closing_utc
+                ):
+                    await self.refresh_for_minute(target_min)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "NASDAQ_TRACKER_LOOP_ERROR symbol=%s error_type=%s detail=%s",
+                    self.symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(5.0)
+
+
 class MinuteCoordinator:
     """Single event-loop owner of pending closes, RSI state and summary output.
 
@@ -6011,6 +7087,10 @@ class MinuteCoordinator:
         self.option_sell_events = {}
         self.option_history = OptionContractHistoryTracker()
         self.option_history.attach_coordinator(self)
+        self.daily_rsi30_tracker = DailyRsi30Tracker()
+        self.nasdaq_tracker = NasdaqMarketTracker(
+            symbol=NASDAQ_SYMBOL, coordinator=self
+        )
         self.event_loop = None
         self.minute_finalized_event = None
         self.minute_finalized_listeners = []
@@ -6491,18 +7571,36 @@ class MinuteCoordinator:
             Bar(minute, candidate.close), candidate.source, warmup=True
         )
 
-    def _apply(self, provider, symbol, minute, candidate):
+    def _apply(self, provider, symbol, minute, candidate, rsi_30d=None):
         tracker = self.trackers[(provider, symbol)]
-        result = tracker.process_bar(Bar(minute, candidate.close), candidate.source)
+        result = tracker.process_bar(
+            Bar(minute, candidate.close), candidate.source, rsi_30d=rsi_30d
+        )
         day = minute.astimezone(MARKET_TZ).date()
         count_key = (provider, symbol, day)
         self.counts[count_key] = self.counts.get(count_key, 0) + 1
         return result
 
+    def _compute_rsi_30d(self, symbol, close, ref_dt=None):
+        if close is None:
+            return None
+        tracker = getattr(self, "daily_rsi30_tracker", None)
+        if tracker is None:
+            return None
+        try:
+            return tracker.compute_live_rsi30(symbol, close, ref_dt=ref_dt)
+        except Exception:
+            return None
+
     def _symbol_record(self, provider, symbol, minute):
         key = (provider, symbol, minute)
         candidate = self.pending.pop(key, None)
-        base = {"close": None, "rsi": None, "status": "missing"}
+        base = {"close": None, "rsi": None, "rsi_30d": None, "status": "missing"}
+        curr_rsi_30d = (
+            self._compute_rsi_30d(symbol, candidate.close, ref_dt=minute)
+            if candidate is not None and candidate.close is not None
+            else None
+        )
         if provider != "TRADINGVIEW":
             tracker = self.trackers[(provider, symbol)]
             day = minute.astimezone(MARKET_TZ).date()
@@ -6528,10 +7626,13 @@ class MinuteCoordinator:
                 if other[2] < opening:
                     self._apply_warmup_candidate(provider, symbol, other[2], w_cand)
                 else:
-                    self._apply(provider, symbol, other[2], w_cand)
+                    w_rsi30 = self._compute_rsi_30d(symbol, w_cand.close, ref_dt=other[2])
+                    self._apply(provider, symbol, other[2], w_cand, rsi_30d=w_rsi30)
             observation = None
             if candidate:
-                observation = self._apply(provider, symbol, minute, candidate)
+                observation = self._apply(
+                    provider, symbol, minute, candidate, rsi_30d=curr_rsi_30d
+                )
             expected = int((minute - opening) / MINUTE) + 1
             observed = self.counts.get((provider, symbol, day), 0)
             base.update(
@@ -6548,6 +7649,8 @@ class MinuteCoordinator:
             )
             if observation:
                 base["rsi"] = observation["rsi"]
+            if curr_rsi_30d is not None:
+                base["rsi_30d"] = curr_rsi_30d
             if candidate:
                 base["status"] = "ok" if observation else "warming_up"
         elif candidate:
@@ -6555,6 +7658,7 @@ class MinuteCoordinator:
             base.update(
                 {
                     "rsi": candidate.reported_rsi,
+                    "rsi_30d": curr_rsi_30d,
                     "rsi_source": "webhook_reported",
                     # BUY when rsi <= OPTION_CHAIN_RSI_LOW, SELL when
                     # rsi >= OPTION_CHAIN_RSI_HIGH, else null (neutral band).
@@ -6731,6 +7835,7 @@ class MinuteCoordinator:
                     "close": curr_close,
                     "smoothed_close": smoothed_close,
                     "rsi": curr_rsi,
+                    "rsi_30d": curr_rsi_30d,
                     "price_velocity": price_velocity,
                     "price_velocity_pct": price_velocity_pct,
                     "price_acceleration": price_acceleration,
@@ -6767,6 +7872,7 @@ class MinuteCoordinator:
 
         base.update(
             {
+                "rsi_30d": curr_rsi_30d,
                 "price_velocity": price_velocity,
                 "price_velocity_pct": price_velocity_pct,
                 "price_acceleration": price_acceleration,
@@ -6778,6 +7884,7 @@ class MinuteCoordinator:
                 "projected_price_next": forecast["projected_price_next"],
                 "forecast_direction": forecast["forecast_direction"],
                 "kinematics": {
+                    "rsi_30d": curr_rsi_30d,
                     "price_velocity_1m": price_velocity,
                     "price_velocity_1m_pct": price_velocity_pct,
                     "price_acceleration_1m": price_acceleration,
@@ -6941,6 +8048,12 @@ class MinuteCoordinator:
                         "connected" if self.connected[provider] else "disconnected"
                     ),
                     "late_records_since_previous_summary": self.late_counts[provider],
+                    "nasdaq_market": (
+                        self.nasdaq_tracker.get_status()
+                        if hasattr(self, "nasdaq_tracker") and self.nasdaq_tracker is not None
+                        else None
+                    ),
+                    "rsi_30d_enabled": bool(RSI_30D_ENABLED),
                     "symbols": symbols_data,
                     "kinematics_summary": kinematics_summary,
                 }
@@ -6975,7 +8088,16 @@ class MinuteCoordinator:
     async def run(self):
         self.attach_event_loop(asyncio.get_running_loop())
         while True:
-            self.finalize_due()
+            try:
+                self.finalize_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.exception(
+                    "MINUTE_COORDINATOR_FINALIZE_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
             await asyncio.sleep(0.25)
 
 
@@ -8737,6 +9859,25 @@ def get_default_parms_ini_path():
     return resolve_parms_ini_path()
 
 
+def _parse_ini_text_tolerant(raw_text, source_label="parms.ini"):
+    """Parse INI text with standard semantics; on duplicate keys/sections log a
+    warning and re-parse with strict=False so the last definition wins instead
+    of crashing startup."""
+    cfg = configparser.ConfigParser(interpolation=None, strict=True)
+    try:
+        cfg.read_string(raw_text)
+        return cfg
+    except (configparser.DuplicateOptionError, configparser.DuplicateSectionError) as exc:
+        logging.warning(
+            "CONFIG_INI_DUPLICATE_IGNORED source=%s detail=%s action=using_last_value",
+            source_label,
+            exc,
+        )
+        cfg_relaxed = configparser.ConfigParser(interpolation=None, strict=False)
+        cfg_relaxed.read_string(raw_text)
+        return cfg_relaxed
+
+
 def _read_chart_capture_ini_enabled(ini_path=None):
     """Read [chart_capture] enabled from lib/parms.ini without raising on missing file."""
     cfg_path = Path(ini_path) if ini_path else get_default_parms_ini_path()
@@ -8744,8 +9885,7 @@ def _read_chart_capture_ini_enabled(ini_path=None):
         return None
     try:
         raw_text = cfg_path.read_text(encoding="utf-8-sig")
-        cfg = configparser.ConfigParser(interpolation=None)
-        cfg.read_string(raw_text)
+        cfg = _parse_ini_text_tolerant(raw_text, source_label=str(cfg_path))
         if cfg.has_option("chart_capture", "enabled"):
             raw = (
                 str(_strip_ini_value(cfg.get("chart_capture", "enabled", fallback="")))
@@ -8910,16 +10050,17 @@ def _ini_bool(cfg, section, option, env_name, default):
         raw = (
             str(_strip_ini_value(cfg.get(section, option, fallback=""))).strip().lower()
         )
-        if raw in {"1", "true", "yes"}:
-            return True
-        if raw in {"0", "false", "no"}:
-            return False
-        raise ValueError(f"[{section}] {option} must be true/false; got {raw!r}")
-    return os.getenv(env_name, "true" if default else "false").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+        if raw != "":
+            if raw in {"1", "true", "yes"}:
+                return True
+            if raw in {"0", "false", "no"}:
+                return False
+            raise ValueError(f"[{section}] {option} must be true/false; got {raw!r}")
+    env_raw = os.getenv(env_name, "")
+    env_clean = str(env_raw).strip().lower() if env_raw is not None else ""
+    if env_clean == "":
+        return bool(default)
+    return env_clean in {"1", "true", "yes"}
 
 
 def _ini_int(cfg, section, option, env_name, default, minimum=None):
@@ -8987,6 +10128,8 @@ def _provider_priority_score(provider):
 def _apply_ini_feature_settings(cfg):
     """Load [general], [market_signal_providers], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA, INSTANCE_OWNER
+    global NASDAQ_MUST_BE_POSITIVE, NASDAQ_SYMBOL
+    global RSI_30D_ENABLED, RSI_30D_MIN
     global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
     global OPTION_CHAIN_RSI_COOLDOWN_SECONDS, OPTION_CHAIN_PACING_SECONDS
@@ -9023,12 +10166,14 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_SELL_LIMIT_DISCOUNT_PCT, OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT
     global OPTION_SELL_STOP_LOSS_FORCE_MARKET
     global OPTION_SELL_PROFIT_TARGET_ENABLED, OPTION_SELL_PROFIT_TARGET_PCT
+    global OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT, OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT
     global OPTION_SELL_TRAILING_STOP_ENABLED, OPTION_SELL_TRAILING_ACTIVATION_PCT
     global OPTION_SELL_TRAILING_DRAWDOWN_PCT, OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY
     global OPTION_SELL_PEAK_PROFIT_CALLS_ONLY
     global OPTION_SELL_STOP_LOSS_ENABLED, OPTION_SELL_STOP_LOSS_PCT
     global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES, OPTION_SELL_MIN_HOLD_MINUTES
     global OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS, OPTION_SELL_STOP_LOSS_HARD_PCT
+    global OPTION_SELL_OPEN_POSITION_CAPTURE_MODE
     global CHART_CAPTURE_ENABLED, CHART_CAPTURE_DIR, CHART_CAPTURE_HISTORY_BARS
     global CHART_CAPTURE_WIDTH, CHART_CAPTURE_HEIGHT
     global CHART_CAPTURE_ONLY_UPDATED, CHART_CAPTURE_WRITE_LATEST, CHART_CAPTURE_STALE_AFTER_SECONDS
@@ -9037,7 +10182,7 @@ def _apply_ini_feature_settings(cfg):
     global DASHBOARD_SSL_ENABLED, DASHBOARD_SSL_MODE, DASHBOARD_SSL_CERT
     global DASHBOARD_SSL_KEY, DASHBOARD_SSL_AUTO_SELF_SIGNED
     global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
-    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES, STRIKE_ANALYZER_ENABLED
+    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES, STRIKE_ANALYZER_ENABLED, FINDBEST_ENABLED
 
     tz_setting = (
         _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
@@ -9046,6 +10191,21 @@ def _apply_ini_feature_settings(cfg):
     DISPLAY_TZ, DISPLAY_TZ_IANA = _resolve_display_timezone(tz_setting)
     _reconfigure_logging_timezone()
     INSTANCE_OWNER = _ini_str(cfg, "general", "owner", "INSTANCE_OWNER", "").strip()
+    NASDAQ_MUST_BE_POSITIVE = _ini_bool(
+        cfg, "general", "nasdaq_must_be_positive", "NASDAQ_MUST_BE_POSITIVE", False
+    )
+    NASDAQ_SYMBOL = (
+        _ini_str(cfg, "general", "nasdaq_symbol", "NASDAQ_SYMBOL", "QQQ")
+        .strip()
+        .upper()
+        or "QQQ"
+    )
+    RSI_30D_ENABLED = _ini_bool(
+        cfg, "general", "rsi_30d_enabled", "RSI_30D_ENABLED", False
+    )
+    RSI_30D_MIN = _ini_float(
+        cfg, "general", "rsi_30d_min", "RSI_30D_MIN", 30.0
+    )
 
     raw_prio = _ini_str(cfg, "market_signal_providers", "priority", "PROVIDER_PRIORITY", "")
     PROVIDER_PRIORITY = _parse_provider_priority(raw_prio)
@@ -9754,6 +10914,25 @@ def _apply_ini_feature_settings(cfg):
             )
         ),
     )
+    OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT = _ini_bool(
+        cfg,
+        "option_seller",
+        "take_profit_require_profit",
+        "OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT",
+        True,
+    )
+    OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT = max(
+        0.0,
+        abs(
+            _ini_float(
+                cfg,
+                "option_seller",
+                "take_profit_min_pnl_pct",
+                "OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT",
+                0.0,
+            )
+        ),
+    )
     OPTION_SELL_TRAILING_STOP_ENABLED = _ini_bool(
         cfg,
         "option_seller",
@@ -9845,6 +11024,22 @@ def _apply_ini_feature_settings(cfg):
             )
         ),
     )
+    raw_open_cap = _ini_str(
+        cfg,
+        "option_seller",
+        "open_position_capture_mode",
+        "OPTION_SELL_OPEN_POSITION_CAPTURE_MODE",
+        "none",
+    )
+    norm_open_cap = _normalize_open_position_capture_mode(raw_open_cap)
+    if norm_open_cap is None:
+        logging.warning(
+            "INVALID_OPTION_SELL_OPEN_POSITION_CAPTURE_MODE value=%r valid=%s; falling back to none",
+            raw_open_cap,
+            sorted(VALID_OPTION_SELL_OPEN_POSITION_CAPTURE_MODES),
+        )
+        norm_open_cap = "none"
+    OPTION_SELL_OPEN_POSITION_CAPTURE_MODE = norm_open_cap
     CHART_CAPTURE_ENABLED = _ini_bool(
         cfg, "chart_capture", "enabled", "CHART_CAPTURE_ENABLED", True
     )
@@ -9999,9 +11194,26 @@ def _apply_ini_feature_settings(cfg):
     STRIKE_ANALYZER_ENABLED = _ini_bool(
         cfg, "dashboard", "strike_analyzer_enabled", "STRIKE_ANALYZER_ENABLED", False
     )
+    _raw_findbest = (
+        _strip_ini_value(cfg.get("dashboard", "findbest", fallback="")).strip()
+        if cfg.has_option("dashboard", "findbest")
+        else ""
+    )
+    if _raw_findbest != "":
+        FINDBEST_ENABLED = _ini_bool(
+            cfg, "dashboard", "findbest", "FINDBEST_ENABLED", False
+        )
+    elif cfg.has_option("dashboard", "findbest_enabled"):
+        FINDBEST_ENABLED = _ini_bool(
+            cfg, "dashboard", "findbest_enabled", "FINDBEST_ENABLED", False
+        )
+    else:
+        FINDBEST_ENABLED = _ini_bool(
+            cfg, "dashboard", "findbest", "FINDBEST_ENABLED", False
+        )
 
     logging.info(
-        "FEATURE_CONFIG owner=%s tz=%s(%s) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
+        "FEATURE_CONFIG owner=%s tz=%s(%s) nasdaq_pos=%s(%s) rsi_30d=%s(min>%.1f) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s chain_cd=%ds chain_pace=%.2fs chain_greeks=%s "
         "dashboard=%s:%d webhook=%s:%d "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d summary_delay=%.1fs early_finalize=%s(min=%.1fs) opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
@@ -10009,13 +11221,17 @@ def _apply_ini_feature_settings(cfg):
         "paper=%s sell_paper=%s rsi_low=%.1f rsi_high=%.1f buy_lookback=%dm bounce_rsi<=%.1f buy_qty=%d "
         "max_single_trade=$%.2f invest_buf=%.1f%% buy_entry_mode=%s buy_sel_mode=%s buy_delta=%.2f[%.2f..%.2f] "
         "buy_min_oi=%d buy_min_vol=%d buy_stepdown=%s buy_win_et=%s..%s sell_full=%s "
-        "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
-        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% "
+        "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% tp_req_profit=%s tp_min_pnl=%.2f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
+        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% open_capture=%s "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
-        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s",
+        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s findbest=%s",
         INSTANCE_OWNER or "unset",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
+        NASDAQ_MUST_BE_POSITIVE,
+        NASDAQ_SYMBOL,
+        RSI_30D_ENABLED,
+        RSI_30D_MIN,
         RSI_SESSION_MODE,
         RSI_WARMUP_SESSIONS,
         "sip" if FEED == DataFeed.SIP else "iex",
@@ -10068,6 +11284,8 @@ def _apply_ini_feature_settings(cfg):
         OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT,
         OPTION_SELL_PROFIT_TARGET_ENABLED,
         OPTION_SELL_PROFIT_TARGET_PCT,
+        OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT,
+        OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT,
         OPTION_SELL_TRAILING_STOP_ENABLED,
         OPTION_SELL_TRAILING_ACTIVATION_PCT,
         OPTION_SELL_TRAILING_DRAWDOWN_PCT,
@@ -10075,6 +11293,7 @@ def _apply_ini_feature_settings(cfg):
         OPTION_SELL_STOP_LOSS_PCT,
         OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
         OPTION_SELL_STOP_LOSS_HARD_PCT,
+        OPTION_SELL_OPEN_POSITION_CAPTURE_MODE,
         CHART_CAPTURE_ENABLED,
         CHART_CAPTURE_DIR or "logs/charts",
         CHART_CAPTURE_HISTORY_BARS,
@@ -10087,6 +11306,7 @@ def _apply_ini_feature_settings(cfg):
         DASHBOARD_SESSION_TTL_HOURS,
         DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
         STRIKE_ANALYZER_ENABLED,
+        FINDBEST_ENABLED,
     )
 
 
@@ -10131,8 +11351,7 @@ def load_settings(ini_path=None):
     # how the project's JsonIniParser interprets dotted names, unquoted strings,
     # or inline ';'/'#' comments.
     raw_ini_text = config_path.read_text(encoding="utf-8-sig")
-    provider_config = configparser.ConfigParser(interpolation=None)
-    provider_config.read_string(raw_ini_text)
+    provider_config = _parse_ini_text_tolerant(raw_ini_text, source_label=str(config_path))
 
     _apply_ini_feature_settings(provider_config)
 
@@ -10573,6 +11792,12 @@ OPTION_SELL_PROFIT_TARGET_ENABLED = os.getenv(
 OPTION_SELL_PROFIT_TARGET_PCT = max(
     0.0, abs(float(os.getenv("OPTION_SELL_PROFIT_TARGET_PCT", "25.0")))
 )
+OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT = os.getenv(
+    "OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT = max(
+    0.0, abs(float(os.getenv("OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT", "0.0")))
+)
 OPTION_SELL_TRAILING_STOP_ENABLED = os.getenv(
     "OPTION_SELL_TRAILING_STOP_ENABLED", "true"
 ).strip().lower() in {"1", "true", "yes"}
@@ -10602,6 +11827,28 @@ OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS = os.getenv(
 ).strip().lower() in {"1", "true", "yes"}
 OPTION_SELL_STOP_LOSS_HARD_PCT = max(
     0.0, abs(float(os.getenv("OPTION_SELL_STOP_LOSS_HARD_PCT", "25.0")))
+)
+VALID_OPTION_SELL_OPEN_POSITION_CAPTURE_MODES = frozenset(
+    {"none", "contract_quote", "full_chain"}
+)
+
+
+def _normalize_open_position_capture_mode(raw_val):
+    cleaned = str(raw_val or "").strip().lower()
+    if cleaned in {"", "none", "off", "disabled", "false", "0"}:
+        return "none"
+    if cleaned in {"contract_quote", "quote", "quotes", "contract", "1"}:
+        return "contract_quote"
+    if cleaned in {"full_chain", "chain", "full", "2"}:
+        return "full_chain"
+    return None
+
+
+OPTION_SELL_OPEN_POSITION_CAPTURE_MODE = (
+    _normalize_open_position_capture_mode(
+        os.getenv("OPTION_SELL_OPEN_POSITION_CAPTURE_MODE", "none")
+    )
+    or "none"
 )
 CHART_CAPTURE_ENABLED = os.getenv("CHART_CAPTURE_ENABLED", "true").strip().lower() in {
     "1",
@@ -10676,6 +11923,20 @@ except ValueError:
 STRIKE_ANALYZER_ENABLED = os.getenv(
     "STRIKE_ANALYZER_ENABLED", "false"
 ).strip().lower() in {"1", "true", "yes"}
+FINDBEST_ENABLED = os.getenv(
+    "FINDBEST_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes"}
+NASDAQ_MUST_BE_POSITIVE = os.getenv(
+    "NASDAQ_MUST_BE_POSITIVE", "false"
+).strip().lower() in {"1", "true", "yes"}
+NASDAQ_SYMBOL = os.getenv("NASDAQ_SYMBOL", "QQQ").strip().upper() or "QQQ"
+RSI_30D_ENABLED = os.getenv(
+    "RSI_30D_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes"}
+try:
+    RSI_30D_MIN = float(os.getenv("RSI_30D_MIN", "30.0"))
+except ValueError:
+    RSI_30D_MIN = 30.0
 
 
 def rsi_signal(rsi):
@@ -13756,6 +15017,20 @@ def _extract_analysis_metrics(entry):
     )
 
 
+def _extract_rsi_30d_metric(entry):
+    """Return formatted 30-day RSI string ('42.15' or 'n/a') from a kinematics entry."""
+    if not isinstance(entry, dict):
+        return "n/a"
+    raw = entry.get("rsi_30d")
+    if raw is None or isinstance(raw, bool):
+        return "n/a"
+    try:
+        f = float(raw)
+        return f"{f:.2f}" if math.isfinite(f) else "n/a"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 class OptionBuyer:
     """Async task synced to 1-minute finalization that uses kinematics to buy
     an option contract returned in `contract` by collect_option_chain."""
@@ -14355,13 +15630,15 @@ class OptionBuyer:
         contract_symbol=None,
     ):
         rsi_s, v_s, a_s, pdelta_s = _extract_analysis_metrics(entry)
+        rsi_30d_s = _extract_rsi_30d_metric(entry)
         self.logger.info(
-            "OPTION_BUY_ANALYSIS minute=%s symbol=%s provider=%s rsi=%s v=%s a=%s "
+            "OPTION_BUY_ANALYSIS minute=%s symbol=%s provider=%s rsi=%s rsi_30d=%s v=%s a=%s "
             "projected_delta=%s pnl%%=n/a decision=%s reason=%s contract=%s",
             minute_key,
             symbol,
             provider or "none",
             rsi_s,
+            rsi_30d_s,
             v_s,
             a_s,
             pdelta_s,
@@ -14446,6 +15723,19 @@ class OptionBuyer:
             minute_key = format_display_iso(now.replace(second=0, microsecond=0))
         self.last_eval_minute_utc = now.isoformat()
         self.last_status = "evaluating"
+
+        # Ensure NASDAQ day-open & current-minute price are refreshed before evaluating buys
+        nq_tracker = getattr(self.coordinator, "nasdaq_tracker", None)
+        if nq_tracker is not None:
+            try:
+                await nq_tracker.refresh_for_minute(target_minute)
+            except Exception as exc:
+                self.logger.warning(
+                    "OPTION_BUY_NASDAQ_REFRESH_ERROR symbol=%s error_type=%s detail=%s",
+                    getattr(nq_tracker, "symbol", NASDAQ_SYMBOL),
+                    type(exc).__name__,
+                    exc,
+                )
 
         if len(self.attempted_minutes) > 1000:
             self.attempted_minutes.clear()
@@ -14582,6 +15872,96 @@ class OptionBuyer:
                 continue
 
             self.attempted_minutes.add(dedup_key)
+
+            # Ex-ante gate: NASDAQ must be positive vs. start of trading day (09:30 ET)
+            if NASDAQ_MUST_BE_POSITIVE:
+                if nq_tracker is not None:
+                    nq_ok, nq_reason, nq_snap = nq_tracker.evaluate_buy_gate()
+                else:
+                    nq_ok, nq_reason, nq_snap = (
+                        False,
+                        f"nasdaq_down({NASDAQ_SYMBOL}_tracker_unavailable)",
+                        {"symbol": NASDAQ_SYMBOL},
+                    )
+                if not nq_ok:
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        nq_reason,
+                    )
+                    self.logger.info(
+                        "OPTION_BUY_SKIPPED symbol=%s reason=nasdaq_down detail=%s "
+                        "nasdaq_symbol=%s open=%s current=%s diff=%s minute=%s",
+                        symbol,
+                        nq_reason,
+                        nq_snap.get("symbol", NASDAQ_SYMBOL),
+                        nq_snap.get("open_price"),
+                        nq_snap.get("current_price"),
+                        nq_snap.get("diff"),
+                        minute_key,
+                    )
+                    continue
+
+            # Ex-ante gate: 30-day daily RSI must strictly exceed rsi_30d_min
+            if RSI_30D_ENABLED:
+                rsi_30d_val = entry.get("rsi_30d")
+                if rsi_30d_val is None and hasattr(self.coordinator, "_compute_rsi_30d"):
+                    rsi_30d_val = self.coordinator._compute_rsi_30d(
+                        symbol, entry.get("close")
+                    )
+                    if rsi_30d_val is not None:
+                        entry = dict(entry)
+                        entry["rsi_30d"] = rsi_30d_val
+                rsi_30d_f = None
+                if rsi_30d_val is not None and not isinstance(rsi_30d_val, bool):
+                    try:
+                        cand_f = float(rsi_30d_val)
+                        if math.isfinite(cand_f):
+                            rsi_30d_f = cand_f
+                    except (TypeError, ValueError):
+                        rsi_30d_f = None
+                if rsi_30d_f is None:
+                    r30_reason = f"rsi_30d_unavailable(min>{RSI_30D_MIN:.1f})"
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        r30_reason,
+                    )
+                    self.logger.info(
+                        "OPTION_BUY_SKIPPED symbol=%s reason=rsi_30d_unavailable "
+                        "detail=%s rsi_30d=n/a min=%s minute=%s",
+                        symbol,
+                        r30_reason,
+                        RSI_30D_MIN,
+                        minute_key,
+                    )
+                    continue
+                if rsi_30d_f <= float(RSI_30D_MIN):
+                    r30_reason = f"rsi_30d_below_min({rsi_30d_f:.2f}<={RSI_30D_MIN:.1f})"
+                    self._log_buy_analysis(
+                        minute_key,
+                        symbol,
+                        provider,
+                        entry,
+                        "REJECTED",
+                        r30_reason,
+                    )
+                    self.logger.info(
+                        "OPTION_BUY_SKIPPED symbol=%s reason=rsi_30d_below_min "
+                        "detail=%s rsi_30d=%.2f min=%s minute=%s",
+                        symbol,
+                        r30_reason,
+                        rsi_30d_f,
+                        RSI_30D_MIN,
+                        minute_key,
+                    )
+                    continue
 
             last_buy = self.last_buy_by_symbol.get(symbol)
             if (
@@ -15591,6 +16971,11 @@ class OptionSeller:
         self.attempted_minutes = set()
         self._exit_chain_client = None
         self._exit_chain_dry_captured = set()
+        self._open_capture_lock = asyncio.Lock()
+        self._open_capture_minutes = set()
+        self.open_capture_count = 0
+        self.open_capture_errors = 0
+        self.last_open_capture_utc = None
 
     def _resolve_exit_chain_client(self, chain_prov):
         if self._exit_chain_client is not None:
@@ -15734,6 +17119,340 @@ class OptionSeller:
                 self._capture_exit_option_chain_async(
                     underlying, sym, trigger_kind, rsi, sell_dt
                 )
+            )
+        except RuntimeError:
+            pass
+
+    def _fetch_open_contract_quotes_sync(self, contract_symbols):
+        """Approach 1 (contract_quote): Batched live bid/ask/spread/Greeks snapshot for open OCC contracts."""
+        syms = sorted(
+            {
+                str(s or "").strip().upper()
+                for s in (contract_symbols or [])
+                if _is_option_contract_symbol(str(s or "").strip().upper())
+            }
+        )
+        if not syms:
+            return {}
+
+        chain_prov = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+        results = {}
+
+        if chain_prov == "tastytrade":
+            tt_client = self._resolve_exit_chain_client("tastytrade")
+            if not isinstance(tt_client, TastytradeClient):
+                return {}
+            opt_quotes = tt_client.get_quotes_batch(syms, is_option=True) or {}
+            need_greeks_map = {}
+
+            def _raw_num(raw_dict, *keys):
+                if not isinstance(raw_dict, dict):
+                    return None
+                for k in keys:
+                    if raw_dict.get(k) is not None:
+                        v = _opt_safe_float(raw_dict.get(k), None)
+                        if v is not None:
+                            return v
+                return None
+
+            for sym in syms:
+                q = opt_quotes.get(sym)
+                if q is None:
+                    continue
+                raw_q = getattr(q, "raw", None)
+                bid_v = _opt_safe_float(getattr(q, "bid_price", None), None)
+                ask_v = _opt_safe_float(getattr(q, "ask_price", None), None)
+                bid_v = round(bid_v, 4) if (bid_v is not None and bid_v > 0) else None
+                ask_v = round(ask_v, 4) if (ask_v is not None and ask_v > 0) else None
+                mid_v = (
+                    round((bid_v + ask_v) / 2.0, 4)
+                    if (bid_v is not None and ask_v is not None and ask_v >= bid_v)
+                    else _opt_safe_float(getattr(q, "mid_price", None), None)
+                )
+                if mid_v is not None and mid_v <= 0:
+                    mid_v = None
+                spr_v = (
+                    round(((ask_v - bid_v) / mid_v) * 100.0, 2)
+                    if (bid_v is not None and ask_v is not None and mid_v and mid_v > 0 and ask_v >= bid_v)
+                    else None
+                )
+                delta_v = _raw_num(raw_q, "delta")
+                gamma_v = _raw_num(raw_q, "gamma")
+                theta_v = _raw_num(raw_q, "theta")
+                vega_v = _raw_num(raw_q, "vega")
+                iv_v = _raw_num(raw_q, "volatility", "implied-volatility", "implied_volatility", "iv")
+                vol_v = _raw_num(raw_q, "volume")
+                oi_v = _raw_num(raw_q, "open-interest", "open_interest", "openInterest")
+                if delta_v is None:
+                    need_greeks_map[sym] = _to_dxlink_option_symbol(sym)
+                results[sym] = {
+                    "bid": bid_v,
+                    "ask": ask_v,
+                    "mid": round(mid_v, 4) if mid_v is not None else None,
+                    "spread_pct": spr_v,
+                    "delta": round(delta_v, 4) if delta_v is not None else None,
+                    "gamma": round(gamma_v, 4) if gamma_v is not None else None,
+                    "theta": round(theta_v, 4) if theta_v is not None else None,
+                    "vega": round(vega_v, 4) if vega_v is not None else None,
+                    "iv": round(iv_v, 4) if iv_v is not None else None,
+                    "volume": int(vol_v) if vol_v is not None else None,
+                    "open_interest": int(oi_v) if oi_v is not None else None,
+                }
+            if (
+                OPTION_CHAIN_INCLUDE_GREEKS
+                and need_greeks_map
+                and hasattr(tt_client, "get_option_greeks_batch")
+            ):
+                try:
+                    gmap = tt_client.get_option_greeks_batch(need_greeks_map) or {}
+                    for sym, g in gmap.items():
+                        if sym in results and isinstance(g, dict):
+                            for gk in ("delta", "gamma", "theta", "vega", "iv"):
+                                if results[sym].get(gk) is None and g.get(gk) is not None:
+                                    results[sym][gk] = round(float(g[gk]), 4)
+                except Exception as exc:
+                    self.logger.debug(
+                        "OPEN_CAPTURE_GREEKS_FAILED provider=tastytrade detail=%s", exc
+                    )
+            return results
+
+        # Alpaca single batched REST snapshot call for all open OCC contracts
+        api_key = self.credentials.get("alpaca_key")
+        api_secret = self.credentials.get("alpaca_secret")
+        if not api_key or not api_secret:
+            return {}
+
+        snapshots = {}
+        for feed_opt in ("indicative", None):
+            params = {"symbols": ",".join(syms)}
+            if feed_opt:
+                params["feed"] = feed_opt
+            url = (
+                "https://data.alpaca.markets/v1beta1/options/snapshots?"
+                + urllib.parse.urlencode(params)
+            )
+            req = urllib.request.Request(url)
+            req.add_header("APCA-API-KEY-ID", api_key)
+            req.add_header("APCA-API-SECRET-KEY", api_secret)
+            req.add_header("accept", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                snaps = payload.get("snapshots") if isinstance(payload, dict) else None
+                if isinstance(snaps, dict) and snaps:
+                    snapshots = snaps
+                    break
+            except Exception as exc:
+                if feed_opt is None:
+                    self.logger.warning(
+                        "OPEN_CAPTURE_QUOTE_FAILED provider=alpaca symbols=%s error_type=%s detail=%s",
+                        ",".join(syms),
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        for sym in syms:
+            details = snapshots.get(sym)
+            if not isinstance(details, dict):
+                continue
+            lq = details.get("latestQuote") or {}
+            gr = details.get("greeks") or {}
+            db = details.get("dailyBar") or {}
+            bid_v = _opt_safe_float(lq.get("bp"), None)
+            ask_v = _opt_safe_float(lq.get("ap"), None)
+            bid_v = round(bid_v, 4) if (bid_v is not None and bid_v > 0) else None
+            ask_v = round(ask_v, 4) if (ask_v is not None and ask_v > 0) else None
+            mid_v = (
+                round((bid_v + ask_v) / 2.0, 4)
+                if (bid_v is not None and ask_v is not None and ask_v >= bid_v)
+                else None
+            )
+            spr_v = (
+                round(((ask_v - bid_v) / mid_v) * 100.0, 2)
+                if (bid_v is not None and ask_v is not None and mid_v and mid_v > 0 and ask_v >= bid_v)
+                else None
+            )
+            delta_v = _opt_safe_float(gr.get("delta"), None)
+            gamma_v = _opt_safe_float(gr.get("gamma"), None)
+            theta_v = _opt_safe_float(gr.get("theta"), None)
+            vega_v = _opt_safe_float(gr.get("vega"), None)
+            iv_v = _opt_safe_float(details.get("impliedVolatility"), None)
+            vol_v = _opt_safe_float(db.get("v"), None)
+            oi_v = _opt_safe_float(details.get("openInterest"), None)
+            results[sym] = {
+                "bid": bid_v,
+                "ask": ask_v,
+                "mid": mid_v,
+                "spread_pct": spr_v,
+                "delta": round(delta_v, 4) if delta_v is not None else None,
+                "gamma": round(gamma_v, 4) if gamma_v is not None else None,
+                "theta": round(theta_v, 4) if theta_v is not None else None,
+                "vega": round(vega_v, 4) if vega_v is not None else None,
+                "iv": round(iv_v, 4) if iv_v is not None else None,
+                "volume": int(vol_v) if vol_v is not None else None,
+                "open_interest": int(oi_v) if oi_v is not None else None,
+            }
+        return results
+
+    def _capture_hold_option_chain_sync(
+        self, underlying, right, expiry, contracts, rsi, capture_dt
+    ):
+        """Approach 2 (full_chain): Capture & persist a full pruned option chain snapshot for an open position."""
+        und = str(underlying or "").strip().upper()
+        if not und or not expiry:
+            return None
+        chain_prov = str(OPTION_CHAIN_PROVIDER or "alpaca").strip().lower()
+        chain_client = self._resolve_exit_chain_client(chain_prov)
+        if chain_client is None:
+            return None
+
+        eff_right = "PUT" if str(right or "").upper() == "PUT" else "CALL"
+        if chain_prov == "tastytrade":
+            raw_res = get_pruned_option_chain_tastytrade(
+                und,
+                chain_client,
+                right=eff_right,
+                expiration_date=expiry,
+                include_greeks=OPTION_CHAIN_INCLUDE_GREEKS,
+            )
+        else:
+            api_key = self.credentials.get("alpaca_key")
+            api_secret = self.credentials.get("alpaca_secret")
+            if not api_key or not api_secret:
+                return None
+            try:
+                sig_params = inspect.signature(get_pruned_option_chain).parameters
+            except (TypeError, ValueError):
+                sig_params = {}
+            kwargs = {}
+            if "expiration_date" in sig_params:
+                kwargs["expiration_date"] = expiry
+            if "option_type" in sig_params:
+                kwargs["option_type"] = eff_right.lower()
+            raw_res = get_pruned_option_chain(
+                und, api_key, api_secret, chain_client, **kwargs
+            )
+
+        _, clean_payload = _unpack_pruned_option_chain_result(raw_res)
+        if not isinstance(clean_payload, dict) or clean_payload.get("error"):
+            return None
+
+        enriched_payload = dict(clean_payload)
+        enriched_payload["hold_contracts"] = sorted(
+            {str(c).strip().upper() for c in (contracts or []) if c}
+        )
+        enriched_payload["hold_trigger"] = "hold_1m"
+        enriched_payload["utc_timestamp"] = as_utc(capture_dt).isoformat()
+
+        directory = LOG_ROOT / "optionchains"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_und = "".join(c if c.isalnum() or c in "-_." else "_" for c in und)
+        dt_disp = as_display_tz(capture_dt)
+        tz_lbl = "".join(c for c in display_tz_abbr(dt_disp) if c.isalnum()) or "TZ"
+        stamp = f"{dt_disp.strftime('%Y%m%dT%H%M%S')}_{tz_lbl}"
+        rsi_val = _opt_safe_float(rsi, None)
+        rsi_tag = f"{rsi_val:.2f}" if rsi_val is not None else "na"
+        path = (
+            directory
+            / f"optionchain-OPTION_SELLER-{chain_prov.upper()}-{safe_und}-HOLD_1M-rsi{rsi_tag}-{stamp}-{uuid4().hex[:6]}.json"
+        )
+        path.write_text(
+            json.dumps(enriched_payload, indent=2, default=str), encoding="utf-8"
+        )
+        self.logger.info(
+            "OPTION_HOLD_CHAIN_CAPTURED provider=%s underlying=%s contracts=%s expiry=%s file=%s",
+            chain_prov,
+            und,
+            ",".join(enriched_payload["hold_contracts"]),
+            expiry,
+            path.name,
+        )
+        return path
+
+    async def _capture_open_positions_async(
+        self, mode, open_opt_entries, capture_dt
+    ):
+        """Background serialized capture for open option positions (contract_quote or full_chain)."""
+        async with self._open_capture_lock:
+            try:
+                if mode == "contract_quote":
+                    syms = [e["contract"] for e in open_opt_entries if e.get("contract")]
+                    quotes = await asyncio.to_thread(
+                        self._fetch_open_contract_quotes_sync, syms
+                    )
+                    if quotes and hasattr(self.coordinator, "option_history"):
+                        n_upd = self.coordinator.option_history.enrich_minute_quotes(
+                            quotes, timestamp=capture_dt
+                        )
+                        if n_upd > 0:
+                            self.open_capture_count += n_upd
+                            self.last_open_capture_utc = as_utc(capture_dt).isoformat()
+                            self.logger.info(
+                                "OPEN_POSITION_QUOTES_CAPTURED mode=contract_quote contracts=%d/%d",
+                                n_upd,
+                                len(syms),
+                            )
+                elif mode == "full_chain":
+                    # Deduplicate by (underlying, right, expiry) so multiple strikes share 1 chain fetch
+                    grouped = {}
+                    for e in open_opt_entries:
+                        gkey = (e["underlying"], e["right"], e["expiry"])
+                        grp = grouped.setdefault(
+                            gkey, {"contracts": [], "rsi": e.get("rsi")}
+                        )
+                        grp["contracts"].append(e["contract"])
+                        if grp["rsi"] is None and e.get("rsi") is not None:
+                            grp["rsi"] = e.get("rsi")
+
+                    pace = max(0.0, float(OPTION_CHAIN_PACING_SECONDS or 0.0))
+                    for idx, ((und, right, exp), info) in enumerate(grouped.items()):
+                        if idx > 0 and pace > 0:
+                            await asyncio.sleep(pace)
+                        try:
+                            out_path = await asyncio.to_thread(
+                                self._capture_hold_option_chain_sync,
+                                und,
+                                right,
+                                exp,
+                                info["contracts"],
+                                info["rsi"],
+                                capture_dt,
+                            )
+                            if out_path is not None:
+                                self.open_capture_count += 1
+                                self.last_open_capture_utc = as_utc(capture_dt).isoformat()
+                        except Exception as exc:
+                            self.open_capture_errors += 1
+                            self.logger.warning(
+                                "OPEN_HOLD_CHAIN_CAPTURE_FAILED underlying=%s expiry=%s error_type=%s detail=%s",
+                                und,
+                                exp,
+                                type(exc).__name__,
+                                exc,
+                            )
+            except Exception as exc:
+                self.open_capture_errors += 1
+                self.logger.warning(
+                    "OPEN_POSITION_CAPTURE_FAILED mode=%s error_type=%s detail=%s",
+                    mode,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _schedule_open_position_capture(self, open_opt_entries, target_min_dt, capture_dt):
+        mode = str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE or "none").strip().lower()
+        if mode not in {"contract_quote", "full_chain"} or not open_opt_entries:
+            return
+        dedup_key = (mode, minute_utc(target_min_dt).isoformat())
+        if dedup_key in self._open_capture_minutes:
+            return
+        if len(self._open_capture_minutes) > 500:
+            self._open_capture_minutes.clear()
+        self._open_capture_minutes.add(dedup_key)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._capture_open_positions_async(mode, list(open_opt_entries), capture_dt)
             )
         except RuntimeError:
             pass
@@ -16077,6 +17796,7 @@ class OptionSeller:
         reason,
     ):
         rsi_s, v_s, a_s, pdelta_s = _extract_analysis_metrics(entry)
+        rsi_30d_s = _extract_rsi_30d_metric(entry)
         if pnl_pct is not None and not isinstance(pnl_pct, bool):
             try:
                 pf = float(pnl_pct)
@@ -16087,12 +17807,13 @@ class OptionSeller:
             pnl_s = "n/a"
         self.logger.info(
             "OPTION_SELL_ANALYSIS minute=%s contract=%s underlying=%s provider=%s "
-            "rsi=%s v=%s a=%s projected_delta=%s pnl%%=%s decision=%s reason=%s",
+            "rsi=%s rsi_30d=%s v=%s a=%s projected_delta=%s pnl%%=%s decision=%s reason=%s",
             minute_key,
             contract_symbol or "none",
             underlying or "n/a",
             provider or "none",
             rsi_s,
+            rsi_30d_s,
             v_s,
             a_s,
             pdelta_s,
@@ -16394,9 +18115,21 @@ class OptionSeller:
             return
 
         if hasattr(self.coordinator, "option_history"):
-            self.coordinator.option_history.record_positions_snapshot(
-                positions, timestamp=now
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.coordinator.option_history.record_positions_snapshot,
+                        positions,
+                        now,
+                    ),
+                    timeout=20.0,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "OPTION_SELL_HISTORY_SNAPSHOT_ERROR error_type=%s detail=%s",
+                    type(exc).__name__,
+                    exc,
+                )
 
         self.last_positions_checked = len(positions)
         if not positions:
@@ -16418,6 +18151,7 @@ class OptionSeller:
             return
 
         seen_long_symbols = set()
+        open_opt_capture_entries = []
         for pos in positions:
             pos_sym = (
                 str(
@@ -16469,6 +18203,18 @@ class OptionSeller:
 
             is_call = self._is_call_contract(pos_sym, is_option)
             seen_long_symbols.add(pos_sym)
+            if is_option and OPTION_SELL_OPEN_POSITION_CAPTURE_MODE in {"contract_quote", "full_chain"}:
+                _, _p_und, _p_right, _, _p_exp = _parse_occ_contract(pos_sym)
+                _, _cap_kin = _select_best_kinematics_entry(self.coordinator, underlying)
+                open_opt_capture_entries.append(
+                    {
+                        "contract": pos_sym,
+                        "underlying": underlying or _p_und,
+                        "right": _p_right or ("CALL" if is_call else "PUT"),
+                        "expiry": _p_exp,
+                        "rsi": _cap_kin.get("rsi") if isinstance(_cap_kin, dict) else None,
+                    }
+                )
             if pos_sym not in self.first_seen_at_by_symbol:
                 inferred_entry_dt = now
                 for buy_evt in reversed(
@@ -16573,9 +18319,29 @@ class OptionSeller:
             if not qualifies:
                 rsi_ok, rsi_reason = self._evaluate_sell_kinematics(entry)
                 if rsi_ok:
-                    qualifies = True
-                    trigger_kind = "take_profit"
-                    reason = rsi_reason
+                    if OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT:
+                        min_tp_pnl = max(
+                            0.0, float(OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT or 0.0)
+                        )
+                        if pnl_pct is None or not math.isfinite(pnl_pct):
+                            rejection_notes.append(
+                                f"take_profit_pnl_unavailable({rsi_reason})"
+                            )
+                        elif (min_tp_pnl <= 0.0 and pnl_pct <= 0.0) or (
+                            min_tp_pnl > 0.0 and pnl_pct < min_tp_pnl
+                        ):
+                            cmp_op = "<=" if min_tp_pnl <= 0.0 else "<"
+                            rejection_notes.append(
+                                f"take_profit_no_profit(pnl={pnl_pct:+.2f}%{cmp_op}{min_tp_pnl:.2f}%)"
+                            )
+                        else:
+                            qualifies = True
+                            trigger_kind = "take_profit"
+                            reason = f"{rsi_reason}&pnl={pnl_pct:+.2f}%"
+                    else:
+                        qualifies = True
+                        trigger_kind = "take_profit"
+                        reason = rsi_reason
                 else:
                     rejection_notes.append(rsi_reason)
 
@@ -17136,6 +18902,11 @@ class OptionSeller:
             if stale_sym not in seen_long_symbols:
                 self.first_seen_at_by_symbol.pop(stale_sym, None)
 
+        if open_opt_capture_entries:
+            self._schedule_open_position_capture(
+                open_opt_capture_entries, target_min_dt, now
+            )
+
         if not str(self.last_status).startswith(("order_error", "positions_error")):
             self.last_status = (
                 "watching_dry_run" if OPTION_SELL_DRY_RUN else "watching_live"
@@ -17161,8 +18932,8 @@ class OptionSeller:
         self.logger.info(
             "OPTION_SELLER_START mode=%s rsi_high>=%.2f qty=%d close_full=%s "
             "options_only=%s cooldown_min=%d min_hold=%dm order_type=%s limit_disc=%.2f%% sl_disc=%.2f%% "
-            "pt_enabled=%s pt=%.1f%% ts_enabled=%s ts_act=%.1f%% ts_dd=%.1f%% ts_vel=%s "
-            "allowed=%s sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_kin=%s sl_hard=%.2f%%",
+            "pt_enabled=%s pt=%.1f%% tp_req_profit=%s tp_min_pnl=%.2f%% ts_enabled=%s ts_act=%.1f%% ts_dd=%.1f%% ts_vel=%s "
+            "allowed=%s sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_kin=%s sl_hard=%.2f%% open_capture=%s",
             self.mode,
             OPTION_CHAIN_RSI_HIGH,
             OPTION_SELL_QTY,
@@ -17175,6 +18946,8 @@ class OptionSeller:
             OPTION_SELL_STOP_LOSS_LIMIT_DISCOUNT_PCT,
             OPTION_SELL_PROFIT_TARGET_ENABLED,
             OPTION_SELL_PROFIT_TARGET_PCT,
+            OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT,
+            OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT,
             OPTION_SELL_TRAILING_STOP_ENABLED,
             OPTION_SELL_TRAILING_ACTIVATION_PCT,
             OPTION_SELL_TRAILING_DRAWDOWN_PCT,
@@ -17185,6 +18958,7 @@ class OptionSeller:
             OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
             OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS,
             OPTION_SELL_STOP_LOSS_HARD_PCT,
+            OPTION_SELL_OPEN_POSITION_CAPTURE_MODE,
         )
         wake_event = self.coordinator.subscribe_minute_finalized()
         last_processed_minute = self.coordinator.last_finalized
@@ -17249,6 +19023,7 @@ def _build_provider_entry_from_state(provider, symbol, cur, feed_status="LIVE"):
         "close": cur.get("close"),
         "smoothed_close": cur.get("smoothed_close"),
         "rsi": cur.get("rsi"),
+        "rsi_30d": cur.get("rsi_30d"),
         "price_velocity": cur.get("price_velocity"),
         "price_velocity_pct": cur.get("price_velocity_pct"),
         "price_acceleration": cur.get("price_acceleration"),
@@ -17271,13 +19046,27 @@ def _build_provider_entry_from_state(provider, symbol, cur, feed_status="LIVE"):
     }
 
 
-def _preview_pending_candidate_point(provider, hist, p_minute, cand):
+def _preview_pending_candidate_point(
+    provider, hist, p_minute, cand, coordinator=None, symbol=None
+):
     """Build a non-mutating live preview bar state from a pending MinuteCandidate."""
     curr_close = cand.close
     if provider == "TRADINGVIEW":
         curr_rsi = cand.reported_rsi
     else:
         curr_rsi = hist[-1].get("rsi") if hist else None
+    curr_rsi_30d = None
+    if (
+        coordinator is not None
+        and symbol
+        and curr_close is not None
+        and hasattr(coordinator, "_compute_rsi_30d")
+    ):
+        curr_rsi_30d = coordinator._compute_rsi_30d(
+            symbol, curr_close, ref_dt=p_minute
+        )
+    if curr_rsi_30d is None and hist:
+        curr_rsi_30d = hist[-1].get("rsi_30d")
 
     price_velocity = None
     price_velocity_pct = None
@@ -17386,6 +19175,7 @@ def _preview_pending_candidate_point(provider, hist, p_minute, cand):
         "close": curr_close,
         "smoothed_close": smoothed_close,
         "rsi": curr_rsi,
+        "rsi_30d": curr_rsi_30d,
         "price_velocity": price_velocity,
         "price_velocity_pct": price_velocity_pct,
         "price_acceleration": price_acceleration,
@@ -17761,7 +19551,12 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             should_preview = p_cand.kind != "tick" or not hist
             if is_newer and should_preview:
                 preview_cur = _preview_pending_candidate_point(
-                    provider, hist, p_min, p_cand
+                    provider,
+                    hist,
+                    p_min,
+                    p_cand,
+                    coordinator=coordinator,
+                    symbol=symbol,
                 )
                 eff_hist = hist + [preview_cur]
                 feed_status = "PENDING"
@@ -17786,6 +19581,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "closes": [],
                 "smoothed_closes": [],
                 "rsis": [],
+                "rsi_30ds": [],
                 "price_velocities": [],
                 "price_velocity_pcts": [],
                 "price_accelerations": [],
@@ -17824,6 +19620,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                     "smoothed_velocity": h.get("smoothed_velocity"),
                     "smoothed_acceleration": h.get("smoothed_acceleration"),
                     "rsi": h.get("rsi"),
+                    "rsi_30d": h.get("rsi_30d"),
                     "crossover_signal": h.get("crossover_signal"),
                 }
                 for h in window_slice
@@ -17834,6 +19631,8 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             sym_group["smoothed_closes"].append(entry["smoothed_close"])
         if entry["rsi"] is not None:
             sym_group["rsis"].append(entry["rsi"])
+        if entry.get("rsi_30d") is not None:
+            sym_group["rsi_30ds"].append(entry["rsi_30d"])
         if entry["price_velocity"] is not None:
             sym_group["price_velocities"].append(entry["price_velocity"])
         if entry["price_velocity_pct"] is not None:
@@ -17874,6 +19673,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
         c_close = _median_or_none(g["closes"])
         c_smooth = _median_or_none(g["smoothed_closes"])
         c_rsi = _median_or_none(g["rsis"])
+        c_rsi_30d = _median_or_none(g["rsi_30ds"])
         c_pv = _median_or_none(g["price_velocities"])
         c_pv_pct = _median_or_none(g["price_velocity_pcts"])
         c_pa = _median_or_none(g["price_accelerations"])
@@ -17944,6 +19744,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                     "close": p_close,
                     "smoothed_close": None,
                     "rsi": p_rsi,
+                    "rsi_30d": None,
                     "price_velocity": None,
                     "price_velocity_pct": None,
                     "price_acceleration": None,
@@ -17979,6 +19780,7 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
                 "close": round(c_close, 2) if c_close is not None else None,
                 "smoothed_close": round(c_smooth, 2) if c_smooth is not None else None,
                 "rsi": round(c_rsi, 2) if c_rsi is not None else None,
+                "rsi_30d": round(c_rsi_30d, 2) if c_rsi_30d is not None else None,
                 "price_velocity": round(c_pv, 2) if c_pv is not None else None,
                 "price_velocity_pct": (
                     round(c_pv_pct, 4) if c_pv_pct is not None else None
@@ -18049,6 +19851,15 @@ def build_kinematics_snapshot_data(coordinator, history_limit=20):
             "oversold": KINEMATICS_RSI_OVERSOLD,
             "history_max_bars": KINEMATICS_HISTORY_MAX_BARS,
         },
+        "rsi_30d_config": {
+            "enabled": bool(RSI_30D_ENABLED),
+            "min_threshold": float(RSI_30D_MIN),
+        },
+        "nasdaq_market": (
+            coordinator.nasdaq_tracker.get_status()
+            if getattr(coordinator, "nasdaq_tracker", None) is not None
+            else None
+        ),
         "history_max_bars": KINEMATICS_HISTORY_MAX_BARS,
         "regime_counts": regime_counts,
         "display_timezone": {
@@ -18120,7 +19931,12 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
             should_preview = p_cand.kind != "tick" or not hist
             if is_newer and should_preview:
                 preview_cur = _preview_pending_candidate_point(
-                    prov, hist, p_min, p_cand
+                    prov,
+                    hist,
+                    p_min,
+                    p_cand,
+                    coordinator=coordinator,
+                    symbol=target_sym,
                 )
                 eff_hist = hist + [preview_cur]
 
@@ -18147,6 +19963,7 @@ def build_symbol_kinematics_history(coordinator, symbol, history_limit=None):
             "smoothed_velocity": h.get("smoothed_velocity"),
             "smoothed_acceleration": h.get("smoothed_acceleration"),
             "rsi": h.get("rsi"),
+            "rsi_30d": h.get("rsi_30d"),
             "crossover_signal": h.get("crossover_signal"),
         }
         for h in sliced
@@ -20436,6 +22253,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                             ACTIVE
                         </span>
+                        <span id="nasdaqHeaderBadge" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="NASDAQ intraday tracker vs. 09:30 ET open (always collected)">
+                            __NASDAQ_SYMBOL__ --
+                        </span>
+                        <span id="rsi30HeaderBadge" class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/30" title="30-day daily RSI (always collected &amp; displayed)">
+                            30D RSI
+                        </span>
                         __INSTANCE_OWNER_HEADER_BADGE_HTML__
                     </div>
                     <p class="text-[11px] text-slate-400">Multi-Stream Aggregation &bull; 1m Velocities &bull; Accelerations &bull; Dynamic Phase Regimes</p>
@@ -20474,7 +22297,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     Docs
                 </button>
 
-                <button id="btnRefresh" onclick="fetchAllData()" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
+                <button id="btnRefresh" onclick="fetchAllData(true)" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
                     <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                 </button>
 
@@ -20561,6 +22384,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <h2 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                         <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
                         Kinematics 4-Quadrant Phase Matrix
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </h2>
                     <p class="text-[11px] text-slate-400">Velocity (v) vs Acceleration (a) regime classification. Click any symbol to inspect below.</p>
@@ -20643,6 +22467,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         All Provider Feeds (<span id="tabStreamsCount">0</span>)
                     </button>
                 </div>
+
+                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
             </div>
 
             <!-- Regime Filter Buttons -->
@@ -20708,6 +22534,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     </span>
                                 </div>
                             </th>
+                            <th class="px-3 py-2.5 text-right rsi30-col">
+                                <div class="inline-flex items-center justify-end gap-1">
+                                    <button type="button" onclick="toggleTableSort('rsi_30d')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="rsi_30d" title="Sort by 30-Day Daily RSI (always collected; gate &gt; __RSI_30D_MIN__)">30D RSI</button>
+                                    <span class="inline-flex flex-col leading-[0.65] text-[8px]">
+                                        <button type="button" onclick="setTableSort('rsi_30d', 'asc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi_30d:asc" title="Sort 30D RSI ascending">&#9650;</button>
+                                        <button type="button" onclick="setTableSort('rsi_30d', 'desc')" class="sort-arrow-btn px-0.5 text-slate-600 hover:text-indigo-300 transition cursor-pointer" data-sort-arrow="rsi_30d:desc" title="Sort 30D RSI descending">&#9660;</button>
+                                    </span>
+                                </div>
+                            </th>
                             <th class="px-4 py-2.5 text-right">
                                 <div class="inline-flex items-center justify-end gap-1">
                                     <button type="button" onclick="toggleTableSort('rsi_vel')" class="sort-header-btn hover:text-white transition cursor-pointer select-none" data-sort-key="rsi_vel" title="Sort by RSI Vel / Acc">RSI Vel / Acc</button>
@@ -20723,7 +22558,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </thead>
                     <tbody id="kinematicsTableBody" class="divide-y divide-slate-800/60">
                         <tr>
-                            <td colspan="10" class="px-4 py-8 text-center text-slate-500">
+                            <td colspan="11" class="px-4 py-8 text-center text-slate-500">
                                 <div class="flex flex-col items-center justify-center gap-2">
                                     <svg class="w-5 h-5 animate-spin text-indigo-400" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
                                     <span>Connecting to engine telemetry stream...</span>
@@ -20752,6 +22587,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <h3 class="text-sm font-bold text-white tracking-tight flex flex-wrap items-center gap-2">
                                     <span id="detailSymbolTitle">Symbol Multi-Stream Inspector</span>
                                     <span id="detailRegimeBadge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold border bg-slate-800 text-slate-300 border-slate-700">Neutral</span>
+                                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                                     __INSTANCE_OWNER_PANEL_TAG_HTML__
                                 </h3>
                             </div>
@@ -20792,6 +22628,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     <div class="flex justify-between">
                                         <span class="text-slate-400">RSI Boundary Zone:</span>
                                         <span id="detailRsiZone" class="mono font-semibold text-slate-200">--</span>
+                                    </div>
+                                    <div id="detailRsi30Row" class="flex justify-between">
+                                        <span id="detailRsi30Label" class="text-slate-400">30-Day RSI:</span>
+                                        <span id="detailRsi30Val" class="mono font-semibold text-purple-300">--</span>
                                     </div>
                                     <div class="flex justify-between">
                                         <span class="text-slate-400">Crossover Event:</span>
@@ -20873,6 +22713,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     <th class="px-3.5 py-2 text-right">Price Vel (v)</th>
                                     <th class="px-3.5 py-2 text-right">Price Acc (a)</th>
                                     <th class="px-3.5 py-2 text-right">RSI (14)</th>
+                                    <th class="px-3.5 py-2 text-right rsi30-col">30D RSI</th>
                                     <th class="px-3.5 py-2 text-right">RSI Vel / Acc</th>
                                     <th class="px-3.5 py-2">Forecast Action</th>
                                     <th class="px-3.5 py-2 text-center">Status</th>
@@ -20880,7 +22721,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </thead>
                             <tbody id="detailProvidersTableBody" class="divide-y divide-slate-800/50 font-mono text-[11px]">
                                 <tr>
-                                    <td colspan="9" class="px-3.5 py-4 text-center text-slate-500">
+                                    <td colspan="10" class="px-3.5 py-4 text-center text-slate-500">
                                         Select a symbol to view provider stream breakdown.
                                     </td>
                                 </tr>
@@ -20919,6 +22760,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                                 <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
                                 Emitted Minute Summaries Log Feed
+                                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                                 __INSTANCE_OWNER_PANEL_TAG_HTML__
                             </h3>
                             <p class="text-[11px] text-slate-400">Records from <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
@@ -20939,6 +22781,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div>
                         <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                             <span>Engine Diagnostic Telemetry</span>
+                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                             __INSTANCE_OWNER_PANEL_TAG_HTML__
                         </h3>
                         <p class="text-[11px] text-slate-400">Positions monitor &amp; feed heartbeat</p>
@@ -21081,6 +22924,25 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                         </div>
 
+                        <div id="telemetryNasdaqRow" class="p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 space-y-1">
+                            <div class="flex justify-between items-center gap-2">
+                                <span class="text-slate-300 font-medium flex items-center gap-1.5">
+                                    <span>NASDAQ (<span id="telemetryNasdaqSym">__NASDAQ_SYMBOL__</span>)</span>
+                                    <span id="telemetryNasdaqGateBadge" class="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 font-semibold uppercase tracking-wide">MONITOR</span>
+                                </span>
+                                <span id="telemetryNasdaqDiff" class="mono text-[11px] font-semibold text-slate-300 text-right">--</span>
+                            </div>
+                            <div class="flex justify-between items-center text-[10px] mono text-slate-400 gap-2">
+                                <span id="telemetryNasdaqPrices">Open -- · Now --</span>
+                                <span id="telemetryNasdaqMeta" class="text-slate-500 truncate">--</span>
+                            </div>
+                        </div>
+
+                        <div id="telemetryRsi30Row" class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 gap-2">
+                            <span class="text-slate-400">30-Day RSI Filter</span>
+                            <span id="telemetryRsi30Status" class="mono text-[11px] text-slate-400 text-right">disabled</span>
+                        </div>
+
                         <div id="telemetryStrikeAnalyzerRow" onclick="openStrikeAnalysisPanel('')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openStrikeAnalysisPanel('');}" class="hidden group cursor-pointer flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 hover:border-indigo-500/50 hover:bg-slate-900/80 transition gap-2">
                             <span class="text-slate-300 group-hover:text-white font-medium flex items-center gap-1.5">
                                 Option Chain Strike Analyzer
@@ -21107,6 +22969,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <h3 class="text-base font-bold text-white flex flex-wrap items-center gap-2">
                     <span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span>
                     Inject Live Test Bar
+                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                     __INSTANCE_OWNER_PANEL_TAG_HTML__
                 </h3>
                 <button onclick="toggleInjectModal()" class="text-slate-400 hover:text-white">&times;</button>
@@ -21156,6 +23019,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <h3 class="text-sm font-bold text-white flex flex-wrap items-center gap-2">
                             <span id="optModalDot" class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
                             <span id="optModalTitle">Option Buyer — Open Contracts</span>
+                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                             __INSTANCE_OWNER_PANEL_TAG_HTML__
                         </h3>
                         <p id="optModalSubtitle" class="text-[11px] text-slate-400">Minute-by-minute contract valuation, price history, and P/L ($ &amp; %)</p>
@@ -21174,11 +23038,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <div class="flex items-center gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                     <span id="optProviderBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-900 text-indigo-300 border border-indigo-500/40 uppercase">broker</span>
                     <span id="optBackfillBadge" class="text-[10px] mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">backfill: idle</span>
                     <button id="btnOptSyncAlpaca" onclick="refreshOptionHistoryFromAlpaca()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
                         Sync Broker History
+                    </button>
+                    <button id="btnOptDrilldownBuySellLog" type="button" onclick="openOptionLogDetailsFromDrilldown()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="View triggering BUY &amp; SELL log entries (&plusmn;3 rows before &amp; after) for the selected trade">
+                        Buy/Sell Log Details
+                    </button>
+                    <button id="btnOptDrilldownFindBest" type="button" onclick="openFindBestFromDrilldown()" class="hidden px-2.5 py-1 rounded-lg bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 hover:text-white border border-amber-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="Analyze option chain data between buy &amp; sell to find peak exit and tune parms.ini">
+                        Find Best
                     </button>
                     <button onclick="closeOptionDrilldown()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
                 </div>
@@ -21230,8 +23100,38 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Trade-Scoped Buy / Sell Log Details Modal (Triggering Buy/Sell +/- 3 Entries) -->
+    <div id="optionLogDetailsModal" onclick="if(event.target===this) closeOptionLogDetailsModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[60] hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-emerald-500/30 rounded-2xl max-w-7xl w-full h-[88vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/85 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">Buy / Sell Log Details</h3>
+                        <span id="optLogDetailsBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/35">--</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
+                    </div>
+                    <p id="optLogDetailsSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Triggering BUY &amp; SELL log entries plus 3 entries before and 3 entries after each transaction</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="btnOptDetailsOpenFullLog" type="button" onclick="openOptionLogsFromDetailsModal()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="Open full Buy/Sell Decision &amp; Execution Logs jumped to this trade's buy time">
+                        Buy/Sell Log
+                    </button>
+                    <button type="button" onclick="fetchOptionLogDetails()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/40 text-[11px] font-semibold transition">
+                        Refresh
+                    </button>
+                    <button type="button" onclick="closeOptionLogDetailsModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div id="optLogDetailsPane" class="flex-1 min-h-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
+                <div class="text-xs text-slate-500 text-center py-12 mono">Select a contract on the Option Buyer or Option Seller panel to inspect its triggering buy/sell log details...</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Standalone Buy / Sell Decision & Execution Logs Modal -->
-    <div id="optionLogsModal" onclick="if(event.target===this) closeOptionLogsModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 hidden flex items-center justify-center p-3 sm:p-5">
+    <div id="optionLogsModal" onclick="if(event.target===this) closeOptionLogsModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[70] hidden flex items-center justify-center p-3 sm:p-5">
         <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-7xl w-full h-[88vh] flex flex-col shadow-2xl overflow-hidden">
             <div class="px-5 py-3.5 bg-slate-950/80 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
                 <div class="min-w-0">
@@ -21239,6 +23139,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</h3>
                         <span id="optLogsRowBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 rows</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="optLogsFileSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Minute-by-minute Option Buyer &amp; Option Seller evaluations</p>
@@ -21265,6 +23166,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-indigo-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Option Chain Strike Selection &amp; Exit Horizon Analyzer</h3>
                         <span id="strikeModalBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 BUY signals</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="strikeModalSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Compares -2 ITM through +4 OTM strikes captured at BUY signals across +5m, +10m, +15m, +30m, +60m, Actual Exit &amp; Peak</p>
@@ -21285,6 +23187,33 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
             <div id="strikeAnalysisPane" class="flex-1 min-h-0 flex flex-col overflow-hidden p-4 sm:p-5 space-y-3">
                 <div class="text-xs text-slate-500 text-center py-12 mono">Select Strike Analyzer to inspect option chain strike performance...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Find Best Exit & Parameter Tuning Analyzer Modal (Option Seller, gated by [dashboard] findbest=true) -->
+    <div id="findBestModal" onclick="if(event.target===this) closeFindBestModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[60] hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-amber-500/30 rounded-2xl max-w-7xl w-full h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">Find Best — Contract Exit &amp; Parameter Tuning Analyzer</h3>
+                        <span id="findBestContractBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/40">--</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
+                    </div>
+                    <p id="findBestSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Analyzing captured option chain &amp; minute valuation data between buy and sell...</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="btnFindBestRefresh" type="button" onclick="refreshFindBestAnalysis()" class="px-2.5 py-1 rounded-lg bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 text-[11px] font-semibold transition">
+                        Re-analyze
+                    </button>
+                    <button type="button" onclick="closeFindBestModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div id="findBestPane" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
+                <div class="text-xs text-slate-500 text-center py-12 mono">Select a closed contract on the Option Seller panel and click Find Best...</div>
             </div>
         </div>
     </div>
@@ -21334,11 +23263,20 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         const DASHBOARD_AUTH_ENABLED = ('__DASHBOARD_AUTH_ENABLED__' === 'true');
         const DASHBOARD_INACTIVITY_MINUTES = Math.max(0, Number('__DASHBOARD_INACTIVITY_MINUTES__') || 0);
         const STRIKE_ANALYZER_ENABLED = ('__STRIKE_ANALYZER_ENABLED__' === 'true');
+        const FINDBEST_ENABLED = ('__FINDBEST_ENABLED__' === 'true');
+        const RSI_30D_ENABLED = ('__RSI_30D_ENABLED__' === 'true');
+        const RSI_30D_MIN = Number('__RSI_30D_MIN__') || 30.0;
+        const NASDAQ_MUST_BE_POSITIVE = ('__NASDAQ_MUST_BE_POSITIVE__' === 'true');
+        const NASDAQ_SYMBOL = '__NASDAQ_SYMBOL__' || 'QQQ';
         const _ACTIVITY_STORAGE_KEY = 'msi_dashboard_last_activity';
         let _lastUserActivityMs = Date.now();
         let _lastServerHeartbeatMs = Date.now();
         let _idleRedirecting = false;
         let _idleWatchTimer = null;
+        let _fetchDataTimer = null;
+        let _fetchSummariesTimer = null;
+        let _fetchAllInFlight = false;
+        let _fetchSummariesInFlight = false;
 
         if (DASHBOARD_AUTH_ENABLED) {
             const logoutBtn = document.getElementById('btnLogout');
@@ -21349,6 +23287,147 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (strikeBtn) strikeBtn.classList.remove('hidden');
             const strikeRow = document.getElementById('telemetryStrikeAnalyzerRow');
             if (strikeRow) strikeRow.classList.remove('hidden');
+        }
+        // 30-Day RSI is always collected & displayed; RSI_30D_ENABLED only activates the OptionBuyer buy gate
+        (function initRsi30HeaderUi() {
+            const r30Badge = document.getElementById('rsi30HeaderBadge');
+            if (r30Badge) {
+                r30Badge.classList.remove('hidden');
+                if (RSI_30D_ENABLED) {
+                    r30Badge.textContent = `30D RSI GATE > ${RSI_30D_MIN.toFixed(1)}`;
+                    r30Badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/35';
+                    r30Badge.title = `30-day daily RSI buy gate ENABLED (requires 30D RSI > ${RSI_30D_MIN.toFixed(1)})`;
+                } else {
+                    r30Badge.textContent = '30D RSI MONITOR';
+                    r30Badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-purple-300/90 border border-slate-700/80';
+                    r30Badge.title = `30-day daily RSI always collected & displayed (buy gate OFF; threshold when enabled > ${RSI_30D_MIN.toFixed(1)})`;
+                }
+            }
+            const r30DetailRow = document.getElementById('detailRsi30Row');
+            if (r30DetailRow) r30DetailRow.classList.remove('hidden');
+            const r30DetailLabel = document.getElementById('detailRsi30Label');
+            if (r30DetailLabel) {
+                r30DetailLabel.textContent = RSI_30D_ENABLED
+                    ? `30-Day RSI (Gate > ${RSI_30D_MIN.toFixed(1)}):`
+                    : '30-Day RSI (Monitor):';
+            }
+            document.querySelectorAll('.rsi30-col').forEach(el => el.classList.remove('hidden'));
+        })();
+
+        function _rsi30ColorClass(val) {
+            const n = safeNum(val);
+            if (n === null) return 'text-slate-500';
+            return n > RSI_30D_MIN ? 'text-emerald-300' : 'text-rose-400';
+        }
+
+        function renderNasdaqAndRsi30Telemetry(nq, rsi30Info) {
+            const hdrBadge = document.getElementById('nasdaqHeaderBadge');
+            const symEl = document.getElementById('telemetryNasdaqSym');
+            const gateEl = document.getElementById('telemetryNasdaqGateBadge');
+            const diffEl = document.getElementById('telemetryNasdaqDiff');
+            const pxEl = document.getElementById('telemetryNasdaqPrices');
+            const metaEl = document.getElementById('telemetryNasdaqMeta');
+
+            if (nq && typeof nq === 'object') {
+                const sym = nq.symbol || NASDAQ_SYMBOL || 'QQQ';
+                const gateOn = Boolean(nq.gate_enabled ?? NASDAQ_MUST_BE_POSITIVE);
+                const oPx = safeNum(nq.open_price);
+                const cPx = safeNum(nq.current_price);
+                const diff = safeNum(nq.diff);
+                const diffPct = safeNum(nq.diff_pct);
+                const isPos = diff !== null && diff > 0;
+                const isNeg = diff !== null && diff < 0;
+                const isDown = diff !== null && diff <= 0;
+                const dirArrow = diff !== null ? (isPos ? '▲' : (isNeg ? '▼' : '•')) : '';
+
+                if (symEl) symEl.textContent = sym;
+                if (gateEl) {
+                    if (gateOn) {
+                        gateEl.textContent = isPos ? 'GATE PASS' : (isDown ? 'GATE BLOCK' : 'GATE WAIT');
+                        gateEl.className = `text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide border ${
+                            isPos
+                                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                : (isDown ? 'bg-rose-500/15 text-rose-300 border-rose-500/40' : 'bg-amber-500/15 text-amber-300 border-amber-500/40')
+                        }`;
+                    } else {
+                        gateEl.textContent = 'MONITOR';
+                        gateEl.className = 'text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 font-semibold uppercase tracking-wide';
+                    }
+                }
+                const diffTxt = diff !== null
+                    ? `${diff >= 0 ? '+' : ''}${diff.toFixed(2)}${diffPct !== null ? ` (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(2)}%)` : ''}`
+                    : (nq.status || 'awaiting RTH');
+                if (diffEl) {
+                    diffEl.textContent = diffTxt;
+                    diffEl.className = `mono text-[11px] font-semibold text-right ${
+                        isPos ? 'text-emerald-400' : (isDown ? 'text-rose-400' : 'text-slate-400')
+                    }`;
+                }
+                if (pxEl) {
+                    pxEl.textContent = `Open ${oPx !== null ? '$' + oPx.toFixed(2) : '--'} · Now ${cPx !== null ? '$' + cPx.toFixed(2) : '--'}`;
+                }
+                if (metaEl) {
+                    const obsCount = nq.observations_today ?? nq.samples_today ?? 0;
+                    metaEl.textContent = `${nq.trading_date || '--'} · ${obsCount}m`;
+                    metaEl.title = `Source: open=${nq.open_source || '--'}, cur=${nq.current_source || '--'} | Log: ${nq.log_file || '--'}`;
+                }
+                const tooltipText = `NASDAQ Tracker (${sym}) | 09:30 ET Open: ${oPx !== null ? '$' + oPx.toFixed(2) : '--'} | Current: ${cPx !== null ? '$' + cPx.toFixed(2) : '--'} | Change: ${diffTxt} | Buy Gate: ${gateOn ? 'ENABLED (must be > 0)' : 'MONITOR ONLY'}`;
+                const badgeColorCls = isPos
+                    ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                    : ((isNeg || (isDown && gateOn)) ? 'bg-rose-500/15 text-rose-300 border-rose-500/35' : 'bg-slate-800/80 text-slate-300 border-slate-700/80');
+
+                if (hdrBadge) {
+                    const pricePart = cPx !== null ? `$${cPx.toFixed(2)} ` : '';
+                    const pctPart = diff !== null
+                        ? `${dirArrow} ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}${diffPct !== null ? ` (${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(2)}%)` : ''}`
+                        : '--';
+                    const gateTag = gateOn ? (isPos ? ' · GATE ✓' : ' · GATE ✕') : '';
+                    hdrBadge.textContent = `${sym} ${pricePart}${pctPart}${gateTag}`;
+                    hdrBadge.className = `inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold border ${badgeColorCls}`;
+                    hdrBadge.title = tooltipText;
+                }
+
+                // Update compact QQQ price & up/down % chips on all panel and modal headers
+                const chipPctPart = diffPct !== null
+                    ? `${dirArrow} ${diffPct >= 0 ? '+' : ''}${diffPct.toFixed(2)}%`
+                    : (diff !== null ? `${dirArrow} ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}` : '');
+                const chipText = cPx !== null
+                    ? `${sym} $${cPx.toFixed(2)}${chipPctPart ? ' ' + chipPctPart : ''}`
+                    : `${sym} --`;
+                const chipCls = `nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold border whitespace-nowrap ${badgeColorCls}`;
+                document.querySelectorAll('.nasdaq-panel-chip').forEach(el => {
+                    if (el.textContent !== chipText) el.textContent = chipText;
+                    if (el.className !== chipCls) el.className = chipCls;
+                    if (el.title !== tooltipText) el.title = tooltipText;
+                });
+            }
+
+            const r30El = document.getElementById('telemetryRsi30Status');
+            const r30Badge = document.getElementById('rsi30HeaderBadge');
+            const enabled = Boolean((rsi30Info && rsi30Info.enabled) ?? RSI_30D_ENABLED);
+            const minVal = safeNum(rsi30Info && rsi30Info.min_threshold) ?? RSI_30D_MIN;
+            const seededCount = (rsi30Info && rsi30Info.seeded_count != null) ? Number(rsi30Info.seeded_count) : null;
+            const seededTag = seededCount !== null ? ` · ${seededCount} seeded` : '';
+            if (r30El) {
+                if (enabled) {
+                    r30El.textContent = `GATE ON (> ${minVal.toFixed(1)}${seededTag})`;
+                    r30El.className = 'mono text-[11px] font-semibold text-purple-300 text-right';
+                } else {
+                    r30El.textContent = `MONITOR${seededTag} (gate off)`;
+                    r30El.className = 'mono text-[11px] font-semibold text-slate-300 text-right';
+                }
+            }
+            if (r30Badge) {
+                if (enabled) {
+                    r30Badge.textContent = `30D RSI GATE > ${minVal.toFixed(1)}`;
+                    r30Badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-purple-500/15 text-purple-300 border border-purple-500/35';
+                    r30Badge.title = `30-day daily RSI buy gate ENABLED (requires 30D RSI > ${minVal.toFixed(1)})${seededTag}`;
+                } else {
+                    r30Badge.textContent = '30D RSI MONITOR';
+                    r30Badge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-purple-300/90 border border-slate-700/80';
+                    r30Badge.title = `30-day daily RSI always collected & displayed (buy gate OFF; threshold when enabled > ${minVal.toFixed(1)})${seededTag}`;
+                }
+            }
         }
 
         function _buildLoginRedirectUrl(reason = '') {
@@ -21362,10 +23441,33 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             return qs ? `/login?${qs}` : '/login';
         }
 
+        function _stopPollingTimers() {
+            if (_fetchDataTimer) {
+                clearInterval(_fetchDataTimer);
+                _fetchDataTimer = null;
+            }
+            if (_fetchSummariesTimer) {
+                clearInterval(_fetchSummariesTimer);
+                _fetchSummariesTimer = null;
+            }
+            if (countdownTimer) {
+                clearInterval(countdownTimer);
+                countdownTimer = null;
+            }
+            if (_idleWatchTimer) {
+                clearInterval(_idleWatchTimer);
+                _idleWatchTimer = null;
+            }
+        }
+
         const _nativeFetch = window.fetch.bind(window);
-        window.fetch = async function(...args) {
-            const res = await _nativeFetch(...args);
+        window.fetch = async function(input, init) {
+            const opts = init ? { ...init } : {};
+            if (!opts.credentials) opts.credentials = 'same-origin';
+            const res = await _nativeFetch(input, opts);
             if (res && res.status === 401 && DASHBOARD_AUTH_ENABLED && !_idleRedirecting) {
+                _idleRedirecting = true;
+                _stopPollingTimers();
                 let reason = '';
                 try {
                     const body = await res.clone().json();
@@ -21375,7 +23477,6 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 } catch (_) {
                     // ignore JSON parse issues
                 }
-                _idleRedirecting = true;
                 window.location.replace(_buildLoginRedirectUrl(reason));
             }
             return res;
@@ -21384,10 +23485,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         async function signOutDashboard(reason = '') {
             if (_idleRedirecting) return;
             _idleRedirecting = true;
-            if (_idleWatchTimer) {
-                clearInterval(_idleWatchTimer);
-                _idleWatchTimer = null;
-            }
+            _stopPollingTimers();
             try {
                 await _nativeFetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
             } catch (_) {
@@ -21856,14 +23954,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
-        async function fetchAllData() {
+        function _fetchWithTimeout(url, opts = {}, timeoutMs = 12000) {
+            if (typeof AbortController === 'undefined') {
+                return fetch(url, opts);
+            }
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+            return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+        }
+
+        async function fetchAllData(manual = false) {
+            if (_idleRedirecting || _fetchAllInFlight) return;
+            _fetchAllInFlight = true;
             const refreshIcon = document.getElementById('refreshIcon');
-            if (refreshIcon) refreshIcon.classList.add('animate-spin');
+            if (manual && refreshIcon) refreshIcon.classList.add('animate-spin');
 
             try {
+                const _jsonIfOk = (r) => (r && r.ok ? r.json() : null);
                 const jobs = [
-                    fetch('/cli/status').then(r => r.json()).catch(() => null),
-                    fetch('/api/kinematics').then(r => r.json()).catch(() => null)
+                    _fetchWithTimeout('/cli/status', { cache: 'no-store' }, 12000).then(_jsonIfOk).catch(() => null),
+                    _fetchWithTimeout('/api/kinematics', { cache: 'no-store' }, 12000).then(_jsonIfOk).catch(() => null)
                 ];
                 const contractsModal = document.getElementById('optionDrilldownModal');
                 const contractsOpen = contractsModal && !contractsModal.classList.contains('hidden');
@@ -21871,23 +23981,24 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const logsOpen = logsModal && !logsModal.classList.contains('hidden');
                 const logsFetchSeq = logsOpen ? ++_optionLogsReqSeq : 0;
                 if (contractsOpen) {
-                    jobs.push(fetch('/api/option-history').then(r => r.json()).catch(() => null));
+                    jobs.push(_fetchWithTimeout('/api/option-history', { cache: 'no-store' }, 15000).then(_jsonIfOk).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
                 if (logsOpen) {
-                    jobs.push(fetch(buildOptionLogsQueryUrl(40000), { cache: 'no-store' }).then(r => r.json()).catch(() => null));
+                    jobs.push(_fetchWithTimeout(buildOptionLogsQueryUrl(40000), { cache: 'no-store' }, 20000).then(_jsonIfOk).catch(() => null));
                 } else {
                     jobs.push(Promise.resolve(null));
                 }
 
                 const [statusRes, kinRes, optRes, optLogsRes] = await Promise.all(jobs);
+                if (_idleRedirecting) return;
 
                 if (statusRes && statusRes.metrics) {
                     renderStatusMetrics(statusRes.metrics);
                 }
 
-                if (kinRes) {
+                if (kinRes && kinRes.status === 'ok') {
                     latestData = kinRes;
                     renderKinematics(kinRes);
                     renderSymbolDeepDive();
@@ -21904,6 +24015,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             } catch (err) {
                 console.error("Telemetry fetch error:", err);
             } finally {
+                _fetchAllInFlight = false;
                 if (refreshIcon) refreshIcon.classList.remove('animate-spin');
             }
         }
@@ -22175,6 +24287,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 }
             }
+            renderNasdaqAndRsi30Telemetry(m.nasdaq_market || null, m.rsi_30d || null);
             if (m.chart_capture) {
                 const cc = m.chart_capture;
                 chartCaptureEnabledState = Boolean(cc.enabled);
@@ -22242,6 +24355,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function renderKinematics(data) {
             if (data.display_timezone) syncDisplayTimezoneMeta(data.display_timezone);
+            if (data.nasdaq_market || data.rsi_30d_config) {
+                renderNasdaqAndRsi30Telemetry(data.nasdaq_market || null, data.rsi_30d_config || null);
+            }
             const consolidated = data.consolidated_symbols || [];
             const streams = data.instruments || [];
 
@@ -22427,9 +24543,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const pill = document.createElement('span');
                     const rv = safeNum(item.rsi_velocity);
                     const vText = rv !== null ? ` ${fmtNum(rv, 1, '+')}/m` : '';
+                    const r30 = safeNum(item.rsi_30d);
+                    const r30Pill = (r30 !== null) ? ` ·30D:${r30.toFixed(0)}` : '';
+                    const r30Tip = `\n30D RSI: ${r30 !== null ? r30.toFixed(1) : '--'} (${RSI_30D_ENABLED ? `gate > ${RSI_30D_MIN.toFixed(1)}` : 'monitor only'})`;
                     pill.className = `cursor-pointer px-2 py-0.5 rounded text-[11px] font-mono font-medium border transition hover:scale-105 ${REGIME_CONFIG[regime].badgeClass}`;
-                    pill.textContent = `${item.symbol}${vText}`;
-                    pill.title = `${item.symbol}\nPrice: ${fmtPrice(item.close)}\nRSI: ${fmtNum(item.rsi, 1)}\nv_rsi: ${fmtNum(item.rsi_velocity, 2, '+')}\na_rsi: ${fmtNum(item.rsi_acceleration, 2, '+')}\nClick to inspect in detail panel`;
+                    pill.textContent = `${item.symbol}${vText}${r30Pill}`;
+                    pill.title = `${item.symbol}\nPrice: ${fmtPrice(item.close)}\nRSI: ${fmtNum(item.rsi, 1)}${r30Tip}\nv_rsi: ${fmtNum(item.rsi_velocity, 2, '+')}\na_rsi: ${fmtNum(item.rsi_acceleration, 2, '+')}\nClick to inspect in detail panel`;
                     pill.onclick = () => selectAndInspectSymbol(item.symbol);
                     container.appendChild(pill);
                 });
@@ -22493,6 +24612,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return safeNum(item.price_acceleration);
             }
             if (key === 'rsi') return safeNum(item.rsi);
+            if (key === 'rsi_30d') return safeNum(item.rsi_30d);
             if (key === 'rsi_vel') return safeNum(item.rsi_velocity);
             return null;
         }
@@ -22550,7 +24670,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             dataset = sortTableDataset(dataset);
 
             if (dataset.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="10" class="px-4 py-8 text-center text-slate-500">No instruments match current filter criteria.</td></tr>`;
+                _setTbodyHtmlPreservingScroll(tbody, `<tr><td colspan="11" class="px-4 py-8 text-center text-slate-500">No instruments match current filter criteria.</td></tr>`);
                 return;
             }
 
@@ -22561,8 +24681,22 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function _setTbodyHtmlPreservingScroll(tbody, html) {
+            if (!tbody) return;
+            if (tbody.dataset.lastHtml === html) return;
+            const scroller = tbody.closest('.overflow-x-auto, .overflow-auto');
+            const prevLeft = scroller ? scroller.scrollLeft : 0;
+            const prevTop = scroller ? scroller.scrollTop : 0;
+            tbody.innerHTML = html;
+            tbody.dataset.lastHtml = html;
+            if (scroller) {
+                scroller.scrollLeft = prevLeft;
+                scroller.scrollTop = prevTop;
+            }
+        }
+
         function renderConsolidatedTableRows(tbody, symbolsList) {
-            tbody.innerHTML = symbolsList.map(item => {
+            const html = symbolsList.map(item => {
                 const rConf = REGIME_CONFIG[item.regime] || REGIME_CONFIG.neutral;
                 const fConf = FORECAST_CONFIG[item.forecast_direction] || FORECAST_CONFIG.neutral;
                 const priceFormatted = fmtPrice(item.close);
@@ -22634,6 +24768,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </div>
                             </div>
                         </td>
+                        <td class="px-3 py-2.5 text-right mono font-semibold ${_rsi30ColorClass(item.rsi_30d)} rsi30-col" title="30-Day Daily RSI (${RSI_30D_ENABLED ? `buy gate requires &gt; ${RSI_30D_MIN.toFixed(1)}` : `monitor only; threshold when enabled &gt; ${RSI_30D_MIN.toFixed(1)}`})">${fmtNum(item.rsi_30d, 1)}</td>
                         <td class="px-4 py-2.5 text-right mono">
                             <div class="font-semibold ${rvColor}">${rv !== null ? fmtNum(rv, 2, '+') + '/m' : '--'}</div>
                             <div class="text-[10px] text-slate-400">${ra !== null ? fmtNum(ra, 2, '+') + '/m²' : '--'}</div>
@@ -22680,6 +24815,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <td class="px-4 py-1.5 text-right mono ${sPv > 0 ? 'text-emerald-400' : (sPv < 0 ? 'text-rose-400' : '')}">${fmtNum(sPv, 2, '+')}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtNum(sub.price_acceleration, 2, '+')}</td>
                                 <td class="px-4 py-1.5 mono">${fmtNum(sub.rsi, 1)}</td>
+                                <td class="px-3 py-1.5 text-right mono ${_rsi30ColorClass(sub.rsi_30d)} rsi30-col">${fmtNum(sub.rsi_30d, 1)}</td>
                                 <td class="px-4 py-1.5 text-right mono">${fmtNum(sRv, 2, '+')} / ${fmtNum(sRa, 2, '+')}</td>
                                 <td class="px-4 py-1.5"><span class="text-[10px] px-1.5 py-0.5 rounded border ${sFConf.cls}">${isPlaceholder ? (sub.trading_action || sFConf.label) : sFConf.label}</span></td>
                                 <td class="px-4 py-1.5 text-center mono text-[10px]">${formatFeedStatusBadge(sub.feed_status, true)}</td>
@@ -22690,10 +24826,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 return rowHtml;
             }).join('');
+            _setTbodyHtmlPreservingScroll(tbody, html);
         }
 
         function renderStreamTableRows(tbody, streamList) {
-            tbody.innerHTML = streamList.map(inst => {
+            const html = streamList.map(inst => {
                 const fConf = FORECAST_CONFIG[inst.forecast_direction] || FORECAST_CONFIG.neutral;
                 const pv = safeNum(inst.price_velocity);
                 const rv = safeNum(inst.rsi_velocity);
@@ -22712,6 +24849,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td class="px-4 py-2.5 text-right mono font-semibold ${pv > 0 ? 'text-emerald-400' : (pv < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(pv, 2, '+')}</td>
                         <td class="px-4 py-2.5 text-right mono text-slate-300">${fmtNum(inst.price_acceleration, 2, '+')}</td>
                         <td class="px-4 py-2.5 mono font-semibold text-slate-200">${fmtNum(rsi, 1)}</td>
+                        <td class="px-3 py-2.5 text-right mono font-semibold ${_rsi30ColorClass(inst.rsi_30d)} rsi30-col">${fmtNum(inst.rsi_30d, 1)}</td>
                         <td class="px-4 py-2.5 text-right mono">${fmtNum(rv, 2, '+')} / ${fmtNum(ra, 2, '+')}</td>
                         <td class="px-4 py-2.5">
                             <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold border ${fConf.cls}">${fConf.label}</span>
@@ -22729,6 +24867,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </tr>
                 `;
             }).join('');
+            _setTbodyHtmlPreservingScroll(tbody, html);
         }
 
         function formatMinuteTick(point, idx) {
@@ -22776,8 +24915,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         : `Flyover cursor over chart to inspect values (${escSvg(displayTzAbbr)})`;
                     const edgeLbl = isHist ? 'Window End' : 'Latest';
                     const edgeDatePrefix = (lastCol && lastCol.dateLabel && lastCol.dateLabel !== '--') ? `${lastCol.dateLabel}, ` : '';
+                    const lastR30Part = lastCol
+                        ? ` · 30D=${lastCol.rsi30 !== null ? lastCol.rsi30.toFixed(1) : '--'}`
+                        : '';
                     hud.innerHTML = `<span class="text-slate-400">${hint}</span>`
-                        + (lastCol ? `<span class="text-slate-300">${edgeLbl} <strong class="text-white">${escSvg(edgeDatePrefix + lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}</span>` : '');
+                        + (lastCol ? `<span class="text-slate-300">${edgeLbl} <strong class="text-white">${escSvg(edgeDatePrefix + lastCol.tick)} ${escSvg(displayTzAbbr)}</strong> · P=${fmtPrice(lastCol.close)} · RSI=${lastCol.rsi !== null ? lastCol.rsi.toFixed(1) : '--'}${lastR30Part}</span>` : '');
                 }
                 return;
             }
@@ -22855,7 +24997,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const vaLbl = col.isProj
                     ? ''
                     : `v ${fmtNum(col.vel, 2, '+')} · a ${fmtNum(col.acc, 2, '+')}`;
-                const rsiLbl = col.rsi !== null ? `RSI ${col.rsi.toFixed(1)}` : '';
+                const rsiLbl = col.rsi !== null
+                    ? `RSI ${col.rsi.toFixed(1)}${col.rsi30 !== null ? ' · 30D ' + col.rsi30.toFixed(1) : ''}`
+                    : (col.rsi30 !== null ? `30D ${col.rsi30.toFixed(1)}` : '');
 
                 setBadge('cxTagPriceBg', 'cxTagPriceTxt', 11, pLbl, col.isProj ? '#22d3ee' : '#94a3b8');
                 setBadge('cxTagVaBg', 'cxTagVaTxt', 81, vaLbl, '#38bdf8');
@@ -22879,6 +25023,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const rsiPart = col.rsi !== null
                     ? `<span>RSI: <strong class="text-purple-300">${col.rsi.toFixed(1)}</strong></span>`
                     : '';
+                const rsi30Part = col.rsi30 !== null
+                    ? `<span>30D RSI: <strong class="${_rsi30ColorClass(col.rsi30)}">${col.rsi30.toFixed(1)}</strong></span>`
+                    : '';
                 const sigPart = col.crossover && col.crossover !== 'none'
                     ? `<span class="text-amber-300 font-semibold">[${escSvg(col.crossover.replace('_', ' '))}]</span>`
                     : '';
@@ -22888,7 +25035,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const sellPart = col.sellNote
                     ? `<span class="text-amber-300 font-semibold">&#9733; SELL: ${escSvg(col.sellNote)}</span>`
                     : '';
-                hud.innerHTML = `<div class="flex flex-wrap items-center gap-x-3 gap-y-0.5">${timeBadge}${closePart}${smoothPart}${vaPart}${rsiPart}${sigPart}${buyPart}${sellPart}</div>`;
+                hud.innerHTML = `<div class="flex flex-wrap items-center gap-x-3 gap-y-0.5">${timeBadge}${closePart}${smoothPart}${vaPart}${rsiPart}${rsi30Part}${sigPart}${buyPart}${sellPart}</div>`;
             }
         }
 
@@ -23453,6 +25600,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const vVal = safeNum(p.smoothed_velocity ?? p.price_velocity);
                 const aVal = safeNum(p.smoothed_acceleration ?? p.price_acceleration);
                 const rVal = safeNum(p.rsi);
+                const r30Val = safeNum(p.rsi_30d);
                 const ptTs = p.timestamp || p.minute_utc || '';
                 return {
                     x: xAt(i),
@@ -23465,6 +25613,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     vel: vVal,
                     acc: aVal,
                     rsi: rVal,
+                    rsi30: r30Val,
                     yClose: cVal !== null ? yP(cVal) : null,
                     ySmooth: sVal !== null ? yP(sVal) : null,
                     yVel: yVA(vels[i]),
@@ -23487,6 +25636,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     vel: null,
                     acc: null,
                     rsi: null,
+                    rsi30: null,
                     yClose: nextY,
                     ySmooth: null,
                     yVel: null,
@@ -23634,7 +25784,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById('detailSymbolBadge').textContent = sym;
             document.getElementById('detailSymbolTitle').textContent = `${sym} Multi-Stream Kinematics Analysis`;
             const totalProvs = symbolData.configured_providers_count || symbolData.providers_count;
-            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count}/${totalProvs} reporting feeds (${(symbolData.providers || []).join(', ') || 'none'}) • Close ${fmtPrice(symbolData.close)} • RSI ${fmtNum(symbolData.rsi, 1)}`;
+            const subRsi30Part = ` • 30D RSI ${fmtNum(symbolData.rsi_30d, 1)}`;
+            document.getElementById('detailSymbolSubtitle').textContent = `Synthesized consensus across ${symbolData.providers_count}/${totalProvs} reporting feeds (${(symbolData.providers || []).join(', ') || 'none'}) • Close ${fmtPrice(symbolData.close)} • RSI ${fmtNum(symbolData.rsi, 1)}${subRsi30Part}`;
             
             const badgeEl = document.getElementById('detailRegimeBadge');
             badgeEl.className = `text-[10px] px-2 py-0.5 rounded-full font-semibold border ${rConf.badgeClass}`;
@@ -23650,6 +25801,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             deltaEl.textContent = pDeltaPct !== null ? `${fmtNum(symbolData.projected_delta, 2, '+')} (${fmtPct(pDeltaPct, 2, '+')})` : '--';
             deltaEl.className = `text-sm font-bold mono mt-0.5 ${pDeltaPct > 0 ? 'text-emerald-400' : (pDeltaPct < 0 ? 'text-rose-400' : 'text-slate-300')}`;
             document.getElementById('detailRsiZone').textContent = (symbolData.rsi_zone || 'unknown').replace('_', ' ');
+            const detRsi30El = document.getElementById('detailRsi30Val');
+            if (detRsi30El) {
+                const dR30 = safeNum(symbolData.rsi_30d);
+                detRsi30El.textContent = dR30 !== null
+                    ? (RSI_30D_ENABLED ? `${dR30.toFixed(2)} ${dR30 > RSI_30D_MIN ? '✓' : '✕'}` : dR30.toFixed(2))
+                    : '--';
+                detRsi30El.className = `mono font-semibold ${_rsi30ColorClass(dR30)}`;
+            }
             document.getElementById('detailCrossoverSignal').textContent = (symbolData.crossover_signal || 'none').replace('_', ' ');
             document.getElementById('detailTradingAction').textContent = symbolData.trading_action || fConf.label;
             const detailLogBtn = document.getElementById('btnDetailBuySellLog');
@@ -23701,13 +25860,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const entries = symbolData.provider_entries || [];
 
             if (entries.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="9" class="px-3.5 py-4 text-center text-slate-500">No active streams for ${sym}</td></tr>`;
+                _setTbodyHtmlPreservingScroll(tbody, `<tr><td colspan="10" class="px-3.5 py-4 text-center text-slate-500">No active streams for ${sym}</td></tr>`);
                 return;
             }
 
-            tbody.innerHTML = entries.map(e => {
+            const detailRowsHtml = entries.map(e => {
                 const pFConf = FORECAST_CONFIG[e.forecast_direction] || FORECAST_CONFIG.neutral;
                 const pRsi = safeNum(e.rsi);
+                const pRsi30 = safeNum(e.rsi_30d);
                 const pRv = safeNum(e.rsi_velocity);
                 const pRa = safeNum(e.rsi_acceleration);
                 const isPlaceholder = e.close === null && e.rsi === null;
@@ -23721,6 +25881,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td class="px-3.5 py-2 text-right ${safeNum(e.price_velocity) > 0 ? 'text-emerald-400' : (safeNum(e.price_velocity) < 0 ? 'text-rose-400' : 'text-slate-400')}">${fmtNum(e.price_velocity, 2, '+')}</td>
                         <td class="px-3.5 py-2 text-right text-slate-300">${fmtNum(e.price_acceleration, 2, '+')}</td>
                         <td class="px-3.5 py-2 text-right text-slate-200">${fmtNum(pRsi, 1)}</td>
+                        <td class="px-3.5 py-2 text-right font-semibold ${_rsi30ColorClass(pRsi30)} rsi30-col">${fmtNum(pRsi30, 1)}</td>
                         <td class="px-3.5 py-2 text-right">${fmtNum(pRv, 2, '+')} / ${fmtNum(pRa, 2, '+')}</td>
                         <td class="px-3.5 py-2">
                             <span class="text-[10px] px-2 py-0.5 rounded border ${pFConf.cls}">
@@ -23731,6 +25892,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </tr>
                 `;
             }).join('');
+            _setTbodyHtmlPreservingScroll(tbody, detailRowsHtml);
 
             const tvBanner = document.getElementById('detailTvDiagnosticBanner');
             if (tvBanner) {
@@ -23774,12 +25936,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         async function fetchMinuteSummaries() {
+            if (_idleRedirecting || _fetchSummariesInFlight) return;
+            _fetchSummariesInFlight = true;
             const container = document.getElementById('summariesContainer');
             try {
-                const res = await fetch('/api/minute-summaries');
+                const res = await _fetchWithTimeout('/api/minute-summaries', { cache: 'no-store' }, 12000);
+                if (_idleRedirecting || !res || !res.ok) return;
                 const data = await res.json();
-                if (!res.ok || !data.summaries || data.summaries.length === 0) {
-                    container.innerHTML = `
+                if (!data || !data.summaries || data.summaries.length === 0) {
+                    const emptyHtml = `
                         <div class="p-4 rounded-xl bg-slate-950/50 border border-slate-800/80 text-center text-slate-400 text-xs space-y-1.5">
                             <div class="font-semibold text-slate-300">Awaiting Minute Finalization</div>
                             <p class="text-[11px] text-slate-500">
@@ -23788,11 +25953,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </p>
                         </div>
                     `;
+                    if (container.dataset.lastHtml !== emptyHtml) {
+                        container.innerHTML = emptyHtml;
+                        container.dataset.lastHtml = emptyHtml;
+                    }
                     return;
                 }
 
                 const reversed = [...data.summaries].reverse();
-                container.innerHTML = reversed.map((rec, idx) => {
+                const nextHtml = reversed.map((rec, idx) => {
                     const minUtc = rec.minute_start_utc ? `${fmtTzClock(rec.minute_start_utc, { hour: '2-digit', minute: '2-digit' })} ${displayTzAbbr}` : '--';
                     const kin = rec.kinematics_summary || {};
                     const regimes = kin.regimes || {};
@@ -23800,6 +25969,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const symbolsCount = rec.symbols ? Object.keys(rec.symbols).length : 0;
                     const maxRsi = kin.max_rsi_velocity;
                     const maxPrice = kin.max_price_velocity_pct;
+                    const nqRec = rec.nasdaq_market || null;
+                    const nqDiff = nqRec ? safeNum(nqRec.diff) : null;
+                    const nqBadgeHtml = (nqRec && nqDiff !== null)
+                        ? `<span class="px-1.5 py-0.5 rounded mono border ${nqDiff > 0 ? 'bg-emerald-950/40 text-emerald-300 border-emerald-900/50' : 'bg-rose-950/40 text-rose-300 border-rose-900/50'}">${escSvg(nqRec.symbol || NASDAQ_SYMBOL)} ${nqDiff >= 0 ? '+' : ''}${nqDiff.toFixed(2)}</span>`
+                        : '';
+                    const r30Pairs = Object.entries(rec.symbols || {})
+                        .map(([s, v]) => [s, v && safeNum(v.rsi_30d)])
+                        .filter(([, val]) => val !== null);
+                    const r30SummaryHtml = r30Pairs.length > 0
+                        ? `<div class="text-[10px] mono text-purple-300/90 flex flex-wrap gap-x-2.5 gap-y-0.5 pt-1 border-t border-slate-900"><span>30D RSI:</span>${r30Pairs.slice(0, 8).map(([s, val]) => `<span class="${_rsi30ColorClass(val)}">${escSvg(s)}=${val.toFixed(1)}</span>`).join('')}${r30Pairs.length > 8 ? `<span class="text-slate-500">+${r30Pairs.length - 8}</span>` : ''}</div>`
+                        : '';
 
                     return `
                         <div class="p-2.5 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-1.5">
@@ -23822,6 +26002,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <span class="px-1.5 py-0.5 rounded bg-rose-950/40 text-rose-300 border border-rose-900/40">&darr; Acc Bear: ${regimes.accelerating_bearish || 0}</span>
                                 <span class="px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 border border-amber-900/40">&searr; Dec Bear: ${regimes.decelerating_bearish || 0}</span>
                                 ${(forecasts.bearish_reversal || forecasts.bullish_reversal) ? `<span class="px-1.5 py-0.5 rounded bg-purple-950/40 text-purple-300 border border-purple-900/40">Reversals: &darr;${forecasts.bearish_reversal || 0} / &uarr;${forecasts.bullish_reversal || 0}</span>` : ''}
+                                ${nqBadgeHtml}
                             </div>
 
                             ${maxRsi || maxPrice ? `
@@ -23830,12 +26011,26 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     ${maxPrice ? `<span>Max &Delta;P%: <strong class="text-indigo-400">${maxPrice.symbol} (+${fmtNum(maxPrice.value, 2)}%)</strong></span>` : ''}
                                 </div>
                             ` : ''}
+                            ${r30SummaryHtml}
                             <input type="hidden" id="rawSummary_${idx}" value='${JSON.stringify(rec).replace(/'/g, "&apos;")}'>
                         </div>
                     `;
                 }).join('');
+                if (container.dataset.lastHtml !== nextHtml) {
+                    const prevTop = container.scrollTop;
+                    const prevLeft = container.scrollLeft;
+                    container.innerHTML = nextHtml;
+                    container.dataset.lastHtml = nextHtml;
+                    container.scrollTop = prevTop;
+                    container.scrollLeft = prevLeft;
+                }
             } catch (err) {
-                container.innerHTML = `<div class="text-rose-400 text-xs py-4">Error loading minute summaries: ${err.message}</div>`;
+                if (!_idleRedirecting) {
+                    container.innerHTML = `<div class="text-rose-400 text-xs py-4">Error loading minute summaries: ${err.message}</div>`;
+                    delete container.dataset.lastHtml;
+                }
+            } finally {
+                _fetchSummariesInFlight = false;
             }
         }
 
@@ -23859,9 +26054,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let optionLogStreamFilter = 'all'; // 'all' | 'BUY' | 'SELL'
         let optionLogDecisionFilter = 'all'; // 'all' | 'QUALIFIED' | 'REJECTED'
         let optionLogSearchFilter = '';
+        let optionLogStartFilter = ''; // 'YYYY-MM-DDTHH:MM' in browser local timezone
+        let optionLogStopFilter = ''; // 'YYYY-MM-DDTHH:MM' in browser local timezone
+        let optionLogFocusEpochMs = null; // target epoch ms to highlight & scroll into view (e.g. selected trade buy time)
+        let _optionLogTimeFromDrilldown = false;
         let _optionLogsAbortCtrl = null;
         let _optionLogsReqSeq = 0;
         let _optionLogSearchDebounce = null;
+        let _optionLogTimeDebounce = null;
         let activeOptionHistoryPoints = [];
         window._optPanState = {
             windowBars: 60, // 20 | 60 | 120 | 240 | 390 | 0 (All)
@@ -24030,6 +26230,68 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             renderOptionDrilldown();
         }
 
+        function _getBrowserTzInfo() {
+            let tzName = 'Local';
+            let tzAbbr = 'LOCAL';
+            try {
+                tzName = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
+            } catch (_) {}
+            try {
+                const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(new Date());
+                const tzPart = parts.find(p => p.type === 'timeZoneName');
+                if (tzPart && tzPart.value) tzAbbr = tzPart.value;
+            } catch (_) {}
+            return { tzName, tzAbbr };
+        }
+
+        function _parseLocalDateTimeInputToEpochMs(val, isStop = false) {
+            const raw = String(val || '').trim();
+            if (!raw) return null;
+            const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?$/);
+            if (!m) {
+                const parsed = Date.parse(raw);
+                return Number.isFinite(parsed) ? parsed : null;
+            }
+            const year = Number(m[1]);
+            const month = Number(m[2]) - 1;
+            const day = Number(m[3]);
+            const hour = Number(m[4]);
+            const minute = Number(m[5]);
+            const hasSeconds = typeof m[6] === 'string' && m[6].length > 0;
+            const second = hasSeconds ? Number(m[6]) : (isStop ? 59 : 0);
+            const ms = isStop ? 999 : 0;
+            const d = new Date(year, month, day, hour, minute, second, ms);
+            const t = d.getTime();
+            return Number.isFinite(t) ? t : null;
+        }
+
+        function _formatEpochMsToLocalDateTimeInput(epochMs) {
+            if (typeof epochMs !== 'number' || !Number.isFinite(epochMs) || epochMs <= 0) return '';
+            const d = new Date(epochMs);
+            if (!Number.isFinite(d.getTime())) return '';
+            const pad2 = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+        }
+
+        function _formatLogTimeInBrowserTz(entry) {
+            const epMs = entry && typeof entry.timestamp_epoch_ms === 'number' && Number.isFinite(entry.timestamp_epoch_ms) && entry.timestamp_epoch_ms > 0
+                ? entry.timestamp_epoch_ms
+                : null;
+            if (epMs === null) {
+                const fallback = (entry && (entry.timestamp_short || entry.timestamp)) || '--';
+                return { shortLabel: fallback, title: (entry && entry.timestamp) || fallback };
+            }
+            const d = new Date(epMs);
+            const pad2 = (n) => String(n).padStart(2, '0');
+            const shortLabel = `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+            const fullLocal = `${d.getFullYear()}-${shortLabel}`;
+            const { tzAbbr } = _getBrowserTzInfo();
+            return {
+                shortLabel,
+                title: `${fullLocal} ${tzAbbr} (UTC: ${d.toISOString()})`,
+            };
+        }
+
         function buildOptionLogsQueryUrl(limit = 40000) {
             const params = new URLSearchParams();
             params.set('limit', String(limit));
@@ -24040,14 +26302,389 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (q) {
                 params.set('q', q);
             }
+            const startMs = _parseLocalDateTimeInputToEpochMs(optionLogStartFilter, false);
+            const stopMs = _parseLocalDateTimeInputToEpochMs(optionLogStopFilter, true);
+            if (startMs !== null) {
+                params.set('start_ms', String(startMs));
+            }
+            if (stopMs !== null) {
+                params.set('stop_ms', String(stopMs));
+            }
             params.set('_ts', String(Date.now()));
             return `/api/option-logs?${params.toString()}`;
         }
 
-        async function openOptionLogsPanel(symbolFilter = '') {
+        let latestOptionLogDetails = null;
+        let optionLogDetailsTarget = null;
+        let _optLogDetailsAbortCtrl = null;
+        let _optLogDetailsReqSeq = 0;
+
+        function _getSelectedDrilldownContract() {
+            const data = latestOptionHistory || { open_contracts: [], closed_contracts: [] };
+            const isBuyer = optionDrilldownMode === 'buyer';
+            const items = isBuyer ? (data.open_contracts || []) : (data.closed_contracts || []);
+            const getKey = (c) => isBuyer ? c.contract : c.trade_id;
+            const activeKey = isBuyer ? selectedBuyerContract : selectedSellerTradeId;
+            return {
+                isBuyer,
+                selectedItem: items.find(c => getKey(c) === activeKey) || items[0] || null,
+            };
+        }
+
+        function openOptionLogDetailsFromDrilldown() {
+            const { isBuyer, selectedItem } = _getSelectedDrilldownContract();
+            if (!selectedItem) {
+                openOptionLogsFromDrilldown();
+                return;
+            }
+            const sym = String(selectedItem.underlying || selectedItem.contract || '').trim().toUpperCase();
+            const contract = String(selectedItem.contract || '').trim().toUpperCase();
+            const buyUtc = selectedItem.purchased_at_utc || selectedItem.purchased_minute_utc || '';
+            const sellUtc = !isBuyer ? (selectedItem.sold_at_utc || selectedItem.closed_at_utc || '') : '';
+            optionLogDetailsTarget = {
+                symbol: sym,
+                contract,
+                buyUtc,
+                sellUtc,
+                mode: isBuyer ? 'buyer' : 'seller',
+                entryPrice: safeNum(selectedItem.entry_price),
+                exitPrice: safeNum(isBuyer ? selectedItem.current_price : selectedItem.exit_price),
+                pnlPct: safeNum(isBuyer ? selectedItem.pnl_pct : selectedItem.total_pnl_pct),
+                pnlDollars: safeNum(isBuyer ? selectedItem.pnl_dollars : selectedItem.total_pnl_dollars),
+            };
+            latestOptionLogDetails = null;
+
+            const badge = document.getElementById('optLogDetailsBadge');
+            if (badge) badge.textContent = contract || sym || '--';
+            const sub = document.getElementById('optLogDetailsSubtitle');
+            if (sub) {
+                const buyLbl = buyUtc ? `Bought ${fmtShortLocalTs(buyUtc)}` : 'Buy time n/a';
+                const sellLbl = sellUtc ? ` · Sold ${fmtShortLocalTs(sellUtc)}` : ' · Open Position';
+                sub.textContent = `${sym}${contract && contract !== sym ? ' · ' + contract : ''} · ${buyLbl}${sellLbl} · ±3 entries around triggering BUY/SELL`;
+            }
+            const fullBtn = document.getElementById('btnOptDetailsOpenFullLog');
+            if (fullBtn) {
+                fullBtn.title = sym
+                    ? `Open full Buy/Sell Decision & Execution Logs for ${sym} jumped to buy time`
+                    : 'Open full Buy/Sell Decision & Execution Logs';
+            }
+
+            const modal = document.getElementById('optionLogDetailsModal');
+            if (modal) modal.classList.remove('hidden');
+            fetchOptionLogDetails();
+        }
+
+        function closeOptionLogDetailsModal() {
+            if (_optLogDetailsAbortCtrl) {
+                try { _optLogDetailsAbortCtrl.abort(); } catch (_) {}
+                _optLogDetailsAbortCtrl = null;
+            }
+            const modal = document.getElementById('optionLogDetailsModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function openOptionLogsFromDetailsModal() {
+            const t = optionLogDetailsTarget;
+            if (!t) {
+                openOptionLogsFromDrilldown();
+                return;
+            }
+            const sym = String(t.symbol || t.contract || '').trim().toUpperCase();
+            const buyMs = t.buyUtc ? Date.parse(t.buyUtc) : NaN;
+            if (Number.isFinite(buyMs) && buyMs > 0) {
+                const WINDOW_BEFORE_MS = 5 * 60 * 1000;
+                const WINDOW_AFTER_MS = 5 * 60 * 1000;
+                openOptionLogsPanel(sym, {
+                    startFilter: _formatEpochMsToLocalDateTimeInput(buyMs - WINDOW_BEFORE_MS),
+                    stopFilter: _formatEpochMsToLocalDateTimeInput(buyMs + WINDOW_AFTER_MS),
+                    focusEpochMs: buyMs,
+                    resetFilters: true,
+                    fromDrilldown: true,
+                });
+            } else {
+                openOptionLogsPanel(sym, {
+                    startFilter: '',
+                    stopFilter: '',
+                    focusEpochMs: null,
+                    resetFilters: true,
+                    fromDrilldown: true,
+                });
+            }
+        }
+
+        async function fetchOptionLogDetails() {
+            const pane = document.getElementById('optLogDetailsPane');
+            const t = optionLogDetailsTarget;
+            if (!pane || !t) return;
+            pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-12 mono">Loading triggering BUY &amp; SELL log entries (±3 context rows) for ${escSvg(t.contract || t.symbol)}...</div>`;
+
+            if (_optLogDetailsAbortCtrl) {
+                try { _optLogDetailsAbortCtrl.abort(); } catch (_) {}
+            }
+            _optLogDetailsAbortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const reqSeq = ++_optLogDetailsReqSeq;
+
+            try {
+                const params = new URLSearchParams();
+                if (t.symbol) params.set('symbol', t.symbol);
+                if (t.contract) params.set('contract', t.contract);
+                const buyMs = t.buyUtc ? Date.parse(t.buyUtc) : NaN;
+                const sellMs = t.sellUtc ? Date.parse(t.sellUtc) : NaN;
+                if (Number.isFinite(buyMs) && buyMs > 0) params.set('buy_ms', String(buyMs));
+                if (Number.isFinite(sellMs) && sellMs > 0) params.set('sell_ms', String(sellMs));
+                params.set('context', '3');
+                params.set('_ts', String(Date.now()));
+
+                const fetchOpts = { cache: 'no-store' };
+                if (_optLogDetailsAbortCtrl) fetchOpts.signal = _optLogDetailsAbortCtrl.signal;
+                const res = await fetch(`/api/option-log-details?${params.toString()}`, fetchOpts);
+                const data = await res.json();
+                if (reqSeq !== _optLogDetailsReqSeq) return;
+                if (res.ok && data && data.status === 'ok') {
+                    latestOptionLogDetails = data;
+                    renderOptionLogDetailsPanel();
+                } else {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-10 mono">Failed to load log details: ${escSvg((data && data.message) || 'Unknown error')}</div>`;
+                }
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-10 mono">Error loading log details: ${escSvg(err.message)}</div>`;
+            }
+        }
+
+        function _renderOptionLogDetailRow(e) {
+            const isBuy = e.stream === 'BUY';
+            const isTrigger = !!e.is_trigger;
+            const offset = Number(e.offset || 0);
+            const streamBadge = isBuy
+                ? `<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold">BUY</span>`
+                : `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-bold">SELL</span>`;
+
+            const dec = String(e.decision || e.event || 'INFO');
+            const decUpper = dec.toUpperCase();
+            let decCls = 'bg-slate-800 text-slate-300 border-slate-700';
+            if (decUpper.includes('QUALIFIED_SUBMITTED') || decUpper.includes('QUALIFIED_DRY_RUN') || decUpper.includes('SUBMITTED') || decUpper.includes('DRY_RUN')) {
+                decCls = 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40';
+            } else if (decUpper.includes('REJECTED') || decUpper.includes('FAILED')) {
+                decCls = 'bg-rose-500/15 text-rose-300 border-rose-500/40';
+            } else if (decUpper.includes('HOLD') || decUpper.includes('WATCH') || decUpper.includes('SKIPPED')) {
+                decCls = 'bg-amber-500/15 text-amber-300 border-amber-500/40';
+            }
+
+            const pnlVal = e.pnl_pct && e.pnl_pct !== 'n/a' ? String(e.pnl_pct) : '--';
+            const pnlCls = pnlVal.startsWith('+') ? 'text-emerald-400' : (pnlVal.startsWith('-') ? 'text-rose-400' : 'text-slate-400');
+            const vVal = e.v && e.v !== 'n/a' ? String(e.v) : '--';
+            const vCls = vVal.startsWith('+') ? 'text-emerald-300' : (vVal.startsWith('-') ? 'text-rose-300' : 'text-slate-400');
+            const aVal = e.a && e.a !== 'n/a' ? String(e.a) : '--';
+            const pdVal = e.projected_delta && e.projected_delta !== 'n/a' ? String(e.projected_delta) : '--';
+            const symLabel = e.symbol && e.symbol !== 'none' ? e.symbol : '--';
+            const contractLabel = e.contract && e.contract !== 'n/a' && e.contract !== 'none' && e.contract !== symLabel ? e.contract : '';
+            const reasonText = e.reason || e.raw_message || e.event || '';
+            const timeFmt = _formatLogTimeInBrowserTz(e);
+
+            const offsetBadge = isTrigger
+                ? (isBuy
+                    ? '<span class="ml-1.5 px-1.5 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/50 text-[9px] font-bold">BUY TRIGGER</span>'
+                    : '<span class="ml-1.5 px-1.5 py-0.5 rounded bg-amber-500/25 text-amber-200 border border-amber-400/50 text-[9px] font-bold">SELL TRIGGER</span>')
+                : `<span class="ml-1.5 px-1 py-0.5 rounded bg-slate-800/90 text-slate-400 border border-slate-700/80 text-[9px] font-semibold">${offset > 0 ? '+' + offset : String(offset)}</span>`;
+
+            const rowCls = isTrigger
+                ? (isBuy
+                    ? 'bg-emerald-500/15 hover:bg-emerald-500/20 align-top border-b border-emerald-500/40 ring-1 ring-inset ring-emerald-400/40'
+                    : 'bg-amber-500/15 hover:bg-amber-500/20 align-top border-b border-amber-500/40 ring-1 ring-inset ring-amber-400/40')
+                : 'hover:bg-slate-900/70 align-top border-b border-slate-800/50';
+
+            return `
+                <tr class="${rowCls}">
+                    <td class="px-2.5 py-2 text-slate-300 whitespace-nowrap" title="${escSvg(timeFmt.title)}">${escSvg(timeFmt.shortLabel)}${offsetBadge}</td>
+                    <td class="px-2 py-2 whitespace-nowrap">${streamBadge}</td>
+                    <td class="px-2.5 py-2 whitespace-nowrap">
+                        <div class="font-bold text-white">${escSvg(symLabel)}</div>
+                        ${contractLabel ? `<div class="text-[9.5px] text-slate-400">${escSvg(contractLabel)}</div>` : ''}
+                    </td>
+                    <td class="px-2 py-2 text-indigo-300 whitespace-nowrap">${escSvg(e.provider || '--')}</td>
+                    <td class="px-2 py-2 text-right text-slate-200 whitespace-nowrap">${escSvg(e.rsi && e.rsi !== 'n/a' ? e.rsi : '--')}</td>
+                    <td class="px-2 py-2 text-right font-semibold ${_rsi30ColorClass(e.rsi_30d)} whitespace-nowrap">${escSvg(e.rsi_30d && e.rsi_30d !== 'n/a' ? e.rsi_30d : '--')}</td>
+                    <td class="px-2 py-2 text-right ${vCls} whitespace-nowrap">${escSvg(vVal)}</td>
+                    <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(aVal)}</td>
+                    <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(pdVal)}</td>
+                    <td class="px-2 py-2 text-right font-semibold ${pnlCls} whitespace-nowrap">${escSvg(pnlVal)}</td>
+                    <td class="px-2 py-2 whitespace-nowrap">
+                        <span class="inline-block px-1.5 py-0.5 rounded border text-[9.5px] font-semibold ${decCls}">${escSvg(dec)}</span>
+                    </td>
+                    <td class="px-2.5 py-2 text-slate-300 break-words min-w-[240px]">${escSvg(reasonText)}</td>
+                </tr>
+            `;
+        }
+
+        function renderOptionLogDetailsPanel() {
+            const pane = document.getElementById('optLogDetailsPane');
+            const badge = document.getElementById('optLogDetailsBadge');
+            const sub = document.getElementById('optLogDetailsSubtitle');
+            if (!pane || !latestOptionLogDetails) return;
+
+            const { tzName: browserTzName, tzAbbr: browserTzAbbr } = _getBrowserTzInfo();
+            const payload = latestOptionLogDetails;
+            const t = optionLogDetailsTarget || {};
+            const buyWin = payload.buy_window || { matched: false, entries: [] };
+            const sellWin = payload.sell_window || { applicable: false, matched: false, entries: [] };
+            const buyEntries = Array.isArray(buyWin.entries) ? buyWin.entries : [];
+            const sellEntries = Array.isArray(sellWin.entries) ? sellWin.entries : [];
+            const totalRows = buyEntries.length + sellEntries.length;
+
+            if (badge) {
+                badge.textContent = `${totalRows} ${totalRows === 1 ? 'row' : 'rows'} (BUY ${buyEntries.length} · SELL ${sellEntries.length})`;
+            }
+            if (sub) {
+                const fileParts = [];
+                if (payload.provider) fileParts.push(`Provider: ${payload.provider}`);
+                if (Array.isArray(payload.buyer_log_files) && payload.buyer_log_files.length) {
+                    fileParts.push(`Buyer: ${payload.buyer_log_files[0]}`);
+                }
+                if (Array.isArray(payload.seller_log_files) && payload.seller_log_files.length) {
+                    fileParts.push(`Seller: ${payload.seller_log_files[0]}`);
+                }
+                sub.textContent = fileParts.join(' · ') || 'Triggering BUY & SELL log entries (±3 context rows)';
+            }
+
+            const pnlColor = t.pnlPct !== null && t.pnlPct !== undefined
+                ? (t.pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400')
+                : 'text-slate-300';
+            const summaryStripHtml = `
+                <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-950/70 border border-slate-800 text-[11px] mono shrink-0">
+                    <div class="flex flex-wrap items-center gap-3">
+                        <span class="font-bold text-white">${escSvg(t.symbol || payload.symbol || '--')}</span>
+                        ${t.contract ? `<span class="text-cyan-300">${escSvg(t.contract)}</span>` : ''}
+                        <span class="text-slate-400">Entry: <strong class="text-slate-200">${t.entryPrice !== null && t.entryPrice !== undefined ? '$' + t.entryPrice.toFixed(2) : '--'}</strong></span>
+                        <span class="text-slate-400">${t.mode === 'buyer' ? 'Current' : 'Exit'}: <strong class="text-slate-200">${t.exitPrice !== null && t.exitPrice !== undefined ? '$' + t.exitPrice.toFixed(2) : '--'}</strong></span>
+                        ${t.pnlPct !== null && t.pnlPct !== undefined ? `<span class="font-semibold ${pnlColor}">P/L: ${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct.toFixed(2)}%${t.pnlDollars !== null && t.pnlDollars !== undefined ? ` (${fmtSignedDollars(t.pnlDollars)})` : ''}</span>` : ''}
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 text-[10px]">
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">BUY: ${buyEntries.length} rows (±${payload.context ?? 3})</span>
+                        <span class="px-2 py-0.5 rounded ${sellWin.applicable ? 'bg-amber-500/10 text-amber-300 border-amber-500/30' : 'bg-slate-800 text-slate-400 border-slate-700'} border">SELL: ${sellWin.applicable ? `${sellEntries.length} rows (±${payload.context ?? 3})` : 'Open Position'}</span>
+                    </div>
+                </div>
+            `;
+
+            const buySectionHeader = `
+                <tr class="bg-emerald-950/45 border-y border-emerald-500/30">
+                    <td colspan="12" class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-emerald-300">
+                        BUY TRANSACTION WINDOW — Triggering BUY Entry &amp; ±${payload.context ?? 3} Surrounding Entries
+                        ${t.buyUtc ? `<span class="ml-2 font-normal text-slate-400 normal-case">(Bought ${escSvg(fmtShortLocalTs(t.buyUtc))})</span>` : ''}
+                    </td>
+                </tr>
+            `;
+            const buyRowsHtml = buyEntries.length > 0
+                ? buyEntries.map(_renderOptionLogDetailRow).join('')
+                : `<tr><td colspan="12" class="px-4 py-5 text-center text-slate-500">No matching BUY log entry found in option_buyer logs for ${escSvg(t.symbol || payload.symbol || '--')}.</td></tr>`;
+
+            const sellSectionHeader = `
+                <tr class="bg-amber-950/40 border-y border-amber-500/30">
+                    <td colspan="12" class="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                        SELL TRANSACTION WINDOW — Triggering SELL Entry &amp; ±${payload.context ?? 3} Surrounding Entries
+                        ${t.sellUtc ? `<span class="ml-2 font-normal text-slate-400 normal-case">(Sold ${escSvg(fmtShortLocalTs(t.sellUtc))})</span>` : '<span class="ml-2 font-normal text-slate-400 normal-case">(Open contract — no sell transaction yet)</span>'}
+                    </td>
+                </tr>
+            `;
+            const sellRowsHtml = sellEntries.length > 0
+                ? sellEntries.map(_renderOptionLogDetailRow).join('')
+                : (sellWin.applicable
+                    ? `<tr><td colspan="12" class="px-4 py-5 text-center text-slate-500">No matching SELL log entry found in option_seller logs for ${escSvg(t.contract || t.symbol || '--')}.</td></tr>`
+                    : `<tr><td colspan="12" class="px-4 py-4 text-center text-slate-500">Contract is currently open — SELL log entries will appear once Option Seller exits this position.</td></tr>`);
+
+            pane.innerHTML = `
+                ${summaryStripHtml}
+                <div class="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-800/80 bg-slate-950/60">
+                    <table class="w-full text-left text-[11px] mono border-collapse">
+                        <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
+                            <tr>
+                                <th class="px-2.5 py-2 whitespace-nowrap" title="Timestamps displayed in browser timezone (${escSvg(browserTzName)})">Time (${escSvg(browserTzAbbr)})</th>
+                                <th class="px-2 py-2">Side</th>
+                                <th class="px-2.5 py-2">Symbol / Contract</th>
+                                <th class="px-2 py-2">Provider</th>
+                                <th class="px-2 py-2 text-right">RSI</th>
+                                <th class="px-2 py-2 text-right">30D RSI</th>
+                                <th class="px-2 py-2 text-right">v</th>
+                                <th class="px-2 py-2 text-right">a</th>
+                                <th class="px-2 py-2 text-right">&Delta;P&#770;</th>
+                                <th class="px-2 py-2 text-right">P/L %</th>
+                                <th class="px-2 py-2">Decision</th>
+                                <th class="px-2.5 py-2">Reason / Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${buySectionHeader}
+                            ${buyRowsHtml}
+                            ${sellSectionHeader}
+                            ${sellRowsHtml}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function openOptionLogsFromDrilldown() {
+            const { selectedItem } = _getSelectedDrilldownContract();
+            const sym = selectedItem ? String(selectedItem.underlying || selectedItem.contract || '').trim().toUpperCase() : '';
+            const buyRaw = selectedItem ? (selectedItem.purchased_at_utc || selectedItem.purchased_minute_utc || '') : '';
+            const buyMs = buyRaw ? Date.parse(buyRaw) : NaN;
+            if (Number.isFinite(buyMs) && buyMs > 0) {
+                const WINDOW_BEFORE_MS = 5 * 60 * 1000;
+                const WINDOW_AFTER_MS = 5 * 60 * 1000;
+                openOptionLogsPanel(sym, {
+                    startFilter: _formatEpochMsToLocalDateTimeInput(buyMs - WINDOW_BEFORE_MS),
+                    stopFilter: _formatEpochMsToLocalDateTimeInput(buyMs + WINDOW_AFTER_MS),
+                    focusEpochMs: buyMs,
+                    resetFilters: true,
+                    fromDrilldown: true,
+                });
+            } else {
+                openOptionLogsPanel(sym, {
+                    startFilter: '',
+                    stopFilter: '',
+                    focusEpochMs: null,
+                    resetFilters: true,
+                    fromDrilldown: true,
+                });
+            }
+        }
+
+        async function openOptionLogsPanel(symbolFilter = '', opts = null) {
             if (typeof symbolFilter === 'string') {
                 optionLogSearchFilter = symbolFilter.trim().toUpperCase();
             }
+            const hasOpts = opts && typeof opts === 'object';
+            if (hasOpts) {
+                if (opts.resetFilters) {
+                    optionLogStreamFilter = 'all';
+                    optionLogDecisionFilter = 'all';
+                }
+                if (typeof opts.startFilter === 'string') {
+                    optionLogStartFilter = opts.startFilter.trim();
+                }
+                if (typeof opts.stopFilter === 'string') {
+                    optionLogStopFilter = opts.stopFilter.trim();
+                }
+                optionLogFocusEpochMs = (typeof opts.focusEpochMs === 'number' && Number.isFinite(opts.focusEpochMs) && opts.focusEpochMs > 0)
+                    ? opts.focusEpochMs
+                    : null;
+                _optionLogTimeFromDrilldown = !!opts.fromDrilldown;
+            } else {
+                optionLogFocusEpochMs = null;
+                if (_optionLogTimeFromDrilldown) {
+                    optionLogStartFilter = '';
+                    optionLogStopFilter = '';
+                    _optionLogTimeFromDrilldown = false;
+                }
+            }
+            if (_optionLogTimeDebounce) {
+                clearTimeout(_optionLogTimeDebounce);
+                _optionLogTimeDebounce = null;
+            }
+            const startInp = document.getElementById('optLogStartInput');
+            const stopInp = document.getElementById('optLogStopInput');
+            if (startInp) startInp.value = optionLogStartFilter;
+            if (stopInp) stopInp.value = optionLogStopFilter;
             const modal = document.getElementById('optionLogsModal');
             if (modal) {
                 modal.classList.remove('hidden');
@@ -24062,6 +26699,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (_optionLogSearchDebounce) {
                 clearTimeout(_optionLogSearchDebounce);
                 _optionLogSearchDebounce = null;
+            }
+            if (_optionLogTimeDebounce) {
+                clearTimeout(_optionLogTimeDebounce);
+                _optionLogTimeDebounce = null;
             }
             const modal = document.getElementById('optionLogsModal');
             if (modal) modal.classList.add('hidden');
@@ -24126,18 +26767,69 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function _scheduleOptionLogTimeFetch() {
+            if (_optionLogTimeDebounce) {
+                clearTimeout(_optionLogTimeDebounce);
+                _optionLogTimeDebounce = null;
+            }
+            _optionLogTimeDebounce = setTimeout(() => {
+                _optionLogTimeDebounce = null;
+                fetchOptionLogs(true);
+            }, 150);
+        }
+
+        function setOptionLogStartFilter(val) {
+            optionLogStartFilter = String(val || '').trim();
+            optionLogFocusEpochMs = null;
+            _optionLogTimeFromDrilldown = false;
+            renderOptionLogsPanel(false, true);
+            _scheduleOptionLogTimeFetch();
+        }
+
+        function setOptionLogStopFilter(val) {
+            optionLogStopFilter = String(val || '').trim();
+            optionLogFocusEpochMs = null;
+            _optionLogTimeFromDrilldown = false;
+            renderOptionLogsPanel(false, true);
+            _scheduleOptionLogTimeFetch();
+        }
+
+        function clearOptionLogTimeFilters() {
+            optionLogStartFilter = '';
+            optionLogStopFilter = '';
+            optionLogFocusEpochMs = null;
+            _optionLogTimeFromDrilldown = false;
+            const startInp = document.getElementById('optLogStartInput');
+            const stopInp = document.getElementById('optLogStopInput');
+            if (startInp) startInp.value = '';
+            if (stopInp) stopInp.value = '';
+            if (_optionLogTimeDebounce) {
+                clearTimeout(_optionLogTimeDebounce);
+                _optionLogTimeDebounce = null;
+            }
+            renderOptionLogsPanel(false, true);
+            fetchOptionLogs(true);
+        }
+
         function renderOptionLogsPanel(preserveInputFocus = false, resetScroll = false) {
             const logsEl = document.getElementById('optLogsPane');
             if (!logsEl) return;
-            const prevScroll = resetScroll ? 0 : (document.getElementById('optLogsScrollContainer')?.scrollTop || 0);
+            const existingScrollBox = document.getElementById('optLogsScrollContainer');
+            const prevScrollTop = resetScroll ? 0 : (existingScrollBox ? existingScrollBox.scrollTop : 0);
+            const prevScrollLeft = resetScroll ? 0 : (existingScrollBox ? existingScrollBox.scrollLeft : 0);
             const activeEl = document.activeElement;
             const wasSearchFocused = !!(activeEl && activeEl.id === 'optLogSearchInput');
+            const wasStartFocused = !!(activeEl && activeEl.id === 'optLogStartInput');
+            const wasStopFocused = !!(activeEl && activeEl.id === 'optLogStopInput');
             const selStart = wasSearchFocused ? activeEl.selectionStart : null;
             const selEnd = wasSearchFocused ? activeEl.selectionEnd : null;
             const shouldFocusSearch = preserveInputFocus || wasSearchFocused;
             const payload = latestOptionLogs || { entries: [], buyer_log_file: null, seller_log_file: null, counts: {}, filters: {} };
             const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
             const q = optionLogSearchFilter.trim().toUpperCase();
+            const startMs = _parseLocalDateTimeInputToEpochMs(optionLogStartFilter, false);
+            const stopMs = _parseLocalDateTimeInputToEpochMs(optionLogStopFilter, true);
+            const { tzName: browserTzName, tzAbbr: browserTzAbbr } = _getBrowserTzInfo();
 
             const isEntryQualified = (e) => {
                 const dec = String(e.decision || '').toUpperCase();
@@ -24165,12 +26857,25 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return true;
             };
 
-            const searchMatched = q
-                ? allEntries.filter(e => {
-                      const hay = `${e.symbol || ''} ${e.contract || ''} ${e.provider || ''} ${e.reason || ''} ${e.event || ''}`.toUpperCase();
-                      return hay.includes(q);
-                  })
-                : allEntries;
+            const matchesTimeFilter = (e) => {
+                if (startMs === null && stopMs === null) return true;
+                const epMs = typeof e.timestamp_epoch_ms === 'number' && Number.isFinite(e.timestamp_epoch_ms) && e.timestamp_epoch_ms > 0
+                    ? e.timestamp_epoch_ms
+                    : null;
+                if (epMs === null) return false;
+                if (startMs !== null && epMs < startMs) return false;
+                if (stopMs !== null && epMs > stopMs) return false;
+                return true;
+            };
+
+            const searchMatched = allEntries.filter(e => {
+                if (!matchesTimeFilter(e)) return false;
+                if (q) {
+                    const hay = `${e.symbol || ''} ${e.contract || ''} ${e.provider || ''} ${e.reason || ''} ${e.event || ''}`.toUpperCase();
+                    if (!hay.includes(q)) return false;
+                }
+                return true;
+            });
 
             const sidePool = optionLogDecisionFilter === 'all'
                 ? searchMatched
@@ -24181,10 +26886,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const srvFilters = payload.filters || {};
             const srvCounts = payload.counts || {};
+            const srvStartMs = typeof srvFilters.start_ms === 'number' ? srvFilters.start_ms : null;
+            const srvStopMs = typeof srvFilters.stop_ms === 'number' ? srvFilters.stop_ms : null;
             const hasServerCounts = typeof srvCounts.total === 'number'
                 && String(srvFilters.q || '').trim().toUpperCase() === q
                 && String(srvFilters.stream || 'all').toUpperCase() === String(optionLogStreamFilter || 'all').toUpperCase()
-                && String(srvFilters.decision || 'all').toUpperCase() === String(optionLogDecisionFilter || 'all').toUpperCase();
+                && String(srvFilters.decision || 'all').toUpperCase() === String(optionLogDecisionFilter || 'all').toUpperCase()
+                && srvStartMs === startMs
+                && srvStopMs === stopMs;
 
             const countAllSide = hasServerCounts ? Number(srvCounts.total || 0) : sidePool.length;
             const countBuySide = hasServerCounts ? Number(srvCounts.buy || 0) : sidePool.filter(e => e.stream === 'BUY').length;
@@ -24198,8 +26907,38 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return true;
             });
 
-            const rowsHtml = filtered.map(e => {
+            let focusRowIdx = -1;
+            if (typeof optionLogFocusEpochMs === 'number' && Number.isFinite(optionLogFocusEpochMs) && optionLogFocusEpochMs > 0 && filtered.length > 0) {
+                let bestBuyIdx = -1;
+                let bestBuyScore = Infinity;
+                let bestAnyIdx = -1;
+                let bestAnyDiff = Infinity;
+                for (let idx = 0; idx < filtered.length; idx++) {
+                    const row = filtered[idx];
+                    const epMs = typeof row.timestamp_epoch_ms === 'number' && Number.isFinite(row.timestamp_epoch_ms) && row.timestamp_epoch_ms > 0
+                        ? row.timestamp_epoch_ms
+                        : null;
+                    if (epMs === null) continue;
+                    const diff = Math.abs(epMs - optionLogFocusEpochMs);
+                    if (diff < bestAnyDiff) {
+                        bestAnyDiff = diff;
+                        bestAnyIdx = idx;
+                    }
+                    if (row.stream === 'BUY' && diff <= 120000) {
+                        const qualBonus = isEntryQualified(row) ? -15000 : 0;
+                        const score = diff + qualBonus;
+                        if (score < bestBuyScore) {
+                            bestBuyScore = score;
+                            bestBuyIdx = idx;
+                        }
+                    }
+                }
+                focusRowIdx = bestBuyIdx >= 0 ? bestBuyIdx : bestAnyIdx;
+            }
+
+            const rowsHtml = filtered.map((e, rowIdx) => {
                 const isBuy = e.stream === 'BUY';
+                const isFocusRow = rowIdx === focusRowIdx;
                 const streamBadge = isBuy
                     ? `<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold">BUY</span>`
                     : `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px] font-bold">SELL</span>`;
@@ -24224,10 +26963,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const symLabel = e.symbol && e.symbol !== 'none' ? e.symbol : '--';
                 const contractLabel = e.contract && e.contract !== 'n/a' && e.contract !== 'none' && e.contract !== symLabel ? e.contract : '';
                 const reasonText = e.reason || e.raw_message || e.event || '';
+                const timeFmt = _formatLogTimeInBrowserTz(e);
+                const rowCls = isFocusRow
+                    ? 'bg-emerald-500/15 hover:bg-emerald-500/20 align-top border-b border-emerald-500/40 ring-1 ring-inset ring-emerald-400/40'
+                    : 'hover:bg-slate-900/70 align-top border-b border-slate-800/50';
 
                 return `
-                    <tr class="hover:bg-slate-900/70 align-top border-b border-slate-800/50">
-                        <td class="px-2.5 py-2 text-slate-300 whitespace-nowrap">${escSvg(e.timestamp_short || e.timestamp || '--')}</td>
+                    <tr${isFocusRow ? ' id="optLogFocusRow"' : ''} class="${rowCls}">
+                        <td class="px-2.5 py-2 text-slate-300 whitespace-nowrap" title="${escSvg(timeFmt.title)}">${escSvg(timeFmt.shortLabel)}${isFocusRow ? '<span class="ml-1.5 px-1 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/40 text-[9px] font-bold">BUY TIME</span>' : ''}</td>
                         <td class="px-2 py-2 whitespace-nowrap">${streamBadge}</td>
                         <td class="px-2.5 py-2 whitespace-nowrap">
                             <div class="font-bold text-white">${escSvg(symLabel)}</div>
@@ -24235,6 +26978,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </td>
                         <td class="px-2 py-2 text-indigo-300 whitespace-nowrap">${escSvg(e.provider || '--')}</td>
                         <td class="px-2 py-2 text-right text-slate-200 whitespace-nowrap">${escSvg(e.rsi && e.rsi !== 'n/a' ? e.rsi : '--')}</td>
+                        <td class="px-2 py-2 text-right font-semibold ${_rsi30ColorClass(e.rsi_30d)} whitespace-nowrap optlog-rsi30-col">${escSvg(e.rsi_30d && e.rsi_30d !== 'n/a' ? e.rsi_30d : '--')}</td>
                         <td class="px-2 py-2 text-right ${vCls} whitespace-nowrap">${escSvg(vVal)}</td>
                         <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(aVal)}</td>
                         <td class="px-2 py-2 text-right text-slate-300 whitespace-nowrap">${escSvg(pdVal)}</td>
@@ -24292,58 +27036,157 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 fileSubtitle.title = titleInfoParts.join('\n\n') || subTxt;
             }
 
-            logsEl.innerHTML = `
-
-                <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
-                    <div class="flex flex-wrap items-center gap-2">
-                        <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
-                            <button type="button" onclick="setOptionLogStreamFilter('all')" class="${streamBtnCls('all')}">All (${countAllSide})</button>
-                            <button type="button" onclick="setOptionLogStreamFilter('BUY')" class="${streamBtnCls('BUY')}">Buy (${countBuySide})</button>
-                            <button type="button" onclick="setOptionLogStreamFilter('SELL')" class="${streamBtnCls('SELL')}">Sell (${countSellSide})</button>
-                        </div>
-                        <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
-                            <button type="button" onclick="setOptionLogDecisionFilter('all')" class="${decBtnCls('all')}">All Decisions</button>
-                            <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${countQualified})</button>
-                            <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${countRejected})</button>
-                        </div>
-                        <div class="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/70 border border-slate-700/60 rounded-lg text-[11px]">
-                            <span class="text-slate-400">Next Minute:</span>
-                            <span id="optLogsMinuteCountdown" class="mono font-semibold text-amber-300">--s</span>
-                        </div>
-                    </div>
-                    <div class="flex items-center gap-1.5">
-                        <input id="optLogSearchInput" type="text" value="${escSvg(optionLogSearchFilter)}" oninput="setOptionLogSearchFilter(this.value)" placeholder="Filter symbol / contract / reason..." class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] text-white mono w-48 focus:outline-none focus:border-indigo-500">
-                        ${optionLogSearchFilter ? `<button type="button" onclick="setOptionLogSearchFilter('')" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold">Show All</button>` : ''}
-                    </div>
+            const filterPillsHtml = `
+                <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                    <button type="button" onclick="setOptionLogStreamFilter('all')" class="${streamBtnCls('all')}">All (${countAllSide})</button>
+                    <button type="button" onclick="setOptionLogStreamFilter('BUY')" class="${streamBtnCls('BUY')}">Buy (${countBuySide})</button>
+                    <button type="button" onclick="setOptionLogStreamFilter('SELL')" class="${streamBtnCls('SELL')}">Sell (${countSellSide})</button>
                 </div>
-
-                <div id="optLogsScrollContainer" class="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-800/80 bg-slate-950/60">
-                    <table class="w-full text-left text-[11px] mono border-collapse">
-                        <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
-                            <tr>
-                                <th class="px-2.5 py-2">Time</th>
-                                <th class="px-2 py-2">Side</th>
-                                <th class="px-2.5 py-2">Symbol / Contract</th>
-                                <th class="px-2 py-2">Provider</th>
-                                <th class="px-2 py-2 text-right">RSI</th>
-                                <th class="px-2 py-2 text-right">v</th>
-                                <th class="px-2 py-2 text-right">a</th>
-                                <th class="px-2 py-2 text-right">&Delta;P&#770;</th>
-                                <th class="px-2 py-2 text-right">P/L %</th>
-                                <th class="px-2 py-2">Decision</th>
-                                <th class="px-2.5 py-2">Reason / Details</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${rowsHtml || `<tr><td colspan="11" class="px-4 py-10 text-center text-slate-500">No log entries match the current filter.</td></tr>`}
-                        </tbody>
-                    </table>
+                <div class="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                    <button type="button" onclick="setOptionLogDecisionFilter('all')" class="${decBtnCls('all')}">All Decisions</button>
+                    <button type="button" onclick="setOptionLogDecisionFilter('QUALIFIED')" class="${decBtnCls('QUALIFIED')}">Qualified / Orders (${countQualified})</button>
+                    <button type="button" onclick="setOptionLogDecisionFilter('REJECTED')" class="${decBtnCls('REJECTED')}">Rejected / Hold (${countRejected})</button>
                 </div>
             `;
+            const clearBtnHtml = optionLogSearchFilter
+                ? `<button type="button" onclick="setOptionLogSearchFilter('')" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold">Show All</button>`
+                : '';
+            const timeClearBtnHtml = (optionLogStartFilter || optionLogStopFilter)
+                ? `<button type="button" onclick="clearOptionLogTimeFilters()" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[10px] font-semibold whitespace-nowrap" title="Clear Start &amp; Stop date/time filters">Clear</button>`
+                : '';
+            const showOptLogRsi30 = true;
+            const emptyMsg = (startMs !== null && stopMs !== null && startMs > stopMs)
+                ? 'Start date/time is after Stop date/time — adjust the range to view rows.'
+                : 'No log entries match the current filter.';
+            const finalRowsHtml = rowsHtml || `<tr><td colspan="12" class="px-4 py-10 text-center text-slate-500">${emptyMsg}</td></tr>`;
+
+            const existingTbody = document.getElementById('optLogsTableBody');
+            const existingFilterPills = document.getElementById('optLogsFilterPills');
+            const existingClearWrap = document.getElementById('optLogsClearBtnWrap');
+            const existingTimeClearWrap = document.getElementById('optLogsTimeClearWrap');
+
+            if (existingScrollBox && existingTbody && existingFilterPills && existingClearWrap && existingTimeClearWrap) {
+                // Keep #optLogsScrollContainer and filter inputs mounted across live 2.5s polls
+                // so active horizontal/vertical scrollbar drags and date/time pickers are never interrupted.
+                const thRsi30 = document.getElementById('optLogsThRsi30');
+                if (thRsi30) thRsi30.classList.remove('hidden');
+                if (existingFilterPills.dataset.lastHtml !== filterPillsHtml) {
+                    existingFilterPills.innerHTML = filterPillsHtml;
+                    existingFilterPills.dataset.lastHtml = filterPillsHtml;
+                }
+                if (existingClearWrap.dataset.lastHtml !== clearBtnHtml) {
+                    existingClearWrap.innerHTML = clearBtnHtml;
+                    existingClearWrap.dataset.lastHtml = clearBtnHtml;
+                }
+                if (existingTimeClearWrap.dataset.lastHtml !== timeClearBtnHtml) {
+                    existingTimeClearWrap.innerHTML = timeClearBtnHtml;
+                    existingTimeClearWrap.dataset.lastHtml = timeClearBtnHtml;
+                }
+                const inp = document.getElementById('optLogSearchInput');
+                if (inp && !wasSearchFocused && inp.value !== optionLogSearchFilter) {
+                    inp.value = optionLogSearchFilter;
+                }
+                const startInp = document.getElementById('optLogStartInput');
+                if (startInp && !wasStartFocused && startInp.value !== optionLogStartFilter) {
+                    startInp.value = optionLogStartFilter;
+                }
+                const stopInp = document.getElementById('optLogStopInput');
+                if (stopInp && !wasStopFocused && stopInp.value !== optionLogStopFilter) {
+                    stopInp.value = optionLogStopFilter;
+                }
+                if (existingTbody.dataset.lastHtml !== finalRowsHtml) {
+                    existingTbody.innerHTML = finalRowsHtml;
+                    existingTbody.dataset.lastHtml = finalRowsHtml;
+                }
+                if (resetScroll) {
+                    const focusRow = document.getElementById('optLogFocusRow');
+                    if (focusRow) {
+                        existingScrollBox.scrollTop = Math.max(0, focusRow.offsetTop - Math.floor(existingScrollBox.clientHeight / 2) + Math.floor(focusRow.offsetHeight / 2));
+                    } else {
+                        existingScrollBox.scrollTop = 0;
+                    }
+                    existingScrollBox.scrollLeft = 0;
+                } else {
+                    existingScrollBox.scrollTop = prevScrollTop;
+                    existingScrollBox.scrollLeft = prevScrollLeft;
+                }
+            } else {
+                logsEl.innerHTML = `
+
+                    <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <div id="optLogsFilterPills" class="flex flex-wrap items-center gap-2">${filterPillsHtml}</div>
+                            <div class="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/70 border border-slate-700/60 rounded-lg text-[11px]">
+                                <span class="text-slate-400">Next Minute:</span>
+                                <span id="optLogsMinuteCountdown" class="mono font-semibold text-amber-300">--s</span>
+                            </div>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-1.5">
+                            <label class="inline-flex items-center gap-1 bg-slate-950 border border-slate-800 focus-within:border-indigo-500 rounded-lg px-2 py-0.5 text-[10.5px] text-slate-400" title="Filter rows from this Start date/time (${escSvg(browserTzName)} · ${escSvg(browserTzAbbr)})">
+                                <span class="uppercase text-[9.5px] font-semibold tracking-wider text-slate-400">Start</span>
+                                <input id="optLogStartInput" type="datetime-local" value="${escSvg(optionLogStartFilter)}" onchange="setOptionLogStartFilter(this.value)" oninput="setOptionLogStartFilter(this.value)" class="bg-transparent text-[11px] text-white mono focus:outline-none [color-scheme:dark]">
+                            </label>
+                            <label class="inline-flex items-center gap-1 bg-slate-950 border border-slate-800 focus-within:border-indigo-500 rounded-lg px-2 py-0.5 text-[10.5px] text-slate-400" title="Filter rows up through this Stop date/time (${escSvg(browserTzName)} · ${escSvg(browserTzAbbr)})">
+                                <span class="uppercase text-[9.5px] font-semibold tracking-wider text-slate-400">Stop</span>
+                                <input id="optLogStopInput" type="datetime-local" value="${escSvg(optionLogStopFilter)}" onchange="setOptionLogStopFilter(this.value)" oninput="setOptionLogStopFilter(this.value)" class="bg-transparent text-[11px] text-white mono focus:outline-none [color-scheme:dark]">
+                            </label>
+                            <span id="optLogsTzBadge" class="px-1.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700/70 text-[10px] mono text-cyan-300 whitespace-nowrap" title="Browser local timezone: ${escSvg(browserTzName)}">${escSvg(browserTzAbbr)}</span>
+                            <span id="optLogsTimeClearWrap">${timeClearBtnHtml}</span>
+                            <input id="optLogSearchInput" type="text" value="${escSvg(optionLogSearchFilter)}" oninput="setOptionLogSearchFilter(this.value)" placeholder="Filter symbol / contract / reason..." class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] text-white mono w-44 focus:outline-none focus:border-indigo-500">
+                            <span id="optLogsClearBtnWrap">${clearBtnHtml}</span>
+                        </div>
+                    </div>
+
+                    <div id="optLogsScrollContainer" class="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-800/80 bg-slate-950/60">
+                        <table class="w-full text-left text-[11px] mono border-collapse">
+                            <thead class="sticky top-0 z-10 bg-slate-950 text-slate-400 border-b border-slate-800 text-[10px] uppercase">
+                                <tr>
+                                    <th class="px-2.5 py-2 whitespace-nowrap" title="Timestamps displayed in browser timezone (${escSvg(browserTzName)})">Time (${escSvg(browserTzAbbr)})</th>
+                                    <th class="px-2 py-2">Side</th>
+                                    <th class="px-2.5 py-2">Symbol / Contract</th>
+                                    <th class="px-2 py-2">Provider</th>
+                                    <th class="px-2 py-2 text-right">RSI</th>
+                                    <th id="optLogsThRsi30" class="px-2 py-2 text-right">30D RSI</th>
+                                    <th class="px-2 py-2 text-right">v</th>
+                                    <th class="px-2 py-2 text-right">a</th>
+                                    <th class="px-2 py-2 text-right">&Delta;P&#770;</th>
+                                    <th class="px-2 py-2 text-right">P/L %</th>
+                                    <th class="px-2 py-2">Decision</th>
+                                    <th class="px-2.5 py-2">Reason / Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="optLogsTableBody">
+                                ${finalRowsHtml}
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+                const newFilterPills = document.getElementById('optLogsFilterPills');
+                if (newFilterPills) newFilterPills.dataset.lastHtml = filterPillsHtml;
+                const newClearWrap = document.getElementById('optLogsClearBtnWrap');
+                if (newClearWrap) newClearWrap.dataset.lastHtml = clearBtnHtml;
+                const newTimeClearWrap = document.getElementById('optLogsTimeClearWrap');
+                if (newTimeClearWrap) newTimeClearWrap.dataset.lastHtml = timeClearBtnHtml;
+                const newTbody = document.getElementById('optLogsTableBody');
+                if (newTbody) newTbody.dataset.lastHtml = finalRowsHtml;
+                const scrollBox = document.getElementById('optLogsScrollContainer');
+                if (scrollBox) {
+                    if (resetScroll) {
+                        const focusRow = document.getElementById('optLogFocusRow');
+                        if (focusRow) {
+                            scrollBox.scrollTop = Math.max(0, focusRow.offsetTop - Math.floor(scrollBox.clientHeight / 2) + Math.floor(focusRow.offsetHeight / 2));
+                        } else {
+                            scrollBox.scrollTop = 0;
+                        }
+                        scrollBox.scrollLeft = 0;
+                    } else {
+                        scrollBox.scrollTop = prevScrollTop;
+                        scrollBox.scrollLeft = prevScrollLeft;
+                    }
+                }
+            }
 
             updateCountdown();
-            const scrollBox = document.getElementById('optLogsScrollContainer');
-            if (scrollBox) scrollBox.scrollTop = prevScroll;
             if (shouldFocusSearch) {
                 const inp = document.getElementById('optLogSearchInput');
                 if (inp) {
@@ -25303,20 +28146,43 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     : `Wins: ${sum.win_count ?? 0} · Losses: ${sum.loss_count ?? 0}`;
             }
 
-            // Contract List & Selection (preserve scroll position)
+            // Contract List & Selection (preserve vertical & horizontal scroll positions)
             const listEl = document.getElementById('optContractList');
             const detailEl = document.getElementById('optContractDetailPane');
             const items = isBuyer ? openList : closedList;
-            const prevScroll = listEl ? listEl.scrollTop : 0;
+            const prevListTop = listEl ? listEl.scrollTop : 0;
+            const prevListLeft = listEl ? listEl.scrollLeft : 0;
+            const prevDetailTop = detailEl ? detailEl.scrollTop : 0;
+            const prevDetailLeft = detailEl ? detailEl.scrollLeft : 0;
+            const prevLedgerBox = document.getElementById('optLedgerScrollContainer');
+            const prevLedgerTop = prevLedgerBox ? prevLedgerBox.scrollTop : 0;
+            const prevLedgerLeft = prevLedgerBox ? prevLedgerBox.scrollLeft : 0;
 
             if (items.length === 0) {
+                const drillLogBtn = document.getElementById('btnOptDrilldownBuySellLog');
+                if (drillLogBtn) {
+                    drillLogBtn.title = 'View Buy/Sell Log Details (±3 entries around triggering buy/sell)';
+                }
+                const findBestBtn = document.getElementById('btnOptDrilldownFindBest');
+                if (findBestBtn) {
+                    if (FINDBEST_ENABLED && !isBuyer) {
+                        findBestBtn.classList.remove('hidden');
+                        findBestBtn.disabled = true;
+                        findBestBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                        findBestBtn.title = 'Select a closed contract to run Find Best analysis';
+                    } else {
+                        findBestBtn.classList.add('hidden');
+                    }
+                }
                 const syncLabel = _formatBrokerSyncLabel(activeProv);
                 listEl.innerHTML = `
                     <div class="p-4 rounded-xl bg-slate-950/60 border border-slate-800/70 text-center space-y-1.5">
                         <div class="text-xs font-semibold text-slate-300">No ${isBuyer ? 'Open' : 'Closed'} Contracts Found</div>
                         <p class="text-[11px] text-slate-500">${isBuyer ? 'Open option positions or newly placed Option Buyer orders will appear here and track minute by minute.' : 'Completed Option Seller exits or historical closed orders will appear here.'}</p>
                     </div>`;
+                delete listEl.dataset.lastHtml;
                 detailEl.innerHTML = `<div class="text-xs text-slate-500 text-center py-12">No ${isBuyer ? 'open' : 'closed'} contracts available to chart. Click "${syncLabel}" if orders were placed outside this session.</div>`;
+                delete detailEl.dataset.lastHtml;
                 activeOptionHistoryPoints = [];
                 window._optChartState = null;
                 window._optActiveRenderParams = null;
@@ -25330,12 +28196,34 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (isBuyer) selectedBuyerContract = activeKey;
             else selectedSellerTradeId = activeKey;
 
+            const drillLogBtn = document.getElementById('btnOptDrilldownBuySellLog');
+            if (drillLogBtn) {
+                const activeSym = String((selectedItem && (selectedItem.underlying || selectedItem.contract)) || '').trim().toUpperCase();
+                drillLogBtn.title = activeSym
+                    ? `View Buy/Sell Log Details (±3 entries around buy/sell) for ${activeSym}`
+                    : 'View Buy/Sell Log Details (±3 entries around triggering buy/sell)';
+            }
+            const findBestBtn = document.getElementById('btnOptDrilldownFindBest');
+            if (findBestBtn) {
+                if (FINDBEST_ENABLED && !isBuyer) {
+                    findBestBtn.classList.remove('hidden', 'opacity-50', 'cursor-not-allowed');
+                    findBestBtn.disabled = false;
+                    const cSym = String((selectedItem && selectedItem.contract) || '').trim().toUpperCase();
+                    findBestBtn.title = cSym
+                        ? `Run Find Best exit & parms.ini tuning analysis for ${cSym}`
+                        : 'Run Find Best exit & parms.ini tuning analysis';
+                } else {
+                    findBestBtn.classList.add('hidden');
+                }
+            }
+
             const scopedKey = `${optionDrilldownMode}:${activeKey}`;
-            if (window._optPanState.activeContractKey !== scopedKey) {
+            const contractChanged = window._optPanState.activeContractKey !== scopedKey;
+            if (contractChanged) {
                 resetOptPanView(scopedKey);
             }
 
-            listEl.innerHTML = items.map(c => {
+            const nextListHtml = items.map(c => {
                 const k = getKey(c);
                 const selected = k === activeKey;
                 const pnlD = safeNum(isBuyer ? c.pnl_dollars : c.total_pnl_dollars) ?? 0;
@@ -25369,7 +28257,12 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 `;
             }).join('');
-            listEl.scrollTop = prevScroll;
+            if (listEl.dataset.lastHtml !== nextListHtml) {
+                listEl.innerHTML = nextListHtml;
+                listEl.dataset.lastHtml = nextListHtml;
+                listEl.scrollTop = prevListTop;
+                listEl.scrollLeft = prevListLeft;
+            }
 
             // Render Right Detail Pane for selectedItem
             const pts = selectedItem.history || [];
@@ -25520,7 +28413,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span>Minute-by-Minute History (${allChartPts.length} bars · ${pts.length}m hold${prePts.length ? ` · ${prePts.length}m pre-entry` : ''})</span>
                         <span class="font-normal text-slate-500">Newest First</span>
                     </div>
-                    <div class="max-h-52 overflow-y-auto">
+                    <div id="optLedgerScrollContainer" class="max-h-52 overflow-auto">
                         <table class="w-full text-left text-[11px] mono">
                             <thead class="sticky top-0 bg-slate-950 text-slate-400 border-b border-slate-800">
                                 <tr>
@@ -25541,6 +28434,18 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
             `;
+            if (contractChanged) {
+                detailEl.scrollTop = 0;
+                detailEl.scrollLeft = 0;
+            } else {
+                detailEl.scrollTop = prevDetailTop;
+                detailEl.scrollLeft = prevDetailLeft;
+                const newLedgerBox = document.getElementById('optLedgerScrollContainer');
+                if (newLedgerBox) {
+                    newLedgerBox.scrollTop = prevLedgerTop;
+                    newLedgerBox.scrollLeft = prevLedgerLeft;
+                }
+            }
 
             // Sync pan bar state & mount interactive hover/drag/wheel overlay
             (() => {
@@ -25555,6 +28460,490 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 _updateOptToolbarControls(tot, vis.length, maxOff, off, vis[0], vis[vis.length - 1]);
                 mountOptionChartInteractions();
             })();
+        }
+
+        // =========================================================================================
+        // FIND BEST — OPTION SELLER EXIT & PARMS.INI TUNING ANALYZER ([dashboard] findbest=true)
+        // =========================================================================================
+        let latestFindBest = null;
+        let findBestViewMode = 'combined'; // 'combined' | 'optionchains' | 'history'
+        let findBestRowFilter = 'all'; // 'all' | 'profit' | 'loss' | 'chain'
+        let findBestRowSort = 'time'; // 'time' | 'best' | 'worst'
+        let _findBestAbortCtrl = null;
+        let _findBestReqSeq = 0;
+        let _findBestLastItem = null;
+
+        function _fmtFindBestLocalTs(epochMs, fallbackIso = '') {
+            let ms = (typeof epochMs === 'number' && Number.isFinite(epochMs) && epochMs > 0) ? epochMs : NaN;
+            if (!Number.isFinite(ms) && fallbackIso) {
+                ms = Date.parse(fallbackIso);
+            }
+            if (!Number.isFinite(ms) || ms <= 0) {
+                return { short: '--', full: '--', title: '--' };
+            }
+            const d = new Date(ms);
+            const pad2 = (n) => String(n).padStart(2, '0');
+            const { tzAbbr } = _getBrowserTzInfo();
+            const md = `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+            const hms = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+            return {
+                short: `${md} ${hms}`,
+                full: `${d.getFullYear()}-${md} ${hms} ${tzAbbr}`,
+                title: `${d.getFullYear()}-${md} ${hms} ${tzAbbr} (UTC: ${d.toISOString()})`,
+            };
+        }
+
+        async function openFindBestFromDrilldown() {
+            if (!FINDBEST_ENABLED) return;
+            const data = latestOptionHistory || { open_contracts: [], closed_contracts: [] };
+            const closedItems = data.closed_contracts || [];
+            if (closedItems.length === 0) return;
+            const selectedItem = closedItems.find(c => c.trade_id === selectedSellerTradeId) || closedItems[0];
+            if (!selectedItem) return;
+            _findBestLastItem = selectedItem;
+            findBestViewMode = 'combined';
+            findBestRowFilter = 'all';
+            findBestRowSort = 'time';
+            const badge = document.getElementById('findBestContractBadge');
+            if (badge) badge.textContent = selectedItem.contract || '--';
+            const modal = document.getElementById('findBestModal');
+            if (modal) modal.classList.remove('hidden');
+            await fetchFindBestAnalysis(selectedItem);
+        }
+
+        function closeFindBestModal() {
+            if (_findBestAbortCtrl) {
+                try { _findBestAbortCtrl.abort(); } catch (_) {}
+                _findBestAbortCtrl = null;
+            }
+            const modal = document.getElementById('findBestModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function refreshFindBestAnalysis() {
+            if (_findBestLastItem) {
+                fetchFindBestAnalysis(_findBestLastItem);
+            }
+        }
+
+        function setFindBestViewMode(mode) {
+            findBestViewMode = mode || 'combined';
+            renderFindBestModal();
+        }
+
+        function setFindBestRowFilter(f) {
+            findBestRowFilter = f || 'all';
+            renderFindBestModal();
+        }
+
+        function setFindBestRowSort(s) {
+            findBestRowSort = s || 'time';
+            renderFindBestModal();
+        }
+
+        async function fetchFindBestAnalysis(selectedItem) {
+            if (!FINDBEST_ENABLED || !selectedItem) return;
+            const pane = document.getElementById('findBestPane');
+            const btn = document.getElementById('btnFindBestRefresh');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Analyzing...';
+            }
+            if (pane) {
+                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-14 mono">Scanning option chain captures &amp; 1-minute contract history between buy and sell...</div>`;
+            }
+            if (_findBestAbortCtrl) {
+                try { _findBestAbortCtrl.abort(); } catch (_) {}
+            }
+            _findBestAbortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const reqSeq = ++_findBestReqSeq;
+
+            const params = new URLSearchParams();
+            if (selectedItem.trade_id) params.set('trade_id', String(selectedItem.trade_id));
+            if (selectedItem.contract) params.set('contract', String(selectedItem.contract));
+            if (selectedItem.underlying) params.set('underlying', String(selectedItem.underlying));
+            if (selectedItem.purchased_at_utc) params.set('buy_utc', String(selectedItem.purchased_at_utc));
+            if (selectedItem.sold_at_utc) params.set('sell_utc', String(selectedItem.sold_at_utc));
+            if (selectedItem.entry_price != null) params.set('entry_price', String(selectedItem.entry_price));
+            if (selectedItem.exit_price != null) params.set('exit_price', String(selectedItem.exit_price));
+            if (selectedItem.qty != null) params.set('qty', String(selectedItem.qty));
+            params.set('_ts', String(Date.now()));
+
+            try {
+                const fetchOpts = { cache: 'no-store' };
+                if (_findBestAbortCtrl) fetchOpts.signal = _findBestAbortCtrl.signal;
+                const res = await fetch(`/api/findbest?${params.toString()}`, fetchOpts);
+                const payload = await res.json();
+                if (reqSeq !== _findBestReqSeq) return;
+                if (res.ok && payload && payload.status === 'ok') {
+                    latestFindBest = payload;
+                    const views = payload.views || {};
+                    const ocCount = (views.optionchains && views.optionchains.total_points) || 0;
+                    const combCount = (views.combined && views.combined.total_points) || 0;
+                    if (combCount === 0 && ocCount > 0) {
+                        findBestViewMode = 'optionchains';
+                    }
+                    renderFindBestModal();
+                } else if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-12 mono">Find Best analysis failed: ${escSvg((payload && payload.message) || 'Unknown error')}</div>`;
+                }
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-12 mono">Error running Find Best analysis: ${escSvg(err.message)}</div>`;
+                }
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Re-analyze';
+                }
+            }
+        }
+
+        function renderFindBestModal() {
+            const pane = document.getElementById('findBestPane');
+            if (!pane || !latestFindBest) return;
+            const d = latestFindBest;
+            const tr = d.trade || {};
+            const views = d.views || {};
+            const liveParams = d.current_parms || {};
+            const { tzName: browserTzName, tzAbbr: browserTzAbbr } = _getBrowserTzInfo();
+
+            const view = views[findBestViewMode] || views.combined || views.optionchains || views.history || {};
+            const totalPts = Number(view.total_points || 0);
+            const combPts = Number((views.combined && views.combined.total_points) || 0);
+            const ocPts = Number((views.optionchains && views.optionchains.total_points) || 0);
+            const histPts = Number((views.history && views.history.total_points) || 0);
+
+            const buyFmt = _fmtFindBestLocalTs(tr.buy_epoch_ms, tr.buy_utc);
+            const sellFmt = _fmtFindBestLocalTs(tr.sell_epoch_ms, tr.sell_utc);
+
+            const badge = document.getElementById('findBestContractBadge');
+            if (badge) badge.textContent = tr.contract || '--';
+            const sub = document.getElementById('findBestSubtitle');
+            if (sub) {
+                const holdStr = tr.hold_minutes != null ? fmtDurationMin(tr.hold_minutes) : '--';
+                sub.textContent = `${tr.underlying || '--'} · Qty ${tr.qty || 1} · Entry $${Number(tr.entry_price || 0).toFixed(2)} → Exit $${Number(tr.exit_price || 0).toFixed(2)} · Window (${browserTzAbbr}): ${buyFmt.short} → ${sellFmt.short} (${holdStr})`;
+                sub.title = `Browser TZ: ${browserTzName} · Buy: ${buyFmt.title} · Sell: ${sellFmt.title}`;
+            }
+
+            const fmtPct = (v) => (v === null || v === undefined || !Number.isFinite(Number(v))) ? '--' : `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+            const fmtDol = (v) => (v === null || v === undefined || !Number.isFinite(Number(v))) ? '--' : fmtSignedDollars(Number(v));
+            const fmtNum = (v, dec = 2) => (v === null || v === undefined || !Number.isFinite(Number(v))) ? '--' : Number(v).toFixed(dec);
+            const pctCls = (v) => (v === null || v === undefined || !Number.isFinite(Number(v))) ? 'text-slate-300' : (Number(v) > 0 ? 'text-emerald-400' : (Number(v) < 0 ? 'text-rose-400' : 'text-slate-300'));
+
+            const viewBtnCls = (m) => findBestViewMode === m
+                ? 'px-2.5 py-1 rounded-md bg-amber-600 text-white font-semibold'
+                : 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white';
+
+            const best = view.best_point || null;
+            const worst = view.worst_point || null;
+            const bestFmt = best ? _fmtFindBestLocalTs(best.timestamp_epoch_ms, best.timestamp_utc) : { short: '--', full: '--', title: '--' };
+            const worstFmt = worst ? _fmtFindBestLocalTs(worst.timestamp_epoch_ms, worst.timestamp_utc) : { short: '--', full: '--', title: '--' };
+
+            const actPnlPct = safeNum(tr.actual_pnl_pct);
+            const actPnlDol = safeNum(tr.actual_pnl_dollars);
+
+            // Top Source Switcher + Trade Context Bar
+            const sourceBarHtml = `
+                <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-[11px] mono">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="text-slate-400 uppercase text-[10px] font-bold">Data Source:</span>
+                        <div class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
+                            <button type="button" onclick="setFindBestViewMode('combined')" class="${viewBtnCls('combined')}">Combined (${combPts})</button>
+                            <button type="button" onclick="setFindBestViewMode('optionchains')" class="${viewBtnCls('optionchains')}">Option Chains Only (${ocPts})</button>
+                            <button type="button" onclick="setFindBestViewMode('history')" class="${viewBtnCls('history')}">1m Contract History (${histPts})</button>
+                        </div>
+                        <span class="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700 text-[10px]" title="All timestamps displayed in your browser timezone: ${escSvg(browserTzName)}">${escSvg(browserTzAbbr)}</span>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-3 text-[11px]">
+                        <span class="text-slate-400">Actual Exit: <strong class="${pctCls(actPnlPct)}">${fmtDol(actPnlDol)} (${fmtPct(actPnlPct)})</strong></span>
+                        <span class="text-slate-500">Scanned ${Number(d.chain_files_scanned || 0)} chain files (${Number(d.chain_files_in_window || 0)} in window)</span>
+                    </div>
+                </div>
+            `;
+
+            if (totalPts === 0) {
+                pane.innerHTML = sourceBarHtml + `
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 p-8 text-center space-y-2">
+                        <div class="text-sm font-semibold text-slate-200">No data points found for this source in the Buy → Sell timeframe</div>
+                        <p class="text-xs text-slate-400 max-w-xl mx-auto">
+                            ${findBestViewMode === 'optionchains'
+                                ? 'No saved logs/optionchains/*.json snapshots for this contract fell between the buy and sell timestamps. Switch to "Combined" or "1m Contract History" above to analyze the 1-minute tracked contract valuation data.'
+                                : 'No option chain captures or 1-minute contract history points were recorded between the buy and sell timestamps for this contract.'}
+                        </p>
+                    </div>
+                `;
+                return;
+            }
+
+            // 1. Five Core Summary KPI Cards
+            const kpiCardsHtml = `
+                <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3 mono">
+                    <div class="rounded-xl bg-slate-950/70 border border-slate-800 p-3.5 space-y-1">
+                        <div class="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Total Data Points</div>
+                        <div class="text-2xl font-bold text-white">${totalPts}</div>
+                        <div class="text-[10.5px] text-slate-400">Chain: <span class="text-amber-300 font-semibold">${Number(view.chain_points_count || 0)}</span> · 1m Bars: <span class="text-cyan-300 font-semibold">${Number(view.history_points_count || 0)}</span></div>
+                        <div class="text-[10px] text-slate-500">Breakeven: ${Number(view.breakeven_count || 0)} · Hold: ${tr.hold_minutes != null ? escSvg(fmtDurationMin(tr.hold_minutes)) : '--'}</div>
+                    </div>
+
+                    <div class="rounded-xl bg-emerald-950/25 border border-emerald-500/40 p-3.5 space-y-1">
+                        <div class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold">Most Profitable (Peak / MFE)</div>
+                        <div class="text-lg font-bold ${pctCls(best ? best.pnl_pct : null)}">${best ? `${fmtPct(best.pnl_pct)} (${fmtDol(best.pnl_dollars)})` : '--'}</div>
+                        <div class="text-[11px] font-semibold text-white" title="${escSvg(bestFmt.title)}">${escSvg(bestFmt.full)}</div>
+                        <div class="text-[10px] text-slate-300">Price $${best ? Number(best.price).toFixed(2) : '--'} · +${best && best.minutes_after_buy != null ? fmtNum(best.minutes_after_buy, 1) : '--'}m after buy (${best && best.hold_progress_pct != null ? fmtNum(best.hold_progress_pct, 0) : '--'}%)</div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/70 border border-emerald-800/50 p-3.5 space-y-1">
+                        <div class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold">Profitable Data Points</div>
+                        <div class="text-xl font-bold text-emerald-300">${Number(view.profitable_count || 0)} <span class="text-xs font-normal text-slate-400">(${fmtNum(view.profitable_pct_of_total, 1)}%)</span></div>
+                        <div class="text-[11px] text-slate-200">Avg: <strong class="text-emerald-400">${fmtPct(view.profitable_avg_pnl_pct)}</strong> (${fmtDol(view.profitable_avg_pnl_dollars)})</div>
+                        <div class="text-[10px] text-slate-400">Median: ${fmtPct(view.profitable_median_pnl_pct)}</div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/70 border border-rose-800/50 p-3.5 space-y-1">
+                        <div class="text-[10px] uppercase tracking-wider text-rose-400 font-bold">Losing Data Points</div>
+                        <div class="text-xl font-bold text-rose-300">${Number(view.losing_count || 0)} <span class="text-xs font-normal text-slate-400">(${fmtNum(view.losing_pct_of_total, 1)}%)</span></div>
+                        <div class="text-[11px] text-slate-200">Avg: <strong class="text-rose-400">${fmtPct(view.losing_avg_pnl_pct)}</strong> (${fmtDol(view.losing_avg_pnl_dollars)})</div>
+                        <div class="text-[10px] text-slate-400" title="${escSvg(worstFmt.title)}">Worst (MAE): <span class="text-rose-300">${worst ? fmtPct(worst.pnl_pct) : '--'}</span> @ ${escSvg(worstFmt.short)}</div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/70 border border-indigo-800/50 p-3.5 space-y-1">
+                        <div class="text-[10px] uppercase tracking-wider text-indigo-300 font-bold">Exit Efficiency &amp; Peak RSI</div>
+                        <div class="text-lg font-bold text-white">${view.exit_capture_efficiency_pct != null ? `${fmtNum(view.exit_capture_efficiency_pct, 1)}% captured` : 'No Profit Peak'}</div>
+                        <div class="text-[10.5px] text-amber-300">Left on table: ${fmtDol(view.profit_left_dollars)} (${fmtPct(view.profit_left_pct)})</div>
+                        <div class="text-[10px] text-slate-400">Peak RSI: <strong class="text-slate-200">${best && best.rsi != null ? fmtNum(best.rsi, 2) : '--'}</strong>${best && best.rsi_30d != null ? ` · 30D: <strong class="${_rsi30ColorClass(best.rsi_30d)}">${fmtNum(best.rsi_30d, 2)}</strong>` : ''} · v=${best && best.v != null ? (best.v >= 0 ? '+' : '') + fmtNum(best.v, 4) : '--'} · Post-Peak DD: ${fmtNum(view.post_peak_drawdown_pct, 2)}%</div>
+                    </div>
+                </div>
+            `;
+
+            // 2. Tuning Insights for lib/parms.ini
+            const insights = Array.isArray(view.tuning_insights) ? view.tuning_insights : [];
+            const insightsHtml = insights.length > 0 ? `
+                <div class="rounded-xl bg-indigo-950/20 border border-indigo-500/30 p-3.5 space-y-2">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="text-[11px] font-bold uppercase tracking-wider text-indigo-300">lib/parms.ini Parameter Tuning Takeaways</div>
+                        <div class="text-[10px] mono text-slate-400">
+                            Live Config: pt=${fmtNum(liveParams.profit_target_pct, 1)}% · rsi_high=${fmtNum(liveParams.rsi_high, 1)} · ts=${fmtNum(liveParams.trailing_activation_pct, 1)}%/${fmtNum(liveParams.trailing_drawdown_pct, 1)}% (v&lt;0:${liveParams.trailing_require_negative_velocity ? 'on' : 'off'}) · sl=${fmtNum(liveParams.stop_loss_pct, 1)}%/${liveParams.stop_loss_consecutive_minutes}m · grace=${liveParams.min_hold_minutes}m
+                        </div>
+                    </div>
+                    <ul class="space-y-1 text-[11.5px] text-slate-200 list-disc pl-4">
+                        ${insights.map(txt => `<li>${escSvg(txt)}</li>`).join('')}
+                    </ul>
+                </div>
+            ` : '';
+
+            // 3. Diagnostics Strip (Kinematics / Stop-Loss / Chain Liquidity)
+            const diag = view.diagnostics || {};
+            const liq = view.liquidity || {};
+            const diagStripHtml = `
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 text-[11px] mono">
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 p-3 space-y-1">
+                        <div class="text-[10px] uppercase font-bold text-cyan-300">Tier 2 Overbought RSI &amp; Kinematics</div>
+                        <div class="text-slate-300">Peak RSI: <strong class="text-white">${diag.peak_rsi != null ? fmtNum(diag.peak_rsi, 2) : '--'}</strong> (cfg rsi_high=${fmtNum(liveParams.rsi_high, 1)}) · v=${diag.peak_v != null ? (diag.peak_v >= 0 ? '+' : '') + fmtNum(diag.peak_v, 4) : '--'} · a=${diag.peak_a != null ? (diag.peak_a >= 0 ? '+' : '') + fmtNum(diag.peak_a, 4) : '--'}</div>
+                        <div class="text-slate-400">Max RSI in hold: <strong class="text-slate-200">${diag.max_rsi != null ? fmtNum(diag.max_rsi, 2) : '--'}</strong> (P/L at max RSI: <span class="${pctCls(diag.max_rsi_pnl_pct)}">${fmtPct(diag.max_rsi_pnl_pct)}</span>)</div>
+                        <div class="text-slate-400">First RSI &ge; ${fmtNum(liveParams.rsi_high, 1)}: ${diag.first_rsi_high_epoch_ms ? `${escSvg(_fmtFindBestLocalTs(diag.first_rsi_high_epoch_ms).short)} (<span class="${pctCls(diag.first_rsi_high_pnl_pct)}">${fmtPct(diag.first_rsi_high_pnl_pct)}</span>)` : '<span class="text-slate-500">Never crossed</span>'}</div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 p-3 space-y-1">
+                        <div class="text-[10px] uppercase font-bold text-rose-300">Tier 4 Stop-Loss &amp; Hold Grace</div>
+                        <div class="text-slate-300">Max Adverse Excursion (MAE): <strong class="${pctCls(worst ? worst.pnl_pct : null)}">${worst ? `${fmtPct(worst.pnl_pct)} (${fmtDol(worst.pnl_dollars)})` : '--'}</strong></div>
+                        <div class="text-slate-400">Max consec. pts &le; -${fmtNum(liveParams.stop_loss_pct, 1)}%: <strong class="text-slate-200">${Number(diag.max_consecutive_below_sl || 0)}</strong> (cfg: ${liveParams.stop_loss_consecutive_minutes}m) · Hard SL (-${fmtNum(liveParams.stop_loss_hard_pct, 1)}%): <strong class="${diag.breached_hard_sl ? 'text-rose-400' : 'text-emerald-400'}">${diag.breached_hard_sl ? 'Breached' : 'Not hit'}</strong></div>
+                        <div class="text-slate-400">Min P/L in first ${liveParams.min_hold_minutes}m grace: <strong class="${pctCls(diag.min_pnl_during_grace)}">${fmtPct(diag.min_pnl_during_grace)}</strong></div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 p-3 space-y-1">
+                        <div class="text-[10px] uppercase font-bold text-amber-300">Option Chain Spread &amp; Greeks (${Number(liq.chain_samples || 0)} snaps)</div>
+                        <div class="text-slate-300">Spread %: avg <strong class="text-white">${liq.avg_spread_pct != null ? fmtNum(liq.avg_spread_pct, 2) + '%' : '--'}</strong> · max ${liq.max_spread_pct != null ? fmtNum(liq.max_spread_pct, 2) + '%' : '--'} (cfg max=${fmtNum(liveParams.buy_max_spread_pct, 1)}%)</div>
+                        <div class="text-slate-400">Avg Delta: <strong class="text-slate-200">${liq.avg_delta != null ? fmtNum(liq.avg_delta, 3) : '--'}</strong> · Avg IV: ${liq.avg_iv != null ? fmtNum(liq.avg_iv * 100, 1) + '%' : '--'} · Avg Theta: ${liq.avg_theta != null ? fmtNum(liq.avg_theta, 4) : '--'}</div>
+                        <div class="text-slate-400">Avg Vol: ${liq.avg_volume != null ? Math.round(liq.avg_volume) : '--'} · Avg OI: ${liq.avg_open_interest != null ? Math.round(liq.avg_open_interest) : '--'}</div>
+                    </div>
+                </div>
+            `;
+
+            // 4. Side-by-Side Profit Target Ladder & Trailing Stop Replay Tables
+            const ptRows = (view.profit_target_ladder || []).map(r => {
+                const hitFmt = r.hit ? _fmtFindBestLocalTs(r.first_hit_epoch_ms) : null;
+                const rowCls = r.is_current_param ? 'bg-indigo-950/35 border-b border-indigo-800/50' : 'border-b border-slate-800/50';
+                return `
+                    <tr class="${rowCls}">
+                        <td class="px-2 py-1.5 font-semibold text-white">+${fmtNum(r.target_pct, 1)}%${r.is_current_param ? ' <span class="px-1 py-0.5 rounded bg-indigo-500/25 text-indigo-200 text-[9px]">CFG</span>' : ''}</td>
+                        <td class="px-2 py-1.5">${r.hit ? '<span class="text-emerald-400 font-semibold">HIT</span>' : '<span class="text-slate-500">MISS</span>'}</td>
+                        <td class="px-2 py-1.5 text-slate-300">${hitFmt ? `${escSvg(hitFmt.short)} (+${fmtNum(r.first_hit_minutes, 1)}m)` : '--'}</td>
+                        <td class="px-2 py-1.5 text-right ${pctCls(r.first_hit_pnl_pct)}">${r.hit ? `${fmtPct(r.first_hit_pnl_pct)} (${fmtDol(r.first_hit_pnl_dollars)})` : '--'}</td>
+                        <td class="px-2 py-1.5 text-right ${pctCls(r.vs_actual_dollars)}">${r.hit ? fmtDol(r.vs_actual_dollars) : '--'}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const tsRows = (view.trailing_stop_grid || []).map(r => {
+                const exFmt = r.triggered ? _fmtFindBestLocalTs(r.exit_epoch_ms) : null;
+                const rowCls = r.is_best
+                    ? 'bg-emerald-950/30 border-b border-emerald-700/50'
+                    : (r.is_current ? 'bg-indigo-950/35 border-b border-indigo-800/50' : 'border-b border-slate-800/50');
+                const badges = [
+                    r.is_current ? '<span class="px-1 py-0.5 rounded bg-indigo-500/25 text-indigo-200 text-[9px]">CFG</span>' : '',
+                    r.is_best ? '<span class="px-1 py-0.5 rounded bg-emerald-500/25 text-emerald-200 text-[9px]">BEST</span>' : '',
+                ].filter(Boolean).join(' ');
+                return `
+                    <tr class="${rowCls}">
+                        <td class="px-2 py-1.5 font-semibold text-white">+${fmtNum(r.activation_pct, 1)}% / -${fmtNum(r.drawdown_pct, 1)}% ${badges}</td>
+                        <td class="px-2 py-1.5 text-slate-300">${r.require_neg_vel ? 'v&lt;0' : 'any v'}</td>
+                        <td class="px-2 py-1.5">${r.triggered ? `<span class="text-emerald-400">EXIT ${escSvg(exFmt.short)}</span>` : (r.armed ? '<span class="text-amber-300">ARMED</span>' : '<span class="text-slate-500">UNARMED</span>')}</td>
+                        <td class="px-2 py-1.5 text-right ${pctCls(r.exit_pnl_pct)}">${r.triggered ? `${fmtPct(r.exit_pnl_pct)} (${fmtDol(r.exit_pnl_dollars)})` : '--'}</td>
+                        <td class="px-2 py-1.5 text-right ${pctCls(r.vs_actual_dollars)}">${r.triggered ? fmtDol(r.vs_actual_dollars) : '--'}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const tuningTablesHtml = `
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-3 mono text-[10.5px]">
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden">
+                        <div class="px-3 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+                            <span class="font-bold uppercase text-[10px] text-emerald-300">Fixed Profit Target Ladder ([option_seller] profit_target_pct)</span>
+                            <span class="text-[9.5px] text-slate-500">vs Actual Exit</span>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="text-[9.5px] uppercase text-slate-400 border-b border-slate-800/80">
+                                    <tr>
+                                        <th class="px-2 py-1.5">Target</th>
+                                        <th class="px-2 py-1.5">Status</th>
+                                        <th class="px-2 py-1.5">First Hit (${escSvg(browserTzAbbr)})</th>
+                                        <th class="px-2 py-1.5 text-right">Exit P/L</th>
+                                        <th class="px-2 py-1.5 text-right">&Delta; vs Actual</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${ptRows || '<tr><td colspan="5" class="px-3 py-4 text-center text-slate-500">No targets evaluated</td></tr>'}</tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden">
+                        <div class="px-3 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+                            <span class="font-bold uppercase text-[10px] text-amber-300">Trailing Stop Replay (activation / drawdown)</span>
+                            <span class="text-[9.5px] text-slate-500">Relative Peak Drawdown</span>
+                        </div>
+                        <div class="overflow-x-auto max-h-64 overflow-y-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="sticky top-0 bg-slate-950 text-[9.5px] uppercase text-slate-400 border-b border-slate-800/80">
+                                    <tr>
+                                        <th class="px-2 py-1.5">Act / DD</th>
+                                        <th class="px-2 py-1.5">Vel</th>
+                                        <th class="px-2 py-1.5">Outcome (${escSvg(browserTzAbbr)})</th>
+                                        <th class="px-2 py-1.5 text-right">Sim P/L</th>
+                                        <th class="px-2 py-1.5 text-right">&Delta; vs Actual</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${tsRows || '<tr><td colspan="5" class="px-3 py-4 text-center text-slate-500">No trailing stop scenarios</td></tr>'}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // 5. Filterable & Sortable Data Points Timeline Table
+            let rawPts = Array.isArray(view.points) ? view.points.slice() : [];
+            if (findBestRowFilter === 'profit') rawPts = rawPts.filter(p => Number(p.pnl_pct) > 0);
+            else if (findBestRowFilter === 'loss') rawPts = rawPts.filter(p => Number(p.pnl_pct) < 0);
+            else if (findBestRowFilter === 'chain') rawPts = rawPts.filter(p => p.source === 'optionchain');
+
+            if (findBestRowSort === 'best') rawPts.sort((a, b) => (Number(b.pnl_pct) || -1e9) - (Number(a.pnl_pct) || -1e9));
+            else if (findBestRowSort === 'worst') rawPts.sort((a, b) => (Number(a.pnl_pct) || 1e9) - (Number(b.pnl_pct) || 1e9));
+            else rawPts.sort((a, b) => (Number(a.timestamp_epoch_ms) || 0) - (Number(b.timestamp_epoch_ms) || 0));
+
+            const fBtnCls = (k) => findBestRowFilter === k
+                ? 'px-2 py-0.5 rounded bg-indigo-600 text-white font-semibold'
+                : 'px-2 py-0.5 rounded text-slate-400 hover:text-white';
+            const sBtnCls = (k) => findBestRowSort === k
+                ? 'px-2 py-0.5 rounded bg-slate-700 text-white font-semibold'
+                : 'px-2 py-0.5 rounded text-slate-400 hover:text-white';
+
+            const showFbRsi30 = true;
+            const ptsRowsHtml = rawPts.map(p => {
+                const tFmt = _fmtFindBestLocalTs(p.timestamp_epoch_ms, p.timestamp_utc);
+                const isBest = best && p.timestamp_epoch_ms === best.timestamp_epoch_ms && p.source === best.source;
+                const isWorst = worst && p.timestamp_epoch_ms === worst.timestamp_epoch_ms && p.source === worst.source;
+                const rowCls = isBest
+                    ? 'bg-emerald-500/15 border-b border-emerald-500/40'
+                    : (isWorst ? 'bg-rose-500/15 border-b border-rose-500/40' : 'hover:bg-slate-900/70 border-b border-slate-800/50');
+                const srcBadge = p.source === 'optionchain'
+                    ? `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[9.5px] font-bold">CHAIN${p.signal ? '·' + escSvg(p.signal) : ''}</span>`
+                    : `<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[9.5px] font-bold">1M BAR</span>`;
+                const tagHtml = isBest
+                    ? '<span class="ml-1 px-1 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/40 text-[8.5px] font-bold">BEST</span>'
+                    : (isWorst ? '<span class="ml-1 px-1 py-0.5 rounded bg-rose-500/25 text-rose-200 border border-rose-400/40 text-[8.5px] font-bold">WORST</span>' : '');
+                const bidAsk = (p.bid != null || p.ask != null)
+                    ? `$${p.bid != null ? Number(p.bid).toFixed(2) : '--'} / $${p.ask != null ? Number(p.ask).toFixed(2) : '--'}${p.spread_pct != null ? ` (${fmtNum(p.spread_pct, 1)}%)` : ''}`
+                    : '--';
+                const greeks = (p.delta != null || p.iv != null)
+                    ? `Δ${p.delta != null ? fmtNum(p.delta, 2) : '--'} · IV${p.iv != null ? fmtNum(p.iv * 100, 0) + '%' : '--'}`
+                    : '--';
+                return `
+                    <tr class="${rowCls}">
+                        <td class="px-2.5 py-1.5 whitespace-nowrap text-slate-200" title="${escSvg(tFmt.title)}">${escSvg(tFmt.short)} <span class="text-slate-500">+${fmtNum(p.minutes_after_buy, 1)}m</span>${tagHtml}</td>
+                        <td class="px-2 py-1.5 whitespace-nowrap">${srcBadge}</td>
+                        <td class="px-2 py-1.5 text-right text-white font-semibold whitespace-nowrap">$${fmtNum(p.price, 2)}${p.price_field ? ` <span class="text-[9px] text-slate-500">${escSvg(p.price_field)}</span>` : ''}</td>
+                        <td class="px-2 py-1.5 text-right font-semibold ${pctCls(p.pnl_pct)} whitespace-nowrap">${fmtPct(p.pnl_pct)}</td>
+                        <td class="px-2 py-1.5 text-right font-semibold ${pctCls(p.pnl_dollars)} whitespace-nowrap">${fmtDol(p.pnl_dollars)}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-400 whitespace-nowrap">${p.drawdown_from_peak_pct != null ? '-' + fmtNum(p.drawdown_from_peak_pct, 2) + '%' : '--'}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-300 whitespace-nowrap">${p.stock_price != null ? '$' + fmtNum(p.stock_price, 2) : '--'}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-200 whitespace-nowrap">${p.rsi != null ? fmtNum(p.rsi, 2) : '--'}</td>
+                        ${showFbRsi30 ? `<td class="px-2 py-1.5 text-right font-semibold ${_rsi30ColorClass(p.rsi_30d)} whitespace-nowrap">${p.rsi_30d != null ? fmtNum(p.rsi_30d, 2) : '--'}</td>` : ''}
+                        <td class="px-2 py-1.5 text-right ${pctCls(p.v)} whitespace-nowrap">${p.v != null ? (p.v >= 0 ? '+' : '') + fmtNum(p.v, 4) : '--'}</td>
+                        <td class="px-2 py-1.5 text-right text-slate-400 whitespace-nowrap">${p.a != null ? (p.a >= 0 ? '+' : '') + fmtNum(p.a, 4) : '--'}</td>
+                        <td class="px-2 py-1.5 text-slate-400 whitespace-nowrap">${bidAsk}</td>
+                        <td class="px-2 py-1.5 text-slate-400 whitespace-nowrap">${greeks}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            const timelineHtml = `
+                <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden mono text-[10.5px]">
+                    <div class="px-3 py-2 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <span class="font-bold uppercase text-[10px] text-slate-300">Captured Data Points (${rawPts.length} / ${totalPts})</span>
+                            <div class="inline-flex rounded bg-slate-900 p-0.5 border border-slate-800 text-[10px]">
+                                <button type="button" onclick="setFindBestRowFilter('all')" class="${fBtnCls('all')}">All</button>
+                                <button type="button" onclick="setFindBestRowFilter('profit')" class="${fBtnCls('profit')}">Profitable</button>
+                                <button type="button" onclick="setFindBestRowFilter('loss')" class="${fBtnCls('loss')}">Losing</button>
+                                <button type="button" onclick="setFindBestRowFilter('chain')" class="${fBtnCls('chain')}">Chains Only</button>
+                            </div>
+                        </div>
+                        <div class="inline-flex rounded bg-slate-900 p-0.5 border border-slate-800 text-[10px]">
+                            <button type="button" onclick="setFindBestRowSort('time')" class="${sBtnCls('time')}">Chronological</button>
+                            <button type="button" onclick="setFindBestRowSort('best')" class="${sBtnCls('best')}">Best P/L First</button>
+                            <button type="button" onclick="setFindBestRowSort('worst')" class="${sBtnCls('worst')}">Worst P/L First</button>
+                        </div>
+                    </div>
+                    <div class="overflow-x-auto max-h-80 overflow-y-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead class="sticky top-0 z-10 bg-slate-950 text-[9.5px] uppercase text-slate-400 border-b border-slate-800">
+                                <tr>
+                                    <th class="px-2.5 py-2 whitespace-nowrap">Time (${escSvg(browserTzAbbr)})</th>
+                                    <th class="px-2 py-2 whitespace-nowrap">Source</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">Opt Price</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">P/L %</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">P/L $</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">Peak DD</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">Stock</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">RSI</th>
+                                    ${showFbRsi30 ? '<th class="px-2 py-2 text-right whitespace-nowrap">30D RSI</th>' : ''}
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">v</th>
+                                    <th class="px-2 py-2 text-right whitespace-nowrap">a</th>
+                                    <th class="px-2 py-2 whitespace-nowrap">Bid / Ask (Spr)</th>
+                                    <th class="px-2 py-2 whitespace-nowrap">Greeks</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${ptsRowsHtml || `<tr><td colspan="${showFbRsi30 ? 13 : 12}" class="px-4 py-8 text-center text-slate-500">No points match this filter.</td></tr>`}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+
+            pane.innerHTML = sourceBarHtml + kpiCardsHtml + insightsHtml + diagStripHtml + tuningTablesHtml + timelineHtml;
         }
 
         let latestStrikeAnalysis = null;
@@ -25774,7 +29163,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return `
                     <button type="button" onclick="selectStrikeEvent('${escSvg(ev.event_id)}')" class="w-full text-left p-2.5 rounded-xl border transition ${isSel ? 'bg-indigo-950/50 border-indigo-500/60' : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700 hover:bg-slate-900/70'}">
                         <div class="flex items-center justify-between gap-2">
-                            <span class="font-bold text-white text-xs mono">${escSvg(ev.symbol)} <span class="text-[10px] font-normal text-slate-400">RSI ${ev.rsi !== null && ev.rsi !== undefined ? Number(ev.rsi).toFixed(1) : '--'}</span></span>
+                            <span class="font-bold text-white text-xs mono">${escSvg(ev.symbol)} <span class="text-[10px] font-normal text-slate-400">RSI ${ev.rsi !== null && ev.rsi !== undefined ? Number(ev.rsi).toFixed(1) : '--'}${ev.rsi_30d !== null && ev.rsi_30d !== undefined ? ` · 30D ${Number(ev.rsi_30d).toFixed(1)}` : ''}</span></span>
                             ${pnlBadge}
                         </div>
                         <div class="flex items-center justify-between gap-2 text-[10px] mono text-slate-400 mt-1">
@@ -25837,7 +29226,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                     <span class="text-slate-400">Exp ${escSvg(activeEv.expiry || '--')}</span>
                                 </div>
                                 <div class="text-[10px] text-slate-400">
-                                    RSI=${_fmtStrikeNum(activeEv.rsi, 2)} · v=${_fmtStrikeNum(kin.v, 4)} · a=${_fmtStrikeNum(kin.a, 4)} · Regime=${escSvg(kin.regime || 'n/a')} · File: ${escSvg(activeEv.filename || '')}
+                                    RSI=${_fmtStrikeNum(activeEv.rsi, 2)} · 30D RSI=${_fmtStrikeNum(activeEv.rsi_30d, 2)} · v=${_fmtStrikeNum(kin.v, 4)} · a=${_fmtStrikeNum(kin.a, 4)} · Regime=${escSvg(kin.regime || 'n/a')} · File: ${escSvg(activeEv.filename || '')}
                                 </div>
                             </div>
                             <div class="text-right space-y-0.5">
@@ -26748,9 +30137,20 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (strikeModal && !strikeModal.classList.contains('hidden')) {
                     closeStrikeAnalysisModal();
                 }
+                const findBestModal = document.getElementById('findBestModal');
+                if (findBestModal && !findBestModal.classList.contains('hidden')) {
+                    closeFindBestModal();
+                    return;
+                }
                 const logsModal = document.getElementById('optionLogsModal');
                 if (logsModal && !logsModal.classList.contains('hidden')) {
                     closeOptionLogsModal();
+                    return;
+                }
+                const logDetailsModal = document.getElementById('optionLogDetailsModal');
+                if (logDetailsModal && !logDetailsModal.classList.contains('hidden')) {
+                    closeOptionLogDetailsModal();
+                    return;
                 }
                 const modal = document.getElementById('optionDrilldownModal');
                 if (modal && !modal.classList.contains('hidden')) {
@@ -26762,8 +30162,8 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         // Initialize engine telemetry loop
         fetchAllData();
         fetchMinuteSummaries();
-        setInterval(fetchAllData, 2500);
-        setInterval(fetchMinuteSummaries, 6000);
+        _fetchDataTimer = setInterval(fetchAllData, 2500);
+        _fetchSummariesTimer = setInterval(fetchMinuteSummaries, 6000);
         countdownTimer = setInterval(updateCountdown, 1000);
     </script>
 </body>
@@ -26845,14 +30245,16 @@ _OPTION_LOG_HEADER_RE = re.compile(
     r"(INFO|WARNING|ERROR|DEBUG|CRITICAL)\s+(\S+)(?:\s+(.*))?$"
 )
 _OPTION_BUY_ANALYSIS_RE = re.compile(
-    r"^minute=(\S+)\s+symbol=(\S+)\s+provider=(\S+)\s+rsi=(\S+)\s+"
-    r"v=(\S+)\s+a=(\S+)\s+projected_delta=(\S+)\s+pnl%=(\S+)\s+"
-    r"decision=(\S+)\s+reason=(.*?)\s+contract=(\S+)\s*$"
+    r"^minute=(?P<minute>\S+)\s+symbol=(?P<symbol>\S+)\s+provider=(?P<provider>\S+)\s+"
+    r"rsi=(?P<rsi>\S+)(?:\s+rsi_30d=(?P<rsi_30d>\S+))?\s+"
+    r"v=(?P<v>\S+)\s+a=(?P<a>\S+)\s+projected_delta=(?P<projected_delta>\S+)\s+pnl%=(?P<pnl>\S+)\s+"
+    r"decision=(?P<decision>\S+)\s+reason=(?P<reason>.*?)\s+contract=(?P<contract>\S+)\s*$"
 )
 _OPTION_SELL_ANALYSIS_RE = re.compile(
-    r"^minute=(\S+)\s+contract=(\S+)\s+underlying=(\S+)\s+provider=(\S+)\s+"
-    r"rsi=(\S+)\s+v=(\S+)\s+a=(\S+)\s+projected_delta=(\S+)\s+pnl%=(\S+)\s+"
-    r"decision=(\S+)\s+reason=(.*)$"
+    r"^minute=(?P<minute>\S+)\s+contract=(?P<contract>\S+)\s+underlying=(?P<underlying>\S+)\s+"
+    r"provider=(?P<provider>\S+)\s+rsi=(?P<rsi>\S+)(?:\s+rsi_30d=(?P<rsi_30d>\S+))?\s+"
+    r"v=(?P<v>\S+)\s+a=(?P<a>\S+)\s+projected_delta=(?P<projected_delta>\S+)\s+pnl%=(?P<pnl>\S+)\s+"
+    r"decision=(?P<decision>\S+)\s+reason=(?P<reason>.*)$"
 )
 _OPTION_KV_KEY_RE = re.compile(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_%]*)=")
 
@@ -26892,6 +30294,7 @@ def _normalize_option_log_record_tz(rec: dict, force_utc_source=None):
     naive, ms = _parse_option_log_timestamp(ts_full)
     seq = rec.get("_seq", 0)
     if naive is None:
+        rec["timestamp_epoch_ms"] = None
         rec["_sort_key"] = (0.0, seq)
         return None
 
@@ -26932,6 +30335,7 @@ def _normalize_option_log_record_tz(rec: dict, force_utc_source=None):
     else:
         epoch = dt_disp.astimezone(timezone.utc).timestamp()
 
+    rec["timestamp_epoch_ms"] = int(round(epoch * 1000.0))
     rec["_sort_key"] = (epoch, seq)
     return detected
 
@@ -26972,6 +30376,7 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         "contract": "n/a",
         "provider": "none",
         "rsi": "n/a",
+        "rsi_30d": "n/a",
         "v": "n/a",
         "a": "n/a",
         "projected_delta": "n/a",
@@ -26986,39 +30391,41 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
     if event == "OPTION_BUY_ANALYSIS":
         bm = _OPTION_BUY_ANALYSIS_RE.match(rest)
         if bm:
-            rec["minute"] = bm.group(1)
-            rec["symbol"] = bm.group(2)
-            rec["provider"] = bm.group(3)
-            rec["rsi"] = bm.group(4)
-            rec["v"] = bm.group(5)
-            rec["a"] = bm.group(6)
-            rec["projected_delta"] = bm.group(7)
-            rec["pnl_pct"] = bm.group(8)
-            rec["decision"] = bm.group(9)
-            rec["reason"] = bm.group(10).strip()
-            rec["contract"] = bm.group(11)
+            rec["minute"] = bm.group("minute")
+            rec["symbol"] = bm.group("symbol")
+            rec["provider"] = bm.group("provider")
+            rec["rsi"] = bm.group("rsi")
+            rec["rsi_30d"] = bm.group("rsi_30d") or "n/a"
+            rec["v"] = bm.group("v")
+            rec["a"] = bm.group("a")
+            rec["projected_delta"] = bm.group("projected_delta")
+            rec["pnl_pct"] = bm.group("pnl")
+            rec["decision"] = bm.group("decision")
+            rec["reason"] = bm.group("reason").strip()
+            rec["contract"] = bm.group("contract")
             return rec
 
     if event == "OPTION_SELL_ANALYSIS":
         sm = _OPTION_SELL_ANALYSIS_RE.match(rest)
         if sm:
-            contract_val = sm.group(2)
-            underlying_val = sm.group(3)
-            rec["minute"] = sm.group(1)
+            contract_val = sm.group("contract")
+            underlying_val = sm.group("underlying")
+            rec["minute"] = sm.group("minute")
             rec["contract"] = contract_val
             rec["symbol"] = (
                 underlying_val
                 if underlying_val not in {"n/a", "none", ""}
                 else contract_val
             )
-            rec["provider"] = sm.group(4)
-            rec["rsi"] = sm.group(5)
-            rec["v"] = sm.group(6)
-            rec["a"] = sm.group(7)
-            rec["projected_delta"] = sm.group(8)
-            rec["pnl_pct"] = sm.group(9)
-            rec["decision"] = sm.group(10)
-            rec["reason"] = sm.group(11).strip()
+            rec["provider"] = sm.group("provider")
+            rec["rsi"] = sm.group("rsi")
+            rec["rsi_30d"] = sm.group("rsi_30d") or "n/a"
+            rec["v"] = sm.group("v")
+            rec["a"] = sm.group("a")
+            rec["projected_delta"] = sm.group("projected_delta")
+            rec["pnl_pct"] = sm.group("pnl")
+            rec["decision"] = sm.group("decision")
+            rec["reason"] = sm.group("reason").strip()
             return rec
 
     # Fallback / generic parser for execution, hold, watch, skip, start, and error lines
@@ -27038,6 +30445,8 @@ def _parse_option_log_line(raw_line: str, stream: str, seq: int = 0):
         rec["provider"] = kv["provider"]
     if kv.get("rsi") and kv["rsi"] not in {"None", ""}:
         rec["rsi"] = kv["rsi"]
+    if kv.get("rsi_30d") and kv["rsi_30d"] not in {"None", ""}:
+        rec["rsi_30d"] = kv["rsi_30d"]
     if kv.get("v") and kv["v"] not in {"None", ""}:
         rec["v"] = kv["v"]
     if kv.get("a") and kv["a"] not in {"None", ""}:
@@ -27143,12 +30552,38 @@ def _option_log_is_rejected(rec: dict) -> bool:
     )
 
 
+def _parse_option_log_bound_epoch(raw_ms=None, raw_iso=None, is_stop: bool = False):
+    """Parse an optional Start/Stop query bound (UTC epoch ms or ISO timestamp) -> UTC float seconds."""
+    if raw_ms is not None and str(raw_ms).strip() != "":
+        try:
+            ms_val = float(str(raw_ms).strip())
+            if math.isfinite(ms_val) and ms_val > 0.0:
+                return ms_val / 1000.0
+        except (TypeError, ValueError):
+            pass
+    if raw_iso is not None and str(raw_iso).strip() != "":
+        txt = str(raw_iso).strip()
+        try:
+            dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=DISPLAY_TZ)
+            epoch_sec = dt.astimezone(timezone.utc).timestamp()
+            if is_stop and len(txt) <= 16:
+                epoch_sec += 59.999
+            return epoch_sec
+        except ValueError:
+            return None
+    return None
+
+
 def read_option_analysis_logs(
     limit_per_file: int = 50000,
     max_total_entries: int = 40000,
     stream_filter: str = "all",
     decision_filter: str = "all",
     search_query: str = "",
+    start_epoch: float = None,
+    stop_epoch: float = None,
 ):
     """Read, filter, merge, and interleave all Option Buyer & Option Seller log files (newest first)."""
     from collections import deque
@@ -27214,6 +30649,11 @@ def read_option_analysis_logs(
             for parsed, hint in file_records:
                 if hint is None and file_is_utc:
                     _normalize_option_log_record_tz(parsed, force_utc_source=True)
+                row_epoch = parsed["_sort_key"][0]
+                if start_epoch is not None and (row_epoch <= 0.0 or row_epoch < start_epoch):
+                    continue
+                if stop_epoch is not None and (row_epoch <= 0.0 or row_epoch > stop_epoch):
+                    continue
                 if q_upper:
                     haystack = (
                         f"{parsed.get('symbol', '')} {parsed.get('contract', '')} "
@@ -27294,6 +30734,204 @@ def read_option_analysis_logs(
     }
 
 
+def read_option_trade_log_details(
+    symbol: str = "",
+    contract: str = "",
+    buy_epoch: float = None,
+    sell_epoch: float = None,
+    context: int = 3,
+    limit_per_file: int = 100000,
+):
+    """Find the triggering BUY and (if applicable) SELL log entries for a trade,
+    plus `context` entries immediately prior and `context` entries immediately after each."""
+    from collections import deque
+
+    tx_tag = str(OPTION_TRANSACTION_PROVIDER or "alpaca").strip().upper() or "ALPACA"
+    sym_u = str(symbol or "").strip().upper()
+    contract_u = str(contract or "").strip().upper()
+    if not sym_u and contract_u:
+        occ_m = re.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", contract_u)
+        if occ_m:
+            sym_u = occ_m.group(1)
+
+    ctx = max(1, min(20, int(context if context is not None else 3)))
+    per_file_cap = max(int(limit_per_file or 100000), 50000)
+
+    buyer_candidates = _list_provider_option_log_files(
+        "option_buyer", f"{tx_tag}-OPTION_BUYER-"
+    )
+    seller_candidates = _list_provider_option_log_files(
+        "option_seller", f"{tx_tag}-OPTION_SELLER-"
+    )
+
+    def _load_stream_rows(stream_name, paths, match_fn):
+        rows = []
+        used_files = []
+        seq = 0
+        # Read oldest file -> newest file so chronological sequence is natural
+        for path in reversed(paths):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    tail_lines = deque(f, maxlen=per_file_cap)
+            except OSError:
+                continue
+            if not tail_lines:
+                continue
+            file_records = []
+            utc_votes = 0
+            disp_votes = 0
+            for raw in tail_lines:
+                seq += 1
+                parsed = _parse_option_log_line(raw, stream=stream_name, seq=seq)
+                if parsed is not None:
+                    hint = _normalize_option_log_record_tz(parsed)
+                    if hint == "utc":
+                        utc_votes += 1
+                    elif hint == "display":
+                        disp_votes += 1
+                    file_records.append((parsed, hint))
+            if file_records:
+                used_files.append(path.name)
+            file_is_utc = utc_votes > 0 and utc_votes > disp_votes
+            for parsed, hint in file_records:
+                if hint is None and file_is_utc:
+                    _normalize_option_log_record_tz(parsed, force_utc_source=True)
+                if match_fn(parsed):
+                    rows.append(parsed)
+        rows.sort(key=lambda r: r["_sort_key"])
+        return rows, list(reversed(used_files))
+
+    def _row_matches_symbol(r):
+        r_sym = str(r.get("symbol") or "").strip().upper()
+        r_con = str(r.get("contract") or "").strip().upper()
+        if sym_u and r_sym == sym_u:
+            return True
+        if contract_u and r_con == contract_u:
+            return True
+        return False
+
+    def _row_matches_contract(r):
+        r_con = str(r.get("contract") or "").strip().upper()
+        return bool(contract_u and r_con == contract_u)
+
+    def _is_trigger_entry(r, stream_name):
+        dec = str(r.get("decision") or "").upper()
+        ev = str(r.get("event") or "").upper()
+        if "FAILED" in dec or "FAILED" in ev:
+            return False
+        if _option_log_is_qualified(r):
+            return True
+        if stream_name == "BUY" and (dec == "BUY" or "BUY_SUBMITTED" in ev or "BUY_DRY_RUN" in ev):
+            return True
+        if stream_name == "SELL" and (dec == "SELL" or "SELL_SUBMITTED" in ev or "SELL_DRY_RUN" in ev):
+            return True
+        return False
+
+    def _pick_trigger_index(rows, target_epoch, stream_name):
+        if not rows:
+            return None
+
+        def _time_diff(r):
+            ep = r["_sort_key"][0]
+            if target_epoch is None or target_epoch <= 0.0 or ep <= 0.0:
+                return None
+            return abs(ep - target_epoch)
+
+        # Tier 1: Exact contract + qualified/executed within 10 min (or closest overall if no epoch)
+        # Tier 2: Exact symbol + qualified/executed within 10 min
+        # Tier 3: Exact contract closest within 15 min
+        # Tier 4: Exact symbol closest within 15 min
+        best_idx = None
+        best_rank = None
+        for idx, r in enumerate(rows):
+            is_con = _row_matches_contract(r)
+            is_trig = _is_trigger_entry(r, stream_name)
+            diff = _time_diff(r)
+
+            if target_epoch is not None and target_epoch > 0.0:
+                if diff is None:
+                    continue
+                # Prefer entries near the trade timestamp
+                if is_con and is_trig and diff <= 600.0:
+                    rank = (0, diff)
+                elif is_trig and diff <= 600.0:
+                    rank = (1, diff)
+                elif is_con and diff <= 900.0:
+                    rank = (2, diff)
+                elif diff <= 900.0:
+                    rank = (3, diff)
+                elif is_con and is_trig:
+                    rank = (4, diff)
+                else:
+                    continue
+            else:
+                if is_con and is_trig:
+                    rank = (0, -idx)
+                elif is_trig:
+                    rank = (1, -idx)
+                elif is_con:
+                    rank = (2, -idx)
+                else:
+                    rank = (3, -idx)
+
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_idx = idx
+        return best_idx
+
+    def _slice_context(rows, trig_idx, side_label):
+        if trig_idx is None or not rows:
+            return []
+        lo = max(0, trig_idx - ctx)
+        hi = min(len(rows), trig_idx + ctx + 1)
+        out = []
+        for i in range(lo, hi):
+            item = dict(rows[i])
+            item.pop("_sort_key", None)
+            item.pop("_seq", None)
+            item["window_side"] = side_label
+            item["offset"] = i - trig_idx
+            item["is_trigger"] = (i == trig_idx)
+            out.append(item)
+        return out
+
+    buy_rows, buyer_files = _load_stream_rows("BUY", buyer_candidates, _row_matches_symbol)
+    buy_trig_idx = _pick_trigger_index(buy_rows, buy_epoch, "BUY")
+    buy_entries = _slice_context(buy_rows, buy_trig_idx, "BUY")
+
+    sell_applicable = sell_epoch is not None and sell_epoch > 0.0
+    sell_rows_all, seller_files = _load_stream_rows("SELL", seller_candidates, _row_matches_symbol)
+    # For seller logs, prefer filtering strictly to the contract if contract rows exist
+    sell_rows_contract = [r for r in sell_rows_all if _row_matches_contract(r)] if contract_u else []
+    sell_pool = sell_rows_contract if sell_rows_contract else sell_rows_all
+    sell_trig_idx = _pick_trigger_index(sell_pool, sell_epoch, "SELL") if (sell_applicable or sell_rows_contract) else None
+    # If contract is open (no sell_epoch), only show sell window if a trigger SELL actually exists
+    if not sell_applicable and sell_trig_idx is not None:
+        if not _is_trigger_entry(sell_pool[sell_trig_idx], "SELL"):
+            sell_trig_idx = None
+    sell_entries = _slice_context(sell_pool, sell_trig_idx, "SELL")
+
+    return {
+        "provider": tx_tag,
+        "symbol": sym_u,
+        "contract": contract_u,
+        "context": ctx,
+        "buyer_log_files": buyer_files,
+        "seller_log_files": seller_files,
+        "buy_window": {
+            "matched": buy_trig_idx is not None,
+            "total_symbol_rows": len(buy_rows),
+            "entries": buy_entries,
+        },
+        "sell_window": {
+            "applicable": bool(sell_applicable or sell_trig_idx is not None),
+            "matched": sell_trig_idx is not None,
+            "total_rows": len(sell_pool),
+            "entries": sell_entries,
+        },
+    }
+
+
 _STRIKE_BAR_CACHE_LOCK = threading.Lock()
 _STRIKE_BAR_CACHE = {}
 _MINUTE_KINEMATICS_CACHE_LOCK = threading.Lock()
@@ -27317,6 +30955,9 @@ _OPTIONCHAIN_BUY_RE = re.compile(
 )
 _OPTIONCHAIN_SELL_RE = re.compile(
     r"^optionchain-(.+?)-([A-Za-z0-9._-]+)-SELL-(.+?)-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
+)
+_OPTIONCHAIN_HOLD_RE = re.compile(
+    r"^optionchain-(.+)-([A-Za-z0-9._]+)-HOLD_1M-rsi([0-9.naNA]+)-(\d{8}T\d{6})_([A-Za-z]+)-([0-9a-fA-F]+)\.json$"
 )
 
 _STRIKE_RANK_LABELS = {
@@ -27366,6 +31007,14 @@ def _parse_optionchain_file_meta(path: Path, payload: dict):
             side = "SELL"
             rsi = _opt_safe_float(rsi_raw, None)
             dt_utc = _parse_chain_tz_stamp(stamp_s, tz_s)
+        else:
+            m_hold = _OPTIONCHAIN_HOLD_RE.match(name)
+            if m_hold:
+                source, sym, rsi_raw, stamp_s, tz_s, _ = m_hold.groups()
+                side = "HOLD"
+                trigger = "hold_1m"
+                rsi = _opt_safe_float(rsi_raw, None)
+                dt_utc = _parse_chain_tz_stamp(stamp_s, tz_s)
 
     if isinstance(payload, dict):
         if payload.get("underlying"):
@@ -27453,46 +31102,101 @@ def _load_minute_summary_kinematics_index():
                         rec = json.loads(line)
                     except Exception:
                         continue
-                    dt = _opt_parse_utc(rec.get("minute_utc") or rec.get("minute"))
+                    dt = _opt_parse_utc(
+                        rec.get("minute_start_utc")
+                        or rec.get("minute_utc")
+                        or rec.get("minute")
+                    )
                     if dt is None:
                         continue
                     min_iso = minute_utc(dt).isoformat()
+                    rec_provider = str(rec.get("provider") or "").strip().upper() or None
                     syms_block = rec.get("symbols") if isinstance(rec.get("symbols"), dict) else {}
-                    for sym_k, prov_map in syms_block.items():
-                        if not isinstance(prov_map, dict):
+                    prio_order = list(_provider_priority_order())
+
+                    def _prov_rank(p_name):
+                        pu = str(p_name or "").strip().upper()
+                        try:
+                            return prio_order.index(pu)
+                        except ValueError:
+                            return len(prio_order) + 1
+
+                    for sym_k, raw_sym_val in syms_block.items():
+                        if not isinstance(raw_sym_val, dict):
                             continue
                         sym_u = str(sym_k).strip().upper()
-                        # Follow configured [market_signal_providers] priority, preferring finite RSI/close
                         best_p = None
                         best_e = None
-                        for prov_name in _provider_priority_order():
-                            cand = prov_map.get(prov_name)
-                            if isinstance(cand, dict) and (_opt_safe_float(cand.get("close"), None) is not None or _opt_safe_float(cand.get("rsi"), None) is not None):
-                                best_p, best_e = prov_name, cand
-                                if _opt_safe_float(cand.get("rsi"), None) is not None:
-                                    break
-                        if best_e is None:
-                            for prov_name, cand in prov_map.items():
-                                if isinstance(cand, dict):
+                        # Support both flat per-provider MINUTE_SUMMARY lines and nested {sym: {prov: {...}}} lines
+                        if rec_provider and any(
+                            k in raw_sym_val for k in ("close", "rsi", "rsi_30d", "kinematics", "status")
+                        ):
+                            kin_sub = raw_sym_val.get("kinematics") if isinstance(raw_sym_val.get("kinematics"), dict) else {}
+                            merged_e = dict(kin_sub)
+                            merged_e.update(raw_sym_val)
+                            best_p = rec_provider
+                            best_e = merged_e
+                        else:
+                            for prov_name in prio_order:
+                                cand = raw_sym_val.get(prov_name)
+                                if isinstance(cand, dict) and (
+                                    _opt_safe_float(cand.get("close"), None) is not None
+                                    or _opt_safe_float(cand.get("rsi"), None) is not None
+                                ):
                                     best_p, best_e = prov_name, cand
-                                    break
+                                    if _opt_safe_float(cand.get("rsi"), None) is not None:
+                                        break
+                            if best_e is None:
+                                for prov_name, cand in raw_sym_val.items():
+                                    if isinstance(cand, dict):
+                                        best_p, best_e = prov_name, cand
+                                        break
                         if isinstance(best_e, dict):
+                            close_val = _opt_safe_float(best_e.get("close"), None)
+                            rsi_val = _opt_safe_float(best_e.get("rsi"), None)
+                            rsi_30d_val = _opt_safe_float(best_e.get("rsi_30d"), None)
                             v_val = _opt_safe_float(
-                                best_e.get("smoothed_velocity") if best_e.get("smoothed_velocity") is not None else best_e.get("price_velocity"),
+                                best_e.get("smoothed_velocity")
+                                if best_e.get("smoothed_velocity") is not None
+                                else best_e.get("price_velocity"),
                                 None,
                             )
                             a_val = _opt_safe_float(
-                                best_e.get("smoothed_acceleration") if best_e.get("smoothed_acceleration") is not None else best_e.get("price_acceleration"),
+                                best_e.get("smoothed_acceleration")
+                                if best_e.get("smoothed_acceleration") is not None
+                                else best_e.get("price_acceleration"),
                                 None,
                             )
-                            idx[(min_iso, sym_u)] = {
+                            cand_entry = {
                                 "provider": best_p,
-                                "close": _opt_safe_float(best_e.get("close"), None),
-                                "rsi": _opt_safe_float(best_e.get("rsi"), None),
+                                "close": close_val,
+                                "rsi": rsi_val,
+                                "rsi_30d": rsi_30d_val,
                                 "v": v_val,
                                 "a": a_val,
                                 "regime": best_e.get("regime"),
                             }
+                            existing = idx.get((min_iso, sym_u))
+                            if existing is None:
+                                idx[(min_iso, sym_u)] = cand_entry
+                            else:
+                                # Prefer higher-priority provider or one with finite RSI/rsi_30d
+                                new_score = (
+                                    1 if rsi_val is not None else 0,
+                                    1 if close_val is not None else 0,
+                                    -_prov_rank(best_p),
+                                )
+                                old_score = (
+                                    1 if existing.get("rsi") is not None else 0,
+                                    1 if existing.get("close") is not None else 0,
+                                    -_prov_rank(existing.get("provider")),
+                                )
+                                if new_score > old_score:
+                                    if cand_entry["rsi_30d"] is None and existing.get("rsi_30d") is not None:
+                                        cand_entry["rsi_30d"] = existing["rsi_30d"]
+                                    idx[(min_iso, sym_u)] = cand_entry
+                                elif existing.get("rsi_30d") is None and rsi_30d_val is not None:
+                                    existing["rsi_30d"] = rsi_30d_val
         except OSError:
             continue
 
@@ -28058,6 +31762,7 @@ def analyze_option_chain_strikes(
             "right": right,
             "expiry": meta["expiry"],
             "rsi": meta["rsi"] if meta["rsi"] is not None else base_kin.get("rsi"),
+            "rsi_30d": base_kin.get("rsi_30d"),
             "buy_dt": buy_dt,
             "buy_min": buy_min,
             "horizon_end": horizon_end,
@@ -28258,6 +31963,7 @@ def analyze_option_chain_strikes(
             "right": ev["right"],
             "expiry": ev["expiry"],
             "rsi": round(float(ev["rsi"]), 2) if ev["rsi"] is not None else None,
+            "rsi_30d": round(float(ev["rsi_30d"]), 2) if ev.get("rsi_30d") is not None else None,
             "timestamp_utc": ev["buy_dt"].isoformat(),
             "timestamp_display": format_display_ts(ev["buy_dt"], "%Y-%m-%d %H:%M %Z"),
             "timestamp_short": disp_dt.strftime("%m-%d %H:%M"),
@@ -28326,6 +32032,757 @@ def analyze_option_chain_strikes(
             "best_rank_actual": best_summary_actual,
         },
         "events": events_out,
+    }
+
+
+def _compute_findbest_view_metrics(
+    points: list,
+    entry_price: float,
+    exit_price: float,
+    qty: int,
+    buy_dt: datetime,
+    sell_dt: datetime,
+    live_params: dict,
+):
+    """Compute core Find Best statistics + lib/parms.ini tuning analytics for a point timeline."""
+    ordered = sorted(points, key=lambda p: (p["timestamp_epoch_ms"], 0 if p["source"] == "optionchain" else 1))
+    total = len(ordered)
+    chain_count = sum(1 for p in ordered if p["source"] == "optionchain")
+    hist_count = sum(1 for p in ordered if p["source"] != "optionchain")
+
+    actual_pnl_pct = (
+        round(((exit_price - entry_price) / entry_price) * 100.0, 2)
+        if (entry_price is not None and entry_price > 0 and exit_price is not None)
+        else None
+    )
+    actual_pnl_dollars = (
+        round((exit_price - entry_price) * qty * 100.0, 2)
+        if (entry_price is not None and exit_price is not None)
+        else None
+    )
+
+    if total == 0:
+        return {
+            "total_points": 0,
+            "chain_points_count": 0,
+            "history_points_count": 0,
+            "profitable_count": 0,
+            "profitable_pct_of_total": 0.0,
+            "profitable_avg_pnl_pct": None,
+            "profitable_avg_pnl_dollars": None,
+            "profitable_median_pnl_pct": None,
+            "losing_count": 0,
+            "losing_pct_of_total": 0.0,
+            "losing_avg_pnl_pct": None,
+            "losing_avg_pnl_dollars": None,
+            "losing_median_pnl_pct": None,
+            "breakeven_count": 0,
+            "best_point": None,
+            "worst_point": None,
+            "profit_left_pct": None,
+            "profit_left_dollars": None,
+            "exit_capture_efficiency_pct": None,
+            "post_peak_drawdown_pct": None,
+            "profit_target_ladder": [],
+            "trailing_stop_grid": [],
+            "diagnostics": {},
+            "liquidity": {"chain_samples": 0},
+            "tuning_insights": [],
+            "points": [],
+        }
+
+    # Annotate running high-water mark & relative drawdown from peak (exact OptionSeller formula)
+    running_peak_pnl = None
+    for p in ordered:
+        pnl_p = p["pnl_pct"]
+        if running_peak_pnl is None or pnl_p > running_peak_pnl:
+            running_peak_pnl = pnl_p
+        peak_factor = 1.0 + (running_peak_pnl / 100.0)
+        cur_factor = 1.0 + (pnl_p / 100.0)
+        if peak_factor > 0 and cur_factor < peak_factor:
+            dd = ((peak_factor - cur_factor) / peak_factor) * 100.0
+        else:
+            dd = 0.0
+        p["running_peak_pnl_pct"] = round(running_peak_pnl, 2)
+        p["drawdown_from_peak_pct"] = round(dd, 2)
+
+    profitable = [p for p in ordered if p["pnl_pct"] > 0]
+    losing = [p for p in ordered if p["pnl_pct"] < 0]
+    breakeven = [p for p in ordered if p["pnl_pct"] == 0]
+
+    def _median(vals):
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        mid = n // 2
+        return round((s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0), 2)
+
+    prof_avg_pct = (
+        round(sum(p["pnl_pct"] for p in profitable) / len(profitable), 2)
+        if profitable
+        else None
+    )
+    prof_avg_dol = (
+        round(sum(p["pnl_dollars"] for p in profitable) / len(profitable), 2)
+        if profitable
+        else None
+    )
+    loss_avg_pct = (
+        round(sum(p["pnl_pct"] for p in losing) / len(losing), 2)
+        if losing
+        else None
+    )
+    loss_avg_dol = (
+        round(sum(p["pnl_dollars"] for p in losing) / len(losing), 2)
+        if losing
+        else None
+    )
+
+    best_pt = max(ordered, key=lambda p: (p["pnl_pct"], -p["timestamp_epoch_ms"]))
+    worst_pt = min(ordered, key=lambda p: (p["pnl_pct"], p["timestamp_epoch_ms"]))
+
+    profit_left_pct = (
+        round(best_pt["pnl_pct"] - actual_pnl_pct, 2)
+        if actual_pnl_pct is not None
+        else None
+    )
+    profit_left_dollars = (
+        round(best_pt["pnl_dollars"] - actual_pnl_dollars, 2)
+        if actual_pnl_dollars is not None
+        else None
+    )
+    exit_capture_eff = (
+        round((actual_pnl_pct / best_pt["pnl_pct"]) * 100.0, 1)
+        if (actual_pnl_pct is not None and best_pt["pnl_pct"] > 0)
+        else None
+    )
+    post_peak_dd = None
+    if actual_pnl_pct is not None:
+        pf = 1.0 + (best_pt["pnl_pct"] / 100.0)
+        cf = 1.0 + (actual_pnl_pct / 100.0)
+        if pf > 0 and cf < pf:
+            post_peak_dd = round(((pf - cf) / pf) * 100.0, 2)
+        else:
+            post_peak_dd = 0.0
+
+    # Profit Target Ladder ([option_seller] profit_target_pct)
+    cfg_pt = float(live_params.get("profit_target_pct") or 25.0)
+    target_levels = sorted(set([5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, round(cfg_pt, 2)]))
+    pt_ladder = []
+    for lvl in target_levels:
+        hit_pt = next((p for p in ordered if p["pnl_pct"] >= lvl), None)
+        pt_ladder.append({
+            "target_pct": lvl,
+            "is_current_param": abs(lvl - cfg_pt) < 1e-6,
+            "hit": hit_pt is not None,
+            "first_hit_epoch_ms": hit_pt["timestamp_epoch_ms"] if hit_pt else None,
+            "first_hit_minutes": hit_pt["minutes_after_buy"] if hit_pt else None,
+            "first_hit_price": hit_pt["price"] if hit_pt else None,
+            "first_hit_pnl_pct": hit_pt["pnl_pct"] if hit_pt else None,
+            "first_hit_pnl_dollars": hit_pt["pnl_dollars"] if hit_pt else None,
+            "vs_actual_dollars": (
+                round(hit_pt["pnl_dollars"] - actual_pnl_dollars, 2)
+                if (hit_pt is not None and actual_pnl_dollars is not None)
+                else None
+            ),
+        })
+
+    # Trailing Stop Replay Grid ([option_seller] trailing_activation_pct / trailing_drawdown_pct / v < 0)
+    cfg_ts_act = float(live_params.get("trailing_activation_pct") or 10.0)
+    cfg_ts_dd = float(live_params.get("trailing_drawdown_pct") or 5.0)
+    cfg_ts_vel = bool(live_params.get("trailing_require_negative_velocity", True))
+
+    candidate_pairs = [
+        (round(cfg_ts_act, 2), round(cfg_ts_dd, 2), cfg_ts_vel, True),
+        (round(cfg_ts_act, 2), round(cfg_ts_dd, 2), not cfg_ts_vel, False),
+        (5.0, 3.0, cfg_ts_vel, False),
+        (5.0, 5.0, cfg_ts_vel, False),
+        (8.0, 4.0, cfg_ts_vel, False),
+        (10.0, 3.0, cfg_ts_vel, False),
+        (10.0, 5.0, cfg_ts_vel, False),
+        (10.0, 8.0, cfg_ts_vel, False),
+        (15.0, 5.0, cfg_ts_vel, False),
+        (15.0, 8.0, cfg_ts_vel, False),
+        (20.0, 5.0, cfg_ts_vel, False),
+        (20.0, 10.0, cfg_ts_vel, False),
+    ]
+    seen_ts = set()
+    ts_grid = []
+    for act_p, dd_p, req_v, is_cur in candidate_pairs:
+        key = (act_p, dd_p, req_v)
+        if key in seen_ts:
+            continue
+        seen_ts.add(key)
+        armed = False
+        trig_pt = None
+        pk = None
+        for p in ordered:
+            cur_pnl = p["pnl_pct"]
+            if pk is None or cur_pnl > pk:
+                pk = cur_pnl
+            if pk >= act_p:
+                armed = True
+                pf = 1.0 + (pk / 100.0)
+                cf = 1.0 + (cur_pnl / 100.0)
+                dd = ((pf - cf) / pf) * 100.0 if (pf > 0 and cf < pf) else 0.0
+                if dd > dd_p:
+                    vel_ok = True
+                    if req_v:
+                        v_val = p.get("v")
+                        vel_ok = v_val is not None and v_val < 0
+                    if vel_ok:
+                        trig_pt = p
+                        break
+        ts_grid.append({
+            "activation_pct": act_p,
+            "drawdown_pct": dd_p,
+            "require_neg_vel": req_v,
+            "is_current": is_cur,
+            "is_best": False,
+            "armed": armed,
+            "triggered": trig_pt is not None,
+            "exit_epoch_ms": trig_pt["timestamp_epoch_ms"] if trig_pt else None,
+            "exit_minutes": trig_pt["minutes_after_buy"] if trig_pt else None,
+            "exit_pnl_pct": trig_pt["pnl_pct"] if trig_pt else None,
+            "exit_pnl_dollars": trig_pt["pnl_dollars"] if trig_pt else None,
+            "vs_actual_dollars": (
+                round(trig_pt["pnl_dollars"] - actual_pnl_dollars, 2)
+                if (trig_pt is not None and actual_pnl_dollars is not None)
+                else None
+            ),
+        })
+
+    triggered_ts = [r for r in ts_grid if r["triggered"] and r["exit_pnl_pct"] is not None]
+    best_ts_row = None
+    if triggered_ts:
+        best_ts_row = max(triggered_ts, key=lambda r: r["exit_pnl_pct"])
+        best_ts_row["is_best"] = True
+
+    # Diagnostics: Tier 2 RSI/Kinematics & Tier 4 Stop-Loss/Hold Grace
+    cfg_rsi_high = float(live_params.get("rsi_high") or 65.0)
+    cfg_sl_pct = float(live_params.get("stop_loss_pct") or 10.0)
+    cfg_sl_hard = float(live_params.get("stop_loss_hard_pct") or 15.0)
+    cfg_min_hold = int(live_params.get("min_hold_minutes") or 5)
+
+    rsi_pts = [p for p in ordered if p.get("rsi") is not None]
+    max_rsi_pt = max(rsi_pts, key=lambda p: p["rsi"]) if rsi_pts else None
+    first_rsi_high_pt = next((p for p in rsi_pts if p["rsi"] >= cfg_rsi_high), None)
+
+    cur_sl_streak = 0
+    max_sl_streak = 0
+    breached_hard_sl = False
+    grace_pnls = []
+    for p in ordered:
+        if p["pnl_pct"] <= -cfg_sl_pct:
+            cur_sl_streak += 1
+            if cur_sl_streak > max_sl_streak:
+                max_sl_streak = cur_sl_streak
+        else:
+            cur_sl_streak = 0
+        if cfg_sl_hard > 0 and p["pnl_pct"] < -cfg_sl_hard:
+            breached_hard_sl = True
+        if cfg_min_hold > 0 and p["minutes_after_buy"] is not None and p["minutes_after_buy"] <= cfg_min_hold:
+            grace_pnls.append(p["pnl_pct"])
+
+    diagnostics = {
+        "peak_rsi": best_pt.get("rsi"),
+        "peak_v": best_pt.get("v"),
+        "peak_a": best_pt.get("a"),
+        "peak_regime": best_pt.get("regime"),
+        "max_rsi": max_rsi_pt["rsi"] if max_rsi_pt else None,
+        "max_rsi_pnl_pct": max_rsi_pt["pnl_pct"] if max_rsi_pt else None,
+        "first_rsi_high_epoch_ms": first_rsi_high_pt["timestamp_epoch_ms"] if first_rsi_high_pt else None,
+        "first_rsi_high_pnl_pct": first_rsi_high_pt["pnl_pct"] if first_rsi_high_pt else None,
+        "max_consecutive_below_sl": max_sl_streak,
+        "breached_hard_sl": breached_hard_sl,
+        "min_pnl_during_grace": round(min(grace_pnls), 2) if grace_pnls else None,
+    }
+
+    # Option Chain Liquidity & Greeks Averages
+    chain_pts = [p for p in ordered if p["source"] == "optionchain"]
+    def _avg_field(items, key):
+        vals = [p[key] for p in items if p.get(key) is not None and math.isfinite(p[key])]
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    spreads = [p["spread_pct"] for p in chain_pts if p.get("spread_pct") is not None]
+    liquidity = {
+        "chain_samples": len(chain_pts),
+        "avg_spread_pct": round(sum(spreads) / len(spreads), 2) if spreads else None,
+        "max_spread_pct": round(max(spreads), 2) if spreads else None,
+        "min_spread_pct": round(min(spreads), 2) if spreads else None,
+        "avg_delta": _avg_field(chain_pts, "delta"),
+        "avg_iv": _avg_field(chain_pts, "iv"),
+        "avg_theta": _avg_field(chain_pts, "theta"),
+        "avg_volume": _avg_field(chain_pts, "volume"),
+        "avg_open_interest": _avg_field(chain_pts, "open_interest"),
+    }
+
+    # Deterministic lib/parms.ini Tuning Insights
+    insights = []
+    if best_pt["pnl_pct"] > 0:
+        if best_pt["pnl_pct"] < cfg_pt:
+            insights.append(
+                f"Peak return reached +{best_pt['pnl_pct']:.2f}% (+${best_pt['pnl_dollars']:.2f}) at +{best_pt['minutes_after_buy']:.1f}m, "
+                f"below current [option_seller] profit_target_pct={cfg_pt:.1f}%. Lowering profit_target_pct toward +{max(5.0, math.floor(best_pt['pnl_pct'] / 5.0) * 5.0):.0f}% would have locked profit on this trade."
+            )
+        else:
+            insights.append(
+                f"Peak return (+{best_pt['pnl_pct']:.2f}%) exceeded current [option_seller] profit_target_pct={cfg_pt:.1f}%."
+            )
+    else:
+        insights.append(
+            f"Contract never traded above entry (best was {best_pt['pnl_pct']:+.2f}% at +{best_pt['minutes_after_buy']:.1f}m) — tune [option_buyer] entry filters (rsi_low / kinematics / bounce) rather than exit targets."
+        )
+
+    if profit_left_dollars is not None and profit_left_dollars > 0 and best_pt["pnl_pct"] > 0:
+        insights.append(
+            f"Profit left on table: +${profit_left_dollars:.2f} (+{profit_left_pct:.2f}% from peak to exit, post-peak drawdown {post_peak_dd:.2f}%)."
+        )
+
+    if best_ts_row is not None and actual_pnl_dollars is not None:
+        if best_ts_row["vs_actual_dollars"] is not None and best_ts_row["vs_actual_dollars"] > 0:
+            insights.append(
+                f"Best simulated trailing stop: trailing_activation_pct={best_ts_row['activation_pct']:.1f}, "
+                f"trailing_drawdown_pct={best_ts_row['drawdown_pct']:.1f} ({'v<0' if best_ts_row['require_neg_vel'] else 'any v'}) "
+                f"→ {best_ts_row['exit_pnl_pct']:+.2f}% (${best_ts_row['exit_pnl_dollars']:+.2f}, +${best_ts_row['vs_actual_dollars']:.2f} vs actual)."
+            )
+    elif best_pt["pnl_pct"] >= 5.0 and best_pt["pnl_pct"] < cfg_ts_act:
+        insights.append(
+            f"Trailing stop never armed because peak (+{best_pt['pnl_pct']:.2f}%) stayed below trailing_activation_pct={cfg_ts_act:.1f}%."
+        )
+
+    if best_pt.get("rsi") is not None and best_pt["pnl_pct"] > 0:
+        if best_pt["rsi"] < cfg_rsi_high:
+            insights.append(
+                f"Most profitable point occurred at underlying RSI={best_pt['rsi']:.2f} (< current [option_buyer] rsi_high={cfg_rsi_high:.1f}), so Tier 2 overbought RSI did not fire at the peak."
+            )
+        else:
+            insights.append(
+                f"Most profitable point aligned with overbought RSI={best_pt['rsi']:.2f} (>= rsi_high={cfg_rsi_high:.1f})."
+            )
+
+    if diagnostics["min_pnl_during_grace"] is not None and diagnostics["min_pnl_during_grace"] <= -cfg_sl_pct:
+        if best_pt["pnl_pct"] > 0:
+            insights.append(
+                f"Hold grace [option_seller] min_hold_minutes={cfg_min_hold}m absorbed an early dip to {diagnostics['min_pnl_during_grace']:+.2f}% before the contract recovered to +{best_pt['pnl_pct']:.2f}%."
+            )
+        else:
+            insights.append(
+                f"Contract dipped to {diagnostics['min_pnl_during_grace']:+.2f}% inside the {cfg_min_hold}m grace window and never recovered."
+            )
+
+    if liquidity["avg_spread_pct"] is not None and liquidity["avg_spread_pct"] > float(live_params.get("buy_max_spread_pct") or 12.0):
+        insights.append(
+            f"Wide option-chain bid-ask spreads observed (avg {liquidity['avg_spread_pct']:.2f}%, max {liquidity['max_spread_pct']:.2f}% vs [option_buyer] max_spread_pct={float(live_params.get('buy_max_spread_pct') or 12.0):.1f}%) — consider tightening max_spread_pct or reviewing limit_discount_pct."
+        )
+
+    return {
+        "total_points": total,
+        "chain_points_count": chain_count,
+        "history_points_count": hist_count,
+        "profitable_count": len(profitable),
+        "profitable_pct_of_total": round((len(profitable) / total) * 100.0, 1),
+        "profitable_avg_pnl_pct": prof_avg_pct,
+        "profitable_avg_pnl_dollars": prof_avg_dol,
+        "profitable_median_pnl_pct": _median([p["pnl_pct"] for p in profitable]),
+        "losing_count": len(losing),
+        "losing_pct_of_total": round((len(losing) / total) * 100.0, 1),
+        "losing_avg_pnl_pct": loss_avg_pct,
+        "losing_avg_pnl_dollars": loss_avg_dol,
+        "losing_median_pnl_pct": _median([p["pnl_pct"] for p in losing]),
+        "breakeven_count": len(breakeven),
+        "best_point": best_pt,
+        "worst_point": worst_pt,
+        "profit_left_pct": profit_left_pct,
+        "profit_left_dollars": profit_left_dollars,
+        "exit_capture_efficiency_pct": exit_capture_eff,
+        "post_peak_drawdown_pct": post_peak_dd,
+        "profit_target_ladder": pt_ladder,
+        "trailing_stop_grid": ts_grid,
+        "diagnostics": diagnostics,
+        "liquidity": liquidity,
+        "tuning_insights": insights,
+        "points": ordered,
+    }
+
+
+def analyze_findbest_contract(
+    coordinator=None,
+    trade_id: str = "",
+    contract: str = "",
+    underlying: str = "",
+    buy_utc: str = "",
+    sell_utc: str = "",
+    entry_price=None,
+    exit_price=None,
+    qty=None,
+):
+    """Analyze all option chain captures & 1m contract history between buy and sell of a closed contract."""
+    matched_closed = None
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    req_tid = str(trade_id or "").strip()
+    req_con = str(contract or "").strip().upper()
+    req_und = str(underlying or "").strip().upper()
+
+    if oh is not None:
+        with oh._lock:
+            closed_pool = [dict(c) for c in (oh.closed_contracts or []) if isinstance(c, dict)]
+        if req_tid:
+            matched_closed = next(
+                (c for c in closed_pool if str(c.get("trade_id") or "").strip() == req_tid),
+                None,
+            )
+        if matched_closed is None and req_con:
+            req_buy_dt = _opt_parse_utc(buy_utc)
+            cands = [
+                c for c in closed_pool
+                if str(c.get("contract") or "").strip().upper() == req_con
+            ]
+            if cands:
+                if req_buy_dt is not None:
+                    matched_closed = min(
+                        cands,
+                        key=lambda c: abs(
+                            ((_opt_parse_utc(c.get("purchased_at_utc")) or req_buy_dt) - req_buy_dt).total_seconds()
+                        ),
+                    )
+                else:
+                    matched_closed = cands[0]
+
+    eff_con = (
+        str(matched_closed.get("contract") or "").strip().upper()
+        if matched_closed
+        else req_con
+    )
+    eff_und = (
+        str(matched_closed.get("underlying") or "").strip().upper()
+        if matched_closed
+        else req_und
+    )
+    if not eff_und and eff_con:
+        _, parsed_u, _, _, _ = _parse_occ_contract(eff_con)
+        if parsed_u:
+            eff_und = parsed_u
+
+    buy_dt = _opt_parse_utc(
+        (matched_closed.get("purchased_at_utc") if matched_closed else None) or buy_utc
+    )
+    sell_dt = _opt_parse_utc(
+        (matched_closed.get("sold_at_utc") if matched_closed else None) or sell_utc
+    )
+    eff_entry = _opt_safe_float(
+        (matched_closed.get("entry_price") if matched_closed else None)
+        if (matched_closed and matched_closed.get("entry_price") is not None)
+        else entry_price,
+        None,
+    )
+    eff_exit = _opt_safe_float(
+        (matched_closed.get("exit_price") if matched_closed else None)
+        if (matched_closed and matched_closed.get("exit_price") is not None)
+        else exit_price,
+        None,
+    )
+    try:
+        eff_qty = max(
+            1,
+            int(
+                (matched_closed.get("qty") if matched_closed else None)
+                or qty
+                or 1
+            ),
+        )
+    except (TypeError, ValueError):
+        eff_qty = 1
+
+    if not eff_con or buy_dt is None or sell_dt is None:
+        raise ValueError(
+            "Unable to resolve closed contract buy/sell timeframe (missing contract, buy_utc, or sell_utc)."
+        )
+    if eff_entry is None or eff_entry <= 0:
+        raise ValueError(
+            f"Entry price unavailable or non-positive for contract {eff_con}."
+        )
+    if sell_dt < buy_dt:
+        buy_dt, sell_dt = sell_dt, buy_dt
+
+    hold_minutes = max(0.0, (sell_dt - buy_dt).total_seconds() / 60.0)
+    win_start = buy_dt - timedelta(seconds=60)
+    win_end = sell_dt + timedelta(seconds=60)
+
+    kin_index = _load_minute_summary_kinematics_index()
+
+    def _lookup_kin(dt_u):
+        base_m = minute_utc(as_utc(dt_u))
+        for off in (0, -1, 1):
+            k = kin_index.get(((base_m + timedelta(minutes=off)).isoformat(), eff_und))
+            if k is not None:
+                return k
+        return None
+
+    def _make_point(
+        dt_u,
+        source,
+        price,
+        price_field=None,
+        bid=None,
+        ask=None,
+        mid=None,
+        spread_pct=None,
+        delta=None,
+        gamma=None,
+        theta=None,
+        iv=None,
+        volume=None,
+        open_interest=None,
+        stock_price=None,
+        signal=None,
+        trigger=None,
+        meta_rsi=None,
+        filename=None,
+    ):
+        dt_u = as_utc(dt_u)
+        ep_ms = int(round(dt_u.timestamp() * 1000.0))
+        mins_after = round((dt_u - buy_dt).total_seconds() / 60.0, 2)
+        prog_pct = (
+            round(max(0.0, min(100.0, ((dt_u - buy_dt).total_seconds() / max(1.0, (sell_dt - buy_dt).total_seconds())) * 100.0)), 1)
+            if sell_dt > buy_dt
+            else 100.0
+        )
+        pnl_p = round(((price - eff_entry) / eff_entry) * 100.0, 2)
+        pnl_d = round((price - eff_entry) * eff_qty * 100.0, 2)
+        kin = _lookup_kin(dt_u)
+        eff_stk = stock_price if (stock_price is not None and stock_price > 0) else (kin.get("close") if kin else None)
+        eff_rsi = kin.get("rsi") if (kin and kin.get("rsi") is not None) else meta_rsi
+        return {
+            "timestamp_utc": dt_u.isoformat(),
+            "timestamp_epoch_ms": ep_ms,
+            "minute_key": minute_utc(dt_u).isoformat(),
+            "minutes_after_buy": mins_after,
+            "hold_progress_pct": prog_pct,
+            "source": source,
+            "price": round(float(price), 4),
+            "price_field": price_field,
+            "pnl_pct": pnl_p,
+            "pnl_dollars": pnl_d,
+            "bid": round(float(bid), 4) if bid is not None else None,
+            "ask": round(float(ask), 4) if ask is not None else None,
+            "mid": round(float(mid), 4) if mid is not None else None,
+            "spread_pct": round(float(spread_pct), 2) if spread_pct is not None else None,
+            "delta": round(float(delta), 4) if delta is not None else None,
+            "gamma": round(float(gamma), 4) if gamma is not None else None,
+            "theta": round(float(theta), 4) if theta is not None else None,
+            "iv": round(float(iv), 4) if iv is not None else None,
+            "volume": round(float(volume), 2) if volume is not None else None,
+            "open_interest": round(float(open_interest), 2) if open_interest is not None else None,
+            "stock_price": round(float(eff_stk), 4) if eff_stk is not None else None,
+            "rsi": round(float(eff_rsi), 2) if eff_rsi is not None else None,
+            "rsi_30d": round(float(kin["rsi_30d"]), 2) if (kin and kin.get("rsi_30d") is not None) else None,
+            "v": round(float(kin["v"]), 4) if (kin and kin.get("v") is not None) else None,
+            "a": round(float(kin["a"]), 4) if (kin and kin.get("a") is not None) else None,
+            "regime": kin.get("regime") if kin else None,
+            "signal": signal,
+            "trigger": trigger,
+            "filename": filename,
+        }
+
+    # 1. Scan logs/optionchains/*.json between buy_dt and sell_dt
+    chain_points = []
+    chain_files_scanned = 0
+    chain_files_in_window = 0
+    chain_dir = LOG_ROOT / "optionchains"
+    if chain_dir.exists() and chain_dir.is_dir():
+        for path in sorted(chain_dir.glob("*.json")):
+            if not path.is_file():
+                continue
+            chain_files_scanned += 1
+            try:
+                raw_txt = path.read_text(encoding="utf-8", errors="replace")
+                payload = json.loads(raw_txt)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or payload.get("error"):
+                continue
+            meta = _parse_optionchain_file_meta(path, payload)
+            if eff_und and meta["symbol"] and meta["symbol"] != eff_und:
+                continue
+            dt_u = meta["dt_utc"]
+            if dt_u < win_start or dt_u > win_end:
+                continue
+            chain_files_in_window += 1
+
+            # Locate exact matching contract inside chain_snapshot
+            matched_row = None
+            for item in payload.get("chain_snapshot") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_con = str(item.get("contract") or item.get("symbol") or "").strip().upper()
+                if item_con == eff_con:
+                    matched_row = item
+                    break
+            if matched_row is None:
+                continue
+
+            bid_v = _opt_safe_float(matched_row.get("bid"), None)
+            ask_v = _opt_safe_float(matched_row.get("ask"), None)
+            mid_v = _opt_safe_float(matched_row.get("mid"), None)
+            if mid_v is None and bid_v is not None and ask_v is not None and bid_v > 0 and ask_v > 0:
+                mid_v = (bid_v + ask_v) / 2.0
+            last_v = _opt_safe_float(
+                matched_row.get("last_price") if matched_row.get("last_price") is not None else matched_row.get("last"),
+                None,
+            )
+            spread_v = _opt_safe_float(matched_row.get("spread_pct"), None)
+            if spread_v is None and bid_v is not None and ask_v is not None and mid_v is not None and mid_v > 0:
+                spread_v = ((ask_v - bid_v) / mid_v) * 100.0
+
+            # Use executable sell price (bid > mid > last > ask)
+            px, px_field = None, None
+            for val, lbl in ((bid_v, "bid"), (mid_v, "mid"), (last_v, "last"), (ask_v, "ask")):
+                if val is not None and val > 0:
+                    px, px_field = val, lbl
+                    break
+            if px is None:
+                continue
+
+            spot_v = _opt_safe_float(payload.get("spot_ask_price"), None)
+            chain_points.append(
+                _make_point(
+                    dt_u=dt_u,
+                    source="optionchain",
+                    price=px,
+                    price_field=px_field,
+                    bid=bid_v,
+                    ask=ask_v,
+                    mid=mid_v,
+                    spread_pct=spread_v,
+                    delta=_opt_safe_float(matched_row.get("delta"), None),
+                    gamma=_opt_safe_float(matched_row.get("gamma"), None),
+                    theta=_opt_safe_float(matched_row.get("theta"), None),
+                    iv=_opt_safe_float(matched_row.get("iv"), None),
+                    volume=_opt_safe_float(matched_row.get("volume"), None),
+                    open_interest=_opt_safe_float(matched_row.get("open_interest"), None),
+                    stock_price=spot_v,
+                    signal=meta.get("signal"),
+                    trigger=meta.get("trigger"),
+                    meta_rsi=meta.get("rsi"),
+                    filename=path.name,
+                )
+            )
+
+    # 2. Collect 1-minute tracked contract history points between buy_dt and sell_dt
+    #    (automatically uses enriched bid/mid & Greeks when open_position_capture_mode = contract_quote)
+    history_points = []
+    if matched_closed is not None:
+        for pt in matched_closed.get("history") or []:
+            if not isinstance(pt, dict) or pt.get("pre_entry"):
+                continue
+            pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc"))
+            bid_v = _opt_safe_float(pt.get("bid"), None)
+            ask_v = _opt_safe_float(pt.get("ask"), None)
+            mid_v = _opt_safe_float(pt.get("mid"), None)
+            if mid_v is None and bid_v and ask_v and bid_v > 0 and ask_v >= bid_v:
+                mid_v = (bid_v + ask_v) / 2.0
+            spr_v = _opt_safe_float(pt.get("spread_pct"), None)
+            if spr_v is None and bid_v and ask_v and mid_v and mid_v > 0 and ask_v >= bid_v:
+                spr_v = ((ask_v - bid_v) / mid_v) * 100.0
+            raw_px = _opt_safe_float(pt.get("price"), None)
+            if bid_v is not None and bid_v > 0:
+                pt_px, pt_px_field = bid_v, "quote_bid"
+            elif mid_v is not None and mid_v > 0:
+                pt_px, pt_px_field = mid_v, "quote_mid"
+            else:
+                pt_px, pt_px_field = raw_px, str(pt.get("source") or "1m")
+            if pt_dt is None or pt_px is None or pt_px <= 0:
+                continue
+            if pt_dt < win_start or pt_dt > win_end:
+                continue
+            history_points.append(
+                _make_point(
+                    dt_u=pt_dt,
+                    source="history",
+                    price=pt_px,
+                    price_field=pt_px_field,
+                    bid=bid_v,
+                    ask=ask_v,
+                    mid=mid_v,
+                    spread_pct=spr_v,
+                    delta=_opt_safe_float(pt.get("delta"), None),
+                    gamma=_opt_safe_float(pt.get("gamma"), None),
+                    theta=_opt_safe_float(pt.get("theta"), None),
+                    iv=_opt_safe_float(pt.get("iv"), None),
+                    volume=_opt_safe_float(pt.get("volume"), None),
+                    open_interest=_opt_safe_float(pt.get("open_interest"), None),
+                    stock_price=_opt_safe_float(pt.get("stock_price"), None),
+                )
+            )
+
+    # 3. Build Combined timeline (all optionchain captures + 1m history bars for minutes without a chain capture)
+    chain_minute_keys = {p["minute_key"] for p in chain_points}
+    combined_points = list(chain_points) + [
+        dict(p) for p in history_points if p["minute_key"] not in chain_minute_keys
+    ]
+
+    live_params = {
+        "profit_target_enabled": bool(OPTION_SELL_PROFIT_TARGET_ENABLED),
+        "profit_target_pct": float(OPTION_SELL_PROFIT_TARGET_PCT),
+        "rsi_high": float(OPTION_CHAIN_RSI_HIGH),
+        "take_profit_require_profit": bool(OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT),
+        "take_profit_min_pnl_pct": float(OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT),
+        "trailing_stop_enabled": bool(OPTION_SELL_TRAILING_STOP_ENABLED),
+        "trailing_activation_pct": float(OPTION_SELL_TRAILING_ACTIVATION_PCT),
+        "trailing_drawdown_pct": float(OPTION_SELL_TRAILING_DRAWDOWN_PCT),
+        "trailing_require_negative_velocity": bool(OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY),
+        "stop_loss_enabled": bool(OPTION_SELL_STOP_LOSS_ENABLED),
+        "stop_loss_pct": float(OPTION_SELL_STOP_LOSS_PCT),
+        "stop_loss_consecutive_minutes": int(OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES),
+        "stop_loss_hard_pct": float(OPTION_SELL_STOP_LOSS_HARD_PCT),
+        "min_hold_minutes": int(OPTION_SELL_MIN_HOLD_MINUTES),
+        "buy_max_spread_pct": float(OPTION_BUY_MAX_SPREAD_PCT),
+        "open_position_capture_mode": str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE),
+    }
+
+    actual_pnl_pct = (
+        round(((eff_exit - eff_entry) / eff_entry) * 100.0, 2)
+        if (eff_exit is not None and eff_entry > 0)
+        else None
+    )
+    actual_pnl_dollars = (
+        round((eff_exit - eff_entry) * eff_qty * 100.0, 2)
+        if eff_exit is not None
+        else None
+    )
+
+    return {
+        "trade": {
+            "trade_id": (matched_closed.get("trade_id") if matched_closed else req_tid) or None,
+            "contract": eff_con,
+            "underlying": eff_und,
+            "qty": eff_qty,
+            "entry_price": round(eff_entry, 4),
+            "exit_price": round(eff_exit, 4) if eff_exit is not None else None,
+            "buy_utc": buy_dt.isoformat(),
+            "buy_epoch_ms": int(round(buy_dt.timestamp() * 1000.0)),
+            "sell_utc": sell_dt.isoformat(),
+            "sell_epoch_ms": int(round(sell_dt.timestamp() * 1000.0)),
+            "hold_minutes": round(hold_minutes, 2),
+            "actual_pnl_pct": actual_pnl_pct,
+            "actual_pnl_dollars": actual_pnl_dollars,
+        },
+        "chain_files_scanned": chain_files_scanned,
+        "chain_files_in_window": chain_files_in_window,
+        "current_parms": live_params,
+        "views": {
+            "combined": _compute_findbest_view_metrics(
+                [dict(p) for p in combined_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+            ),
+            "optionchains": _compute_findbest_view_metrics(
+                [dict(p) for p in chain_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+            ),
+            "history": _compute_findbest_view_metrics(
+                [dict(p) for p in history_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+            ),
+        },
     }
 
 
@@ -28757,7 +33214,9 @@ class AdminCliProvider:
                     ),
                     401,
                 )
-                resp.delete_cookie(self._auth_cookie_name, path="/")
+                # Do NOT call resp.delete_cookie() on 401 API/CLI responses: concurrent or
+                # stale background-tab polls would otherwise emit Set-Cookie Max-Age=0 and
+                # wipe a freshly issued valid session cookie after login/restart.
                 resp.headers["Cache-Control"] = "no-store"
                 return resp
             raw_next = request.full_path.rstrip("?")
@@ -28769,7 +33228,7 @@ class AdminCliProvider:
                 params.append(f"next={urllib.parse.quote(safe_next, safe='/')}")
             target = f"/login?{'&'.join(params)}" if params else "/login"
             resp = make_response(redirect(target, code=302))
-            resp.delete_cookie(self._auth_cookie_name, path="/")
+            resp.headers["Cache-Control"] = "no-store"
             return resp
 
         @app.get("/login")
@@ -28906,6 +33365,26 @@ class AdminCliProvider:
                     "__STRIKE_ANALYZER_ENABLED__",
                     "true" if STRIKE_ANALYZER_ENABLED else "false",
                 )
+                .replace(
+                    "__FINDBEST_ENABLED__",
+                    "true" if FINDBEST_ENABLED else "false",
+                )
+                .replace(
+                    "__RSI_30D_ENABLED__",
+                    "true" if RSI_30D_ENABLED else "false",
+                )
+                .replace(
+                    "__RSI_30D_MIN__",
+                    f"{float(RSI_30D_MIN):.1f}",
+                )
+                .replace(
+                    "__NASDAQ_MUST_BE_POSITIVE__",
+                    "true" if NASDAQ_MUST_BE_POSITIVE else "false",
+                )
+                .replace(
+                    "__NASDAQ_SYMBOL__",
+                    str(NASDAQ_SYMBOL or "QQQ"),
+                )
             )
             for _k, _v in owner_vars.items():
                 html = html.replace(_k, _v)
@@ -29001,6 +33480,16 @@ class AdminCliProvider:
                 or request.args.get("symbol")
                 or ""
             )
+            start_epoch = _parse_option_log_bound_epoch(
+                raw_ms=request.args.get("start_ms"),
+                raw_iso=request.args.get("start"),
+                is_stop=False,
+            )
+            stop_epoch = _parse_option_log_bound_epoch(
+                raw_ms=request.args.get("stop_ms"),
+                raw_iso=request.args.get("stop"),
+                is_stop=True,
+            )
 
             payload = read_option_analysis_logs(
                 limit_per_file=limit_per_file,
@@ -29008,6 +33497,8 @@ class AdminCliProvider:
                 stream_filter=stream_filter,
                 decision_filter=decision_filter,
                 search_query=search_query,
+                start_epoch=start_epoch,
+                stop_epoch=stop_epoch,
             )
             return (
                 jsonify(
@@ -29017,6 +33508,16 @@ class AdminCliProvider:
                         "stream": str(stream_filter).strip() or "all",
                         "decision": str(decision_filter).strip() or "all",
                         "q": str(search_query).strip(),
+                        "start_ms": (
+                            int(round(start_epoch * 1000.0))
+                            if start_epoch is not None
+                            else None
+                        ),
+                        "stop_ms": (
+                            int(round(stop_epoch * 1000.0))
+                            if stop_epoch is not None
+                            else None
+                        ),
                         "limit": limit,
                         "limit_per_file": limit_per_file,
                     },
@@ -29024,6 +33525,34 @@ class AdminCliProvider:
                 ),
                 200,
             )
+
+        @app.get("/api/option-log-details")
+        def get_option_log_details():
+            sym = (request.args.get("symbol") or "").strip().upper()
+            contract = (request.args.get("contract") or "").strip().upper()
+            buy_epoch = _parse_option_log_bound_epoch(
+                raw_ms=request.args.get("buy_ms"),
+                raw_iso=request.args.get("buy_utc"),
+                is_stop=False,
+            )
+            sell_epoch = _parse_option_log_bound_epoch(
+                raw_ms=request.args.get("sell_ms"),
+                raw_iso=request.args.get("sell_utc"),
+                is_stop=False,
+            )
+            try:
+                ctx = max(1, min(20, int(request.args.get("context", "3"))))
+            except (TypeError, ValueError):
+                ctx = 3
+
+            payload = read_option_trade_log_details(
+                symbol=sym,
+                contract=contract,
+                buy_epoch=buy_epoch,
+                sell_epoch=sell_epoch,
+                context=ctx,
+            )
+            return jsonify(status="ok", run_id=RUN_ID, **payload), 200
 
         @app.get("/api/strike-analysis")
         def get_strike_analysis():
@@ -29049,6 +33578,34 @@ class AdminCliProvider:
                     force_refresh=force_q,
                 )
                 return jsonify(status="ok", run_id=RUN_ID, **result), 200
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
+
+        @app.get("/api/findbest")
+        def get_findbest_analysis():
+            if not FINDBEST_ENABLED:
+                return (
+                    jsonify(
+                        status="error",
+                        message="Find Best is disabled ([dashboard] findbest=false)",
+                    ),
+                    403,
+                )
+            try:
+                result = analyze_findbest_contract(
+                    coordinator=self.coordinator,
+                    trade_id=str(request.args.get("trade_id") or "").strip(),
+                    contract=str(request.args.get("contract") or "").strip().upper(),
+                    underlying=str(request.args.get("underlying") or "").strip().upper(),
+                    buy_utc=str(request.args.get("buy_utc") or "").strip(),
+                    sell_utc=str(request.args.get("sell_utc") or "").strip(),
+                    entry_price=request.args.get("entry_price"),
+                    exit_price=request.args.get("exit_price"),
+                    qty=request.args.get("qty"),
+                )
+                return jsonify(status="ok", run_id=RUN_ID, **result), 200
+            except ValueError as exc:
+                return jsonify(status="error", message=str(exc)), 400
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
 
@@ -29215,6 +33772,10 @@ class AdminCliProvider:
                 "contract_budget_stepdown": OPTION_BUY_CONTRACT_BUDGET_STEPDOWN,
                 "entry_window_start_et": OPTION_BUY_ENTRY_WINDOW_START_ET,
                 "entry_window_end_et": OPTION_BUY_ENTRY_WINDOW_END_ET,
+                "nasdaq_must_be_positive": bool(NASDAQ_MUST_BE_POSITIVE),
+                "nasdaq_symbol": str(NASDAQ_SYMBOL or "QQQ"),
+                "rsi_30d_enabled": bool(RSI_30D_ENABLED),
+                "rsi_30d_min": float(RSI_30D_MIN),
                 "history_summary": (
                     self.coordinator.option_history.get_buyer_summary()
                     if hasattr(self.coordinator, "option_history")
@@ -29229,6 +33790,12 @@ class AdminCliProvider:
                 "profit_target_orders": osel.profit_target_orders if osel else 0,
                 "trailing_stop_orders": osel.trailing_stop_orders if osel else 0,
                 "stop_loss_orders": osel.stop_loss_orders if osel else 0,
+                "take_profit_require_profit": OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT,
+                "take_profit_min_pnl_pct": OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT,
+                "open_position_capture_mode": OPTION_SELL_OPEN_POSITION_CAPTURE_MODE,
+                "open_capture_count": osel.open_capture_count if osel else 0,
+                "open_capture_errors": osel.open_capture_errors if osel else 0,
+                "last_open_capture_utc": osel.last_open_capture_utc if osel else None,
                 "stop_loss_watches": {
                     sym: {
                         "streak": st.get("streak", 0),
@@ -29283,6 +33850,7 @@ class AdminCliProvider:
                     latest_kinematics.setdefault(provider, {})[symbol] = {
                         "close": latest.get("close"),
                         "rsi": latest.get("rsi"),
+                        "rsi_30d": latest.get("rsi_30d"),
                         "price_velocity": latest.get("price_velocity"),
                         "price_velocity_pct": latest.get("price_velocity_pct"),
                         "price_acceleration": latest.get("price_acceleration"),
@@ -29387,6 +33955,7 @@ class AdminCliProvider:
                         "OPTION_SELLER",
                         "CHART_CAPTURE",
                         "OPTION_CHAIN_COLLECTOR",
+                        "NASDAQ_TRACKER",
                     }
                 ],
                 "position_monitor": position_monitor_report,
@@ -29394,6 +33963,16 @@ class AdminCliProvider:
                 "option_seller": option_seller_report,
                 "chart_capture": chart_capture_report,
                 "tradingview_webhook": tv_report,
+                "nasdaq_market": (
+                    self.coordinator.nasdaq_tracker.get_status()
+                    if getattr(self.coordinator, "nasdaq_tracker", None) is not None
+                    else None
+                ),
+                "rsi_30d": (
+                    self.coordinator.daily_rsi30_tracker.get_status()
+                    if getattr(self.coordinator, "daily_rsi30_tracker", None) is not None
+                    else None
+                ),
                 "latest_kinematics": latest_kinematics,
             }
             return jsonify(status="ok", metrics=status_report), 200
@@ -29689,7 +34268,42 @@ class AdminCliProvider:
             return None
 
     @staticmethod
+    def _is_benign_disconnect_error(exc):
+        if isinstance(
+            exc,
+            (
+                BrokenPipeError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                TimeoutError,
+                socket.timeout,
+            ),
+        ):
+            return True
+        if isinstance(exc, ssl.SSLError):
+            msg = str(exc).upper()
+            if (
+                "UNEXPECTED_EOF_WHILE_READING" in msg
+                or "EOF OCCURRED" in msg
+                or "BAD_RECORD_MAC" in msg
+                or "TLSV1_ALERT_UNKNOWN_CA" in msg
+                or "SSLV3_ALERT_CERTIFICATE_UNKNOWN" in msg
+                or "HANDSHAKE_FAILURE" in msg
+            ):
+                return True
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in {
+            errno.EPIPE,
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.ETIMEDOUT,
+        }:
+            return True
+        return False
+
+    @staticmethod
     def build_adaptive_server_class(base_server_cls):
+        _is_benign = AdminCliProvider._is_benign_disconnect_error
+
         class AdaptiveSSLThreadedWSGIServer(base_server_cls):
             multithread = True
             daemon_threads = True
@@ -29705,11 +34319,17 @@ class AdminCliProvider:
                 self._adaptive_ssl_mode = str(ssl_mode or "auto").strip().lower()
                 super().__init__(*args, **kwargs)
 
+            def handle_error(self, request, client_address):
+                _, exc, _ = sys.exc_info()
+                if exc is not None and _is_benign(exc):
+                    return
+                super().handle_error(request, client_address)
+
             def process_request_thread(self, request, client_address):
                 active_sock = request
                 if self._adaptive_ssl_context is not None:
                     try:
-                        request.settimeout(2.0)
+                        request.settimeout(5.0)
                         first_byte = request.recv(1, socket.MSG_PEEK)
                         if not first_byte:
                             self.shutdown_request(request)
@@ -29735,8 +34355,9 @@ class AdminCliProvider:
                         return
                 try:
                     self.finish_request(active_sock, client_address)
-                except Exception:
-                    self.handle_error(active_sock, client_address)
+                except Exception as exc:
+                    if not _is_benign(exc):
+                        self.handle_error(active_sock, client_address)
                 finally:
                     self.shutdown_request(active_sock)
 
@@ -29751,10 +34372,21 @@ class AdminCliProvider:
         import threading
         from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
 
+        _is_benign = self._is_benign_disconnect_error
+
         class BoundedRequestHandler(WSGIRequestHandler):
             def setup(self):
                 super().setup()
-                self.connection.settimeout(2.0)
+                self.connection.settimeout(5.0)
+
+            def run_wsgi(self):
+                try:
+                    return super().run_wsgi()
+                except Exception as exc:
+                    if _is_benign(exc):
+                        self.close_connection = True
+                        return
+                    raise
 
             def make_environ(self):
                 env = super().make_environ()
@@ -29876,6 +34508,11 @@ async def main():
         return 0
 
     coordinator = MinuteCoordinator(selected, symbols)
+    if getattr(coordinator, "daily_rsi30_tracker", None) is not None:
+        coordinator.daily_rsi30_tracker.set_credentials(keys)
+    if getattr(coordinator, "nasdaq_tracker", None) is not None:
+        coordinator.nasdaq_tracker.symbol = str(NASDAQ_SYMBOL or "QQQ").strip().upper() or "QQQ"
+        coordinator.nasdaq_tracker.set_credentials(keys)
 
     # 2. START THE ADMIN CLI SERVER FIRST
     # Binds to 0.0.0.0:5001 by default (override with DASHBOARD_HOST / DASHBOARD_PORT)
@@ -29916,6 +34553,8 @@ async def main():
         for entry in PROVIDER_REGISTRY.values()
         if hasattr(entry.get("router"), "warmup")
     ]
+    startup_coros = []
+    startup_labels = []
     if warmup_routers and RSI_WARMUP_SESSIONS > 0:
         logging.info(
             "RSI_PRE_WARMUP_START providers=%s mode=%s sessions=%d",
@@ -29923,14 +34562,21 @@ async def main():
             RSI_SESSION_MODE,
             RSI_WARMUP_SESSIONS,
         )
-        warmup_results = await asyncio.gather(
-            *(r.warmup() for r in warmup_routers), return_exceptions=True
-        )
-        for r, res in zip(warmup_routers, warmup_results):
+        for r in warmup_routers:
+            startup_coros.append(r.warmup())
+            startup_labels.append(f"RSI_PRE_WARMUP({r.provider})")
+
+    if getattr(coordinator, "daily_rsi30_tracker", None) is not None:
+        startup_coros.append(coordinator.daily_rsi30_tracker.seed_all(symbols))
+        startup_labels.append("RSI_30D_STARTUP_SEED")
+
+    if startup_coros:
+        startup_results = await asyncio.gather(*startup_coros, return_exceptions=True)
+        for lbl, res in zip(startup_labels, startup_results):
             if isinstance(res, Exception):
                 logging.warning(
-                    "RSI_PRE_WARMUP_ERROR provider=%s error_type=%s detail=%s",
-                    r.provider,
+                    "STARTUP_PRELOAD_ERROR stage=%s error_type=%s detail=%s",
+                    lbl,
                     type(res).__name__,
                     res,
                 )
@@ -30019,6 +34665,14 @@ async def main():
     )
     tasks.append(cc_task)
 
+    nq_task = None
+    if getattr(coordinator, "nasdaq_tracker", None) is not None:
+        nq_task = asyncio.create_task(
+            run_provider_isolated(coordinator.nasdaq_tracker, coordinator),
+            name="NASDAQ_TRACKER",
+        )
+        tasks.append(nq_task)
+
     for provider, entry in PROVIDER_REGISTRY.items():
         task = asyncio.create_task(
             run_provider_isolated(entry["router"], coordinator), name=provider
@@ -30046,6 +34700,11 @@ async def main():
         "router": option_chain_collector,
         "task": occ_task,
     }
+    if nq_task is not None:
+        PROVIDER_REGISTRY["NASDAQ_TRACKER"] = {
+            "router": coordinator.nasdaq_tracker,
+            "task": nq_task,
+        }
 
     # 4b. Interactive TTY stdin CLI (strictly guarded by isatty so systemd/daemons never read EOF)
     try:
@@ -30137,8 +34796,7 @@ def _read_dashboard_password_from_ini(ini_path=None):
     if cfg_path.is_file():
         try:
             raw_text = cfg_path.read_text(encoding="utf-8-sig")
-            cfg = configparser.ConfigParser(interpolation=None)
-            cfg.read_string(raw_text)
+            cfg = _parse_ini_text_tolerant(raw_text, source_label=str(cfg_path))
             auth_on = _ini_bool(
                 cfg, "dashboard", "auth_enabled", "DASHBOARD_AUTH_ENABLED", True
             )
@@ -30157,8 +34815,7 @@ def _read_dashboard_port_from_ini(ini_path=None):
     if cfg_path.is_file():
         try:
             raw_text = cfg_path.read_text(encoding="utf-8-sig")
-            cfg = configparser.ConfigParser(interpolation=None)
-            cfg.read_string(raw_text)
+            cfg = _parse_ini_text_tolerant(raw_text, source_label=str(cfg_path))
             if cfg.has_option("dashboard", "port"):
                 port_val = _ini_int(
                     cfg, "dashboard", "port", "DASHBOARD_PORT", DASHBOARD_PORT, minimum=1

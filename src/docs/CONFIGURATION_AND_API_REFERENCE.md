@@ -69,6 +69,10 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | `timezone` | `DISPLAY_TIMEZONE` | String (`PST`, `EST`, `CST`, `MST`, `UTC`, or IANA string like `America/Los_Angeles`) | `PST` | Controls display timezone for dashboard charts, countdown labels, option-chain filenames, and chart PNG filenames. Internal market-session math and RSI cutoffs remain anchored to `America/New_York` (US/Eastern) and UTC. |
 | `owner` | `INSTANCE_OWNER` | String (e.g., `billt`, `jboa`) | `""` | Drives dashboard multi-instance color identity, browser tab prefix (`[owner - tx_provider]`), and header/panel chips. |
+| `nasdaq_must_be_positive` | `NASDAQ_MUST_BE_POSITIVE` | Bool | `false` | When `true`, `OptionBuyer` requires the tracked NASDAQ symbol's live intraday price minus its 09:30 ET open price to be strictly positive (`diff > 0`) before placing a buy order, logging `nasdaq_down(...)` on rejection. Even when `false`, the engine always collects the open price at 09:30 ET and every minute during RTH, persisting snapshots to `logs/nasdaq/<SYMBOL>-<RUN_ID>.log` and `minute-summary-*.jsonl`. |
+| `nasdaq_symbol` | `NASDAQ_SYMBOL` | String (ticker) | `QQQ` | Ticker symbol tracked by `NasdaqMarketTracker` at the start of the trading day and every minute during regular market hours. Normalized to uppercase. |
+| `rsi_30d_enabled` | `RSI_30D_ENABLED` | Bool | `false` | When `true`, activates the `OptionBuyer` buy gate requiring strictly `rsi_30d > rsi_30d_min` before purchasing an option. Even when `false`, the engine always seeds 30-day daily Wilder RSI baselines, computes live `rsi_30d` alongside every 1-minute RSI update, persists `rsi_30d` in logs (`minute-summary-*.jsonl`, `option_buyer/*.log`, `option_seller/*.log`), and displays `30D RSI` across all dashboard panels. |
+| `rsi_30d_min` | `RSI_30D_MIN` | Float | `30.0` | Minimum 30-day Wilder RSI threshold required when `rsi_30d_enabled = true`; `OptionBuyer` requires strictly `rsi_30d > rsi_30d_min` and logs `rsi_30d_below_min(...)` or `rsi_30d_unavailable(...)` when blocked. |
 
 ### 2.2 Section `symbols`: Tracked Equity Universe
 
@@ -197,7 +201,9 @@ flowchart LR
 | `stop_loss_force_market` | `OPTION_SELL_STOP_LOSS_FORCE_MARKET` | Bool | `false` | Forces `market` order type specifically on stop-loss triggers regardless of `order_type`. |
 | `profit_target_enabled` | `OPTION_SELL_PROFIT_TARGET_ENABLED` | Bool | `true` | Enables **Tier 1** Profit Target exit. |
 | `profit_target_pct` | `OPTION_SELL_PROFIT_TARGET_PCT` | Float | `25.0` | Exits immediately when unrealized `pnl_pct >= 25.0%`. |
-| `trailing_stop_enabled` | `OPTION_SELL_TRAILING_STOP_ENABLED` | Bool | `true` | Enables **Tier 2** Peak-Profit Trailing Stop. |
+| `take_profit_require_profit` | `OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT` | Bool | `true` | Guards **Tier 2** (`kind=take_profit`, Overbought RSI + Bearish Kinematics) so it only exits when unrealized `pnl_pct` is profitable (`> 0.0%` by default, or `>= take_profit_min_pnl_pct` when `> 0`), preventing `take_profit` exits at a loss (fails closed if `pnl_pct` is unavailable). |
+| `take_profit_min_pnl_pct` | `OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT` | Float (min `0.0`) | `0.0` | Optional minimum profit percentage floor for Tier 2 `kind=take_profit` when `take_profit_require_profit = true`. `0.0` requires strictly `pnl_pct > 0.0%`; any value `> 0.0` requires `pnl_pct >= take_profit_min_pnl_pct`. |
+| `trailing_stop_enabled` | `OPTION_SELL_TRAILING_STOP_ENABLED` | Bool | `true` | Enables **Tier 3** Peak-Profit Trailing Stop. |
 | `trailing_activation_pct` | `OPTION_SELL_TRAILING_ACTIVATION_PCT` | Float | `10.0` | Arms the trailing high-water mark once `peak_pnl_pct >= 10.0%`. |
 | `trailing_drawdown_pct` | `OPTION_SELL_TRAILING_DRAWDOWN_PCT` | Float | `5.0` | Fires trailing exit when `peak_pnl_pct - pnl_pct >= 5.0%`. |
 | `trailing_require_negative_velocity` | `OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY` | Bool | `true` | Requires underlying $v_t < 0$ before triggering trailing stop exit. |
@@ -207,6 +213,7 @@ flowchart LR
 | `stop_loss_consecutive_minutes` | `OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES` | Int (min `1`) | `5` | Consecutive minutes required at/below `-stop_loss_pct` before firing soft stop loss. |
 | `stop_loss_require_kinematics` | `OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS` | Bool | `true` | Requires bearish kinematics confirmation on soft stop loss. |
 | `stop_loss_hard_pct` | `OPTION_SELL_STOP_LOSS_HARD_PCT` | Float | `25.0` | Immediate emergency hard stop (`pnl_pct <= -25.0%`), bypassing streak and kinematics checks. |
+| `open_position_capture_mode` | `OPTION_SELL_OPEN_POSITION_CAPTURE_MODE` | `none` \| `contract_quote` \| `full_chain` | `none` | Controls optional per-minute data capture by `OptionSeller` for open option contracts: `none` (default, existing behavior), `contract_quote` (lightweight batched live bid/ask/mid/spread/Greeks snapshot attached directly to 1m `OptionContractHistoryTracker` bars and consumed by Find Best), or `full_chain` (writes full pruned `logs/optionchains/*-HOLD_1M-*.json` snapshots every minute for each open underlying/right/expiry). |
 
 ### 2.10 Section `chart_capture`: 1-Minute PNG Chart Archiver
 
@@ -234,7 +241,8 @@ flowchart LR
 | `password` | `DASHBOARD_PASSWORD` | Secret string | `<DASHBOARD_PASSWORD>` | Password required to unlock the dashboard or pass via `X-Dashboard-Password`. |
 | `session_ttl_hours` | `DASHBOARD_SESSION_TTL_HOURS` | Int (min `1`) | `24` | Maximum lifetime of an authenticated session cookie. |
 | `inactivity_timeout_minutes` *(alias `session_inactivity_minutes`)* | `DASHBOARD_INACTIVITY_TIMEOUT_MINUTES` | Int (min `0`) | `15` | Auto-locks idle browser sessions after $N$ minutes (`0` disables idle timeout). |
-| `strike_analyzer_enabled` | `STRIKE_ANALYZER_ENABLED` | Bool | `false` | Enables `GET /api/strike-analysis` and reveals the `Strike Analyzer` button/row in the dashboard UI. |
+| `strike_analyzer_enabled` | `STRIKE_ANALYZER_ENABLED` | Bool | `false` | Enables `GET /api/strike-analysis` and reveals the `Strike Analyzer` button/row in the dashboard UI. Strictly `false` by default if omitted or blank in both `parms.ini` and environment variables. |
+| `findbest` *(alias `findbest_enabled`)* | `FINDBEST_ENABLED` | Bool | `false` | Enables `GET /api/findbest` and reveals the **`Find Best`** button on the Option Seller (Closed Contracts) panel header to analyze captured option chain & 1m valuation data between buy and sell for tuning `lib/parms.ini`. Strictly `false` by default if omitted or blank in both `parms.ini` and environment variables. |
 
 ### 2.12 Section `webhook`: TradingView Webhook Receiver
 
@@ -263,6 +271,10 @@ flowchart LR
 [general]
 timezone = PST
 owner = billt
+nasdaq_must_be_positive = false
+nasdaq_symbol = QQQ
+rsi_30d_enabled = false
+rsi_30d_min = 30.0
 
 [symbols]
 target_symbols = AAPL,AMD,AMZN,CRWV,DELL,GOOG,INTC,ISRG,KLAC,LITE,LLY,MCD,META,MSFT,MU,NOC,NVDA,ROK,SNDK,SPCX,SQQQ,STX,SURE,TMO,TSLA,TSM,V,VRTX
@@ -276,15 +288,27 @@ TWELVEDATA.enabled = false
 YAHOOFINANCE.enabled = false
 priority = ALPACA,TASTYTRADE,TRADINGVIEW,TRADIER,TWELVEDATA,YAHOOFINANCE
 
-[CREDENTIALS]
-api_key = <ALPACA_API_KEY>
-secret_key = <ALPACA_SECRET_KEY>
-
 [alpaca_api]
+environment = "paper"
+timeout_seconds = 30
+credentials = {"api_key": "<ALPACA_API_KEY>", "secret_key": "<ALPACA_SECRET_KEY>"}
 feed = iex
 
+[tradier]
+tradier_token = "<TRADIER_TOKEN>"
+
 [twelvedata_api]
-twelvedata_api_key = <TWELVEDATA_API_KEY>
+twelvedata_api_key = "<TWELVEDATA_API_KEY>"
+
+[logging]
+log_file = "jboa.log"
+log_level = "INFO"
+multiStreamRSI.level = "INFO"
+utils.level = "WARNING"
+getOptionsContracts.level = "INFO"
+
+[llm_configuration]
+ip_address = "192.168.0.178"
 
 [tastytrade_api]
 transaction_env = sandbox
@@ -385,6 +409,8 @@ stop_loss_limit_discount_pct = 3.0
 stop_loss_force_market = false
 profit_target_enabled = true
 profit_target_pct = 25.0
+take_profit_require_profit = true
+take_profit_min_pnl_pct = 0.0
 trailing_stop_enabled = true
 trailing_activation_pct = 10.0
 trailing_drawdown_pct = 5.0
@@ -395,6 +421,7 @@ stop_loss_pct = 10.0
 stop_loss_consecutive_minutes = 5
 stop_loss_require_kinematics = true
 stop_loss_hard_pct = 25.0
+open_position_capture_mode = none
 
 [chart_capture]
 enabled = true
@@ -419,6 +446,7 @@ password = <DASHBOARD_PASSWORD>
 session_ttl_hours = 24
 inactivity_timeout_minutes = 15
 strike_analyzer_enabled = false
+findbest = false
 
 [webhook]
 host = 127.0.0.1
@@ -475,8 +503,10 @@ When `[dashboard] auth_enabled = true` and a password is set:
 | `GET /api/minute-summaries` | L25945 | Yes | — | `200` last **30** parsed JSON records from `logs/minute-summary-<RUN_ID>.jsonl`; `500` on I/O error. |
 | `GET /api/option-history` | L25963 | Yes | — | `200` open/closed contract ledger, minute price series, and aggregate buyer/seller P/L summaries; `503` if tracker unavailable. |
 | `POST /api/option-history/refresh` | L26056 | Yes | — | `200` executes `OptionContractHistoryTracker.startup_backfill()` (20s timeout) and returns updated snapshot; `500`/`503` on failure. |
-| `GET /api/option-logs` | L25977 | Yes | `?stream=all\|buy\|sell&decision=all&q=<SYM>&limit=40000&limit_per_file=50000` | `200` parsed Buy/Sell decision log entries from `logs/option_buyer/` and `logs/option_seller/`. |
+| `GET /api/option-logs` | L29177 | Yes | `?stream=all\|buy\|sell&decision=all&q=<SYM>&start_ms=<UTC_MS>&stop_ms=<UTC_MS>&start=<ISO>&stop=<ISO>&limit=40000&limit_per_file=50000` | `200` parsed Buy/Sell decision log entries (including `timestamp_epoch_ms` and `rsi_30d`) filtered by stream, decision, search query, and optional Start/Stop time bounds from `logs/option_buyer/` and `logs/option_seller/`. |
+| `GET /api/option-log-details` | — | Yes | `?symbol=<SYM>&contract=<OCC>&buy_ms=<UTC_MS>&sell_ms=<UTC_MS>&context=3` | `200` trade-scoped log slices returning the triggering BUY entry plus `±context` (default `3`) surrounding `option_buyer` entries (`buy_window`) and triggering SELL entry plus `±context` surrounding `option_seller` entries (`sell_window`), backing the **Buy/Sell Log Details** modal. |
 | `GET /api/strike-analysis` | L26029 | Yes | `?symbol=AAPL&limit=25&force=false` (`limit` `1`–`100`) | `200` multi-strike (`-2 ITM` to `+4 OTM`) forward-horizon performance table; `403` when `strike_analyzer_enabled = false`; `500` on error. |
+| `GET /api/findbest` | — | Yes | `?trade_id=<ID>&contract=<OCC>&underlying=<SYM>&buy_utc=<ISO>&sell_utc=<ISO>&entry_price=<F>&exit_price=<F>&qty=<N>` | `200` Buy→Sell option chain & 1m contract valuation analysis (`combined`, `optionchains`, `history` views): total points, peak/MFE timestamp & P/L, profitable/losing counts & averages, profit target ladder, trailing stop replay grid, RSI/stop-loss/grace & chain liquidity diagnostics, and `parms.ini` tuning insights; `403` when `findbest = false`; `400` if timeframe/entry invalid. |
 | `GET /api/docs` | — | Yes | Optional `?file=<relative_md_path>` | `200` lists discovered `.md` files (when `file` omitted) or returns Markdown content for the requested path-confined `.md` file (`400`/`404` on invalid/missing path). |
 | `GET\|POST /cli/status` | L26098 | Yes | — | `200` comprehensive engine telemetry: `app_version`, providers, timezone, TLS/auth state, `position_monitor` (including poll cadence/latency and `account` snapshot with `available_to_invest`, `available_to_invest_source`, `remaining_investable_budget`, `today_pl`/`today_pl_source`/`last_session_pl`, `overall_pl`/`overall_pl_source`/`overall_base_value`), `option_buyer`, `option_seller` (including `stop_loss_watches` & `peak_profit_watches`), `chart_capture`, `tradingview_webhook`, and `latest_kinematics`. |
 | `GET\|POST /cli/chart-capture` | L26307 | Yes | `POST` JSON: `{"action": "start"\|"stop"\|"toggle"\|"status"}` | `200` returns updated `chart_capture` status and persists `lib/parms.ini`; `400` invalid action; `503` manager not loaded. |
@@ -522,3 +552,4 @@ curl -s -X POST http://127.0.0.1:5000/webhook \
 | **`REJECTED` with `exceeds_max_single_trade` or `insufficient_investable_budget`** | Even `1` option contract (`unit_price × 100`) exceeds `[option_buyer] max_single_trade_dollars` (default `$8,000`) or the buffer-withheld investable balance (`(available + invested) × (1 - invest_buffer_withhold_pct/100) - invested`). | Working as designed — when `qty > 1` the engine automatically scales down to the largest whole integer `>= 1` that fits; adjust `max_single_trade_dollars` or `invest_buffer_withhold_pct` in `[option_buyer]` if appropriate. |
 | **Tastytrade Sandbox/Cash shows `buying_power=0.00` in logs** | Tastytrade sandbox and cash accounts often return `"derivative-buying-power": "0.0"` even when `"cash-balance"` is funded (e.g., `$100,000.00`). | Handled automatically in `extract_account_snapshot()` by selecting the first strictly positive field (`derivative-buying-power` → `equity-buying-power` → `cash-available-to-withdraw` → `cash-balance` → `buying_power`); check `available_to_invest_source` in the UI hover tooltip. |
 | **Zero-fallback broker error (`OPTION_CHAIN_PROVIDER` / `OPTION_TRANSACTION_PROVIDER`)** | Configured broker lacks valid credentials; engine intentionally refuses to silently route orders to a different broker. | Supply the missing credentials for the configured broker in `lib/parms.ini` (`[CREDENTIALS]` or `[tastytrade_api]`). |
+| **`CONFIG_INI_DUPLICATE_IGNORED` warning on startup** | The same INI key (e.g., `summary_delay_seconds`) appears twice in a `lib/parms.ini` section. `_parse_ini_text_tolerant()` falls back to `strict=False` (last occurrence wins) so startup does not crash. | Remove or comment out the older duplicate line in `lib/parms.ini` at the line number reported in the warning. |

@@ -268,3 +268,28 @@ contract_budget_stepdown = true     ; if ITM/ATM exceeds budget cap, step outwar
 entry_mode = rsi_ex_ante            ; default is kinematics_forecast
 entry_window_start_et = 09:45       ; optional earliest ET buy time (empty = disabled)
 entry_window_end_et = 15:30         ; optional latest ET buy time (empty = disabled)
+
+
+validate the contents of the lib/parms.ini file are consistent / in-sync with the current level of source code
+compare the 2 parms.ini (lib/parms.ini.redacted.billt and lib/parms.ini) files in this project, 
+lib/parms.ini is the master file, do not update or modify lib/parms.ini in any way
+lib/parms.ini.redacted.billt is the secondary file, do not update or modify lib/parms.ini in any way
+create a 3rd file named lib/parms.ini.combined.billt, create this one from scratch, remove any pre-existing file before starting this merge/update
+compare the sections and keys the 2 files (lib/parms.ini.redacted.billt and lib/parms.ini) ,
+add any sections and it's keys that are in the lib/parms.ini but not in the lib\parms.ini.redacted.billt to the lib\parms.ini.combined.billt file,
+when a section & key exist in both files, write it to the lib\parms.ini.combined.billt file using the key value from the lib\parms.ini.redacted.billt file, use comments from the lib/parms.ini file
+any sections and/or keys in that are in the lib/parms.ini.redacted.billt but not in the lib/parms.ini write it them the lib\parms.ini.combined.billt file
+the goal is to have the lib/parms.ini.combined.billt file look identical to the lib/parms.ini file while using key values from the lib/parms.ini.redacted.billt file
+I have redacted the sensitive data with a value like **** in parms.ini
+
+
+compare the 2 parms.ini (lib/parms.ini.redacted.jboa and lib/parms.ini) files in this project, 
+lib/parms.ini is the master file, do not update or modify lib/parms.ini in any way
+lib/parms.ini.redacted.jboa is the secondary file, do not update or modify lib/parms.ini in any way
+create a 3rd file named lib/parms.ini.combined.jboa, create this one from scratch, remove any pre-existing file before starting this merge/update
+compare the sections and keys the 2 files (lib/parms.ini.redacted.jboa and lib/parms.ini) ,
+add any sections and it's keys that are in the lib/parms.ini but not in the lib\parms.ini.redacted.jboa to the lib\parms.ini.combined.jboa file,
+when a section & key exist in both files, write it to the lib\parms.ini.combined.jboa file using the key value from the lib\parms.ini.redacted.jboa file, use comments from the lib/parms.ini file
+any sections and/or keys in that are in the lib/parms.ini.redacted.jboa but not in the lib/parms.ini write it them the lib\parms.ini.combined.jboa file
+the goal is to have the lib/parms.ini.combined.jboa file look identical to the lib/parms.ini file while using key values from the lib/parms.ini.redacted.jboa file
+I have redacted the sensitive data with a value like **** in parms.ini
