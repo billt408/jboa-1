@@ -2,7 +2,7 @@
 .venv-ORIG/
 **/__pycache__/
 *.pyc
-src/lib/parms.ini
+src/lib/parms.*
 src/jboa.log
 logs/*
 !logs/.gitkeep
