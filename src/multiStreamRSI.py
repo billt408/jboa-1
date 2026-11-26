@@ -125,7 +125,7 @@ QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
 # Semantic version: major.minor.build — increment build on every multiStreamRSI.py edit;
 # change major/minor only when explicitly requested.
-APP_VERSION = "0.1.24"
+APP_VERSION = "0.1.26"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 def _get_app_base_dir():
     """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
@@ -10174,6 +10174,9 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES, OPTION_SELL_MIN_HOLD_MINUTES
     global OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS, OPTION_SELL_STOP_LOSS_HARD_PCT
     global OPTION_SELL_OPEN_POSITION_CAPTURE_MODE
+    global OPTION_SELL_DYNAMIC_RULES_MODE, OPTION_SELL_DYNAMIC_RATCHET_TIERS
+    global OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW, OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT
+    global OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED, OPTION_SELL_DYNAMIC_MIN_SAMPLES
     global CHART_CAPTURE_ENABLED, CHART_CAPTURE_DIR, CHART_CAPTURE_HISTORY_BARS
     global CHART_CAPTURE_WIDTH, CHART_CAPTURE_HEIGHT
     global CHART_CAPTURE_ONLY_UPDATED, CHART_CAPTURE_WRITE_LATEST, CHART_CAPTURE_STALE_AFTER_SECONDS
@@ -11040,6 +11043,59 @@ def _apply_ini_feature_settings(cfg):
         )
         norm_open_cap = "none"
     OPTION_SELL_OPEN_POSITION_CAPTURE_MODE = norm_open_cap
+    raw_dyn_mode = _ini_str(
+        cfg,
+        "option_seller",
+        "dynamic_rules_mode",
+        "OPTION_SELL_DYNAMIC_RULES_MODE",
+        "off",
+    )
+    norm_dyn_mode = _normalize_dynamic_rules_mode(raw_dyn_mode)
+    if norm_dyn_mode is None:
+        logging.warning(
+            "INVALID_OPTION_SELL_DYNAMIC_RULES_MODE value=%r valid=%s; falling back to off",
+            raw_dyn_mode,
+            sorted(VALID_OPTION_SELL_DYNAMIC_RULES_MODES),
+        )
+        norm_dyn_mode = "off"
+    OPTION_SELL_DYNAMIC_RULES_MODE = norm_dyn_mode
+    raw_ratchet = _ini_str(
+        cfg,
+        "option_seller",
+        "dynamic_ratchet_tiers",
+        "OPTION_SELL_DYNAMIC_RATCHET_TIERS",
+        "5:4.0,10:3.0,20:2.0",
+    ).strip()
+    OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW = raw_ratchet or "5:4.0,10:3.0,20:2.0"
+    OPTION_SELL_DYNAMIC_RATCHET_TIERS = _parse_dynamic_ratchet_tiers(
+        OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW
+    )
+    OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT = max(
+        0.0,
+        _ini_float(
+            cfg,
+            "option_seller",
+            "dynamic_breakeven_activation_pct",
+            "OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT",
+            8.0,
+            minimum=0.0,
+        ),
+    )
+    OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED = _ini_bool(
+        cfg,
+        "option_seller",
+        "dynamic_vol_adapt_enabled",
+        "OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED",
+        True,
+    )
+    OPTION_SELL_DYNAMIC_MIN_SAMPLES = _ini_int(
+        cfg,
+        "option_seller",
+        "dynamic_min_samples",
+        "OPTION_SELL_DYNAMIC_MIN_SAMPLES",
+        3,
+        minimum=2,
+    )
     CHART_CAPTURE_ENABLED = _ini_bool(
         cfg, "chart_capture", "enabled", "CHART_CAPTURE_ENABLED", True
     )
@@ -11222,7 +11278,7 @@ def _apply_ini_feature_settings(cfg):
         "max_single_trade=$%.2f invest_buf=%.1f%% buy_entry_mode=%s buy_sel_mode=%s buy_delta=%.2f[%.2f..%.2f] "
         "buy_min_oi=%d buy_min_vol=%d buy_stepdown=%s buy_win_et=%s..%s sell_full=%s "
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% tp_req_profit=%s tp_min_pnl=%.2f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
-        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% open_capture=%s "
+        "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% open_capture=%s dyn_rules=%s dyn_tiers=%s dyn_be=%.1f%% dyn_vol=%s "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
         "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s findbest=%s",
         INSTANCE_OWNER or "unset",
@@ -11294,6 +11350,10 @@ def _apply_ini_feature_settings(cfg):
         OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
         OPTION_SELL_STOP_LOSS_HARD_PCT,
         OPTION_SELL_OPEN_POSITION_CAPTURE_MODE,
+        OPTION_SELL_DYNAMIC_RULES_MODE,
+        OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW,
+        OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT,
+        OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED,
         CHART_CAPTURE_ENABLED,
         CHART_CAPTURE_DIR or "logs/charts",
         CHART_CAPTURE_HISTORY_BARS,
@@ -11850,6 +11910,308 @@ OPTION_SELL_OPEN_POSITION_CAPTURE_MODE = (
     )
     or "none"
 )
+VALID_OPTION_SELL_DYNAMIC_RULES_MODES = frozenset(
+    {"off", "view_only", "view_and_act"}
+)
+
+
+def _normalize_dynamic_rules_mode(raw_val):
+    cleaned = str(raw_val or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if cleaned in {"", "off", "none", "disabled", "false", "0"}:
+        return "off"
+    if cleaned in {"view_only", "view", "shadow", "log_only", "monitor", "1"}:
+        return "view_only"
+    if cleaned in {
+        "view_and_act",
+        "view_take_action",
+        "take_action",
+        "active",
+        "act",
+        "live",
+        "on",
+        "true",
+        "2",
+    }:
+        return "view_and_act"
+    return None
+
+
+def _parse_dynamic_ratchet_tiers(raw_str):
+    """Parse 'peak:dd,peak:dd' into sorted tuple of (peak_pnl_pct, drawdown_pct)."""
+    default_tiers = ((5.0, 4.0), (10.0, 3.0), (20.0, 2.0))
+    txt = str(raw_str or "").strip()
+    if not txt:
+        return default_tiers
+    parsed = []
+    for part in txt.split(","):
+        tok = part.strip()
+        if not tok or ":" not in tok:
+            continue
+        p_s, d_s = tok.split(":", 1)
+        try:
+            pk = float(p_s.strip())
+            dd = float(d_s.strip())
+            if math.isfinite(pk) and math.isfinite(dd) and pk > 0 and dd > 0:
+                parsed.append((round(pk, 2), round(dd, 2)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return default_tiers
+    # Deduplicate by peak threshold (keep last), sort ascending by peak
+    by_pk = {pk: dd for pk, dd in parsed}
+    return tuple(sorted(by_pk.items(), key=lambda kv: kv[0]))
+
+
+OPTION_SELL_DYNAMIC_RULES_MODE = (
+    _normalize_dynamic_rules_mode(
+        os.getenv("OPTION_SELL_DYNAMIC_RULES_MODE", "off")
+    )
+    or "off"
+)
+OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW = os.getenv(
+    "OPTION_SELL_DYNAMIC_RATCHET_TIERS", "5:4.0,10:3.0,20:2.0"
+).strip() or "5:4.0,10:3.0,20:2.0"
+OPTION_SELL_DYNAMIC_RATCHET_TIERS = _parse_dynamic_ratchet_tiers(
+    OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW
+)
+OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT = max(
+    0.0, float(os.getenv("OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT", "8.0"))
+)
+OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED = os.getenv(
+    "OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes"}
+OPTION_SELL_DYNAMIC_MIN_SAMPLES = max(
+    2, int(os.getenv("OPTION_SELL_DYNAMIC_MIN_SAMPLES", "3"))
+)
+
+
+def _evaluate_dynamic_contract_rules(
+    *,
+    pnl_pct,
+    peak_pnl_pct,
+    drawdown_pct,
+    pnl_series=None,
+    spread_pct=None,
+    hold_minutes=0.0,
+    underlying_v=None,
+    loss_streak=0,
+    static_params=None,
+    mode=None,
+):
+    """Compute zero-hindsight dynamic exit thresholds for an open/tracked contract.
+
+    Combines:
+      1. Peak-Ratcheting Trailing Stop (tightens drawdown as peak P/L climbs)
+      2. Dynamic Breakeven Floor (protects winners once peak >= breakeven activation)
+      3. Volatility & Bid/Ask Spread Adaptation (scales drawdown & soft stop-loss to
+         contract-specific observed minute-to-minute P/L sigma and live spread_pct)
+
+    Never alters execution directly — caller inspects mode ('off' | 'view_only' | 'view_and_act').
+    """
+    sp = static_params or {}
+    eff_mode = (
+        _normalize_dynamic_rules_mode(mode)
+        if mode is not None
+        else OPTION_SELL_DYNAMIC_RULES_MODE
+    ) or "off"
+    static_ts_act = float(
+        sp.get("trailing_activation_pct", OPTION_SELL_TRAILING_ACTIVATION_PCT) or 0.0
+    )
+    static_ts_dd = float(
+        sp.get("trailing_drawdown_pct", OPTION_SELL_TRAILING_DRAWDOWN_PCT) or 0.0
+    )
+    static_ts_req_v = bool(
+        sp.get(
+            "trailing_require_negative_velocity",
+            OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY,
+        )
+    )
+    static_sl_pct = float(sp.get("stop_loss_pct", OPTION_SELL_STOP_LOSS_PCT) or 0.0)
+    static_sl_hard = float(
+        sp.get("stop_loss_hard_pct", OPTION_SELL_STOP_LOSS_HARD_PCT) or 0.0
+    )
+    static_sl_mins = int(
+        sp.get("stop_loss_consecutive_minutes", OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES)
+        or 5
+    )
+    static_min_hold = int(
+        sp.get("min_hold_minutes", OPTION_SELL_MIN_HOLD_MINUTES) or 0
+    )
+
+    tiers = OPTION_SELL_DYNAMIC_RATCHET_TIERS or ((5.0, 4.0), (10.0, 3.0), (20.0, 2.0))
+    be_act_pct = float(OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT or 0.0)
+    be_floor_pct = 0.5
+    vol_adapt_on = bool(OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED)
+    min_samples = max(2, int(OPTION_SELL_DYNAMIC_MIN_SAMPLES or 3))
+
+    cur_pnl = _opt_safe_float(pnl_pct, None)
+    pk_pnl = _opt_safe_float(peak_pnl_pct, cur_pnl)
+    dd_pct = max(0.0, _opt_safe_float(drawdown_pct, 0.0) or 0.0)
+    spr_val = _opt_safe_float(spread_pct, None)
+    if spr_val is not None and (spr_val < 0 or spr_val > 100.0):
+        spr_val = None
+    vel_val = _opt_safe_float(underlying_v, None)
+
+    # 1. Observed minute-to-minute P/L% volatility (sigma of deltas)
+    clean_series = []
+    for x in (pnl_series or []):
+        xf = _opt_safe_float(x, None)
+        if xf is not None:
+            clean_series.append(xf)
+    pnl_deltas = [
+        clean_series[i] - clean_series[i - 1]
+        for i in range(1, len(clean_series))
+    ]
+    sample_count = len(clean_series)
+    vol_sigma_pct = None
+    vol_mult = 1.0
+    if vol_adapt_on and len(pnl_deltas) >= max(1, min_samples - 1):
+        mean_d = sum(pnl_deltas) / len(pnl_deltas)
+        var_d = sum((d - mean_d) ** 2 for d in pnl_deltas) / max(1, len(pnl_deltas))
+        vol_sigma_pct = round(math.sqrt(max(0.0, var_d)), 2)
+        # Baseline 1m option P/L sigma ~ 2.0% -> clamp multiplier [0.80, 1.40]
+        vol_mult = min(1.40, max(0.80, vol_sigma_pct / 2.0)) if vol_sigma_pct > 0 else 0.85
+
+    spread_mult = 1.0
+    if vol_adapt_on and spr_val is not None and spr_val > 2.0:
+        spread_mult = min(1.35, 1.0 + ((spr_val - 2.0) / 10.0))
+
+    adapt_mult = round(
+        min(1.50, max(0.75, max(vol_mult, spread_mult))) if vol_adapt_on else 1.0,
+        2,
+    )
+
+    # 2. Peak-Ratcheting Trailing Stop Ladder
+    lowest_tier_act = tiers[0][0] if tiers else static_ts_act
+    eff_ts_act = min(static_ts_act, lowest_tier_act) if static_ts_act > 0 else lowest_tier_act
+    active_tier = None
+    base_ts_dd = static_ts_dd
+    if pk_pnl is not None:
+        for t_pk, t_dd in tiers:
+            if pk_pnl >= t_pk:
+                active_tier = (t_pk, t_dd)
+                base_ts_dd = t_dd
+
+    # Apply volatility/spread scaling + minimum noise floor above half-spread
+    spread_dd_floor = round(spr_val * 0.60, 2) if (vol_adapt_on and spr_val is not None) else 0.0
+    raw_dyn_dd = base_ts_dd * adapt_mult
+    eff_ts_dd = round(max(1.5, spread_dd_floor, min(15.0, raw_dyn_dd)), 2) if base_ts_dd > 0 else static_ts_dd
+
+    # 3. Volatility/Spread-Adaptive Soft Stop-Loss
+    if static_sl_pct > 0:
+        raw_dyn_sl = static_sl_pct * adapt_mult
+        if vol_adapt_on and spr_val is not None:
+            raw_dyn_sl = max(raw_dyn_sl, spr_val * 1.25)
+        if static_sl_hard > 0:
+            raw_dyn_sl = min(raw_dyn_sl, max(1.0, static_sl_hard - 1.0))
+        eff_sl_pct = round(max(2.0, raw_dyn_sl), 2)
+    else:
+        eff_sl_pct = 0.0
+
+    # 4. Arming & Dynamic Trigger Evaluation (Shadow or Active)
+    ratchet_armed = bool(pk_pnl is not None and pk_pnl >= eff_ts_act and eff_ts_dd > 0)
+    breakeven_armed = bool(
+        be_act_pct > 0 and pk_pnl is not None and pk_pnl >= be_act_pct
+    )
+    vel_ok = (not static_ts_req_v) or (vel_val is not None and vel_val < 0)
+
+    would_trigger = False
+    trigger_kind = None
+    trigger_reason = None
+    status = "UNARMED"
+
+    if ratchet_armed:
+        status = "RATCHET_ARMED"
+        if dd_pct > eff_ts_dd:
+            if vel_ok:
+                would_trigger = True
+                trigger_kind = "dynamic_trailing_stop"
+                tier_lbl = (
+                    f"tier>={active_tier[0]:.0f}%->base{active_tier[1]:.1f}%"
+                    if active_tier
+                    else f"base{base_ts_dd:.1f}%"
+                )
+                trigger_reason = (
+                    f"dynamic_ratchet_ts(peak={pk_pnl:+.2f}%,pnl={cur_pnl:+.2f}%,"
+                    f"dd={dd_pct:.2f}%>{eff_ts_dd:.2f}%,{tier_lbl},x{adapt_mult:.2f})"
+                )
+                status = "WOULD_EXIT" if eff_mode != "view_and_act" else "TRIGGERED"
+            else:
+                status = "RATCHET_HOLD_VEL"
+
+    if not would_trigger and breakeven_armed and cur_pnl is not None:
+        if cur_pnl <= be_floor_pct:
+            if vel_ok:
+                would_trigger = True
+                trigger_kind = "dynamic_breakeven"
+                trigger_reason = (
+                    f"dynamic_breakeven(peak={pk_pnl:+.2f}%>={be_act_pct:.1f}%,"
+                    f"pnl={cur_pnl:+.2f}%<=+{be_floor_pct:.1f}%)"
+                )
+                status = "WOULD_EXIT" if eff_mode != "view_and_act" else "TRIGGERED"
+            elif status == "UNARMED":
+                status = "BE_HOLD_VEL"
+        elif status == "UNARMED":
+            status = "BE_ARMED"
+
+    # Check adaptive soft stop-loss breach status (informational / active)
+    dyn_sl_breached = bool(
+        eff_sl_pct > 0 and cur_pnl is not None and cur_pnl < -eff_sl_pct
+    )
+    in_hold_grace = static_min_hold > 0 and float(hold_minutes or 0.0) < static_min_hold
+    if not would_trigger and dyn_sl_breached:
+        if status == "UNARMED":
+            status = "SL_GRACE" if in_hold_grace else (
+                "SL_WATCH" if loss_streak < static_sl_mins else "SL_READY"
+            )
+
+    tier_ladder = [
+        {
+            "peak_pct": t_pk,
+            "base_dd_pct": t_dd,
+            "eff_dd_pct": round(max(1.5, spread_dd_floor, min(15.0, t_dd * adapt_mult)), 2),
+            "active": bool(active_tier is not None and active_tier[0] == t_pk),
+            "reached": bool(pk_pnl is not None and pk_pnl >= t_pk),
+        }
+        for t_pk, t_dd in tiers
+    ]
+
+    return {
+        "mode": eff_mode,
+        "status": status,
+        "pnl_pct": round(cur_pnl, 2) if cur_pnl is not None else None,
+        "peak_pnl_pct": round(pk_pnl, 2) if pk_pnl is not None else None,
+        "drawdown_pct": round(dd_pct, 2),
+        "hold_minutes": round(float(hold_minutes or 0.0), 2),
+        "samples": sample_count,
+        "vol_sigma_pct": vol_sigma_pct,
+        "spread_pct": round(spr_val, 2) if spr_val is not None else None,
+        "vol_adapt_enabled": vol_adapt_on,
+        "adapt_mult": adapt_mult,
+        "static_ts_activation_pct": round(static_ts_act, 2),
+        "static_ts_drawdown_pct": round(static_ts_dd, 2),
+        "eff_ts_activation_pct": round(eff_ts_act, 2),
+        "eff_ts_drawdown_pct": round(eff_ts_dd, 2),
+        "active_ratchet_tier": (
+            {"peak_pct": active_tier[0], "base_dd_pct": active_tier[1]}
+            if active_tier is not None
+            else None
+        ),
+        "tier_ladder": tier_ladder,
+        "ratchet_armed": ratchet_armed,
+        "breakeven_activation_pct": round(be_act_pct, 2),
+        "breakeven_floor_pct": be_floor_pct,
+        "breakeven_armed": breakeven_armed,
+        "static_sl_pct": round(static_sl_pct, 2),
+        "eff_sl_pct": round(eff_sl_pct, 2),
+        "dyn_sl_breached": dyn_sl_breached,
+        "underlying_v": round(vel_val, 4) if vel_val is not None else None,
+        "require_neg_vel": static_ts_req_v,
+        "vel_ok": vel_ok,
+        "would_trigger": would_trigger,
+        "trigger_kind": trigger_kind,
+        "trigger_reason": trigger_reason,
+    }
 CHART_CAPTURE_ENABLED = os.getenv("CHART_CAPTURE_ENABLED", "true").strip().lower() in {
     "1",
     "true",
@@ -16968,6 +17330,9 @@ class OptionSeller:
         self.first_seen_at_by_symbol = {}
         self.peak_profit_state_by_symbol = {}
         self.stop_loss_state_by_symbol = {}
+        self.dynamic_rules_state_by_symbol = {}
+        self.dynamic_shadow_alerts = 0
+        self.dynamic_action_orders = 0
         self.attempted_minutes = set()
         self._exit_chain_client = None
         self._exit_chain_dry_captured = set()
@@ -17682,7 +18047,9 @@ class OptionSeller:
             f"kinematics_recovering_or_flat(v={vel:+.4f},a={acc:+.4f},p_delta={eff_proj:+.4f})",
         )
 
-    def _update_stop_loss_streak(self, pos_sym, pnl_pct, minute_key, minute_dt):
+    def _update_stop_loss_streak(
+        self, pos_sym, pnl_pct, minute_key, minute_dt, threshold_override=None
+    ):
         """Track consecutive 1-minute evaluations where position loss > threshold%."""
         st = self.stop_loss_state_by_symbol.setdefault(
             pos_sym,
@@ -17696,7 +18063,11 @@ class OptionSeller:
         if st["last_minute_key"] == minute_key:
             return st["streak"]
 
-        threshold = OPTION_SELL_STOP_LOSS_PCT
+        threshold = (
+            float(threshold_override)
+            if (threshold_override is not None and threshold_override > 0)
+            else OPTION_SELL_STOP_LOSS_PCT
+        )
         is_breached = (
             threshold > 0
             and pnl_pct is not None
@@ -18245,15 +18616,108 @@ class OptionSeller:
             peak_pnl, drawdown_pct = self._update_peak_profit_state(
                 pos_sym, pnl_pct, now.isoformat()
             )
+            provider, entry = self._select_kinematics_entry(underlying)
+
+            # Dynamic Exit Rules (Peak-Ratcheting Trailing Stop + Vol/Spread-Adaptive Thresholds)
+            dyn_eval = None
+            dyn_mode = OPTION_SELL_DYNAMIC_RULES_MODE
+            if dyn_mode in {"view_only", "view_and_act"}:
+                try:
+                    hist_pnls = []
+                    latest_spread = None
+                    oh_ref = getattr(self.coordinator, "option_history", None)
+                    if oh_ref is not None:
+                        with oh_ref._lock:
+                            oc_rec = oh_ref.open_contracts.get(pos_sym)
+                            if isinstance(oc_rec, dict):
+                                for hpt in (oc_rec.get("history") or [])[-30:]:
+                                    if isinstance(hpt, dict) and not hpt.get("pre_entry"):
+                                        hp = _opt_safe_float(hpt.get("pnl_pct"), None)
+                                        if hp is not None:
+                                            hist_pnls.append(hp)
+                                        hs = _opt_safe_float(hpt.get("spread_pct"), None)
+                                        if hs is not None and hs >= 0:
+                                            latest_spread = hs
+                    if pnl_pct is not None and math.isfinite(pnl_pct):
+                        if not hist_pnls or abs(hist_pnls[-1] - pnl_pct) > 1e-6:
+                            hist_pnls.append(pnl_pct)
+                    raw_v_dyn = (
+                        entry.get("smoothed_velocity")
+                        if (isinstance(entry, dict) and entry.get("smoothed_velocity") is not None)
+                        else (entry.get("price_velocity") if isinstance(entry, dict) else None)
+                    )
+                    prev_sl_streak = int(
+                        (self.stop_loss_state_by_symbol.get(pos_sym) or {}).get("streak", 0)
+                    )
+                    dyn_eval = _evaluate_dynamic_contract_rules(
+                        pnl_pct=pnl_pct,
+                        peak_pnl_pct=peak_pnl,
+                        drawdown_pct=drawdown_pct,
+                        pnl_series=hist_pnls,
+                        spread_pct=latest_spread,
+                        hold_minutes=hold_minutes,
+                        underlying_v=raw_v_dyn,
+                        loss_streak=prev_sl_streak,
+                        mode=dyn_mode,
+                    )
+                    dyn_eval["underlying"] = underlying
+                    dyn_eval["updated_utc"] = now.isoformat()
+                    self.dynamic_rules_state_by_symbol[pos_sym] = dyn_eval
+                    if dyn_mode == "view_only" and (
+                        dyn_eval.get("would_trigger") or dyn_eval.get("ratchet_armed") or dyn_eval.get("breakeven_armed")
+                    ):
+                        if dyn_eval.get("would_trigger"):
+                            self.dynamic_shadow_alerts += 1
+                        self.logger.info(
+                            "OPTION_SELL_DYNAMIC_SHADOW symbol=%s underlying=%s status=%s pnl=%.2f%% peak=%.2f%% dd=%.2f%% "
+                            "dyn_ts=%.1f%%/%.2f%%(static=%.1f%%/%.1f%%) dyn_sl=%.2f%%(static=%.1f%%) mult=%.2fx sigma=%s spr=%s would_trigger=%s reason=%s",
+                            pos_sym,
+                            underlying,
+                            dyn_eval.get("status"),
+                            pnl_pct if pnl_pct is not None else 0.0,
+                            peak_pnl if peak_pnl is not None else 0.0,
+                            drawdown_pct,
+                            dyn_eval.get("eff_ts_activation_pct", 0.0),
+                            dyn_eval.get("eff_ts_drawdown_pct", 0.0),
+                            dyn_eval.get("static_ts_activation_pct", 0.0),
+                            dyn_eval.get("static_ts_drawdown_pct", 0.0),
+                            dyn_eval.get("eff_sl_pct", 0.0),
+                            dyn_eval.get("static_sl_pct", 0.0),
+                            dyn_eval.get("adapt_mult", 1.0),
+                            dyn_eval.get("vol_sigma_pct"),
+                            dyn_eval.get("spread_pct"),
+                            dyn_eval.get("would_trigger"),
+                            dyn_eval.get("trigger_reason") or "n/a",
+                        )
+                except Exception as dyn_exc:
+                    self.logger.warning(
+                        "OPTION_SELL_DYNAMIC_EVAL_FAILED symbol=%s error_type=%s detail=%s",
+                        pos_sym,
+                        type(dyn_exc).__name__,
+                        dyn_exc,
+                    )
+
+            eff_sl_threshold = (
+                dyn_eval["eff_sl_pct"]
+                if (
+                    dyn_mode == "view_and_act"
+                    and isinstance(dyn_eval, dict)
+                    and dyn_eval.get("eff_sl_pct", 0) > 0
+                )
+                else OPTION_SELL_STOP_LOSS_PCT
+            )
             loss_streak = 0
             if OPTION_SELL_STOP_LOSS_ENABLED:
                 loss_streak = self._update_stop_loss_streak(
-                    pos_sym, pnl_pct, minute_key, target_min_dt
+                    pos_sym,
+                    pnl_pct,
+                    minute_key,
+                    target_min_dt,
+                    threshold_override=eff_sl_threshold,
                 )
 
             dedup_key = (pos_sym, minute_key)
             if dedup_key in self.attempted_minutes:
-                provider, entry = self._select_kinematics_entry(underlying)
                 self._log_sell_analysis(
                     minute_key,
                     pos_sym,
@@ -18265,8 +18729,6 @@ class OptionSeller:
                     "already_attempted_minute",
                 )
                 continue
-
-            provider, entry = self._select_kinematics_entry(underlying)
 
             qty_avail = PositionMonitor._num(pos, "qty_available", None)
             if qty_avail is not None and qty_avail <= 0:
@@ -18346,16 +18808,28 @@ class OptionSeller:
                     rejection_notes.append(rsi_reason)
 
             # 3. Session High-Water Mark Trailing Stop (exit when drawdown > X% with v < 0)
+            #    When dynamic_rules_mode = view_and_act, uses contract-adaptive Peak-Ratcheting & Vol/Spread thresholds
+            eff_ts_act_cfg = OPTION_SELL_TRAILING_ACTIVATION_PCT
+            eff_ts_dd_cfg = OPTION_SELL_TRAILING_DRAWDOWN_PCT
+            use_dynamic_t3 = (
+                dyn_mode == "view_and_act"
+                and isinstance(dyn_eval, dict)
+                and dyn_eval.get("eff_ts_drawdown_pct", 0) > 0
+            )
+            if use_dynamic_t3:
+                eff_ts_act_cfg = float(dyn_eval["eff_ts_activation_pct"])
+                eff_ts_dd_cfg = float(dyn_eval["eff_ts_drawdown_pct"])
+
             if (
                 not qualifies
                 and peak_eligible
                 and OPTION_SELL_TRAILING_STOP_ENABLED
-                and OPTION_SELL_TRAILING_DRAWDOWN_PCT > 0
+                and eff_ts_dd_cfg > 0
                 and peak_pnl is not None
             ):
                 if (
-                    peak_pnl >= OPTION_SELL_TRAILING_ACTIVATION_PCT
-                    and drawdown_pct > OPTION_SELL_TRAILING_DRAWDOWN_PCT
+                    peak_pnl >= eff_ts_act_cfg
+                    and drawdown_pct > eff_ts_dd_cfg
                 ):
                     if OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY:
                         ts_vel_ok, _, ts_vel_reason = (
@@ -18367,11 +18841,18 @@ class OptionSeller:
                     if ts_vel_ok:
                         qualifies = True
                         trigger_kind = "trailing_stop"
+                        dyn_tag = (
+                            f"[dynamic:x{dyn_eval['adapt_mult']:.2f}]"
+                            if use_dynamic_t3
+                            else ""
+                        )
                         reason = (
-                            f"trailing_stop(peak={peak_pnl:+.2f}%,pnl={pnl_pct:+.2f}%,"
-                            f"dd={drawdown_pct:.2f}%>{OPTION_SELL_TRAILING_DRAWDOWN_PCT:.2f}%)&"
+                            f"trailing_stop{dyn_tag}(peak={peak_pnl:+.2f}%,pnl={pnl_pct:+.2f}%,"
+                            f"dd={drawdown_pct:.2f}%>{eff_ts_dd_cfg:.2f}%)&"
                             f"{ts_vel_reason}"
                         )
+                        if use_dynamic_t3:
+                            self.dynamic_action_orders += 1
                     else:
                         rejection_notes.append(
                             f"ts_hold(dd={drawdown_pct:.2f}%,{ts_vel_reason})"
@@ -18386,13 +18867,35 @@ class OptionSeller:
                             drawdown_pct,
                             ts_vel_reason,
                         )
-                elif peak_pnl >= OPTION_SELL_TRAILING_ACTIVATION_PCT:
+                elif (
+                    use_dynamic_t3
+                    and dyn_eval.get("breakeven_armed")
+                    and pnl_pct is not None
+                    and pnl_pct <= float(dyn_eval.get("breakeven_floor_pct", 0.5))
+                ):
+                    if OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY:
+                        be_vel_ok, _, be_vel_reason = (
+                            self._evaluate_trailing_stop_velocity(entry)
+                        )
+                    else:
+                        be_vel_ok, _, be_vel_reason = True, None, "velocity_bypassed"
+                    if be_vel_ok:
+                        qualifies = True
+                        trigger_kind = "trailing_stop"
+                        reason = (
+                            f"dynamic_breakeven(peak={peak_pnl:+.2f}%>={dyn_eval['breakeven_activation_pct']:.1f}%,"
+                            f"pnl={pnl_pct:+.2f}%<=+{dyn_eval['breakeven_floor_pct']:.1f}%)&{be_vel_reason}"
+                        )
+                        self.dynamic_action_orders += 1
+                    else:
+                        rejection_notes.append(f"dyn_be_hold({be_vel_reason})")
+                elif peak_pnl >= eff_ts_act_cfg:
                     rejection_notes.append(
-                        f"ts_dd={drawdown_pct:.2f}%<={OPTION_SELL_TRAILING_DRAWDOWN_PCT:.2f}%"
+                        f"ts_dd={drawdown_pct:.2f}%<={eff_ts_dd_cfg:.2f}%"
                     )
                 else:
                     rejection_notes.append(
-                        f"ts_peak={peak_pnl:+.2f}%<{OPTION_SELL_TRAILING_ACTIVATION_PCT:.2f}%"
+                        f"ts_peak={peak_pnl:+.2f}%<{eff_ts_act_cfg:.2f}%"
                     )
 
             # 4. Stop-Loss Protection (respects min_hold_minutes grace period to avoid Ask/Bid spread liquidation)
@@ -18429,7 +18932,7 @@ class OptionSeller:
                             f"streak={loss_streak})"
                         )
                 elif (
-                    OPTION_SELL_STOP_LOSS_PCT > 0
+                    eff_sl_threshold > 0
                     and loss_streak >= OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES
                 ):
                     if in_hold_grace:
@@ -18457,11 +18960,18 @@ class OptionSeller:
                         if sl_kin_ok:
                             qualifies = True
                             trigger_kind = "stop_loss"
+                            dyn_sl_tag = (
+                                f"[dynamic:x{dyn_eval['adapt_mult']:.2f}]"
+                                if (dyn_mode == "view_and_act" and isinstance(dyn_eval, dict))
+                                else ""
+                            )
                             reason = (
-                                f"stop_loss(pnl={pnl_pct:.2f}%<-{OPTION_SELL_STOP_LOSS_PCT:.2f}%,"
+                                f"stop_loss{dyn_sl_tag}(pnl={pnl_pct:.2f}%<-{eff_sl_threshold:.2f}%,"
                                 f"streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES})&"
                                 f"{sl_kin_reason}"
                             )
+                            if dyn_sl_tag:
+                                self.dynamic_action_orders += 1
                         else:
                             rejection_notes.append(
                                 f"sl_hold(streak={loss_streak}/{OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES},{sl_kin_reason})"
@@ -18486,7 +18996,7 @@ class OptionSeller:
                         pos_sym,
                         underlying,
                         pnl_pct if pnl_pct is not None else 0.0,
-                        OPTION_SELL_STOP_LOSS_PCT,
+                        eff_sl_threshold,
                         loss_streak,
                         OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES,
                         hold_minutes,
@@ -18901,6 +19411,9 @@ class OptionSeller:
         for stale_sym in list(self.first_seen_at_by_symbol.keys()):
             if stale_sym not in seen_long_symbols:
                 self.first_seen_at_by_symbol.pop(stale_sym, None)
+        for stale_sym in list(self.dynamic_rules_state_by_symbol.keys()):
+            if stale_sym not in seen_long_symbols:
+                self.dynamic_rules_state_by_symbol.pop(stale_sym, None)
 
         if open_opt_capture_entries:
             self._schedule_open_position_capture(
@@ -22914,6 +23427,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <span id="optionSellerPeakProfit" class="mono text-[11px] text-emerald-300 truncate max-w-[160px]">0 tracked</span>
                         </div>
 
+                        <div id="optionSellerDynamicRulesRow" class="p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 space-y-1.5">
+                            <div class="flex justify-between items-center gap-2">
+                                <span class="text-slate-300 font-medium flex items-center gap-1.5 min-w-0">
+                                    <span class="truncate">Dynamic Exit Rules</span>
+                                    <span id="optionSellerDynamicRulesBadge" class="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 font-semibold uppercase tracking-wide shrink-0">OFF</span>
+                                </span>
+                                <span id="optionSellerDynamicRulesMeta" class="mono text-[10px] text-slate-400 truncate text-right">static rules</span>
+                            </div>
+                            <div id="optionSellerDynamicRulesBody" class="space-y-1 text-[10px] mono text-slate-400"></div>
+                        </div>
+
                         <div class="flex justify-between items-center p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 gap-2">
                             <span class="text-slate-400">Chart Capture (1m PNG)</span>
                             <div class="flex items-center gap-2">
@@ -23047,7 +23571,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <button id="btnOptDrilldownBuySellLog" type="button" onclick="openOptionLogDetailsFromDrilldown()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="View triggering BUY &amp; SELL log entries (&plusmn;3 rows before &amp; after) for the selected trade">
                         Buy/Sell Log Details
                     </button>
-                    <button id="btnOptDrilldownFindBest" type="button" onclick="openFindBestFromDrilldown()" class="hidden px-2.5 py-1 rounded-lg bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 hover:text-white border border-amber-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="Analyze option chain data between buy &amp; sell to find peak exit and tune parms.ini">
+                    <button id="btnOptDrilldownFindBest" type="button" onclick="openFindBestFromDrilldown()" class="hidden px-2.5 py-1 rounded-lg bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 hover:text-white border border-amber-500/40 text-[11px] font-semibold mono transition whitespace-nowrap" title="Analyze option chain data &amp; dynamic rules for this open or closed contract to find peak exit and tune parms.ini">
                         Find Best
                     </button>
                     <button onclick="closeOptionDrilldown()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
@@ -24276,6 +24800,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         slEl.textContent = slOrders > 0 ? `0 active (${slOrders} triggered)` : '0 active';
                     }
                 }
+                latestOptionSellerStatus = os;
                 const ppEl = document.getElementById('optionSellerPeakProfit');
                 if (ppEl) {
                     const peaks = Object.entries(os.peak_profit_watches || {});
@@ -24286,6 +24811,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         ppEl.textContent = ptOrders > 0 ? `0 tracked (${ptOrders} exited)` : '0 tracked';
                     }
                 }
+                renderOptionSellerDynamicRulesCard(os);
             }
             renderNasdaqAndRsi30Telemetry(m.nasdaq_market || null, m.rsi_30d || null);
             if (m.chart_capture) {
@@ -26050,7 +26576,144 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         let selectedBuyerContract = null;
         let selectedSellerTradeId = null;
         let latestOptionHistory = null;
+        let latestOptionSellerStatus = null;
         let latestOptionLogs = null;
+
+        function _normalizeDynMode(mode) {
+            const m = String(mode || 'off').trim().toLowerCase();
+            if (m === 'view_and_act') return 'view_and_act';
+            if (m === 'view_only') return 'view_only';
+            return 'off';
+        }
+
+        function _fmtDynamicModeBadge(mode) {
+            const m = _normalizeDynMode(mode);
+            if (m === 'view_and_act') {
+                return {
+                    label: 'VIEW & ACT',
+                    cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+                    desc: 'Live dynamic overrides active on Trailing Stop, Breakeven, and Soft Stop-Loss',
+                };
+            }
+            if (m === 'view_only') {
+                return {
+                    label: 'VIEW-ONLY (SHADOW)',
+                    shortLabel: 'VIEW-ONLY',
+                    cls: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+                    desc: 'Shadow telemetry only — live sell execution uses static parms.ini rules',
+                };
+            }
+            return {
+                label: 'OFF',
+                shortLabel: 'OFF',
+                cls: 'bg-slate-800 text-slate-400 border-slate-700',
+                desc: 'Disabled — set [option_seller] dynamic_rules_mode = view_only or view_and_act',
+            };
+        }
+
+        function _fmtDynamicStatusBadge(status, mode) {
+            const st = String(status || 'UNARMED').toUpperCase();
+            const isShadow = _normalizeDynMode(mode) !== 'view_and_act';
+            if (st === 'TRIGGERED') {
+                return { label: 'TRIGGERED', cls: 'bg-emerald-500/25 text-emerald-200 border-emerald-400/50' };
+            }
+            if (st === 'WOULD_EXIT') {
+                return { label: isShadow ? 'WOULD EXIT [SHADOW]' : 'WOULD EXIT', cls: 'bg-amber-500/25 text-amber-200 border-amber-400/50' };
+            }
+            if (st === 'RATCHET_ARMED') {
+                return { label: 'RATCHET ARMED', cls: 'bg-cyan-500/20 text-cyan-200 border-cyan-400/40' };
+            }
+            if (st === 'RATCHET_HOLD_VEL') {
+                return { label: 'RATCHET · WAIT v<0', cls: 'bg-indigo-500/20 text-indigo-200 border-indigo-400/40' };
+            }
+            if (st === 'BE_ARMED') {
+                return { label: 'BE FLOOR ARMED', cls: 'bg-teal-500/20 text-teal-200 border-teal-400/40' };
+            }
+            if (st === 'BE_HOLD_VEL') {
+                return { label: 'BE · WAIT v<0', cls: 'bg-indigo-500/20 text-indigo-200 border-indigo-400/40' };
+            }
+            if (st === 'SL_READY') {
+                return { label: 'DYN SL READY', cls: 'bg-rose-500/25 text-rose-200 border-rose-400/50' };
+            }
+            if (st === 'SL_WATCH') {
+                return { label: 'DYN SL WATCH', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/35' };
+            }
+            if (st === 'SL_GRACE') {
+                return { label: 'DYN SL GRACE', cls: 'bg-slate-800 text-amber-300 border-amber-500/30' };
+            }
+            return { label: 'UNARMED', cls: 'bg-slate-800 text-slate-400 border-slate-700' };
+        }
+
+        function renderOptionSellerDynamicRulesCard(os) {
+            const rowEl = document.getElementById('optionSellerDynamicRulesRow');
+            const badgeEl = document.getElementById('optionSellerDynamicRulesBadge');
+            const metaEl = document.getElementById('optionSellerDynamicRulesMeta');
+            const bodyEl = document.getElementById('optionSellerDynamicRulesBody');
+            if (!rowEl || !badgeEl || !metaEl || !bodyEl) return;
+
+            const mode = _normalizeDynMode(os && os.dynamic_rules_mode);
+            const mb = _fmtDynamicModeBadge(mode);
+            badgeEl.textContent = mb.shortLabel || mb.label;
+            badgeEl.className = `text-[9px] px-1.5 py-0.5 rounded border font-semibold uppercase tracking-wide shrink-0 ${mb.cls}`;
+            badgeEl.title = mb.desc;
+
+            if (mode === 'off') {
+                rowEl.className = 'p-2 rounded-xl bg-slate-950/50 border border-slate-800/80 space-y-1';
+                metaEl.textContent = 'static rules';
+                metaEl.className = 'mono text-[10px] text-slate-500 truncate text-right';
+                bodyEl.innerHTML = '';
+                bodyEl.classList.add('hidden');
+                return;
+            }
+
+            rowEl.className = mode === 'view_and_act'
+                ? 'p-2 rounded-xl bg-emerald-950/15 border border-emerald-700/40 space-y-1.5'
+                : 'p-2 rounded-xl bg-amber-950/15 border border-amber-700/40 space-y-1.5';
+            bodyEl.classList.remove('hidden');
+
+            const dynMap = (os && os.dynamic_rules_by_symbol) || {};
+            const entries = Object.entries(dynMap);
+            const shadowAlerts = Number((os && os.dynamic_shadow_alerts) || 0);
+            const actionOrders = Number((os && os.dynamic_action_orders) || 0);
+
+            if (mode === 'view_and_act') {
+                metaEl.textContent = `${entries.length} live · ${actionOrders} act`;
+                metaEl.className = 'mono text-[10px] text-emerald-300 truncate text-right';
+            } else {
+                metaEl.textContent = `${entries.length} live · ${shadowAlerts} shadow`;
+                metaEl.className = 'mono text-[10px] text-amber-300 truncate text-right';
+            }
+
+            if (entries.length === 0) {
+                const tiersStr = (os && os.dynamic_ratchet_tiers) ? String(os.dynamic_ratchet_tiers) : '--';
+                bodyEl.innerHTML = `<div class="text-[9.5px] text-slate-500 truncate" title="Tiers: ${escSvg(tiersStr)}">No open contracts evaluated yet · tiers ${escSvg(tiersStr)}</div>`;
+                return;
+            }
+
+            bodyEl.innerHTML = entries.map(([sym, st]) => {
+                const sb = _fmtDynamicStatusBadge(st.status, mode);
+                const effDd = safeNum(st.eff_ts_drawdown_pct);
+                const effSl = safeNum(st.eff_sl_pct);
+                const mult = safeNum(st.adapt_mult);
+                const pk = safeNum(st.peak_pnl_pct);
+                const dd = safeNum(st.drawdown_pct);
+                const pnl = safeNum(st.pnl_pct);
+                const tierTxt = st.active_ratchet_tier ? `T≥${Number(st.active_ratchet_tier.peak_pct).toFixed(0)}%` : 'Base';
+                const tooltip = `${sym} | ${sb.label} | P/L ${pnl !== null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '%' : '--'} | Peak ${pk !== null ? (pk >= 0 ? '+' : '') + pk.toFixed(2) + '%' : '--'} (dd ${dd !== null ? dd.toFixed(2) : '0.00'}%) | Dyn TS DD -${effDd !== null ? effDd.toFixed(2) : '--'}% (static -${safeNum(st.static_ts_drawdown_pct) !== null ? safeNum(st.static_ts_drawdown_pct).toFixed(1) : '--'}%) | Dyn SL -${effSl !== null ? effSl.toFixed(2) : '--'}% | Adapt x${mult !== null ? mult.toFixed(2) : '1.00'}${st.trigger_reason ? ' | ' + st.trigger_reason : ''}`;
+                return `
+                    <div role="button" tabindex="0" onclick="openOptionDrilldown('buyer','${escSvg(sym)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openOptionDrilldown('buyer','${escSvg(sym)}');}" title="${escSvg(tooltip)}" class="cursor-pointer px-2 py-1 rounded-lg bg-slate-950/75 hover:bg-slate-900 border border-slate-800/80 hover:border-cyan-500/40 transition space-y-0.5">
+                        <div class="flex items-center justify-between gap-1.5">
+                            <span class="text-slate-200 font-semibold truncate">${escSvg(sym)}</span>
+                            <span class="text-[8.5px] px-1.5 py-0.5 rounded border font-bold whitespace-nowrap shrink-0 ${sb.cls}">${escSvg(sb.label)}</span>
+                        </div>
+                        <div class="flex items-center justify-between gap-1 text-[9.5px] text-slate-400">
+                            <span>${escSvg(tierTxt)} · TS -${effDd !== null ? effDd.toFixed(1) : '--'}% · SL -${effSl !== null ? effSl.toFixed(1) : '--'}%</span>
+                            <span class="text-cyan-300 shrink-0">x${mult !== null ? mult.toFixed(2) : '1.00'}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
         let optionLogStreamFilter = 'all'; // 'all' | 'BUY' | 'SELL'
         let optionLogDecisionFilter = 'all'; // 'all' | 'QUALIFIED' | 'REJECTED'
         let optionLogSearchFilter = '';
@@ -26192,12 +26855,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
-        async function openOptionDrilldown(mode = 'buyer') {
+        async function openOptionDrilldown(mode = 'buyer', focusContract = null) {
             const nextMode = mode === 'seller' ? 'seller' : 'buyer';
             if (optionDrilldownMode !== nextMode) {
                 resetOptPanView();
             }
             optionDrilldownMode = nextMode;
+            if (focusContract && nextMode === 'buyer') {
+                selectedBuyerContract = String(focusContract);
+            }
             const modal = document.getElementById('optionDrilldownModal');
             if (modal) modal.classList.remove('hidden');
             await fetchOptionHistory();
@@ -28165,11 +28831,13 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 const findBestBtn = document.getElementById('btnOptDrilldownFindBest');
                 if (findBestBtn) {
-                    if (FINDBEST_ENABLED && !isBuyer) {
+                    if (FINDBEST_ENABLED) {
                         findBestBtn.classList.remove('hidden');
                         findBestBtn.disabled = true;
                         findBestBtn.classList.add('opacity-50', 'cursor-not-allowed');
-                        findBestBtn.title = 'Select a closed contract to run Find Best analysis';
+                        findBestBtn.title = isBuyer
+                            ? 'Select an open contract to run Find Best & dynamic rules analysis'
+                            : 'Select a closed contract to run Find Best analysis';
                     } else {
                         findBestBtn.classList.add('hidden');
                     }
@@ -28205,13 +28873,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
             const findBestBtn = document.getElementById('btnOptDrilldownFindBest');
             if (findBestBtn) {
-                if (FINDBEST_ENABLED && !isBuyer) {
+                if (FINDBEST_ENABLED) {
                     findBestBtn.classList.remove('hidden', 'opacity-50', 'cursor-not-allowed');
                     findBestBtn.disabled = false;
                     const cSym = String((selectedItem && selectedItem.contract) || '').trim().toUpperCase();
-                    findBestBtn.title = cSym
-                        ? `Run Find Best exit & parms.ini tuning analysis for ${cSym}`
-                        : 'Run Find Best exit & parms.ini tuning analysis';
+                    findBestBtn.title = isBuyer
+                        ? (cSym
+                            ? `Run live Find Best & dynamic exit rules analysis on open contract ${cSym}`
+                            : 'Run live Find Best & dynamic exit rules analysis on this open contract')
+                        : (cSym
+                            ? `Run Find Best exit & parms.ini tuning analysis for ${cSym}`
+                            : 'Run Find Best exit & parms.ini tuning analysis');
                 } else {
                     findBestBtn.classList.add('hidden');
                 }
@@ -28365,6 +29037,85 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
+                ${(() => {
+                    if (!isBuyer) return '';
+                    const osSt = latestOptionSellerStatus || {};
+                    const dMode = _normalizeDynMode(osSt.dynamic_rules_mode);
+                    const cSym = String(selectedItem.contract || '').trim();
+                    const dMap = osSt.dynamic_rules_by_symbol || {};
+                    const dyn = dMap[cSym] || dMap[cSym.toUpperCase()] || null;
+                    if (dMode === 'off' && !dyn) return '';
+                    const mb = _fmtDynamicModeBadge(dMode);
+                    const sb = dyn ? _fmtDynamicStatusBadge(dyn.status, dMode) : { label: 'AWAITING 1M BAR', cls: 'bg-slate-800 text-slate-400 border-slate-700' };
+                    const wrapCls = dMode === 'view_and_act'
+                        ? 'bg-emerald-950/15 border-emerald-500/35'
+                        : 'bg-amber-950/15 border-amber-500/35';
+                    if (!dyn) {
+                        return `
+                            <div class="p-3 rounded-xl border ${wrapCls} mono text-[11px] flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-200">Dynamic Exit Rules</span>
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded border font-bold ${mb.cls}">${escSvg(mb.label)}</span>
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded border font-bold ${sb.cls}">${escSvg(sb.label)}</span>
+                                </div>
+                                <div class="text-[10px] text-slate-400">Tiers: ${escSvg(osSt.dynamic_ratchet_tiers || '--')} · Updates on next finalized 1m bar</div>
+                            </div>
+                        `;
+                    }
+                    const effAct = safeNum(dyn.eff_ts_activation_pct);
+                    const effDd = safeNum(dyn.eff_ts_drawdown_pct);
+                    const stAct = safeNum(dyn.static_ts_activation_pct);
+                    const stDd = safeNum(dyn.static_ts_drawdown_pct);
+                    const effSl = safeNum(dyn.eff_sl_pct);
+                    const stSl = safeNum(dyn.static_sl_pct);
+                    const mult = safeNum(dyn.adapt_mult);
+                    const sig = safeNum(dyn.vol_sigma_pct);
+                    const spr = safeNum(dyn.spread_pct);
+                    const beAct = safeNum(dyn.breakeven_activation_pct);
+                    const beFlr = safeNum(dyn.breakeven_floor_pct);
+                    const tierTxt = dyn.active_ratchet_tier
+                        ? `Tier ≥ +${Number(dyn.active_ratchet_tier.peak_pct).toFixed(0)}% (base -${Number(dyn.active_ratchet_tier.base_dd_pct).toFixed(1)}%)`
+                        : 'Pre-tier (base)';
+                    const trigLine = dyn.would_trigger && dyn.trigger_reason
+                        ? `<div class="mt-2 px-2.5 py-1.5 rounded-lg border text-[10.5px] ${dMode === 'view_and_act' ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200' : 'bg-amber-950/40 border-amber-500/40 text-amber-200'}"><strong>${dMode === 'view_and_act' ? 'ACTIVE OVERRIDE:' : 'SHADOW ALERT (NO ORDER):'}</strong> ${escSvg(dyn.trigger_reason)}</div>`
+                        : '';
+                    return `
+                        <div class="p-3 rounded-xl border ${wrapCls} mono text-[10.5px] space-y-2">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-[10px] font-bold uppercase tracking-wider text-slate-100">Dynamic Exit Rules (Peak-Ratchet + Vol/Spread)</span>
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded border font-bold ${mb.cls}" title="${escSvg(mb.desc)}">${escSvg(mb.label)}</span>
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded border font-bold ${sb.cls}">${escSvg(sb.label)}</span>
+                                </div>
+                                ${FINDBEST_ENABLED ? `<button type="button" onclick="openFindBestFromDrilldown()" class="px-2 py-0.5 rounded bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 text-[10px] font-semibold transition">Inspect in Find Best &rarr;</button>` : ''}
+                            </div>
+                            <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                                <div class="px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800/80">
+                                    <div class="text-[9px] uppercase text-slate-400">Dynamic Trailing Stop</div>
+                                    <div class="text-white font-bold">+${effAct !== null ? effAct.toFixed(1) : '--'}% / -${effDd !== null ? effDd.toFixed(2) : '--'}%</div>
+                                    <div class="text-[9.5px] text-slate-400">Static: +${stAct !== null ? stAct.toFixed(1) : '--'}% / -${stDd !== null ? stDd.toFixed(1) : '--'}% · ${escSvg(tierTxt)}</div>
+                                </div>
+                                <div class="px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800/80">
+                                    <div class="text-[9px] uppercase text-slate-400">Adaptive Soft Stop-Loss</div>
+                                    <div class="font-bold ${dyn.dyn_sl_breached ? 'text-rose-400' : 'text-slate-100'}">${effSl !== null && effSl > 0 ? '-' + effSl.toFixed(2) + '%' : 'Disabled'}</div>
+                                    <div class="text-[9.5px] text-slate-400">Static: ${stSl !== null && stSl > 0 ? '-' + stSl.toFixed(1) + '%' : 'off'}${dyn.dyn_sl_breached ? ' · <span class="text-rose-300">BREACHED</span>' : ''}</div>
+                                </div>
+                                <div class="px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800/80">
+                                    <div class="text-[9px] uppercase text-slate-400">Breakeven Profit Lock</div>
+                                    <div class="font-bold ${dyn.breakeven_armed ? 'text-teal-300' : 'text-slate-300'}">${dyn.breakeven_armed ? 'ARMED (+' + (beFlr !== null ? beFlr.toFixed(1) : '0.5') + '%)' : (beAct !== null && beAct > 0 ? 'Arms @ +' + beAct.toFixed(1) + '%' : 'Disabled')}</div>
+                                    <div class="text-[9.5px] text-slate-400">Peak ${safeNum(dyn.peak_pnl_pct) !== null ? (safeNum(dyn.peak_pnl_pct) >= 0 ? '+' : '') + safeNum(dyn.peak_pnl_pct).toFixed(2) + '%' : '--'} · DD ${safeNum(dyn.drawdown_pct) !== null ? '-' + safeNum(dyn.drawdown_pct).toFixed(2) + '%' : '0.00%'}</div>
+                                </div>
+                                <div class="px-2.5 py-1.5 rounded-lg bg-slate-950/70 border border-slate-800/80">
+                                    <div class="text-[9px] uppercase text-slate-400">Vol / Spread Adaptation</div>
+                                    <div class="font-bold text-cyan-300">x${mult !== null ? mult.toFixed(2) : '1.00'} <span class="text-[9.5px] font-normal text-slate-400">(${Number(dyn.samples || 0)}m)</span></div>
+                                    <div class="text-[9.5px] text-slate-400">&sigma;=${sig !== null ? sig.toFixed(2) + '%' : '--'} · Spr=${spr !== null ? spr.toFixed(1) + '%' : '--'} · v=${safeNum(dyn.underlying_v) !== null ? (safeNum(dyn.underlying_v) >= 0 ? '+' : '') + safeNum(dyn.underlying_v).toFixed(3) : '--'}</div>
+                                </div>
+                            </div>
+                            ${trigLine}
+                        </div>
+                    `;
+                })()}
+
                 <!-- 2-Panel Chart + Pan Toolbar + Hover Bar -->
                 <div class="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3.5 space-y-2">
                     <div class="flex flex-wrap items-center justify-between gap-2">
@@ -28496,9 +29247,19 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         async function openFindBestFromDrilldown() {
             if (!FINDBEST_ENABLED) return;
             const data = latestOptionHistory || { open_contracts: [], closed_contracts: [] };
-            const closedItems = data.closed_contracts || [];
-            if (closedItems.length === 0) return;
-            const selectedItem = closedItems.find(c => c.trade_id === selectedSellerTradeId) || closedItems[0];
+            const isBuyer = optionDrilldownMode === 'buyer';
+            let selectedItem = null;
+            if (isBuyer) {
+                const openItems = data.open_contracts || [];
+                if (openItems.length === 0) return;
+                const found = openItems.find(c => c.contract === selectedBuyerContract) || openItems[0];
+                if (found) selectedItem = { ...found, _is_open: true };
+            } else {
+                const closedItems = data.closed_contracts || [];
+                if (closedItems.length === 0) return;
+                const found = closedItems.find(c => c.trade_id === selectedSellerTradeId) || closedItems[0];
+                if (found) selectedItem = { ...found, _is_open: false };
+            }
             if (!selectedItem) return;
             _findBestLastItem = selectedItem;
             findBestViewMode = 'combined';
@@ -28549,8 +29310,9 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 btn.disabled = true;
                 btn.textContent = 'Analyzing...';
             }
+            const isOpenReq = Boolean(selectedItem._is_open);
             if (pane) {
-                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-14 mono">Scanning option chain captures &amp; 1-minute contract history between buy and sell...</div>`;
+                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-14 mono">${isOpenReq ? 'Scanning option chain captures, 1-minute history &amp; dynamic rules from buy to now...' : 'Scanning option chain captures &amp; 1-minute contract history between buy and sell...'}</div>`;
             }
             if (_findBestAbortCtrl) {
                 try { _findBestAbortCtrl.abort(); } catch (_) {}
@@ -28559,13 +29321,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const reqSeq = ++_findBestReqSeq;
 
             const params = new URLSearchParams();
+            if (isOpenReq) params.set('is_open', '1');
             if (selectedItem.trade_id) params.set('trade_id', String(selectedItem.trade_id));
             if (selectedItem.contract) params.set('contract', String(selectedItem.contract));
             if (selectedItem.underlying) params.set('underlying', String(selectedItem.underlying));
             if (selectedItem.purchased_at_utc) params.set('buy_utc', String(selectedItem.purchased_at_utc));
-            if (selectedItem.sold_at_utc) params.set('sell_utc', String(selectedItem.sold_at_utc));
+            if (!isOpenReq && selectedItem.sold_at_utc) params.set('sell_utc', String(selectedItem.sold_at_utc));
             if (selectedItem.entry_price != null) params.set('entry_price', String(selectedItem.entry_price));
-            if (selectedItem.exit_price != null) params.set('exit_price', String(selectedItem.exit_price));
+            const endPriceParam = isOpenReq ? selectedItem.current_price : selectedItem.exit_price;
+            if (endPriceParam != null) params.set('exit_price', String(endPriceParam));
             if (selectedItem.qty != null) params.set('qty', String(selectedItem.qty));
             params.set('_ts', String(Date.now()));
 
@@ -28618,13 +29382,16 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             const buyFmt = _fmtFindBestLocalTs(tr.buy_epoch_ms, tr.buy_utc);
             const sellFmt = _fmtFindBestLocalTs(tr.sell_epoch_ms, tr.sell_utc);
 
+            const isOpenTrade = Boolean(tr.is_open);
             const badge = document.getElementById('findBestContractBadge');
             if (badge) badge.textContent = tr.contract || '--';
             const sub = document.getElementById('findBestSubtitle');
             if (sub) {
                 const holdStr = tr.hold_minutes != null ? fmtDurationMin(tr.hold_minutes) : '--';
-                sub.textContent = `${tr.underlying || '--'} · Qty ${tr.qty || 1} · Entry $${Number(tr.entry_price || 0).toFixed(2)} → Exit $${Number(tr.exit_price || 0).toFixed(2)} · Window (${browserTzAbbr}): ${buyFmt.short} → ${sellFmt.short} (${holdStr})`;
-                sub.title = `Browser TZ: ${browserTzName} · Buy: ${buyFmt.title} · Sell: ${sellFmt.title}`;
+                sub.textContent = isOpenTrade
+                    ? `${tr.underlying || '--'} · OPEN POSITION · Qty ${tr.qty || 1} · Entry $${Number(tr.entry_price || 0).toFixed(2)} → Mark $${Number(tr.exit_price || 0).toFixed(2)} · Window (${browserTzAbbr}): ${buyFmt.short} → Now ${sellFmt.short} (${holdStr})`
+                    : `${tr.underlying || '--'} · Qty ${tr.qty || 1} · Entry $${Number(tr.entry_price || 0).toFixed(2)} → Exit $${Number(tr.exit_price || 0).toFixed(2)} · Window (${browserTzAbbr}): ${buyFmt.short} → ${sellFmt.short} (${holdStr})`;
+                sub.title = `Browser TZ: ${browserTzName} · Buy: ${buyFmt.title} · ${isOpenTrade ? 'Evaluated' : 'Sell'}: ${sellFmt.title}`;
             }
 
             const fmtPct = (v) => (v === null || v === undefined || !Number.isFinite(Number(v))) ? '--' : `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
@@ -28643,11 +29410,15 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const actPnlPct = safeNum(tr.actual_pnl_pct);
             const actPnlDol = safeNum(tr.actual_pnl_dollars);
+            const tradeStatusPill = isOpenTrade
+                ? '<span class="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 text-[10px] font-bold uppercase">OPEN POSITION (LIVE)</span>'
+                : '<span class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/40 text-[10px] font-bold uppercase">CLOSED TRADE</span>';
 
             // Top Source Switcher + Trade Context Bar
             const sourceBarHtml = `
                 <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-[11px] mono">
                     <div class="flex flex-wrap items-center gap-2">
+                        ${tradeStatusPill}
                         <span class="text-slate-400 uppercase text-[10px] font-bold">Data Source:</span>
                         <div class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
                             <button type="button" onclick="setFindBestViewMode('combined')" class="${viewBtnCls('combined')}">Combined (${combPts})</button>
@@ -28657,7 +29428,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700 text-[10px]" title="All timestamps displayed in your browser timezone: ${escSvg(browserTzName)}">${escSvg(browserTzAbbr)}</span>
                     </div>
                     <div class="flex flex-wrap items-center gap-3 text-[11px]">
-                        <span class="text-slate-400">Actual Exit: <strong class="${pctCls(actPnlPct)}">${fmtDol(actPnlDol)} (${fmtPct(actPnlPct)})</strong></span>
+                        <span class="text-slate-400">${isOpenTrade ? 'Current Mark' : 'Actual Exit'}: <strong class="${pctCls(actPnlPct)}">${fmtDol(actPnlDol)} (${fmtPct(actPnlPct)})</strong></span>
                         <span class="text-slate-500">Scanned ${Number(d.chain_files_scanned || 0)} chain files (${Number(d.chain_files_in_window || 0)} in window)</span>
                     </div>
                 </div>
@@ -28666,11 +29437,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (totalPts === 0) {
                 pane.innerHTML = sourceBarHtml + `
                     <div class="rounded-xl bg-slate-950/60 border border-slate-800 p-8 text-center space-y-2">
-                        <div class="text-sm font-semibold text-slate-200">No data points found for this source in the Buy → Sell timeframe</div>
+                        <div class="text-sm font-semibold text-slate-200">No data points found for this source in the ${isOpenTrade ? 'Buy → Now' : 'Buy → Sell'} timeframe</div>
                         <p class="text-xs text-slate-400 max-w-xl mx-auto">
                             ${findBestViewMode === 'optionchains'
-                                ? 'No saved logs/optionchains/*.json snapshots for this contract fell between the buy and sell timestamps. Switch to "Combined" or "1m Contract History" above to analyze the 1-minute tracked contract valuation data.'
-                                : 'No option chain captures or 1-minute contract history points were recorded between the buy and sell timestamps for this contract.'}
+                                ? `No saved logs/optionchains/*.json snapshots for this contract fell between ${isOpenTrade ? 'buy and now' : 'the buy and sell timestamps'}. Switch to "Combined" or "1m Contract History" above to analyze the 1-minute tracked contract valuation data.`
+                                : `No option chain captures or 1-minute contract history points were recorded between ${isOpenTrade ? 'buy and now' : 'the buy and sell timestamps'} for this contract.`}
                         </p>
                     </div>
                 `;
@@ -28717,6 +29488,76 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             `;
 
+            // 1b. Dynamic Exit Rules Snapshot (Peak-Ratcheting + Volatility/Spread-Adaptive)
+            const dyn = d.dynamic_rules || null;
+            const dynamicRulesHtml = dyn ? (() => {
+                const dMode = _normalizeDynMode(dyn.mode || liveParams.dynamic_rules_mode);
+                const mb = _fmtDynamicModeBadge(dMode);
+                const sb = _fmtDynamicStatusBadge(dyn.status, dMode);
+                const panelCls = dMode === 'view_and_act'
+                    ? 'bg-emerald-950/15 border-emerald-500/35'
+                    : (dMode === 'view_only' ? 'bg-amber-950/15 border-amber-500/35' : 'bg-slate-950/60 border-slate-700/80');
+                const ladder = Array.isArray(dyn.tier_ladder) ? dyn.tier_ladder : [];
+                const ladderHtml = ladder.length > 0 ? `
+                    <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
+                        <span class="text-slate-400 uppercase font-bold mr-1">Peak-Ratchet Ladder:</span>
+                        ${ladder.map(t => {
+                            const chipCls = t.active
+                                ? 'bg-cyan-500/25 text-cyan-200 border-cyan-400/60 font-bold shadow-sm'
+                                : (t.reached
+                                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                    : 'bg-slate-900/90 text-slate-400 border-slate-800');
+                            return `<span class="px-2 py-0.5 rounded border ${chipCls}">Peak &ge; +${fmtNum(t.peak_pct, 0)}% &rarr; -${fmtNum(t.eff_dd_pct, 2)}% <span class="text-[9px] opacity-75">(base -${fmtNum(t.base_dd_pct, 1)}%)</span>${t.active ? ' ★' : ''}</span>`;
+                        }).join('')}
+                    </div>
+                ` : '';
+                const verdictHtml = dyn.would_trigger && dyn.trigger_reason
+                    ? `<div class="px-3 py-1.5 rounded-lg border text-[11px] ${dMode === 'view_and_act' ? 'bg-emerald-950/45 border-emerald-500/45 text-emerald-200' : 'bg-amber-950/45 border-amber-500/45 text-amber-200'}">
+                            <strong>${dMode === 'view_and_act' ? 'ACTIVE DYNAMIC EXIT TRIGGER:' : 'SHADOW MODE (LOG-ONLY — NO ORDER PLACED):'}</strong> ${escSvg(dyn.trigger_reason)}
+                       </div>`
+                    : `<div class="text-[10.5px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
+                            <span>Current P/L: <strong class="${pctCls(dyn.pnl_pct)}">${fmtPct(dyn.pnl_pct)}</strong> · Peak: <strong class="${pctCls(dyn.peak_pnl_pct)}">${fmtPct(dyn.peak_pnl_pct)}</strong> · Drawdown: <strong class="text-slate-200">-${fmtNum(dyn.drawdown_pct, 2)}%</strong> · Velocity v=${dyn.underlying_v != null ? (Number(dyn.underlying_v) >= 0 ? '+' : '') + fmtNum(dyn.underlying_v, 4) : '--'} (${dyn.require_neg_vel ? (dyn.vel_ok ? 'v&lt;0 OK' : 'waiting v&lt;0') : 'any v'})</span>
+                            <span class="text-slate-500">Config: [option_seller] dynamic_rules_mode = ${escSvg(dMode)}</span>
+                       </div>`;
+
+                return `
+                    <div class="rounded-xl border ${panelCls} p-3.5 space-y-2.5 mono">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <span class="text-[11px] font-bold uppercase tracking-wider text-white">Dynamic Exit Rules — Peak-Ratcheting &amp; Vol/Spread-Adaptive</span>
+                                <span class="text-[9.5px] px-2 py-0.5 rounded border font-bold ${mb.cls}" title="${escSvg(mb.desc)}">${escSvg(mb.label)}</span>
+                                <span class="text-[9.5px] px-2 py-0.5 rounded border font-bold ${sb.cls}">${escSvg(sb.label)}</span>
+                            </div>
+                            <span class="text-[10px] text-slate-400">${escSvg(mb.desc)}</span>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5 text-[11px]">
+                            <div class="rounded-lg bg-slate-950/75 border border-slate-800 p-2.5 space-y-0.5">
+                                <div class="text-[9.5px] uppercase text-cyan-300 font-bold">Dynamic Trailing Stop</div>
+                                <div class="text-sm font-bold text-white">+${fmtNum(dyn.eff_ts_activation_pct, 1)}% / -${fmtNum(dyn.eff_ts_drawdown_pct, 2)}%</div>
+                                <div class="text-[10px] text-slate-400">Static: +${fmtNum(dyn.static_ts_activation_pct, 1)}% / -${fmtNum(dyn.static_ts_drawdown_pct, 1)}% · ${dyn.ratchet_armed ? '<span class="text-cyan-300 font-semibold">ARMED</span>' : 'Unarmed'}</div>
+                            </div>
+                            <div class="rounded-lg bg-slate-950/75 border border-slate-800 p-2.5 space-y-0.5">
+                                <div class="text-[9.5px] uppercase text-rose-300 font-bold">Adaptive Soft Stop-Loss</div>
+                                <div class="text-sm font-bold ${dyn.dyn_sl_breached ? 'text-rose-400' : 'text-white'}">${Number(dyn.eff_sl_pct || 0) > 0 ? '-' + fmtNum(dyn.eff_sl_pct, 2) + '%' : 'Disabled'}</div>
+                                <div class="text-[10px] text-slate-400">Static: ${Number(dyn.static_sl_pct || 0) > 0 ? '-' + fmtNum(dyn.static_sl_pct, 1) + '%' : 'off'} · Hard: -${fmtNum(liveParams.stop_loss_hard_pct, 1)}%</div>
+                            </div>
+                            <div class="rounded-lg bg-slate-950/75 border border-slate-800 p-2.5 space-y-0.5">
+                                <div class="text-[9.5px] uppercase text-teal-300 font-bold">Breakeven Profit Lock</div>
+                                <div class="text-sm font-bold ${dyn.breakeven_armed ? 'text-teal-300' : 'text-slate-200'}">${dyn.breakeven_armed ? 'ARMED @ +' + fmtNum(dyn.breakeven_floor_pct, 1) + '%' : (Number(dyn.breakeven_activation_pct || 0) > 0 ? 'Arms @ +' + fmtNum(dyn.breakeven_activation_pct, 1) + '%' : 'Disabled')}</div>
+                                <div class="text-[10px] text-slate-400">Protects gains once peak &ge; +${fmtNum(dyn.breakeven_activation_pct, 1)}%</div>
+                            </div>
+                            <div class="rounded-lg bg-slate-950/75 border border-slate-800 p-2.5 space-y-0.5">
+                                <div class="text-[9.5px] uppercase text-amber-300 font-bold">Vol / Spread Scaling</div>
+                                <div class="text-sm font-bold text-amber-300">x${fmtNum(dyn.adapt_mult, 2)} <span class="text-[10px] font-normal text-slate-400">(${dyn.vol_adapt_enabled ? 'adaptive' : 'fixed'})</span></div>
+                                <div class="text-[10px] text-slate-400">1m &sigma;: ${dyn.vol_sigma_pct != null ? fmtNum(dyn.vol_sigma_pct, 2) + '%' : '--'} · Spread: ${dyn.spread_pct != null ? fmtNum(dyn.spread_pct, 2) + '%' : '--'} · ${Number(dyn.samples || 0)} bars</div>
+                            </div>
+                        </div>
+                        ${ladderHtml}
+                        ${verdictHtml}
+                    </div>
+                `;
+            })() : '';
+
             // 2. Tuning Insights for lib/parms.ini
             const insights = Array.isArray(view.tuning_insights) ? view.tuning_insights : [];
             const insightsHtml = insights.length > 0 ? `
@@ -28724,7 +29565,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="flex flex-wrap items-center justify-between gap-2">
                         <div class="text-[11px] font-bold uppercase tracking-wider text-indigo-300">lib/parms.ini Parameter Tuning Takeaways</div>
                         <div class="text-[10px] mono text-slate-400">
-                            Live Config: pt=${fmtNum(liveParams.profit_target_pct, 1)}% · rsi_high=${fmtNum(liveParams.rsi_high, 1)} · ts=${fmtNum(liveParams.trailing_activation_pct, 1)}%/${fmtNum(liveParams.trailing_drawdown_pct, 1)}% (v&lt;0:${liveParams.trailing_require_negative_velocity ? 'on' : 'off'}) · sl=${fmtNum(liveParams.stop_loss_pct, 1)}%/${liveParams.stop_loss_consecutive_minutes}m · grace=${liveParams.min_hold_minutes}m
+                            Live Config: pt=${fmtNum(liveParams.profit_target_pct, 1)}% · rsi_high=${fmtNum(liveParams.rsi_high, 1)} · ts=${fmtNum(liveParams.trailing_activation_pct, 1)}%/${fmtNum(liveParams.trailing_drawdown_pct, 1)}% (v&lt;0:${liveParams.trailing_require_negative_velocity ? 'on' : 'off'}) · sl=${fmtNum(liveParams.stop_loss_pct, 1)}%/${liveParams.stop_loss_consecutive_minutes}m · grace=${liveParams.min_hold_minutes}m · dyn=${escSvg(liveParams.dynamic_rules_mode || 'off')}
                         </div>
                     </div>
                     <ul class="space-y-1 text-[11.5px] text-slate-200 list-disc pl-4">
@@ -28801,7 +29642,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden">
                         <div class="px-3 py-2 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
                             <span class="font-bold uppercase text-[10px] text-emerald-300">Fixed Profit Target Ladder ([option_seller] profit_target_pct)</span>
-                            <span class="text-[9.5px] text-slate-500">vs Actual Exit</span>
+                            <span class="text-[9.5px] text-slate-500">${isOpenTrade ? 'vs Current Mark' : 'vs Actual Exit'}</span>
                         </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-left border-collapse">
@@ -28811,7 +29652,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                         <th class="px-2 py-1.5">Status</th>
                                         <th class="px-2 py-1.5">First Hit (${escSvg(browserTzAbbr)})</th>
                                         <th class="px-2 py-1.5 text-right">Exit P/L</th>
-                                        <th class="px-2 py-1.5 text-right">&Delta; vs Actual</th>
+                                        <th class="px-2 py-1.5 text-right">&Delta; vs ${isOpenTrade ? 'Mark' : 'Actual'}</th>
                                     </tr>
                                 </thead>
                                 <tbody>${ptRows || '<tr><td colspan="5" class="px-3 py-4 text-center text-slate-500">No targets evaluated</td></tr>'}</tbody>
@@ -28832,7 +29673,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                         <th class="px-2 py-1.5">Vel</th>
                                         <th class="px-2 py-1.5">Outcome (${escSvg(browserTzAbbr)})</th>
                                         <th class="px-2 py-1.5 text-right">Sim P/L</th>
-                                        <th class="px-2 py-1.5 text-right">&Delta; vs Actual</th>
+                                        <th class="px-2 py-1.5 text-right">&Delta; vs ${isOpenTrade ? 'Mark' : 'Actual'}</th>
                                     </tr>
                                 </thead>
                                 <tbody>${tsRows || '<tr><td colspan="5" class="px-3 py-4 text-center text-slate-500">No trailing stop scenarios</td></tr>'}</tbody>
@@ -28943,7 +29784,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             `;
 
-            pane.innerHTML = sourceBarHtml + kpiCardsHtml + insightsHtml + diagStripHtml + tuningTablesHtml + timelineHtml;
+            pane.innerHTML = sourceBarHtml + kpiCardsHtml + dynamicRulesHtml + insightsHtml + diagStripHtml + tuningTablesHtml + timelineHtml;
         }
 
         let latestStrikeAnalysis = null;
@@ -32417,47 +33258,59 @@ def analyze_findbest_contract(
     entry_price=None,
     exit_price=None,
     qty=None,
+    is_open: bool = False,
 ):
-    """Analyze all option chain captures & 1m contract history between buy and sell of a closed contract."""
+    """Analyze all option chain captures & 1m contract history for a closed OR currently open contract."""
     matched_closed = None
+    matched_open = None
     oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
     req_tid = str(trade_id or "").strip()
     req_con = str(contract or "").strip().upper()
     req_und = str(underlying or "").strip().upper()
+    resolved_open = bool(is_open)
 
     if oh is not None:
         with oh._lock:
             closed_pool = [dict(c) for c in (oh.closed_contracts or []) if isinstance(c, dict)]
-        if req_tid:
-            matched_closed = next(
-                (c for c in closed_pool if str(c.get("trade_id") or "").strip() == req_tid),
-                None,
-            )
-        if matched_closed is None and req_con:
-            req_buy_dt = _opt_parse_utc(buy_utc)
-            cands = [
-                c for c in closed_pool
-                if str(c.get("contract") or "").strip().upper() == req_con
-            ]
-            if cands:
-                if req_buy_dt is not None:
-                    matched_closed = min(
-                        cands,
-                        key=lambda c: abs(
-                            ((_opt_parse_utc(c.get("purchased_at_utc")) or req_buy_dt) - req_buy_dt).total_seconds()
-                        ),
-                    )
-                else:
-                    matched_closed = cands[0]
+            open_rec = dict(oh.open_contracts[req_con]) if (req_con and req_con in oh.open_contracts) else None
+        if resolved_open and open_rec is not None:
+            matched_open = open_rec
+        else:
+            if req_tid:
+                matched_closed = next(
+                    (c for c in closed_pool if str(c.get("trade_id") or "").strip() == req_tid),
+                    None,
+                )
+            if matched_closed is None and req_con:
+                req_buy_dt = _opt_parse_utc(buy_utc)
+                cands = [
+                    c for c in closed_pool
+                    if str(c.get("contract") or "").strip().upper() == req_con
+                ]
+                if cands:
+                    if req_buy_dt is not None:
+                        matched_closed = min(
+                            cands,
+                            key=lambda c: abs(
+                                ((_opt_parse_utc(c.get("purchased_at_utc")) or req_buy_dt) - req_buy_dt).total_seconds()
+                            ),
+                        )
+                    else:
+                        matched_closed = cands[0]
+            if matched_closed is None and open_rec is not None:
+                matched_open = open_rec
+                resolved_open = True
+
+    matched_rec = matched_open if resolved_open else matched_closed
 
     eff_con = (
-        str(matched_closed.get("contract") or "").strip().upper()
-        if matched_closed
+        str(matched_rec.get("contract") or "").strip().upper()
+        if matched_rec
         else req_con
     )
     eff_und = (
-        str(matched_closed.get("underlying") or "").strip().upper()
-        if matched_closed
+        str(matched_rec.get("underlying") or "").strip().upper()
+        if matched_rec
         else req_und
     )
     if not eff_und and eff_con:
@@ -32466,28 +33319,49 @@ def analyze_findbest_contract(
             eff_und = parsed_u
 
     buy_dt = _opt_parse_utc(
-        (matched_closed.get("purchased_at_utc") if matched_closed else None) or buy_utc
+        (matched_rec.get("purchased_at_utc") if matched_rec else None) or buy_utc
     )
-    sell_dt = _opt_parse_utc(
-        (matched_closed.get("sold_at_utc") if matched_closed else None) or sell_utc
-    )
+    if buy_dt is None and matched_rec is not None:
+        for hpt in matched_rec.get("history") or []:
+            if isinstance(hpt, dict) and not hpt.get("pre_entry"):
+                cand_dt = _opt_parse_utc(hpt.get("timestamp") or hpt.get("minute_utc"))
+                if cand_dt is not None:
+                    buy_dt = cand_dt
+                    break
+
+    now_utc = datetime.now(UTC)
+    if resolved_open:
+        sell_dt = _opt_parse_utc(sell_utc) or now_utc
+    else:
+        sell_dt = _opt_parse_utc(
+            (matched_closed.get("sold_at_utc") if matched_closed else None) or sell_utc
+        )
+
     eff_entry = _opt_safe_float(
-        (matched_closed.get("entry_price") if matched_closed else None)
-        if (matched_closed and matched_closed.get("entry_price") is not None)
+        (matched_rec.get("entry_price") if matched_rec else None)
+        if (matched_rec and matched_rec.get("entry_price") is not None)
         else entry_price,
         None,
     )
-    eff_exit = _opt_safe_float(
-        (matched_closed.get("exit_price") if matched_closed else None)
-        if (matched_closed and matched_closed.get("exit_price") is not None)
-        else exit_price,
-        None,
-    )
+    if resolved_open:
+        eff_exit = _opt_safe_float(
+            (matched_open.get("current_price") if matched_open else None)
+            if (matched_open and matched_open.get("current_price") is not None)
+            else exit_price,
+            None,
+        )
+    else:
+        eff_exit = _opt_safe_float(
+            (matched_closed.get("exit_price") if matched_closed else None)
+            if (matched_closed and matched_closed.get("exit_price") is not None)
+            else exit_price,
+            None,
+        )
     try:
         eff_qty = max(
             1,
             int(
-                (matched_closed.get("qty") if matched_closed else None)
+                (matched_rec.get("qty") if matched_rec else None)
                 or qty
                 or 1
             ),
@@ -32497,7 +33371,7 @@ def analyze_findbest_contract(
 
     if not eff_con or buy_dt is None or sell_dt is None:
         raise ValueError(
-            "Unable to resolve closed contract buy/sell timeframe (missing contract, buy_utc, or sell_utc)."
+            "Unable to resolve contract timeframe (missing contract, buy_utc, or end timestamp)."
         )
     if eff_entry is None or eff_entry <= 0:
         raise ValueError(
@@ -32673,8 +33547,8 @@ def analyze_findbest_contract(
     # 2. Collect 1-minute tracked contract history points between buy_dt and sell_dt
     #    (automatically uses enriched bid/mid & Greeks when open_position_capture_mode = contract_quote)
     history_points = []
-    if matched_closed is not None:
-        for pt in matched_closed.get("history") or []:
+    if matched_rec is not None:
+        for pt in matched_rec.get("history") or []:
             if not isinstance(pt, dict) or pt.get("pre_entry"):
                 continue
             pt_dt = _opt_parse_utc(pt.get("timestamp") or pt.get("minute_utc"))
@@ -32740,6 +33614,11 @@ def analyze_findbest_contract(
         "min_hold_minutes": int(OPTION_SELL_MIN_HOLD_MINUTES),
         "buy_max_spread_pct": float(OPTION_BUY_MAX_SPREAD_PCT),
         "open_position_capture_mode": str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE),
+        "dynamic_rules_mode": str(OPTION_SELL_DYNAMIC_RULES_MODE),
+        "dynamic_ratchet_tiers": str(OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW),
+        "dynamic_breakeven_activation_pct": float(OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT),
+        "dynamic_vol_adapt_enabled": bool(OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED),
+        "dynamic_min_samples": int(OPTION_SELL_DYNAMIC_MIN_SAMPLES),
     }
 
     actual_pnl_pct = (
@@ -32753,9 +33632,61 @@ def analyze_findbest_contract(
         else None
     )
 
+    comb_metrics = _compute_findbest_view_metrics(
+        [dict(p) for p in combined_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+    )
+    # Build per-contract Dynamic Exit Rules readout (Peak-Ratcheting + Vol/Spread-Adaptive)
+    osel_ref = (
+        (PROVIDER_REGISTRY.get("OPTION_SELLER") or {}).get("router")
+        if "PROVIDER_REGISTRY" in globals()
+        else None
+    )
+    live_dyn_state = (
+        dict(osel_ref.dynamic_rules_state_by_symbol.get(eff_con))
+        if (resolved_open and osel_ref is not None and eff_con in getattr(osel_ref, "dynamic_rules_state_by_symbol", {}))
+        else None
+    )
+    if live_dyn_state is None:
+        ordered_comb = comb_metrics.get("points") or []
+        pnl_seq = [p["pnl_pct"] for p in ordered_comb if p.get("pnl_pct") is not None]
+        latest_pt = ordered_comb[-1] if ordered_comb else None
+        cur_p_dyn = (
+            actual_pnl_pct
+            if actual_pnl_pct is not None
+            else (latest_pt["pnl_pct"] if latest_pt else None)
+        )
+        pk_p_dyn = (
+            max([x for x in pnl_seq if x is not None] + ([cur_p_dyn] if cur_p_dyn is not None else []))
+            if (pnl_seq or cur_p_dyn is not None)
+            else None
+        )
+        dd_p_dyn = 0.0
+        if pk_p_dyn is not None and cur_p_dyn is not None:
+            pf_d = 1.0 + (pk_p_dyn / 100.0)
+            cf_d = 1.0 + (cur_p_dyn / 100.0)
+            if pf_d > 0 and cf_d < pf_d:
+                dd_p_dyn = ((pf_d - cf_d) / pf_d) * 100.0
+        spr_vals = [p["spread_pct"] for p in ordered_comb if p.get("spread_pct") is not None]
+        latest_spr = spr_vals[-1] if spr_vals else None
+        latest_v = latest_pt.get("v") if latest_pt else None
+        live_dyn_state = _evaluate_dynamic_contract_rules(
+            pnl_pct=cur_p_dyn,
+            peak_pnl_pct=pk_p_dyn,
+            drawdown_pct=dd_p_dyn,
+            pnl_series=pnl_seq,
+            spread_pct=latest_spr,
+            hold_minutes=hold_minutes,
+            underlying_v=latest_v,
+            loss_streak=int((comb_metrics.get("diagnostics") or {}).get("max_consecutive_below_sl") or 0),
+            static_params=live_params,
+            mode=OPTION_SELL_DYNAMIC_RULES_MODE,
+        )
+        live_dyn_state["underlying"] = eff_und
+
     return {
         "trade": {
             "trade_id": (matched_closed.get("trade_id") if matched_closed else req_tid) or None,
+            "is_open": bool(resolved_open),
             "contract": eff_con,
             "underlying": eff_und,
             "qty": eff_qty,
@@ -32772,10 +33703,9 @@ def analyze_findbest_contract(
         "chain_files_scanned": chain_files_scanned,
         "chain_files_in_window": chain_files_in_window,
         "current_parms": live_params,
+        "dynamic_rules": live_dyn_state,
         "views": {
-            "combined": _compute_findbest_view_metrics(
-                [dict(p) for p in combined_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
-            ),
+            "combined": comb_metrics,
             "optionchains": _compute_findbest_view_metrics(
                 [dict(p) for p in chain_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
             ),
@@ -32790,6 +33720,8 @@ _DOCS_PREFERRED_ORDER = (
     "README.md",
     "docs/CHANGELOG.md",
     "docs/TRADING_ALGORITHMS_AND_RISK.md",
+    "docs/OPTION_BUYER_GUIDE.md",
+    "docs/OPTION_SELLER_AND_STOP_LOSS_GUIDE.md",
     "docs/FRONTEND_DASHBOARD.md",
     "docs/DEPLOYMENT_AND_OPERATIONS.md",
     "docs/CONFIGURATION_AND_API_REFERENCE.md",
@@ -33592,6 +34524,7 @@ class AdminCliProvider:
                     403,
                 )
             try:
+                raw_open = str(request.args.get("is_open") or "").strip().lower()
                 result = analyze_findbest_contract(
                     coordinator=self.coordinator,
                     trade_id=str(request.args.get("trade_id") or "").strip(),
@@ -33602,6 +34535,7 @@ class AdminCliProvider:
                     entry_price=request.args.get("entry_price"),
                     exit_price=request.args.get("exit_price"),
                     qty=request.args.get("qty"),
+                    is_open=(raw_open in {"1", "true", "yes"}),
                 )
                 return jsonify(status="ok", run_id=RUN_ID, **result), 200
             except ValueError as exc:
@@ -33796,6 +34730,19 @@ class AdminCliProvider:
                 "open_capture_count": osel.open_capture_count if osel else 0,
                 "open_capture_errors": osel.open_capture_errors if osel else 0,
                 "last_open_capture_utc": osel.last_open_capture_utc if osel else None,
+                "dynamic_rules_mode": OPTION_SELL_DYNAMIC_RULES_MODE,
+                "dynamic_ratchet_tiers": OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW,
+                "dynamic_breakeven_activation_pct": OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT,
+                "dynamic_vol_adapt_enabled": OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED,
+                "dynamic_min_samples": OPTION_SELL_DYNAMIC_MIN_SAMPLES,
+                "dynamic_shadow_alerts": getattr(osel, "dynamic_shadow_alerts", 0) if osel else 0,
+                "dynamic_action_orders": getattr(osel, "dynamic_action_orders", 0) if osel else 0,
+                "dynamic_rules_by_symbol": {
+                    sym: dict(st)
+                    for sym, st in (
+                        getattr(osel, "dynamic_rules_state_by_symbol", {}) if osel else {}
+                    ).items()
+                },
                 "stop_loss_watches": {
                     sym: {
                         "streak": st.get("streak", 0),
