@@ -17,6 +17,82 @@
 
 ---
 
+## `v0.1.39` — 2026-11-27
+- **NASDAQ Daily `%` & Buy Gate vs. Previous Trading Day's Close (`multiStreamRSI.py`):** Updated `NasdaqMarketTracker` (`diff`, `diff_pct`, `is_positive`, and `evaluate_buy_gate()`) to compare live `nasdaq_symbol` (default `QQQ`) price against the **previous trading day's official close** (`prev_close`, matching brokers, Yahoo Finance, and TradingView) instead of today's 09:30 ET open. Added NYSE-calendar-aware `_get_prev_trading_day()` and multi-source `_fetch_prev_close_sync()` (consolidated `yfinance` daily close first on Alpaca IEX free tier to avoid thin IEX open/close skew; Alpaca `previous_daily_bar` / daily bars first on SIP, with Tastytrade fallback) and automatic retry if `prev_close` is temporarily unavailable.
+- **Dashboard & Log Labels:** Updated header badge tooltips, `.nasdaq-panel-chip` titles, telemetry readout (`Prev Close $XXX.XX · Now $YYY.YY`), and `OPTION_BUY_SKIPPED` / `NASDAQ_PREV_CLOSE` logs to reflect `prev_close` and `prev_close_date`.
+
+---
+
+## `v0.1.38` — 2026-11-26
+- **Dynamic Exit Rules Bar-by-Bar Replay in Find Best (`multiStreamRSI.py`, `GET /api/findbest`):** Added `_replay_dynamic_exit_rules_timeline()` to causally replay Peak-Ratcheting Trailing Stop, Breakeven Profit Lock, and Vol/Spread-Adaptive Soft Stop-Loss minute-by-minute across a contract's captured Find Best timeline and attach `dynamic_rules.replay` to `/api/findbest`.
+- **Simulated Sell Price & Delta Readout (`Find Best` Modal):** Upgraded the Dynamic Exit Rules panel to display the exact **First Trigger Timestamp** (`+Xm after buy`, bar `N/M`), **Simulated Sell Price (`$X.XX`)**, **Simulated P/L (`%` and `$`)**, and **Dollar / Percentage-Point Delta vs. Actual Exit** (or Current Mark for open trades), and tagged the matching trigger bar with an amber **`DYN EXIT`** badge in the Captured Data Points table.
+
+---
+
+## `v0.1.37` — 2026-11-26
+- **Expanded Analyze Day Optimizer to `[general]` & `[kinematics]` (`multiStreamRSI.py`):** Extended `_ANALYZE_DAY_PARM_META`, `_simulate_trade_with_parms()`, `_synthesize_optimal_day_parms()`, and trade snapshot capture/hydration to evaluate **`[general] nasdaq_must_be_positive`**, **`[general] rsi_30d_enabled` / `rsi_30d_min`**, and **`[kinematics] smooth_method` (`hma`/`ema`/`none`) / `smooth_period` (`5`–`21`)** alongside `[option_buyer]` and `[option_seller]` settings (21 tunable parameters across 4 INI sections).
+- **Logged Entry Telemetry & Causal Kinematics Velocity Replay:** Extracted entry-time `nasdaq_market.is_positive` and `rsi_30d` from `logs/minute-summary-*.jsonl` (and trade records), precomputed strictly causal `compute_smoothed_series()` underlying velocity profiles per trade for `[kinematics]` smoothing sweeps, normalized inactive sub-parameters during parsimony pruning, and added `SKIPPED (NASDAQ)` / `SKIPPED (30D RSI)` badges plus `telemetry_coverage` counts in the Analyze Day UI.
+
+---
+
+## `v0.1.36` — 2026-11-26
+- **Analyze Day Date Range Support (`multiStreamRSI.py`, `GET /api/analyze-day`):** Enhanced **Analyze Day** to accept a **`From` / `To` date range** (defaulting both dates to **today** when opened, without overriding today's default), plus one-click range presets (**`Today`**, **`Last 7d`**, **`Last 30d`**, **`All Trades`**) alongside single-day chips.
+- **Range-Wide Trade Summary & Optimal `lib/parms.ini` Synthesis:** `analyze_day_trades()` and `GET /api/analyze-day?from=YYYY-MM-DD&to=YYYY-MM-DD` (backward-compatible with `?date=YYYY-MM-DD`) now evaluate all fully executed closed trades opened and closed within the chosen US/Eastern range (including multi-day/overnight holds), render a per-day P/L summary (`daily_breakdown`) when spanning multiple days, and synthesize the single changed-only `lib/parms.ini` update set that maximizes overall combined profit for the entire date range.
+
+---
+
+## `v0.1.35` — 2026-11-26
+- **Fixed Startup `NameError` (`multiStreamRSI.py`):** Added missing `from typing import Any, Dict, List, Optional, Tuple` import at top level to resolve `NameError: name 'Optional' is not defined` (and `Dict`) on module load.
+
+---
+
+## `v0.1.34` — 2026-11-26
+- **Redacted Full-`lib/parms.ini` Snapshot Store (`logs/parms_snapshots/`):** Added content-addressed, secret-redacted full configuration snapshotting (`_is_secret_ini_key`, `_persist_full_parms_snapshot`, `_load_parms_snapshot_by_id`, `_list_parms_snapshots`). On startup/reload and trade execution, the engine atomically writes deduplicated `logs/parms_snapshots/parms_<hash12>.json` and human-readable `logs/parms_snapshots/parms_<hash12>.ini` files with all API keys, secrets, tokens, passwords, and credential fields replaced by `<REDACTED>`.
+- **Per-Trade Snapshot Attribution & API:** Attached `parms_snapshot_id` (and `parms_snapshot_buy_id`) to open/closed contract records and buy/sell events, hydrated snapshots in **Find Best** and **Analyze Day** (displaying `#<hash8>` provenance badges in both modals), and mounted authenticated read-only `GET /api/parms-snapshot` (list or fetch by `?id=<hash12>`).
+
+---
+
+## `v0.1.33` — 2026-11-26
+- **Recorded Per-Trade `lib/parms.ini` Snapshots (`multiStreamRSI.py`):** Added `_capture_active_trade_parms_snapshot()` and persisted active trading settings onto every option buy/sell record (`parms_snapshot` / `parms_snapshot_buy` in `OptionContractHistoryTracker` state and buy/sell events) so future **Find Best** and **Analyze Day** analyses compare against the exact settings active at execution time instead of guessing from current `lib/parms.ini`.
+- **Transparent Historical Parms Provenance Badges (`Find Best` & `Analyze Day`):** Both modals now explicitly distinguish trades with recorded execution-time snapshots (`Parms: Recorded @ Trade`) from legacy pre-`v0.1.33` trades where historical settings were not recorded (`Parms: Current parms.ini (legacy trade)`).
+- **Fixed Analyze Day `+$0.00` False-Change Bug & Expanded Optimizer Search:** Enforced a strict improvement floor (`synthesized_pnl > max(actual_combined_pnl, baseline_replay_pnl)`) so **Analyze Day** never suggests `lib/parms.ini` changes unless they strictly beat Actual Combined P/L, and expanded the search grid (finer trailing-stop activation/drawdown steps, observed peak anchors, pure-trailing seeds with profit-target off, and `rsi_high` up to `95`) to surface real profit-maximizing rule combinations.
+
+---
+
+## `v0.1.32` — 2026-11-26
+- **Added Top-Level `Analyze Day` Portfolio Optimizer (`multiStreamRSI.py`, `lib/parms.ini`):** Added `[dashboard] analyze_day = false` (alias `analyze_day_enabled`, env `ANALYZE_DAY_ENABLED`) gating a new **`Analyze Day`** button next to `Docs` in the dashboard header and `GET /api/analyze-day?date=YYYY-MM-DD`.
+- **Same-Day Round-Trip Synthesis Using Find Best Logic:** Prompts for a trading date (no time), analyzes all trades both opened and closed on that US/Eastern date via `analyze_findbest_contract()`, runs multi-start portfolio optimization + parsimony pruning across `OptionSeller` 4-tier exits & entry spread filters, displays **only changed `lib/parms.ini` settings** with a copyable INI diff, and compares **Actual Combined P/L vs. Synthesized P/L** per day and per contract.
+
+---
+
+## `v0.1.31` — 2026-11-26
+- **Fixed Off-Hours Flat-Line & History Eviction Defect in `OptionContractHistoryTracker` (`multiStreamRSI.py`):** Restricted 1-minute option contract chart history points strictly to US Regular Trading Hours (`09:30–16:00 ET` on NYSE trading days via `regular_session()`) across `record_positions_snapshot()`, `_fill_minute_gaps()`, `_build_pre_entry_history()`, `_load_persisted_state()`, and persisted/log price replay. Prevents 24/7 overnight, weekend, and holiday polls from generating flat bars and evicting real post-entry intraday bars (while keeping live position KPIs continuously updated).
+- **Consolidated `history_max_bars = 2400` Under `[general]` (`multiStreamRSI.py`, `lib/parms.ini`):** Unified `[kinematics] history_max_bars` and `[option_trading] history_max_bars` into a single `[general] history_max_bars` key (with backwards-compatible fallback and `CONFIG_COMPAT` logging for legacy locations), exposed `history_max_bars` at the top level of `/cli/status`, and synced documentation.
+
+---
+
+## `v0.1.30` — 2026-11-26
+- **Folded `[option_history]` into `[option_trading]` (`multiStreamRSI.py`, `lib/parms.ini`):** Moved `history_max_bars = 2400`, `pre_entry_lookback_minutes = 390`, and `position_poll_seconds = 15` under `[option_trading]` and removed the standalone `[option_history]` section from `lib/parms.ini`.
+- **Backwards-Compatible Loader & Status Visibility:** `_apply_ini_feature_settings()` reads the three keys from `[option_trading]` first and falls back to legacy `[option_history]` (logging a `CONFIG_COMPAT` warning) if an older local INI still defines them. Exposed `history_max_bars`, `pre_entry_lookback_minutes`, and `position_poll_seconds` under `option_trading` in `/cli/status` and synced documentation.
+
+---
+
+## `v0.1.29` — 2026-11-26
+- **Consolidated `options_only` & `peak_profit_calls_only` Under `[general] options_only = true` (`multiStreamRSI.py`, `lib/parms.ini`):** Removed `[option_seller] options_only` and `[option_seller] peak_profit_calls_only`, introducing a single global `[general] options_only` setting (default `true`, env `OPTIONS_ONLY`, with backwards-compatible fallback for legacy `[option_seller] options_only`).
+- **Major Gate Across Buying & Selling:** Enforced `OPTIONS_ONLY` as a major gate in `OptionBuyer.evaluate_and_buy()` (rejecting non-OCC candidates with `options_only_non_option_contract`) and `OptionSeller.evaluate_and_sell()` (skipping non-option holdings with `options_only_equity_ignored` and switching Tier 1 profit target / Tier 3 trailing stop `peak_eligible` from `peak_profit_calls_only` to `(not OPTIONS_ONLY) or is_option`). Exposed `"options_only"` in `/cli/status` and synced all documentation.
+
+---
+
+## `v0.1.28` — 2026-11-26
+- **Restrict Option Seller to Option Contracts Only (`lib/parms.ini`):** Updated `[option_seller] options_only` from `false` to `true` in `lib/parms.ini` (and synced the sample configuration in `docs/CONFIGURATION_AND_API_REFERENCE.md`) so `OptionSeller` ignores equity/stock holdings and evaluates only OCC option contracts.
+
+---
+
+## `v0.1.27` — 2026-11-26
+- **Fixed Startup `TypeError` in `_apply_ini_feature_settings()` (`multiStreamRSI.py`):** Added optional `minimum=None` support to `_ini_float()` (matching `_ini_int()`) and removed the redundant `minimum=0.0` keyword argument on `[option_seller] dynamic_breakeven_activation_pct` so `load_settings()` initializes cleanly at startup without crashing.
+
+---
+
 ## `v0.1.26` — 2026-11-26
 - **Automated `parms.ini` Backup & Merge in `sh/getLatest.sh`:** Enhanced `sh/getLatest.sh` to check for `parms.ini` on Windows Downloads, stage files in a timestamped `/tmp/jboa_deploy.<YYYYMMDD_HHMMSS>` directory (`0700`, auto-removed on exit), back up each instance's `parms.ini` to `parms.ini.<timestamp>` (`/home/billt/jboa-1/src/lib` and `/home/jboa/lib`), merge master comments/new keys with existing local values/custom keys into `parms.ini.combined`, and overlay each instance's `parms.ini` while preserving permissions and `jboa:jboa` ownership.
 - **Configuration Update (`lib/parms.ini`):** Updated `[kinematics] rsi_session` from `extended` to `regular` in `lib/parms.ini` (and synced the sample config in `docs/CONFIGURATION_AND_API_REFERENCE.md` and script catalog in `docs/DEPLOYMENT_AND_OPERATIONS.md`).

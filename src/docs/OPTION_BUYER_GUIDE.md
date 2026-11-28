@@ -246,7 +246,7 @@ Designed for operators who want clean RSI oversold/bounce entries without requir
 
 Configured in `[general]` (always collected, logged, and displayed on the dashboard even when disabled as buy gates):
 
-* **`[general] nasdaq_must_be_positive`** (default `false`) & **`[general] nasdaq_symbol`** (default `QQQ`): When `true`, requires $(\text{current\_price} - \text{09:30\_ET\_open}) > 0$ on `nasdaq_symbol`. Blocks long CALL entries during red market sessions (`nasdaq_down(...)`).
+* **`[general] nasdaq_must_be_positive`** (default `false`) & **`[general] nasdaq_symbol`** (default `QQQ`): When `true`, requires $(\text{current\_price} - \text{prev\_trading\_day\_close}) > 0$ on `nasdaq_symbol`. Blocks long CALL entries during red market sessions (`nasdaq_down(...)`).
 * **`[general] rsi_30d_enabled`** (default `false`) & **`[general] rsi_30d_min`** (default `30.0`): When `true`, requires the symbol's 30-day daily Wilder RSI (blending prior daily closes with live intraday close) to be **strictly greater** than `rsi_30d_min` (`rsi_30d > rsi_30d_min`). Blocks buying falling-knife downtrends (`rsi_30d_below_min(...)`).
 
 ---
@@ -305,6 +305,7 @@ If `contract_budget_stepdown = true` and a capital ceiling is active (`max_singl
 ### Stage 9 — Contract Parsing, Right Verification & Duplicate-Contract Guard
 
 * Extracts the canonical OCC contract symbol (e.g., `NVDA261211C00144000`). Unparseable contracts reject with `unparseable_contract`.
+* **`[general] options_only`** (default `true`): Major buy & sell gate — rejects any candidate whose resolved symbol is not a valid OCC option contract (`options_only_non_option_contract`).
 * **`require_right_match`** (default `true`): Verifies the OCC symbol's inferred right (`C` = `CALL`, `P` = `PUT`) equals `desired_right` (`CALL`). Rejects with `right_mismatch(expected=CALL,got=PUT)` if mismatched.
 * Verifies `contract_symbol` is not already in `open_contracts` (`contract_already_held`).
 
@@ -361,7 +362,7 @@ $$\text{contract\_cost} = \text{est\_unit\_price} \times 100$$
 Upon broker acceptance of a live/paper/sandbox order:
 1. Updates in-memory counters (`orders_submitted`, `buys_this_cycle`, `spent_this_cycle`, `open_option_count`, `open_contracts`, `open_underlyings`, `last_buy_by_symbol[symbol]`).
 2. Calls `coordinator.record_option_buy_event()` so the Dashboard **3-Panel Kinematics Chart** plots a green **BUY** marker at the exact execution minute and so `OptionSeller` knows the exact entry timestamp for `min_hold_minutes`.
-3. Calls `coordinator.option_history.record_buy()` to open an active P/L history ledger for the contract (including backfilling up to `[option_history] pre_entry_lookback_minutes` of pre-entry 1m option bars) and schedules an async fill-price refresh if `filled_avg_price` was not yet populated on immediate submission.
+3. Calls `coordinator.option_history.record_buy()` to open an active P/L history ledger for the contract (including backfilling up to `[option_trading] pre_entry_lookback_minutes` of pre-entry 1m option bars) and schedules an async fill-price refresh if `filled_avg_price` was not yet populated on immediate submission.
 4. Logs `OPTION_BUY_ANALYSIS ... decision=SUBMITTED` and `OPTION_BUY_SUBMITTED`.
 
 ---
@@ -410,10 +411,11 @@ Upon broker acceptance of a live/paper/sandbox order:
 
 | Section & Parameter | Default | Effect on `OptionBuyer` |
 | :--- | :---: | :--- |
-| `[general] nasdaq_must_be_positive` | `false` | When `true`, blocks all buys unless `(current - 09:30_ET_open) > 0` on `nasdaq_symbol`. |
+| `[general] nasdaq_must_be_positive` | `false` | When `true`, blocks all buys unless `(current - prev_trading_day_close) > 0` on `nasdaq_symbol`. |
 | `[general] nasdaq_symbol` | `QQQ` | Reference index ETF tracked every minute for `nasdaq_must_be_positive`. |
 | `[general] rsi_30d_enabled` | `false` | When `true`, blocks buys unless the symbol's 30-day daily RSI `> rsi_30d_min`. |
 | `[general] rsi_30d_min` | `30.0` | Strict lower bound on 30-day daily RSI when `rsi_30d_enabled = true`. |
+| `[general] options_only` | `true` | Major buy & sell gate: restricts `OptionBuyer` purchases (`options_only_non_option_contract`) and `OptionSeller` exits/peak-profit guards strictly to OCC option contracts. |
 | `[option_trading] optionchainprovider` | `alpaca` | Broker queried for option chains & Greeks (`alpaca` or `tastytrade`). |
 | `[option_trading] transactionprovider` | `alpaca` | Broker queried for open positions, account balance, live quotes, and order submission. |
 | `[option_trading] chain_include_greeks` | `true` | Must be `true` for delta/theta-based `contract_selection_mode` (`delta_mid`, `delta_itm_low_spread`, `composite_score`). |

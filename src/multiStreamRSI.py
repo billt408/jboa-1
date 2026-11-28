@@ -67,6 +67,7 @@ import hmac
 import pandas_market_calendars as mcal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -125,7 +126,7 @@ QUEUE_LIMIT = 20000
 LOG_RAW_EVENTS = False
 # Semantic version: major.minor.build — increment build on every multiStreamRSI.py edit;
 # change major/minor only when explicitly requested.
-APP_VERSION = "0.1.26"
+APP_VERSION = "0.1.39"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
 def _get_app_base_dir():
     """Return runtime app root (CWD for Nuitka/frozen binaries, script dir when uncompiled)."""
@@ -377,12 +378,19 @@ KINEMATICS_SMOOTH_PERIOD = max(
 )
 KINEMATICS_RSI_OVERBOUGHT = float(os.getenv("KINEMATICS_RSI_OVERBOUGHT", "70.0"))
 KINEMATICS_RSI_OVERSOLD = float(os.getenv("KINEMATICS_RSI_OVERSOLD", "30.0"))
-KINEMATICS_HISTORY_MAX_BARS = max(
-    60, int(os.getenv("KINEMATICS_HISTORY_MAX_BARS", "2400"))
+HISTORY_MAX_BARS = max(
+    60,
+    int(
+        os.getenv(
+            "HISTORY_MAX_BARS",
+            os.getenv("KINEMATICS_HISTORY_MAX_BARS", "2400"),
+        )
+    ),
 )
+KINEMATICS_HISTORY_MAX_BARS = HISTORY_MAX_BARS
 OPTION_HISTORY_MAX_BARS = max(
     60,
-    int(os.getenv("OPTION_HISTORY_MAX_BARS", str(KINEMATICS_HISTORY_MAX_BARS))),
+    int(os.getenv("OPTION_HISTORY_MAX_BARS", str(HISTORY_MAX_BARS))),
 )
 OPTION_HISTORY_PRE_ENTRY_MINUTES = max(
     0, int(os.getenv("OPTION_HISTORY_PRE_ENTRY_MINUTES", "390"))
@@ -2904,6 +2912,328 @@ def get_pruned_option_chain_tastytrade(
     return selected_contract, payload_json
 
 
+_PARMS_SNAPSHOT_LOCK = threading.Lock()
+_ACTIVE_PARMS_SNAPSHOT_ID: Optional[str] = None
+_ACTIVE_PARMS_SNAPSHOT_MEMO: Dict[str, dict] = {}
+_PARMS_SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+
+_SECRET_INI_KEY_SUBSTRINGS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "passphrase",
+    "api_key",
+    "apikey",
+    "auth_key",
+    "private_key",
+    "client_id",
+    "credential",
+    "bearer",
+    "cookie",
+    "jwt",
+    "ssl_key",
+    "cert_key",
+    "key_file",
+    "account_number",
+    "account_id",
+)
+
+_CREDENTIAL_INI_SECTIONS = frozenset({
+    "alpaca_api",
+    "tradier",
+    "twelvedata_api",
+    "tastytrade_api",
+    "llm_configuration",
+    "credentials",
+    "dashboard",
+    "webhook",
+})
+
+_CREDENTIAL_SECTION_SECRET_KEYS = frozenset({
+    "key",
+    "api",
+    "username",
+    "user",
+    "email",
+    "login",
+    "account",
+    "acct",
+    "secret",
+})
+
+
+def _get_parms_snapshots_dir() -> Path:
+    return LOG_ROOT / "parms_snapshots"
+
+
+def _is_secret_ini_key(section: str, key: str) -> bool:
+    """Return True if an INI (section, key) may hold credentials, tokens, or private secrets."""
+    sec_l = str(section or "").strip().lower()
+    key_l = str(key or "").strip().lower()
+    if any(tok in key_l for tok in _SECRET_INI_KEY_SUBSTRINGS):
+        return True
+    if sec_l in _CREDENTIAL_INI_SECTIONS and key_l in _CREDENTIAL_SECTION_SECRET_KEYS:
+        return True
+    if sec_l in _CREDENTIAL_INI_SECTIONS and (key_l.endswith("_key") or key_l.endswith("_user")):
+        return True
+    return False
+
+
+def _build_redacted_ini_snapshot_payload(cfg=None, ini_path=None):
+    """Build a canonical redacted full-parms.ini snapshot dict + human-readable INI string."""
+    resolved_path = None
+    try:
+        if "resolve_parms_ini_path" in globals():
+            resolved_path = resolve_parms_ini_path(ini_path)
+    except Exception:
+        resolved_path = None
+
+    if cfg is None and resolved_path is not None and resolved_path.is_file():
+        try:
+            raw_text = resolved_path.read_text(encoding="utf-8")
+            if "_parse_ini_text_tolerant" in globals():
+                cfg = _parse_ini_text_tolerant(raw_text, source_label=str(resolved_path))
+            else:
+                cp = configparser.ConfigParser(interpolation=None, strict=False)
+                cp.read_string(raw_text)
+                cfg = cp
+        except Exception as exc:
+            logging.warning("PARMS_SNAPSHOT_READ_ERROR path=%s detail=%s", resolved_path, exc)
+            cfg = None
+
+    sections_out = {}
+    redacted_count = 0
+    if cfg is not None:
+        for sec in sorted(cfg.sections()):
+            sec_dict = {}
+            for k in sorted(cfg.options(sec)):
+                raw_val = cfg.get(sec, k, fallback="")
+                clean_val = _strip_ini_value(raw_val) if "_strip_ini_value" in globals() else str(raw_val).strip()
+                if _is_secret_ini_key(sec, k):
+                    if clean_val != "":
+                        sec_dict[k] = "<REDACTED>"
+                        redacted_count += 1
+                    else:
+                        sec_dict[k] = ""
+                else:
+                    sec_dict[k] = clean_val
+            sections_out[sec] = sec_dict
+
+    active_trading = {
+        "profit_target_enabled": bool(OPTION_SELL_PROFIT_TARGET_ENABLED),
+        "profit_target_pct": round(float(OPTION_SELL_PROFIT_TARGET_PCT), 2),
+        "rsi_high": round(float(OPTION_CHAIN_RSI_HIGH), 2),
+        "take_profit_require_profit": bool(OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT),
+        "take_profit_min_pnl_pct": round(float(OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT), 2),
+        "trailing_stop_enabled": bool(OPTION_SELL_TRAILING_STOP_ENABLED),
+        "trailing_activation_pct": round(float(OPTION_SELL_TRAILING_ACTIVATION_PCT), 2),
+        "trailing_drawdown_pct": round(float(OPTION_SELL_TRAILING_DRAWDOWN_PCT), 2),
+        "trailing_require_negative_velocity": bool(OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY),
+        "stop_loss_enabled": bool(OPTION_SELL_STOP_LOSS_ENABLED),
+        "stop_loss_pct": round(float(OPTION_SELL_STOP_LOSS_PCT), 2),
+        "stop_loss_consecutive_minutes": int(OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES),
+        "stop_loss_require_kinematics": bool(OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS),
+        "stop_loss_hard_pct": round(float(OPTION_SELL_STOP_LOSS_HARD_PCT), 2),
+        "min_hold_minutes": int(OPTION_SELL_MIN_HOLD_MINUTES),
+        "buy_max_spread_pct": round(float(OPTION_BUY_MAX_SPREAD_PCT), 2),
+        "open_position_capture_mode": str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE),
+        "dynamic_rules_mode": str(OPTION_SELL_DYNAMIC_RULES_MODE),
+        "dynamic_ratchet_tiers": str(OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW),
+        "dynamic_breakeven_activation_pct": round(float(OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT), 2),
+        "dynamic_vol_adapt_enabled": bool(OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED),
+        "dynamic_min_samples": int(OPTION_SELL_DYNAMIC_MIN_SAMPLES),
+        "nasdaq_must_be_positive": bool(NASDAQ_MUST_BE_POSITIVE),
+        "rsi_30d_enabled": bool(RSI_30D_ENABLED),
+        "rsi_30d_min": round(float(RSI_30D_MIN), 2),
+        "smooth_method": str(KINEMATICS_SMOOTH_METHOD),
+        "smooth_period": int(KINEMATICS_SMOOTH_PERIOD),
+    }
+
+    canonical_basis = {
+        "sections": sections_out,
+        "active_trading_parms": active_trading,
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonical_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    snap_id = digest[:12]
+
+    ini_lines = [
+        f"; Redacted JBOA-RSI parms.ini snapshot (id={snap_id}, app_version={APP_VERSION})",
+        f"; Captured UTC: {datetime.now(UTC).isoformat()}",
+        f"; Redacted secret keys: {redacted_count}",
+        "",
+    ]
+    for sec, kv in sections_out.items():
+        ini_lines.append(f"[{sec}]")
+        for k, v in kv.items():
+            ini_lines.append(f"{k} = {v}")
+        ini_lines.append("")
+    redacted_ini_text = "\n".join(ini_lines).rstrip() + "\n"
+
+    payload = {
+        "snapshot_id": snap_id,
+        "sha256": digest,
+        "app_version": str(APP_VERSION),
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "source_ini": resolved_path.name if resolved_path is not None else "parms.ini",
+        "redacted_key_count": redacted_count,
+        "section_count": len(sections_out),
+        "sections": sections_out,
+        "active_trading_parms": active_trading,
+    }
+    return snap_id, payload, redacted_ini_text
+
+
+def _persist_full_parms_snapshot(cfg=None, ini_path=None):
+    """Deduplicate and atomically persist the full redacted parms.ini into logs/parms_snapshots/."""
+    global _ACTIVE_PARMS_SNAPSHOT_ID
+    try:
+        snap_id, payload, redacted_ini_text = _build_redacted_ini_snapshot_payload(cfg=cfg, ini_path=ini_path)
+        snap_dir = _get_parms_snapshots_dir()
+        json_path = snap_dir / f"parms_{snap_id}.json"
+        ini_out_path = snap_dir / f"parms_{snap_id}.ini"
+
+        with _PARMS_SNAPSHOT_LOCK:
+            _ACTIVE_PARMS_SNAPSHOT_ID = snap_id
+            _ACTIVE_PARMS_SNAPSHOT_MEMO[snap_id] = payload
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            wrote_new = False
+            if not json_path.is_file():
+                tmp_json = snap_dir / f".parms_{snap_id}.json.tmp.{os.getpid()}"
+                tmp_json.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+                os.replace(tmp_json, json_path)
+                wrote_new = True
+            if not ini_out_path.is_file():
+                tmp_ini = snap_dir / f".parms_{snap_id}.ini.tmp.{os.getpid()}"
+                tmp_ini.write_text(redacted_ini_text, encoding="utf-8")
+                os.replace(tmp_ini, ini_out_path)
+                wrote_new = True
+
+        if wrote_new:
+            logging.info(
+                "PARMS_SNAPSHOT_SAVED id=%s sections=%d redacted_keys=%d json=%s ini=%s",
+                snap_id,
+                payload["section_count"],
+                payload["redacted_key_count"],
+                json_path,
+                ini_out_path,
+            )
+        return snap_id, payload
+    except Exception as exc:
+        logging.warning("PARMS_SNAPSHOT_PERSIST_ERROR detail=%s", exc)
+        return _ACTIVE_PARMS_SNAPSHOT_ID, None
+
+
+def _load_parms_snapshot_by_id(snapshot_id: Optional[str]):
+    """Load a persisted redacted full parms.ini snapshot from logs/parms_snapshots/ by hash ID."""
+    clean_id = str(snapshot_id or "").strip().lower()
+    if not clean_id or not _PARMS_SNAPSHOT_ID_RE.fullmatch(clean_id):
+        return None
+    with _PARMS_SNAPSHOT_LOCK:
+        cached = _ACTIVE_PARMS_SNAPSHOT_MEMO.get(clean_id)
+        if isinstance(cached, dict):
+            return dict(cached)
+    try:
+        snap_dir = _get_parms_snapshots_dir().resolve()
+        json_path = (snap_dir / f"parms_{clean_id}.json").resolve()
+        if json_path.parent != snap_dir or not json_path.is_file():
+            return None
+        loaded = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return None
+        ini_path = (snap_dir / f"parms_{clean_id}.ini").resolve()
+        if ini_path.parent == snap_dir and ini_path.is_file():
+            try:
+                loaded["redacted_ini_text"] = ini_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        with _PARMS_SNAPSHOT_LOCK:
+            _ACTIVE_PARMS_SNAPSHOT_MEMO[clean_id] = dict(loaded)
+        return loaded
+    except Exception as exc:
+        logging.warning("PARMS_SNAPSHOT_LOAD_ERROR id=%s detail=%s", clean_id, exc)
+        return None
+
+
+def _list_parms_snapshots(limit: int = 50):
+    """Return metadata for persisted redacted parms.ini snapshots in logs/parms_snapshots/."""
+    items = []
+    try:
+        snap_dir = _get_parms_snapshots_dir()
+        if not snap_dir.is_dir():
+            return items
+        files = sorted(
+            snap_dir.glob("parms_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[: max(1, int(limit))]
+        for p in files:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                sid = str(data.get("snapshot_id") or "").strip().lower()
+                if not sid:
+                    continue
+                items.append({
+                    "snapshot_id": sid,
+                    "app_version": data.get("app_version"),
+                    "created_at_utc": data.get("created_at_utc"),
+                    "section_count": int(data.get("section_count") or len(data.get("sections") or {})),
+                    "redacted_key_count": int(data.get("redacted_key_count") or 0),
+                    "json_file": f"logs/parms_snapshots/parms_{sid}.json",
+                    "ini_file": f"logs/parms_snapshots/parms_{sid}.ini",
+                })
+            except Exception:
+                continue
+    except Exception as exc:
+        logging.warning("PARMS_SNAPSHOT_LIST_ERROR detail=%s", exc)
+    return items
+
+
+def _capture_active_trade_parms_snapshot():
+    """Ensure the full redacted parms.ini snapshot is persisted in logs/parms_snapshots/
+    and return a compact trade-level reference + active trading parms dict."""
+    snap_id = _ACTIVE_PARMS_SNAPSHOT_ID
+    if not snap_id:
+        snap_id, _ = _persist_full_parms_snapshot()
+    return {
+        "parms_snapshot_id": snap_id,
+        "parms_snapshot_file": f"logs/parms_snapshots/parms_{snap_id}.json" if snap_id else None,
+        "app_version": str(APP_VERSION),
+        "captured_at_utc": datetime.now(UTC).isoformat(),
+        "profit_target_enabled": bool(OPTION_SELL_PROFIT_TARGET_ENABLED),
+        "profit_target_pct": round(float(OPTION_SELL_PROFIT_TARGET_PCT), 2),
+        "rsi_high": round(float(OPTION_CHAIN_RSI_HIGH), 2),
+        "take_profit_require_profit": bool(OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT),
+        "take_profit_min_pnl_pct": round(float(OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT), 2),
+        "trailing_stop_enabled": bool(OPTION_SELL_TRAILING_STOP_ENABLED),
+        "trailing_activation_pct": round(float(OPTION_SELL_TRAILING_ACTIVATION_PCT), 2),
+        "trailing_drawdown_pct": round(float(OPTION_SELL_TRAILING_DRAWDOWN_PCT), 2),
+        "trailing_require_negative_velocity": bool(OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY),
+        "stop_loss_enabled": bool(OPTION_SELL_STOP_LOSS_ENABLED),
+        "stop_loss_pct": round(float(OPTION_SELL_STOP_LOSS_PCT), 2),
+        "stop_loss_consecutive_minutes": int(OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES),
+        "stop_loss_require_kinematics": bool(OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS),
+        "stop_loss_hard_pct": round(float(OPTION_SELL_STOP_LOSS_HARD_PCT), 2),
+        "min_hold_minutes": int(OPTION_SELL_MIN_HOLD_MINUTES),
+        "buy_max_spread_pct": round(float(OPTION_BUY_MAX_SPREAD_PCT), 2),
+        "open_position_capture_mode": str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE),
+        "dynamic_rules_mode": str(OPTION_SELL_DYNAMIC_RULES_MODE),
+        "dynamic_ratchet_tiers": str(OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW),
+        "dynamic_breakeven_activation_pct": round(float(OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT), 2),
+        "dynamic_vol_adapt_enabled": bool(OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED),
+        "dynamic_min_samples": int(OPTION_SELL_DYNAMIC_MIN_SAMPLES),
+        "nasdaq_must_be_positive": bool(NASDAQ_MUST_BE_POSITIVE),
+        "rsi_30d_enabled": bool(RSI_30D_ENABLED),
+        "rsi_30d_min": round(float(RSI_30D_MIN), 2),
+        "smooth_method": str(KINEMATICS_SMOOTH_METHOD),
+        "smooth_period": int(KINEMATICS_SMOOTH_PERIOD),
+    }
+
+
 class OptionContractHistoryTracker:
     """Thread-safe tracker & Alpaca backfill engine for open & closed option contracts.
 
@@ -3006,6 +3336,17 @@ class OptionContractHistoryTracker:
         except (TypeError, ValueError):
             pre_m = 390
         return max(0, min(cls._history_cap(), pre_m))
+
+    @staticmethod
+    def _is_option_market_minute(dt):
+        """Return True if dt falls within US Regular Trading Hours (09:30–16:00 ET on NYSE trading days)."""
+        parsed = _opt_parse_utc(dt) if isinstance(dt, str) else dt
+        if parsed is None:
+            return False
+        try:
+            return bool(regular_session(minute_utc(as_utc(parsed))))
+        except Exception:
+            return False
 
     def attach_coordinator(self, coordinator):
         with self._lock:
@@ -3281,8 +3622,10 @@ class OptionContractHistoryTracker:
         preserved_by_min = {}
         for pt in existing_history or []:
             mk = pt.get("minute_utc")
-            if mk and pt.get("source") in {"live_poll", "order_fill", "position_log"}:
-                preserved_by_min[mk] = pt
+            src = pt.get("source")
+            if mk and src in {"live_poll", "order_fill", "position_log"}:
+                if src == "order_fill" or cls._is_option_market_minute(mk):
+                    preserved_by_min[mk] = pt
 
         total_span_mins = int((end_min - start_min).total_seconds() // 60)
         candidate_mins = []
@@ -3291,12 +3634,8 @@ class OptionContractHistoryTracker:
             while cur <= end_min:
                 if (
                     cur == start_min
-                    or cur == end_min
+                    or (is_closed and cur == end_min)
                     or regular_session(cur)
-                    or cur in bar_map
-                    or cur in live_mark_map
-                    or cur in stk_map
-                    or cur.isoformat() in preserved_by_min
                 ):
                     candidate_mins.append(cur)
                 cur += MINUTE
@@ -3314,15 +3653,17 @@ class OptionContractHistoryTracker:
                         cur += MINUTE
                 day += timedelta(days=1)
             for bm in bar_map.keys():
-                if start_min <= bm <= end_min:
+                if start_min <= bm <= end_min and regular_session(bm):
                     candidate_mins.append(bm)
             for lm in live_mark_map.keys():
-                if start_min <= lm <= end_min:
+                if start_min <= lm <= end_min and regular_session(lm):
                     candidate_mins.append(lm)
             for sm in stk_map.keys():
-                if start_min <= sm <= end_min:
+                if start_min <= sm <= end_min and regular_session(sm):
                     candidate_mins.append(sm)
-            candidate_mins.extend([start_min, end_min])
+            candidate_mins.append(start_min)
+            if is_closed or regular_session(end_min):
+                candidate_mins.append(end_min)
             candidate_mins = sorted(set(candidate_mins))
 
         cap = cls._history_cap()
@@ -3443,17 +3784,18 @@ class OptionContractHistoryTracker:
                     stock_price=end_stk,
                 )
                 return [buy_pt, sell_pt]
-            final_pt = cls._build_point(
-                end_utc,
-                end_price,
-                entry_price,
-                qty,
-                multiplier,
-                source=final_src,
-                minute_key_override=end_min.isoformat(),
-                stock_price=end_stk,
-            )
-            cls._upsert_point(out, final_pt)
+            if is_closed or regular_session(end_min) or not out:
+                final_pt = cls._build_point(
+                    end_utc,
+                    end_price,
+                    entry_price,
+                    qty,
+                    multiplier,
+                    source=final_src,
+                    minute_key_override=end_min.isoformat(),
+                    stock_price=end_stk,
+                )
+                cls._upsert_point(out, final_pt)
         return out
 
     def record_buy(
@@ -3546,6 +3888,7 @@ class OptionContractHistoryTracker:
                             stock_price=stk_p,
                         )
                     )
+                buy_snap = _capture_active_trade_parms_snapshot()
                 res_entry = {
                     "contract": sym,
                     "underlying": eff_und,
@@ -3572,6 +3915,8 @@ class OptionContractHistoryTracker:
                     "pnl_pct": 0.0,
                     "last_updated_utc": exec_dt.isoformat(),
                     "history_source": "live",
+                    "parms_snapshot_id": buy_snap.get("parms_snapshot_id"),
+                    "parms_snapshot": buy_snap,
                     "pre_entry_history": [],
                     "history": history,
                 }
@@ -3825,7 +4170,14 @@ class OptionContractHistoryTracker:
                         existing["history_source"] = "backfilled+live"
 
                 eff_poll_price = cur_price if cur_price > 0 else avg_entry
-                if eff_poll_price > 0 and avg_entry > 0:
+                if (
+                    eff_poll_price > 0
+                    and avg_entry > 0
+                    and (
+                        self._is_option_market_minute(now_dt)
+                        or not existing.get("history")
+                    )
+                ):
                     pt = self._build_point(
                         now_dt,
                         eff_poll_price,
@@ -3923,17 +4275,26 @@ class OptionContractHistoryTracker:
                     s_u = str(entry.get("contract") or sym or "").strip().upper()
                     if not s_u:
                         continue
-                    hist = [
+                    raw_hist = [
                         dict(pt)
                         for pt in (entry.get("history") or [])
                         if isinstance(pt, dict) and pt.get("minute_utc")
                     ]
+                    rth_hist = [
+                        pt
+                        for pt in raw_hist
+                        if pt.get("source") == "order_fill"
+                        or self._is_option_market_minute(pt.get("minute_utc"))
+                    ]
+                    hist = rth_hist if rth_hist else raw_hist[-1:]
                     if len(hist) > cap:
                         hist = hist[-cap:]
                     pre_hist = [
                         dict(pt)
                         for pt in (entry.get("pre_entry_history") or [])
-                        if isinstance(pt, dict) and pt.get("minute_utc")
+                        if isinstance(pt, dict)
+                        and pt.get("minute_utc")
+                        and self._is_option_market_minute(pt.get("minute_utc"))
                     ]
                     if pre_cap > 0 and len(pre_hist) > pre_cap:
                         pre_hist = pre_hist[-pre_cap:]
@@ -3952,17 +4313,26 @@ class OptionContractHistoryTracker:
                     tid = str(rec.get("trade_id") or "").strip()
                     if not tid or tid in self._closed_ids:
                         continue
-                    hist = [
+                    raw_hist = [
                         dict(pt)
                         for pt in (rec.get("history") or [])
                         if isinstance(pt, dict) and pt.get("minute_utc")
                     ]
+                    rth_hist = [
+                        pt
+                        for pt in raw_hist
+                        if pt.get("source") == "order_fill"
+                        or self._is_option_market_minute(pt.get("minute_utc"))
+                    ]
+                    hist = rth_hist if rth_hist else raw_hist[-1:]
                     if len(hist) > cap:
                         hist = hist[-cap:]
                     pre_hist = [
                         dict(pt)
                         for pt in (rec.get("pre_entry_history") or [])
-                        if isinstance(pt, dict) and pt.get("minute_utc")
+                        if isinstance(pt, dict)
+                        and pt.get("minute_utc")
+                        and self._is_option_market_minute(pt.get("minute_utc"))
                     ]
                     if pre_cap > 0 and len(pre_hist) > pre_cap:
                         pre_hist = pre_hist[-pre_cap:]
@@ -4134,7 +4504,7 @@ class OptionContractHistoryTracker:
                 if mdt is None:
                     continue
                 m_utc = minute_utc(mdt)
-                if s_min <= m_utc <= e_min:
+                if s_min <= m_utc <= e_min and self._is_option_market_minute(m_utc):
                     per_min[m_utc] = p
         return result
 
@@ -4201,7 +4571,7 @@ class OptionContractHistoryTracker:
                         except Exception:
                             continue
                         s_min, e_min = target_bounds[sym]
-                        if s_min <= m_utc <= e_min:
+                        if s_min <= m_utc <= e_min and self._is_option_market_minute(m_utc):
                             result.setdefault(sym, {})[m_utc] = price
             except Exception:
                 continue
@@ -4275,7 +4645,7 @@ class OptionContractHistoryTracker:
                             continue
                         m_utc = minute_utc(mdt)
                         s_min, e_min, ep = target_bounds[sym]
-                        if s_min <= m_utc <= e_min:
+                        if s_min <= m_utc <= e_min and self._is_option_market_minute(m_utc):
                             est_price = round(ep * (1.0 + pnl_pct / 100.0), 4)
                             if est_price > 0:
                                 result.setdefault(sym, {})[m_utc] = est_price
@@ -4537,9 +4907,29 @@ class OptionContractHistoryTracker:
                     if open_entry and open_entry.get("history_source")
                     else "live+sell"
                 ),
+                "parms_snapshot_buy_id": (
+                    open_entry.get("parms_snapshot_id")
+                    or (
+                        open_entry.get("parms_snapshot", {}).get("parms_snapshot_id")
+                        if isinstance(open_entry.get("parms_snapshot"), dict)
+                        else None
+                    )
+                    if open_entry
+                    else None
+                ),
+                "parms_snapshot_buy": (
+                    dict(open_entry.get("parms_snapshot"))
+                    if (open_entry and isinstance(open_entry.get("parms_snapshot"), dict))
+                    else None
+                ),
+                "parms_snapshot_id": None,
+                "parms_snapshot": None,
                 "pre_entry_history": pre_hist,
                 "history": rebuilt_hist,
             }
+            sell_snap = _capture_active_trade_parms_snapshot()
+            closed_record["parms_snapshot_id"] = sell_snap.get("parms_snapshot_id")
+            closed_record["parms_snapshot"] = sell_snap
 
             if trade_id in self._closed_ids:
                 for idx, item in enumerate(self.closed_contracts):
@@ -5008,12 +5398,18 @@ class OptionContractHistoryTracker:
         opt_map = {
             m: p
             for m, p in (opt_bars_by_min or {}).items()
-            if m < purchase_min and p is not None and p > 0
+            if m < purchase_min
+            and p is not None
+            and p > 0
+            and cls._is_option_market_minute(m)
         }
         stk_map = {
             m: p
             for m, p in (stk_bars_by_min or {}).items()
-            if m < purchase_min and p is not None and p > 0
+            if m < purchase_min
+            and p is not None
+            and p > 0
+            and cls._is_option_market_minute(m)
         }
         all_mins = sorted(set(opt_map.keys()) | set(stk_map.keys()))
         if not all_mins:
@@ -6350,11 +6746,12 @@ class DailyRsi30Tracker:
 
 
 class NasdaqMarketTracker:
-    """Always tracks the configured NASDAQ proxy symbol (default QQQ) at the
-    start of each trading day (09:30 ET) and every minute thereafter during RTH.
+    """Always tracks the configured NASDAQ proxy symbol (default QQQ) against
+    the previous trading day's official close (matching brokers/Yahoo/TradingView)
+    and every minute thereafter during RTH.
 
     When [general] nasdaq_must_be_positive = true, OptionBuyer consults
-    evaluate_buy_gate() so buys are only permitted when (current - open) > 0.
+    evaluate_buy_gate() so buys are only permitted when (current - prev_close) > 0.
     """
 
     def __init__(self, symbol=None, credentials=None, coordinator=None):
@@ -6372,6 +6769,9 @@ class NasdaqMarketTracker:
         self._stock_client = None
         self._tt_client = None
         self.trading_date = None
+        self.prev_close = None
+        self.prev_close_date = None
+        self.prev_close_source = None
         self.open_price = None
         self.open_minute_utc = None
         self.open_source = None
@@ -6443,6 +6843,9 @@ class NasdaqMarketTracker:
 
     def _reset_day_locked(self, day):
         self.trading_date = day
+        self.prev_close = None
+        self.prev_close_date = None
+        self.prev_close_source = None
         self.open_price = None
         self.open_minute_utc = None
         self.open_source = None
@@ -6453,6 +6856,36 @@ class NasdaqMarketTracker:
         self.observations_today = 0
         self.last_error = None
         self.session_state = "awaiting_rth"
+
+    @staticmethod
+    def _get_prev_trading_day(day):
+        """Return the most recent NYSE trading date strictly prior to `day`."""
+        d = day - timedelta(days=1)
+        for _ in range(14):
+            try:
+                if session_bounds(d) is not None:
+                    return d
+            except Exception:
+                if d.weekday() < 5:
+                    return d
+            d -= timedelta(days=1)
+        return day - timedelta(days=1)
+
+    @staticmethod
+    def _daily_bar_date(ts):
+        """Extract the US market calendar date from an Alpaca/yfinance daily bar timestamp."""
+        if ts is None:
+            return None
+        if hasattr(ts, "to_pydatetime"):
+            ts = ts.to_pydatetime()
+        if isinstance(ts, datetime):
+            if ts.tzinfo is not None:
+                ts_u = ts.astimezone(UTC)
+                if ts_u.hour == 0 and ts_u.minute == 0 and ts_u.second == 0:
+                    return ts_u.date()
+                return ts_u.astimezone(MARKET_TZ).date()
+            return ts.date()
+        return None
 
     def _lookup_coordinator_price(self, day, target_min_utc=None, want_open=False):
         """Reuse price from coordinator if nasdaq_symbol is already a tracked symbol."""
@@ -6494,114 +6927,184 @@ class NasdaqMarketTracker:
         last_m, last_c, prov = pts[-1]
         return last_c, last_m.isoformat(), f"coordinator_{prov.lower()}"
 
-    def _fetch_rth_open_sync(self, day):
-        """Fetch today's 09:30 ET start-of-day price for self.symbol."""
-        opening_utc, _ = self._get_session_bounds(day)
-        if opening_utc is None:
-            return None, None, "market_closed"
-        now_utc = datetime.now(UTC)
-        if now_utc < opening_utc:
-            return None, None, "pre_market"
-
-        # 1. Alpaca 1m bar at 09:30 ET (with SIP -> IEX fallback) and snapshot daily_bar.open
-        client = self._get_alpaca_stock_client()
-        if client is not None:
-            for feed_cand in self._alpaca_feed_candidates():
-                try:
-                    end_dt = min(now_utc, opening_utc + timedelta(minutes=15))
-                    req = StockBarsRequest(
-                        symbol_or_symbols=[self.symbol],
-                        timeframe=TimeFrame.Minute,
-                        start=opening_utc,
-                        end=end_dt,
-                        feed=feed_cand,
-                    )
-                    resp = client.get_stock_bars(req)
-                    bars = []
-                    if hasattr(resp, "data") and isinstance(resp.data, dict):
-                        bars = list(resp.data.get(self.symbol) or [])
-                    elif isinstance(resp, dict):
-                        bars = list(resp.get(self.symbol) or [])
-                    else:
-                        try:
-                            bars = list(resp[self.symbol] or [])
-                        except Exception:
-                            bars = []
-                    for b in sorted(bars, key=lambda x: getattr(x, "timestamp", now_utc)):
-                        ts = getattr(b, "timestamp", None)
-                        o_val = getattr(b, "open", None) or getattr(b, "close", None)
-                        if ts is not None and o_val is not None and as_utc(ts) >= opening_utc:
-                            px = float(o_val)
-                            if math.isfinite(px) and px > 0.0:
-                                return px, as_utc(ts).isoformat(), "alpaca_1m_open"
-                except Exception as exc:
-                    logging.warning(
-                        "NASDAQ_OPEN_ALPACA_FAILED symbol=%s feed=%s error_type=%s detail=%s",
-                        self.symbol,
-                        getattr(feed_cand, "value", feed_cand),
-                        type(exc).__name__,
-                        exc,
-                    )
-            try:
-                from alpaca.data.requests import StockSnapshotRequest
-
-                for feed_cand in self._alpaca_feed_candidates():
-                    try:
-                        s_resp = client.get_stock_snapshot(
-                            StockSnapshotRequest(symbol_or_symbols=[self.symbol], feed=feed_cand)
-                        )
-                        snap_obj = (
-                            s_resp.get(self.symbol)
-                            if isinstance(s_resp, dict)
-                            else getattr(s_resp, "data", {}).get(self.symbol)
-                        )
-                        dbar = getattr(snap_obj, "daily_bar", None) if snap_obj is not None else None
-                        d_ts = getattr(dbar, "timestamp", None) if dbar is not None else None
-                        o_val = getattr(dbar, "open", None) if dbar is not None else None
-                        if o_val is not None and (
-                            d_ts is None or as_utc(d_ts).astimezone(MARKET_TZ).date() == day
-                        ):
-                            px = float(o_val)
-                            if math.isfinite(px) and px > 0.0:
-                                return px, opening_utc.isoformat(), "alpaca_snapshot_open"
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        # 2. yfinance 1m RTH open
+    def _fetch_prev_close_yfinance(self, day, prev_day):
+        """Fetch official consolidated previous trading day close via yfinance."""
         try:
             import yfinance as yf
 
-            hist = yf.Ticker(self.symbol).history(
-                period="1d", interval="1m", prepost=False, timeout=15
+            ticker = yf.Ticker(self.symbol)
+            hist = ticker.history(
+                period="10d", interval="1d", auto_adjust=False, prepost=False, timeout=15
             )
-            if hist is not None and not hist.empty:
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                best_row = None
                 for idx_ts, row in hist.iterrows():
                     try:
-                        ts_dt = idx_ts.to_pydatetime()
-                        ts_u = as_utc(ts_dt) if ts_dt.tzinfo is not None else ts_dt.replace(tzinfo=MARKET_TZ).astimezone(UTC)
-                        if ts_u.astimezone(MARKET_TZ).date() == day and ts_u >= opening_utc:
-                            o_raw = row.get("Open") if "Open" in row else row.get("Close")
-                            px = float(o_raw)
-                            if math.isfinite(px) and px > 0.0:
-                                return px, ts_u.isoformat(), "yfinance_1m_open"
+                        b_date = self._daily_bar_date(idx_ts)
+                        if b_date is None or b_date >= day:
+                            continue
+                        px = float(row["Close"])
+                        if math.isfinite(px) and px > 0.0:
+                            best_row = (b_date, px)
                     except Exception:
                         continue
+                if best_row is not None:
+                    return best_row[1], best_row[0], "yfinance_prev_close"
+            try:
+                fi = getattr(ticker, "fast_info", None)
+                fi_pc = None
+                if fi is not None:
+                    fi_pc = fi.get("previous_close") if hasattr(fi, "get") else getattr(fi, "previous_close", None)
+                if fi_pc is not None:
+                    px = float(fi_pc)
+                    if math.isfinite(px) and px > 0.0:
+                        return px, prev_day, "yfinance_fast_info_prev_close"
+            except Exception:
+                pass
         except Exception as exc:
             logging.warning(
-                "NASDAQ_OPEN_YFINANCE_FAILED symbol=%s error_type=%s detail=%s",
+                "NASDAQ_PREV_CLOSE_YFINANCE_FAILED symbol=%s error_type=%s detail=%s",
                 self.symbol,
                 type(exc).__name__,
                 exc,
             )
+        return None, None, None
 
-        # 3. Coordinator history if symbol is already tracked
-        c_px, c_ts, c_src = self._lookup_coordinator_price(day, want_open=True)
-        if c_px is not None:
-            return c_px, c_ts, c_src
+    def _fetch_prev_close_alpaca(self, day, prev_day):
+        """Fetch previous trading day close via Alpaca snapshot (previous_daily_bar) or daily bars."""
+        client = self._get_alpaca_stock_client()
+        if client is None:
+            return None, None, None
+
+        # 1a. Alpaca StockSnapshot.previous_daily_bar
+        try:
+            from alpaca.data.requests import StockSnapshotRequest
+
+            for feed_cand in self._alpaca_feed_candidates():
+                try:
+                    s_resp = client.get_stock_snapshot(
+                        StockSnapshotRequest(symbol_or_symbols=[self.symbol], feed=feed_cand)
+                    )
+                    snap_obj = (
+                        s_resp.get(self.symbol)
+                        if isinstance(s_resp, dict)
+                        else getattr(s_resp, "data", {}).get(self.symbol)
+                    )
+                    if snap_obj is None:
+                        continue
+                    # Opportunistically capture today's RTH open if valid
+                    try:
+                        dbar = getattr(snap_obj, "daily_bar", None)
+                        d_ts = getattr(dbar, "timestamp", None) if dbar is not None else None
+                        o_val = getattr(dbar, "open", None) if dbar is not None else None
+                        if o_val is not None and self._daily_bar_date(d_ts) == day:
+                            o_px = float(o_val)
+                            if math.isfinite(o_px) and o_px > 0.0:
+                                with self._lock:
+                                    if self.open_price is None:
+                                        self.open_price = round(o_px, 4)
+                                        self.open_source = "alpaca_snapshot_open"
+                    except Exception:
+                        pass
+                    pbar = getattr(snap_obj, "previous_daily_bar", None) or getattr(snap_obj, "prev_daily_bar", None)
+                    if pbar is not None:
+                        p_ts = getattr(pbar, "timestamp", None)
+                        p_date = self._daily_bar_date(p_ts)
+                        c_val = getattr(pbar, "close", None)
+                        if c_val is not None and (p_date is None or p_date < day):
+                            px = float(c_val)
+                            if math.isfinite(px) and px > 0.0:
+                                feed_lbl = str(getattr(feed_cand, "value", feed_cand) or "").lower()
+                                return px, (p_date or prev_day), f"alpaca_snapshot_prev_close_{feed_lbl}"
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 1b. Alpaca daily bars strictly before `day`
+        for feed_cand in self._alpaca_feed_candidates():
+            try:
+                start_dt = datetime.combine(day - timedelta(days=12), clock_time(0), tzinfo=MARKET_TZ).astimezone(UTC)
+                end_dt = datetime.combine(day, clock_time(0), tzinfo=MARKET_TZ).astimezone(UTC)
+                req = StockBarsRequest(
+                    symbol_or_symbols=[self.symbol],
+                    timeframe=TimeFrame.Day,
+                    start=start_dt,
+                    end=end_dt,
+                    feed=feed_cand,
+                )
+                resp = client.get_stock_bars(req)
+                bars = []
+                if hasattr(resp, "data") and isinstance(resp.data, dict):
+                    bars = list(resp.data.get(self.symbol) or [])
+                elif isinstance(resp, dict):
+                    bars = list(resp.get(self.symbol) or [])
+                else:
+                    try:
+                        bars = list(resp[self.symbol] or [])
+                    except Exception:
+                        bars = []
+                best_bar = None
+                for b in sorted(bars, key=lambda x: getattr(x, "timestamp", start_dt)):
+                    b_date = self._daily_bar_date(getattr(b, "timestamp", None))
+                    c_val = getattr(b, "close", None)
+                    if b_date is not None and b_date < day and c_val is not None:
+                        px = float(c_val)
+                        if math.isfinite(px) and px > 0.0:
+                            best_bar = (b_date, px)
+                if best_bar is not None:
+                    feed_lbl = str(getattr(feed_cand, "value", feed_cand) or "").lower()
+                    return best_bar[1], best_bar[0], f"alpaca_1d_prev_close_{feed_lbl}"
+            except Exception as exc:
+                logging.warning(
+                    "NASDAQ_PREV_CLOSE_ALPACA_FAILED symbol=%s feed=%s error_type=%s detail=%s",
+                    self.symbol,
+                    getattr(feed_cand, "value", feed_cand),
+                    type(exc).__name__,
+                    exc,
+                )
+        return None, None, None
+
+    def _fetch_prev_close_sync(self, day):
+        """Fetch the previous trading day's official close for self.symbol.
+
+        On Alpaca SIP (consolidated), prefers Alpaca snapshot/daily bars first then yfinance.
+        On Alpaca IEX (free tier), prefers yfinance consolidated daily close first so thin
+        IEX-only prints cannot skew the official NASDAQ closing price, falling back to Alpaca
+        and Tastytrade.
+        """
+        prev_day = self._get_prev_trading_day(day)
+        if FEED == DataFeed.IEX:
+            providers = (self._fetch_prev_close_yfinance, self._fetch_prev_close_alpaca)
+        else:
+            providers = (self._fetch_prev_close_alpaca, self._fetch_prev_close_yfinance)
+
+        for fetcher in providers:
+            px, p_date, src = fetcher(day, prev_day)
+            if px is not None:
+                return px, p_date, src
+
+        # Final fallback: Tastytrade quote prev_close / close_price
+        tt_client = self._get_tastytrade_client()
+        if tt_client is not None:
+            try:
+                q = tt_client.get_quote(self.symbol, is_option=False)
+                if q is not None:
+                    for fld in ("prev_close", "prev_close_price", "close_price", "close"):
+                        raw_p = q.get(fld) if isinstance(q, dict) else getattr(q, fld, None)
+                        if raw_p is not None:
+                            px = float(raw_p)
+                            if math.isfinite(px) and px > 0.0:
+                                return px, prev_day, f"tastytrade_{fld}"
+            except Exception:
+                pass
 
         return None, None, "unavailable"
+
+    def _fetch_rth_open_sync(self, day):
+        """Legacy helper retained for compatibility — delegates to _fetch_prev_close_sync."""
+        px, p_date, src = self._fetch_prev_close_sync(day)
+        return px, (str(p_date) if p_date else None), src
 
     def _fetch_minute_price_sync(self, day, target_min_utc):
         """Fetch the current/target-minute price for self.symbol during RTH."""
@@ -6748,7 +7251,7 @@ class NasdaqMarketTracker:
         return None, None, "unavailable"
 
     def refresh_sync(self, target_minute=None, force=False):
-        """Synchronously collect/update day-open and current-minute NASDAQ price during RTH."""
+        """Synchronously collect/update previous trading day's close and current-minute NASDAQ price during RTH."""
         now_utc = datetime.now(UTC)
         ref_dt = as_utc(target_minute) if isinstance(target_minute, datetime) else now_utc
         ny_dt = ref_dt.astimezone(MARKET_TZ)
@@ -6758,9 +7261,9 @@ class NasdaqMarketTracker:
         with self._lock:
             if self.trading_date != day:
                 self._reset_day_locked(day)
-            if not force and self.last_refreshed_minute_key == min_key and self.current_price is not None and self.open_price is not None:
+            if not force and self.last_refreshed_minute_key == min_key and self.current_price is not None and self.prev_close is not None:
                 return self._build_status_locked()
-            need_open = self.open_price is None
+            need_prev_close = self.prev_close is None
 
         # Only fetch intraday RTH prices on NYSE trading days during or after 09:30 ET
         opening_utc, closing_utc = self._get_session_bounds(day)
@@ -6773,36 +7276,30 @@ class NasdaqMarketTracker:
                 self.session_state = "pre_market"
                 return self._build_status_locked()
 
-        open_px = None
-        open_ts = None
-        open_src = None
-        if need_open:
-            open_px, open_ts, open_src = self._fetch_rth_open_sync(day)
+        prev_px = None
+        prev_dt = None
+        prev_src = None
+        if need_prev_close:
+            prev_px, prev_dt, prev_src = self._fetch_prev_close_sync(day)
 
         cur_px, cur_ts, cur_src = self._fetch_minute_price_sync(day, ref_dt)
 
-        # If RTH open bar couldn't be fetched independently, seed from first observed RTH price
-        if need_open and open_px is None and cur_px is not None:
-            open_px = cur_px
-            open_ts = cur_ts or ref_dt.isoformat()
-            open_src = f"first_rth_{cur_src}"
-
-        logged_new_open = False
+        logged_new_prev_close = False
         with self._lock:
             if self.trading_date != day:
                 self._reset_day_locked(day)
-            if self.open_price is None and open_px is not None:
-                self.open_price = round(float(open_px), 4)
-                self.open_minute_utc = open_ts
-                self.open_source = open_src
-                logged_new_open = True
+            if self.prev_close is None and prev_px is not None:
+                self.prev_close = round(float(prev_px), 4)
+                self.prev_close_date = prev_dt
+                self.prev_close_source = prev_src
+                logged_new_prev_close = True
                 self.logger.info(
-                    "NASDAQ_DAY_OPEN symbol=%s date=%s open=%.4f source=%s minute=%s",
+                    "NASDAQ_PREV_CLOSE symbol=%s date=%s prev_close=%.4f prev_close_date=%s source=%s",
                     self.symbol,
                     day,
-                    self.open_price,
-                    self.open_source,
-                    format_display_iso(open_ts or ref_dt),
+                    self.prev_close,
+                    self.prev_close_date,
+                    self.prev_close_source,
                 )
             if cur_px is not None:
                 self.current_price = round(float(cur_px), 4)
@@ -6811,7 +7308,7 @@ class NasdaqMarketTracker:
                 self.last_refreshed_minute_key = min_key
                 self.last_updated_utc = now_utc.isoformat()
                 self.observations_today += 1
-                self.last_error = None
+                self.last_error = None if self.prev_close is not None else f"prev_close_unavailable({prev_src})"
                 self.session_state = "live" if now_utc <= closing_utc else "after_hours"
             else:
                 self.last_error = f"price_unavailable({cur_src})"
@@ -6819,23 +7316,24 @@ class NasdaqMarketTracker:
 
             snap = self._build_status_locked()
 
-        if logged_new_open:
+        if logged_new_prev_close:
             logging.info(
-                "NASDAQ_DAY_OPEN symbol=%s date=%s open=%.4f source=%s",
+                "NASDAQ_PREV_CLOSE symbol=%s date=%s prev_close=%.4f prev_close_date=%s source=%s",
                 self.symbol,
                 day,
-                snap["open_price"],
-                snap["open_source"],
+                snap["prev_close"],
+                snap["prev_close_date"],
+                snap["prev_close_source"],
             )
 
-        if cur_px is not None and snap["open_price"] is not None:
+        if cur_px is not None and snap["prev_close"] is not None:
             self.logger.info(
-                "NASDAQ_MINUTE symbol=%s date=%s minute=%s open=%.4f current=%.4f "
+                "NASDAQ_MINUTE symbol=%s date=%s minute=%s prev_close=%.4f current=%.4f "
                 "diff=%+.4f diff_pct=%+.3f%% positive=%s gate_enabled=%s source=%s",
                 self.symbol,
                 day,
                 format_display_iso(ref_dt),
-                snap["open_price"],
+                snap["prev_close"],
                 snap["current_price"],
                 snap["diff"],
                 snap["diff_pct"],
@@ -6845,19 +7343,19 @@ class NasdaqMarketTracker:
             )
         else:
             self.logger.warning(
-                "NASDAQ_MINUTE_MISSING symbol=%s date=%s minute=%s open=%s current=%s detail=%s",
+                "NASDAQ_MINUTE_MISSING symbol=%s date=%s minute=%s prev_close=%s current=%s detail=%s",
                 self.symbol,
                 day,
                 format_display_iso(ref_dt),
-                snap["open_price"],
+                snap["prev_close"],
                 snap["current_price"],
                 snap["last_error"],
             )
             logging.warning(
-                "NASDAQ_MINUTE_MISSING symbol=%s date=%s open=%s current=%s detail=%s",
+                "NASDAQ_MINUTE_MISSING symbol=%s date=%s prev_close=%s current=%s detail=%s",
                 self.symbol,
                 day,
-                snap["open_price"],
+                snap["prev_close"],
                 snap["current_price"],
                 snap["last_error"],
             )
@@ -6889,16 +7387,22 @@ class NasdaqMarketTracker:
         diff = None
         diff_pct = None
         is_positive = None
-        if self.open_price is not None and self.current_price is not None:
-            diff = round(self.current_price - self.open_price, 4)
-            if self.open_price > 0:
-                diff_pct = round((diff / self.open_price) * 100.0, 4)
+        ref_px = self.prev_close
+        if ref_px is not None and self.current_price is not None:
+            diff = round(self.current_price - ref_px, 4)
+            if ref_px > 0:
+                diff_pct = round((diff / ref_px) * 100.0, 4)
             is_positive = diff > 0.0
         return {
             "symbol": self.symbol,
             "gate_enabled": bool(NASDAQ_MUST_BE_POSITIVE),
             "status": self.session_state,
             "trading_date": str(self.trading_date) if self.trading_date else None,
+            "reference_type": "prev_close",
+            "reference_price": ref_px,
+            "prev_close": self.prev_close,
+            "prev_close_date": str(self.prev_close_date) if self.prev_close_date else None,
+            "prev_close_source": self.prev_close_source,
             "open_price": self.open_price,
             "open_minute_utc": self.open_minute_utc,
             "open_source": self.open_source,
@@ -6924,26 +7428,26 @@ class NasdaqMarketTracker:
         snap = self.get_status()
         if not NASDAQ_MUST_BE_POSITIVE:
             return True, "nasdaq_gate_disabled", snap
-        o_px = snap.get("open_price")
+        ref_px = snap.get("prev_close")
         c_px = snap.get("current_price")
         diff = snap.get("diff")
         diff_pct = snap.get("diff_pct")
-        if o_px is None or c_px is None or diff is None:
+        if ref_px is None or c_px is None or diff is None:
             return (
                 False,
-                f"nasdaq_down({self.symbol}_price_unavailable:open={o_px},cur={c_px})",
+                f"nasdaq_down({self.symbol}_price_unavailable:prev_close={ref_px},cur={c_px})",
                 snap,
             )
         pct_s = f"/{diff_pct:+.2f}%" if diff_pct is not None else ""
         if diff > 0.0:
             return (
                 True,
-                f"nasdaq_positive({self.symbol}:{c_px:.2f}-{o_px:.2f}={diff:+.2f}{pct_s})",
+                f"nasdaq_positive({self.symbol}:{c_px:.2f}-prev_close:{ref_px:.2f}={diff:+.2f}{pct_s})",
                 snap,
             )
         return (
             False,
-            f"nasdaq_down({self.symbol}:{c_px:.2f}-{o_px:.2f}={diff:+.2f}{pct_s}<=0)",
+            f"nasdaq_down({self.symbol}:{c_px:.2f}-prev_close:{ref_px:.2f}={diff:+.2f}{pct_s}<=0)",
             snap,
         )
 
@@ -7218,6 +7722,7 @@ class MinuteCoordinator:
             "reason": reason,
             "rsi": round(float(rsi), 2) if rsi is not None else None,
             "dry_run": bool(dry_run),
+            "parms_snapshot": _capture_active_trade_parms_snapshot(),
         }
         events = self.option_buy_events.setdefault(sym, [])
         oid = event.get("order_id")
@@ -7299,6 +7804,7 @@ class MinuteCoordinator:
             "reason": reason,
             "rsi": round(float(rsi), 2) if rsi is not None else None,
             "dry_run": bool(dry_run),
+            "parms_snapshot": _capture_active_trade_parms_snapshot(),
         }
         events = self.option_sell_events.setdefault(sym, [])
         oid = event.get("order_id")
@@ -9685,7 +10191,7 @@ _INI_FEATURE_SECTIONS = frozenset(
         "general",
         "market_signal_providers",
         "kinematics",
-        "option_history",
+        "option_history",  # legacy fallback section (consolidated into [option_trading] in v0.1.30)
         "option_trading",
         "option_buyer",
         "option_seller",
@@ -10072,11 +10578,13 @@ def _ini_int(cfg, section, option, env_name, default, minimum=None):
     return max(minimum, val) if minimum is not None else val
 
 
-def _ini_float(cfg, section, option, env_name, default):
+def _ini_float(cfg, section, option, env_name, default, minimum=None):
     if cfg.has_option(section, option):
         raw = _strip_ini_value(cfg.get(section, option, fallback=""))
-        return float(raw)
-    return float(os.getenv(env_name, str(default)))
+        val = float(raw)
+    else:
+        val = float(os.getenv(env_name, str(default)))
+    return max(minimum, val) if minimum is not None else val
 
 
 _KNOWN_PROVIDERS = frozenset(DEFAULT_PROVIDER_PRIORITY)
@@ -10129,7 +10637,7 @@ def _apply_ini_feature_settings(cfg):
     """Load [general], [market_signal_providers], [kinematics], [option_trading], [option_buyer], [option_seller], [chart_capture], [dashboard], [webhook], and [tastytrade_api] overrides from lib/parms.ini."""
     global DISPLAY_TIMEZONE_SETTING, DISPLAY_TZ, DISPLAY_TZ_IANA, INSTANCE_OWNER
     global NASDAQ_MUST_BE_POSITIVE, NASDAQ_SYMBOL
-    global RSI_30D_ENABLED, RSI_30D_MIN
+    global RSI_30D_ENABLED, RSI_30D_MIN, OPTIONS_ONLY
     global PROVIDER_PRIORITY
     global OPTION_CHAIN_PROVIDER, OPTION_TRANSACTION_PROVIDER
     global OPTION_CHAIN_RSI_COOLDOWN_SECONDS, OPTION_CHAIN_PACING_SECONDS
@@ -10138,7 +10646,7 @@ def _apply_ini_feature_settings(cfg):
     global TASTYTRADE_PROD_ACCOUNT_NUMBER, TASTYTRADE_SANDBOX_ACCOUNT_NUMBER
     global KINEMATICS_SMOOTH_METHOD, KINEMATICS_SMOOTH_PERIOD
     global KINEMATICS_RSI_OVERBOUGHT, KINEMATICS_RSI_OVERSOLD
-    global KINEMATICS_HISTORY_MAX_BARS
+    global HISTORY_MAX_BARS, KINEMATICS_HISTORY_MAX_BARS
     global OPTION_HISTORY_MAX_BARS, OPTION_HISTORY_PRE_ENTRY_MINUTES
     global OPTION_POSITION_POLL_SECONDS
     global RSI_WARMUP_SESSIONS, RSI_SESSION_MODE, FEED
@@ -10169,7 +10677,6 @@ def _apply_ini_feature_settings(cfg):
     global OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT, OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT
     global OPTION_SELL_TRAILING_STOP_ENABLED, OPTION_SELL_TRAILING_ACTIVATION_PCT
     global OPTION_SELL_TRAILING_DRAWDOWN_PCT, OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY
-    global OPTION_SELL_PEAK_PROFIT_CALLS_ONLY
     global OPTION_SELL_STOP_LOSS_ENABLED, OPTION_SELL_STOP_LOSS_PCT
     global OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES, OPTION_SELL_MIN_HOLD_MINUTES
     global OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS, OPTION_SELL_STOP_LOSS_HARD_PCT
@@ -10185,7 +10692,7 @@ def _apply_ini_feature_settings(cfg):
     global DASHBOARD_SSL_ENABLED, DASHBOARD_SSL_MODE, DASHBOARD_SSL_CERT
     global DASHBOARD_SSL_KEY, DASHBOARD_SSL_AUTO_SELF_SIGNED
     global DASHBOARD_AUTH_ENABLED, DASHBOARD_PASSWORD, DASHBOARD_SESSION_TTL_HOURS
-    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES, STRIKE_ANALYZER_ENABLED, FINDBEST_ENABLED
+    global DASHBOARD_INACTIVITY_TIMEOUT_MINUTES, STRIKE_ANALYZER_ENABLED, FINDBEST_ENABLED, ANALYZE_DAY_ENABLED
 
     tz_setting = (
         _ini_str(cfg, "general", "timezone", "DISPLAY_TIMEZONE", "PST").strip() or "PST"
@@ -10209,6 +10716,80 @@ def _apply_ini_feature_settings(cfg):
     RSI_30D_MIN = _ini_float(
         cfg, "general", "rsi_30d_min", "RSI_30D_MIN", 30.0
     )
+    if cfg.has_option("general", "options_only"):
+        OPTIONS_ONLY = _ini_bool(
+            cfg, "general", "options_only", "OPTIONS_ONLY", True
+        )
+    elif cfg.has_option("option_seller", "options_only"):
+        OPTIONS_ONLY = _ini_bool(
+            cfg, "option_seller", "options_only", "OPTIONS_ONLY", True
+        )
+        logging.info(
+            "CONFIG_COMPAT [option_seller] options_only=%s loaded as fallback; move options_only under [general]",
+            OPTIONS_ONLY,
+        )
+    else:
+        _env_opts = os.getenv("OPTIONS_ONLY", os.getenv("OPTION_SELL_OPTIONS_ONLY", ""))
+        OPTIONS_ONLY = (
+            _env_opts.strip().lower() in {"1", "true", "yes"}
+            if _env_opts.strip() != ""
+            else True
+        )
+    OPTION_SELL_OPTIONS_ONLY = OPTIONS_ONLY
+
+    if cfg.has_option("general", "history_max_bars"):
+        HISTORY_MAX_BARS = _ini_int(
+            cfg, "general", "history_max_bars", "HISTORY_MAX_BARS", 2400, minimum=60
+        )
+    elif cfg.has_option("kinematics", "history_max_bars"):
+        HISTORY_MAX_BARS = _ini_int(
+            cfg,
+            "kinematics",
+            "history_max_bars",
+            "KINEMATICS_HISTORY_MAX_BARS",
+            2400,
+            minimum=60,
+        )
+        logging.warning(
+            "CONFIG_COMPAT [kinematics] history_max_bars is deprecated; move to [general] history_max_bars"
+        )
+    elif cfg.has_option("option_trading", "history_max_bars"):
+        HISTORY_MAX_BARS = _ini_int(
+            cfg,
+            "option_trading",
+            "history_max_bars",
+            "OPTION_HISTORY_MAX_BARS",
+            2400,
+            minimum=60,
+        )
+        logging.warning(
+            "CONFIG_COMPAT [option_trading] history_max_bars is deprecated; move to [general] history_max_bars"
+        )
+    elif cfg.has_option("option_history", "history_max_bars"):
+        HISTORY_MAX_BARS = _ini_int(
+            cfg,
+            "option_history",
+            "history_max_bars",
+            "OPTION_HISTORY_MAX_BARS",
+            2400,
+            minimum=60,
+        )
+        logging.warning(
+            "CONFIG_COMPAT [option_history] history_max_bars is deprecated; move to [general] history_max_bars"
+        )
+    else:
+        _env_hmb = (
+            os.getenv("HISTORY_MAX_BARS")
+            or os.getenv("KINEMATICS_HISTORY_MAX_BARS")
+            or os.getenv("OPTION_HISTORY_MAX_BARS")
+            or "2400"
+        )
+        try:
+            HISTORY_MAX_BARS = max(60, int(str(_env_hmb).strip()))
+        except (TypeError, ValueError):
+            HISTORY_MAX_BARS = 2400
+    KINEMATICS_HISTORY_MAX_BARS = HISTORY_MAX_BARS
+    OPTION_HISTORY_MAX_BARS = HISTORY_MAX_BARS
 
     raw_prio = _ini_str(cfg, "market_signal_providers", "priority", "PROVIDER_PRIORITY", "")
     PROVIDER_PRIORITY = _parse_provider_priority(raw_prio)
@@ -10361,41 +10942,89 @@ def _apply_ini_feature_settings(cfg):
     KINEMATICS_RSI_OVERSOLD = _ini_float(
         cfg, "kinematics", "rsi_oversold", "KINEMATICS_RSI_OVERSOLD", 30.0
     )
-    KINEMATICS_HISTORY_MAX_BARS = _ini_int(
-        cfg,
-        "kinematics",
-        "history_max_bars",
-        "KINEMATICS_HISTORY_MAX_BARS",
-        2400,
-        minimum=60,
-    )
-    OPTION_HISTORY_MAX_BARS = _ini_int(
-        cfg,
-        "option_history",
-        "history_max_bars",
-        "OPTION_HISTORY_MAX_BARS",
-        KINEMATICS_HISTORY_MAX_BARS,
-        minimum=60,
-    )
-    OPTION_HISTORY_PRE_ENTRY_MINUTES = _ini_int(
-        cfg,
-        "option_history",
-        "pre_entry_lookback_minutes",
-        "OPTION_HISTORY_PRE_ENTRY_MINUTES",
-        390,
-        minimum=0,
-    )
-    OPTION_POSITION_POLL_SECONDS = min(
-        60,
-        _ini_int(
+    if (
+        cfg.has_option("general", "history_max_bars")
+        and (
+            cfg.has_option("kinematics", "history_max_bars")
+            or cfg.has_option("option_trading", "history_max_bars")
+            or cfg.has_option("option_history", "history_max_bars")
+        )
+    ):
+        logging.warning(
+            "CONFIG_COMPAT ignoring legacy section-level history_max_bars; using [general] history_max_bars=%d",
+            HISTORY_MAX_BARS,
+        )
+
+    if cfg.has_option("option_trading", "pre_entry_lookback_minutes"):
+        OPTION_HISTORY_PRE_ENTRY_MINUTES = _ini_int(
+            cfg,
+            "option_trading",
+            "pre_entry_lookback_minutes",
+            "OPTION_HISTORY_PRE_ENTRY_MINUTES",
+            390,
+            minimum=0,
+        )
+    elif cfg.has_option("option_history", "pre_entry_lookback_minutes"):
+        OPTION_HISTORY_PRE_ENTRY_MINUTES = _ini_int(
             cfg,
             "option_history",
-            "position_poll_seconds",
-            "OPTION_POSITION_POLL_SECONDS",
-            15,
-            minimum=5,
-        ),
-    )
+            "pre_entry_lookback_minutes",
+            "OPTION_HISTORY_PRE_ENTRY_MINUTES",
+            390,
+            minimum=0,
+        )
+        logging.warning(
+            "CONFIG_COMPAT [option_history] pre_entry_lookback_minutes is deprecated; move to [option_trading] pre_entry_lookback_minutes"
+        )
+    else:
+        OPTION_HISTORY_PRE_ENTRY_MINUTES = _ini_int(
+            cfg,
+            "option_trading",
+            "pre_entry_lookback_minutes",
+            "OPTION_HISTORY_PRE_ENTRY_MINUTES",
+            390,
+            minimum=0,
+        )
+
+    if cfg.has_option("option_trading", "position_poll_seconds"):
+        OPTION_POSITION_POLL_SECONDS = min(
+            60,
+            _ini_int(
+                cfg,
+                "option_trading",
+                "position_poll_seconds",
+                "OPTION_POSITION_POLL_SECONDS",
+                15,
+                minimum=5,
+            ),
+        )
+    elif cfg.has_option("option_history", "position_poll_seconds"):
+        OPTION_POSITION_POLL_SECONDS = min(
+            60,
+            _ini_int(
+                cfg,
+                "option_history",
+                "position_poll_seconds",
+                "OPTION_POSITION_POLL_SECONDS",
+                15,
+                minimum=5,
+            ),
+        )
+        logging.warning(
+            "CONFIG_COMPAT [option_history] position_poll_seconds is deprecated; move to [option_trading] position_poll_seconds"
+        )
+    else:
+        OPTION_POSITION_POLL_SECONDS = min(
+            60,
+            _ini_int(
+                cfg,
+                "option_trading",
+                "position_poll_seconds",
+                "OPTION_POSITION_POLL_SECONDS",
+                15,
+                minimum=5,
+            ),
+        )
     RSI_WARMUP_SESSIONS = _ini_int(
         cfg, "kinematics", "rsi_warmup_sessions", "RSI_WARMUP_SESSIONS", 5, minimum=0
     )
@@ -10847,9 +11476,6 @@ def _apply_ini_feature_settings(cfg):
         5,
         minimum=0,
     )
-    OPTION_SELL_OPTIONS_ONLY = _ini_bool(
-        cfg, "option_seller", "options_only", "OPTION_SELL_OPTIONS_ONLY", False
-    )
     OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT = _ini_bool(
         cfg,
         "option_seller",
@@ -10974,13 +11600,6 @@ def _apply_ini_feature_settings(cfg):
         "OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY",
         True,
     )
-    OPTION_SELL_PEAK_PROFIT_CALLS_ONLY = _ini_bool(
-        cfg,
-        "option_seller",
-        "peak_profit_calls_only",
-        "OPTION_SELL_PEAK_PROFIT_CALLS_ONLY",
-        False,
-    )
     OPTION_SELL_STOP_LOSS_ENABLED = _ini_bool(
         cfg,
         "option_seller",
@@ -11078,7 +11697,6 @@ def _apply_ini_feature_settings(cfg):
             "dynamic_breakeven_activation_pct",
             "OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT",
             8.0,
-            minimum=0.0,
         ),
     )
     OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED = _ini_bool(
@@ -11267,9 +11885,26 @@ def _apply_ini_feature_settings(cfg):
         FINDBEST_ENABLED = _ini_bool(
             cfg, "dashboard", "findbest", "FINDBEST_ENABLED", False
         )
+    _raw_analyze_day = (
+        _strip_ini_value(cfg.get("dashboard", "analyze_day", fallback="")).strip()
+        if cfg.has_option("dashboard", "analyze_day")
+        else ""
+    )
+    if _raw_analyze_day != "":
+        ANALYZE_DAY_ENABLED = _ini_bool(
+            cfg, "dashboard", "analyze_day", "ANALYZE_DAY_ENABLED", False
+        )
+    elif cfg.has_option("dashboard", "analyze_day_enabled"):
+        ANALYZE_DAY_ENABLED = _ini_bool(
+            cfg, "dashboard", "analyze_day_enabled", "ANALYZE_DAY_ENABLED", False
+        )
+    else:
+        ANALYZE_DAY_ENABLED = _ini_bool(
+            cfg, "dashboard", "analyze_day", "ANALYZE_DAY_ENABLED", False
+        )
 
     logging.info(
-        "FEATURE_CONFIG owner=%s tz=%s(%s) nasdaq_pos=%s(%s) rsi_30d=%s(min>%.1f) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
+        "FEATURE_CONFIG owner=%s tz=%s(%s) options_only=%s nasdaq_pos=%s(%s) rsi_30d=%s(min>%.1f) rsi_session=%s warmup_sessions=%d alpaca_feed=%s "
         "opt_chain=%s opt_tx=%s tt_tx_env=%s chain_cd=%ds chain_pace=%.2fs chain_greeks=%s "
         "dashboard=%s:%d webhook=%s:%d "
         "smooth=%s(%d) rsi_ob=%.1f rsi_os=%.1f history_max_bars=%d summary_delay=%.1fs early_finalize=%s(min=%.1fs) opt_hist_bars=%d opt_pre_min=%d opt_poll_s=%ds "
@@ -11280,10 +11915,11 @@ def _apply_ini_feature_settings(cfg):
         "limit_disc=%.2f%% sl_disc=%.2f%% pt_enabled=%s pt=%.1f%% tp_req_profit=%s tp_min_pnl=%.2f%% ts_enabled=%s ts=%.1f%%/%.1f%% "
         "sl_enabled=%s sl_pct=%.2f%% sl_mins=%d sl_hard=%.2f%% open_capture=%s dyn_rules=%s dyn_tiers=%s dyn_be=%.1f%% dyn_vol=%s "
         "chart_capture=%s chart_dir=%s chart_bars=%d chart_size=%dx%d chart_stale=%ds "
-        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s findbest=%s",
+        "ssl_enabled=%s ssl_mode=%s auth_active=%s auth_ttl=%dh idle_timeout=%dm strike_analyzer=%s findbest=%s analyze_day=%s",
         INSTANCE_OWNER or "unset",
         DISPLAY_TIMEZONE_SETTING,
         DISPLAY_TZ_IANA,
+        OPTIONS_ONLY,
         NASDAQ_MUST_BE_POSITIVE,
         NASDAQ_SYMBOL,
         RSI_30D_ENABLED,
@@ -11367,7 +12003,9 @@ def _apply_ini_feature_settings(cfg):
         DASHBOARD_INACTIVITY_TIMEOUT_MINUTES,
         STRIKE_ANALYZER_ENABLED,
         FINDBEST_ENABLED,
+        ANALYZE_DAY_ENABLED,
     )
+    _persist_full_parms_snapshot(cfg=cfg)
 
 
 def load_settings(ini_path=None):
@@ -11824,7 +12462,7 @@ OPTION_SELL_MIN_HOLD_MINUTES = max(
     0, int(os.getenv("OPTION_SELL_MIN_HOLD_MINUTES", "5"))
 )
 OPTION_SELL_OPTIONS_ONLY = os.getenv(
-    "OPTION_SELL_OPTIONS_ONLY", "false"
+    "OPTIONS_ONLY", os.getenv("OPTION_SELL_OPTIONS_ONLY", "true")
 ).strip().lower() in {"1", "true", "yes"}
 OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT = os.getenv(
     "OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT", "true"
@@ -11869,9 +12507,6 @@ OPTION_SELL_TRAILING_DRAWDOWN_PCT = max(
 )
 OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY = os.getenv(
     "OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY", "true"
-).strip().lower() in {"1", "true", "yes"}
-OPTION_SELL_PEAK_PROFIT_CALLS_ONLY = os.getenv(
-    "OPTION_SELL_PEAK_PROFIT_CALLS_ONLY", "false"
 ).strip().lower() in {"1", "true", "yes"}
 OPTION_SELL_STOP_LOSS_ENABLED = os.getenv(
     "OPTION_SELL_STOP_LOSS_ENABLED", "true"
@@ -12212,6 +12847,213 @@ def _evaluate_dynamic_contract_rules(
         "trigger_kind": trigger_kind,
         "trigger_reason": trigger_reason,
     }
+
+
+def _replay_dynamic_exit_rules_timeline(
+    ordered_points: list,
+    entry_price: float,
+    exit_price: Optional[float],
+    qty: int,
+    actual_pnl_pct: Optional[float],
+    actual_pnl_dollars: Optional[float],
+    is_open: bool,
+    static_params: Optional[dict] = None,
+    mode: Optional[str] = None,
+) -> dict:
+    """Causally replay Dynamic Exit Rules bar-by-bar over a contract's Find Best timeline
+    to locate the exact first bar where Peak-Ratcheting Trailing Stop, Breakeven Profit Lock,
+    or Vol/Spread-Adaptive Soft Stop-Loss would have triggered an exit, together with the
+    simulated sell price, simulated P/L (% and $), and dollar/pct delta vs actual exit/mark."""
+    sp = static_params or {}
+    sl_enabled = bool(sp.get("stop_loss_enabled", OPTION_SELL_STOP_LOSS_ENABLED))
+    sl_mins = max(
+        1,
+        int(sp.get("stop_loss_consecutive_minutes", OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES) or 5),
+    )
+    sl_req_kin = bool(sp.get("stop_loss_require_kinematics", OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS))
+    min_hold = max(0, int(sp.get("min_hold_minutes", OPTION_SELL_MIN_HOLD_MINUTES) or 0))
+    eff_qty = max(1, int(qty or 1))
+    eff_entry = _opt_safe_float(entry_price, None)
+
+    valid_points = [
+        p for p in (ordered_points or [])
+        if isinstance(p, dict) and _opt_safe_float(p.get("pnl_pct"), None) is not None
+    ]
+    total_bars = len(valid_points)
+
+    # Reference actual exit (closed trade) or latest mark (open trade)
+    last_pt = valid_points[-1] if valid_points else None
+    ref_exit_price = _opt_safe_float(exit_price, None)
+    if ref_exit_price is None and last_pt is not None:
+        ref_exit_price = _opt_safe_float(last_pt.get("price"), None)
+    ref_pnl_pct = _opt_safe_float(actual_pnl_pct, None)
+    if ref_pnl_pct is None and last_pt is not None:
+        ref_pnl_pct = _opt_safe_float(last_pt.get("pnl_pct"), None)
+    ref_pnl_dollars = _opt_safe_float(actual_pnl_dollars, None)
+    if ref_pnl_dollars is None and ref_exit_price is not None and eff_entry is not None:
+        ref_pnl_dollars = round((ref_exit_price - eff_entry) * eff_qty * 100.0, 2)
+    elif ref_pnl_dollars is None and last_pt is not None:
+        ref_pnl_dollars = _opt_safe_float(last_pt.get("pnl_dollars"), None)
+
+    base_out = {
+        "triggered": False,
+        "bars_evaluated": total_bars,
+        "bar_index": None,
+        "timestamp_utc": None,
+        "timestamp_epoch_ms": None,
+        "minutes_after_buy": None,
+        "source": None,
+        "trigger_kind": None,
+        "trigger_reason": None,
+        "sim_exit_price": None,
+        "sim_pnl_pct": None,
+        "sim_pnl_dollars": None,
+        "actual_exit_price": round(ref_exit_price, 4) if ref_exit_price is not None else None,
+        "actual_pnl_pct": round(ref_pnl_pct, 2) if ref_pnl_pct is not None else None,
+        "actual_pnl_dollars": round(ref_pnl_dollars, 2) if ref_pnl_dollars is not None else None,
+        "delta_vs_actual_dollars": None,
+        "delta_vs_actual_pct": None,
+        "peak_pnl_pct_at_trigger": None,
+        "drawdown_pct_at_trigger": None,
+        "eff_ts_drawdown_pct_at_trigger": None,
+        "eff_sl_pct_at_trigger": None,
+        "adapt_mult_at_trigger": None,
+        "underlying_v_at_trigger": None,
+        "active_ratchet_tier_at_trigger": None,
+        "is_open": bool(is_open),
+    }
+    if total_bars == 0:
+        return base_out
+
+    pnl_seq_so_far: list = []
+    last_vol_min: Optional[int] = None
+    running_peak_pnl: Optional[float] = None
+    latest_spread_pct: Optional[float] = None
+    sl_streak = 0
+    last_sl_min: Optional[int] = None
+
+    for idx, pt in enumerate(valid_points):
+        try:
+            p_pnl = _opt_safe_float(pt.get("pnl_pct"), None)
+            if p_pnl is None:
+                continue
+            p_price = _opt_safe_float(pt.get("price"), None)
+            p_epoch = pt.get("timestamp_epoch_ms")
+            min_bucket = int(p_epoch // 60000) if isinstance(p_epoch, (int, float)) else None
+            if min_bucket is not None and min_bucket == last_vol_min and pnl_seq_so_far:
+                pnl_seq_so_far[-1] = p_pnl
+            else:
+                pnl_seq_so_far.append(p_pnl)
+                last_vol_min = min_bucket
+
+            if running_peak_pnl is None or p_pnl > running_peak_pnl:
+                running_peak_pnl = p_pnl
+            pf = 1.0 + (running_peak_pnl / 100.0)
+            cf = 1.0 + (p_pnl / 100.0)
+            dd_pct = ((pf - cf) / pf) * 100.0 if (pf > 0 and cf < pf) else 0.0
+
+            p_spr = _opt_safe_float(pt.get("spread_pct"), None)
+            if p_spr is not None and 0.0 <= p_spr <= 100.0:
+                latest_spread_pct = p_spr
+            p_hold = max(0.0, _opt_safe_float(pt.get("minutes_after_buy"), 0.0) or 0.0)
+            p_v = _opt_safe_float(pt.get("v"), None)
+
+            bar_eval = _evaluate_dynamic_contract_rules(
+                pnl_pct=p_pnl,
+                peak_pnl_pct=running_peak_pnl,
+                drawdown_pct=dd_pct,
+                pnl_series=pnl_seq_so_far,
+                spread_pct=latest_spread_pct,
+                hold_minutes=p_hold,
+                underlying_v=p_v,
+                loss_streak=sl_streak,
+                static_params=sp,
+                mode=mode,
+            )
+
+            eff_sl = _opt_safe_float(bar_eval.get("eff_sl_pct"), 0.0) or 0.0
+            if eff_sl > 0 and p_pnl < -eff_sl:
+                if min_bucket is None or min_bucket != last_sl_min:
+                    sl_streak += 1
+                    last_sl_min = min_bucket
+            else:
+                sl_streak = 0
+                last_sl_min = None
+
+            trig_kind = None
+            trig_reason = None
+            if bar_eval.get("would_trigger"):
+                trig_kind = bar_eval.get("trigger_kind")
+                trig_reason = bar_eval.get("trigger_reason")
+            elif (
+                sl_enabled
+                and eff_sl > 0
+                and p_pnl < -eff_sl
+                and (min_hold <= 0 or p_hold >= min_hold)
+                and sl_streak >= sl_mins
+                and ((not sl_req_kin) or (p_v is not None and p_v < 0))
+            ):
+                trig_kind = "dynamic_adaptive_sl"
+                trig_reason = (
+                    f"dynamic_adaptive_sl(pnl={p_pnl:+.2f}%<-{eff_sl:.2f}%,"
+                    f"streak={sl_streak}/{sl_mins},x{float(bar_eval.get('adapt_mult') or 1.0):.2f})"
+                )
+
+            if trig_kind:
+                sim_price = (
+                    round(p_price, 4)
+                    if (p_price is not None and p_price > 0)
+                    else (
+                        round(eff_entry * (1.0 + p_pnl / 100.0), 4)
+                        if (eff_entry is not None and eff_entry > 0)
+                        else None
+                    )
+                )
+                sim_pnl_pct = round(p_pnl, 2)
+                if sim_price is not None and eff_entry is not None:
+                    sim_pnl_dollars = round((sim_price - eff_entry) * eff_qty * 100.0, 2)
+                else:
+                    sim_pnl_dollars = _opt_safe_float(pt.get("pnl_dollars"), None)
+                    if sim_pnl_dollars is not None:
+                        sim_pnl_dollars = round(sim_pnl_dollars, 2)
+
+                delta_dollars = (
+                    round(sim_pnl_dollars - ref_pnl_dollars, 2)
+                    if (sim_pnl_dollars is not None and ref_pnl_dollars is not None)
+                    else None
+                )
+                delta_pct = (
+                    round(sim_pnl_pct - ref_pnl_pct, 2)
+                    if (sim_pnl_pct is not None and ref_pnl_pct is not None)
+                    else None
+                )
+                base_out.update({
+                    "triggered": True,
+                    "bar_index": idx,
+                    "timestamp_utc": pt.get("timestamp_utc"),
+                    "timestamp_epoch_ms": p_epoch,
+                    "minutes_after_buy": round(p_hold, 2),
+                    "source": pt.get("source"),
+                    "trigger_kind": trig_kind,
+                    "trigger_reason": trig_reason,
+                    "sim_exit_price": sim_price,
+                    "sim_pnl_pct": sim_pnl_pct,
+                    "sim_pnl_dollars": sim_pnl_dollars,
+                    "delta_vs_actual_dollars": delta_dollars,
+                    "delta_vs_actual_pct": delta_pct,
+                    "peak_pnl_pct_at_trigger": round(running_peak_pnl, 2),
+                    "drawdown_pct_at_trigger": round(dd_pct, 2),
+                    "eff_ts_drawdown_pct_at_trigger": bar_eval.get("eff_ts_drawdown_pct"),
+                    "eff_sl_pct_at_trigger": bar_eval.get("eff_sl_pct"),
+                    "adapt_mult_at_trigger": bar_eval.get("adapt_mult"),
+                    "underlying_v_at_trigger": round(p_v, 4) if p_v is not None else None,
+                    "active_ratchet_tier_at_trigger": bar_eval.get("active_ratchet_tier"),
+                })
+                break
+        except Exception:
+            continue
+
+    return base_out
 CHART_CAPTURE_ENABLED = os.getenv("CHART_CAPTURE_ENABLED", "true").strip().lower() in {
     "1",
     "true",
@@ -12288,6 +13130,9 @@ STRIKE_ANALYZER_ENABLED = os.getenv(
 FINDBEST_ENABLED = os.getenv(
     "FINDBEST_ENABLED", "false"
 ).strip().lower() in {"1", "true", "yes"}
+ANALYZE_DAY_ENABLED = os.getenv(
+    "ANALYZE_DAY_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes"}
 NASDAQ_MUST_BE_POSITIVE = os.getenv(
     "NASDAQ_MUST_BE_POSITIVE", "false"
 ).strip().lower() in {"1", "true", "yes"}
@@ -12299,6 +13144,9 @@ try:
     RSI_30D_MIN = float(os.getenv("RSI_30D_MIN", "30.0"))
 except ValueError:
     RSI_30D_MIN = 30.0
+OPTIONS_ONLY = os.getenv(
+    "OPTIONS_ONLY", os.getenv("OPTION_SELL_OPTIONS_ONLY", "true")
+).strip().lower() in {"1", "true", "yes"}
 
 
 def rsi_signal(rsi):
@@ -16235,7 +17083,7 @@ class OptionBuyer:
 
             self.attempted_minutes.add(dedup_key)
 
-            # Ex-ante gate: NASDAQ must be positive vs. start of trading day (09:30 ET)
+            # Ex-ante gate: NASDAQ must be positive vs. previous trading day's close
             if NASDAQ_MUST_BE_POSITIVE:
                 if nq_tracker is not None:
                     nq_ok, nq_reason, nq_snap = nq_tracker.evaluate_buy_gate()
@@ -16256,11 +17104,11 @@ class OptionBuyer:
                     )
                     self.logger.info(
                         "OPTION_BUY_SKIPPED symbol=%s reason=nasdaq_down detail=%s "
-                        "nasdaq_symbol=%s open=%s current=%s diff=%s minute=%s",
+                        "nasdaq_symbol=%s prev_close=%s current=%s diff=%s minute=%s",
                         symbol,
                         nq_reason,
                         nq_snap.get("symbol", NASDAQ_SYMBOL),
-                        nq_snap.get("open_price"),
+                        nq_snap.get("prev_close") if nq_snap.get("prev_close") is not None else nq_snap.get("open_price"),
                         nq_snap.get("current_price"),
                         nq_snap.get("diff"),
                         minute_key,
@@ -16644,6 +17492,23 @@ class OptionBuyer:
                     symbol,
                     reject_reason,
                     contract,
+                )
+                continue
+
+            if OPTIONS_ONLY and not _is_option_contract_symbol(contract_symbol):
+                self._log_buy_analysis(
+                    minute_key,
+                    symbol,
+                    provider,
+                    entry,
+                    "REJECTED",
+                    f"options_only_non_option_contract(contract={contract_symbol})",
+                    contract_symbol=contract_symbol,
+                )
+                self.logger.info(
+                    "OPTION_BUY_SKIPPED symbol=%s contract=%s reason=options_only_non_option_contract",
+                    symbol,
+                    contract_symbol,
                 )
                 continue
 
@@ -17222,9 +18087,10 @@ class OptionBuyer:
 
         self.last_status = "watching_dry_run" if OPTION_BUY_DRY_RUN else "watching_live"
         self.logger.info(
-            "OPTION_BUYER_START mode=%s entry_mode=%s sel_mode=%s win_et=%s..%s rsi_low<=%.2f lookback=%dm bounce_rsi<=%.2f qty=%d order_type=%s aggr=%.2f "
+            "OPTION_BUYER_START mode=%s options_only=%s entry_mode=%s sel_mode=%s win_et=%s..%s rsi_low<=%.2f lookback=%dm bounce_rsi<=%.2f qty=%d order_type=%s aggr=%.2f "
             "max_spread=%.2f%% pos_vel=%s max_per_min=%d cooldown_min=%d max_open=%d allowed=%s",
             self.mode,
+            OPTIONS_ONLY,
             OPTION_BUY_ENTRY_MODE,
             OPTION_BUY_CONTRACT_SELECTION_MODE,
             OPTION_BUY_ENTRY_WINDOW_START_ET or "*",
@@ -18559,7 +19425,7 @@ class OptionSeller:
 
             is_option = PositionMonitor._is_option(pos)
             underlying = self._extract_underlying(pos, pos_sym, is_option)
-            if OPTION_SELL_OPTIONS_ONLY and not is_option:
+            if OPTIONS_ONLY and not is_option:
                 self._log_sell_analysis(
                     minute_key,
                     pos_sym,
@@ -18747,7 +19613,7 @@ class OptionSeller:
             qualifies = False
             reason = None
             trigger_kind = "take_profit"
-            peak_eligible = (not OPTION_SELL_PEAK_PROFIT_CALLS_ONLY) or is_call
+            peak_eligible = (not OPTIONS_ONLY) or is_option
             rejection_notes = []
 
             # 1. Fixed Profit Target (lock in spikes before RSI >= OPTION_CHAIN_RSI_HIGH)
@@ -19451,7 +20317,7 @@ class OptionSeller:
             OPTION_CHAIN_RSI_HIGH,
             OPTION_SELL_QTY,
             OPTION_SELL_CLOSE_FULL_POSITION,
-            OPTION_SELL_OPTIONS_ONLY,
+            OPTIONS_ONLY,
             OPTION_SELL_COOLDOWN_MINUTES,
             OPTION_SELL_MIN_HOLD_MINUTES,
             OPTION_SELL_ORDER_TYPE,
@@ -22810,6 +23676,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     Docs
                 </button>
 
+                <button id="btnAnalyzeDay" onclick="openAnalyzeDayModal()" class="hidden px-2.5 py-1 bg-amber-500/15 hover:bg-amber-500/30 text-amber-300 hover:text-white border border-amber-500/40 rounded-lg text-xs font-semibold transition flex items-center gap-1" title="Analyze all round-trip trades executed on a specific trading day using Find Best logic">
+                    <svg class="w-3.5 h-3.5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                    Analyze Day
+                </button>
+
                 <button id="btnRefresh" onclick="fetchAllData(true)" class="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg transition" title="Refresh Now">
                     <svg id="refreshIcon" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                 </button>
@@ -22897,7 +23768,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <h2 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                         <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
                         Kinematics 4-Quadrant Phase Matrix
-                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </h2>
                     <p class="text-[11px] text-slate-400">Velocity (v) vs Acceleration (a) regime classification. Click any symbol to inspect below.</p>
@@ -22981,7 +23852,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </button>
                 </div>
 
-                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
             </div>
 
             <!-- Regime Filter Buttons -->
@@ -23100,7 +23971,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <h3 class="text-sm font-bold text-white tracking-tight flex flex-wrap items-center gap-2">
                                     <span id="detailSymbolTitle">Symbol Multi-Stream Inspector</span>
                                     <span id="detailRegimeBadge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold border bg-slate-800 text-slate-300 border-slate-700">Neutral</span>
-                                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                                     __INSTANCE_OWNER_PANEL_TAG_HTML__
                                 </h3>
                             </div>
@@ -23273,7 +24144,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                             <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                                 <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
                                 Emitted Minute Summaries Log Feed
-                                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                                <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                                 __INSTANCE_OWNER_PANEL_TAG_HTML__
                             </h3>
                             <p class="text-[11px] text-slate-400">Records from <code class="mono text-indigo-300">minute-summary-{RUN_ID}.jsonl</code></p>
@@ -23294,7 +24165,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div>
                         <h3 class="text-xs font-bold text-white uppercase tracking-wider flex flex-wrap items-center gap-2">
                             <span>Engine Diagnostic Telemetry</span>
-                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80 normal-case tracking-normal" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                             __INSTANCE_OWNER_PANEL_TAG_HTML__
                         </h3>
                         <p class="text-[11px] text-slate-400">Positions monitor &amp; feed heartbeat</p>
@@ -23493,7 +24364,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <h3 class="text-base font-bold text-white flex flex-wrap items-center gap-2">
                     <span class="w-2.5 h-2.5 rounded-full bg-indigo-500"></span>
                     Inject Live Test Bar
-                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                    <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                     __INSTANCE_OWNER_PANEL_TAG_HTML__
                 </h3>
                 <button onclick="toggleInjectModal()" class="text-slate-400 hover:text-white">&times;</button>
@@ -23543,7 +24414,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <h3 class="text-sm font-bold text-white flex flex-wrap items-center gap-2">
                             <span id="optModalDot" class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
                             <span id="optModalTitle">Option Buyer — Open Contracts</span>
-                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                            <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                             __INSTANCE_OWNER_PANEL_TAG_HTML__
                         </h3>
                         <p id="optModalSubtitle" class="text-[11px] text-slate-400">Minute-by-minute contract valuation, price history, and P/L ($ &amp; %)</p>
@@ -23633,7 +24504,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Buy / Sell Log Details</h3>
                         <span id="optLogDetailsBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/35">--</span>
-                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="optLogDetailsSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Triggering BUY &amp; SELL log entries plus 3 entries before and 3 entries after each transaction</p>
@@ -23663,7 +24534,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Buy / Sell Decision &amp; Execution Logs</h3>
                         <span id="optLogsRowBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 rows</span>
-                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="optLogsFileSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Minute-by-minute Option Buyer &amp; Option Seller evaluations</p>
@@ -23690,7 +24561,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-indigo-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Option Chain Strike Selection &amp; Exit Horizon Analyzer</h3>
                         <span id="strikeModalBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">0 BUY signals</span>
-                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="strikeModalSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Compares -2 ITM through +4 OTM strikes captured at BUY signals across +5m, +10m, +15m, +30m, +60m, Actual Exit &amp; Peak</p>
@@ -23724,7 +24595,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span class="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0"></span>
                         <h3 class="text-sm font-bold text-white">Find Best — Contract Exit &amp; Parameter Tuning Analyzer</h3>
                         <span id="findBestContractBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/40">--</span>
-                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; intraday % vs 09:30 ET open">__NASDAQ_SYMBOL__ --</span>
+                        <span class="nasdaq-panel-chip inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] mono font-semibold bg-slate-800/80 text-slate-300 border border-slate-700/80" title="Latest NASDAQ proxy price &amp; daily % vs previous close">__NASDAQ_SYMBOL__ --</span>
                         __INSTANCE_OWNER_PANEL_TAG_HTML__
                     </div>
                     <p id="findBestSubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Analyzing captured option chain &amp; minute valuation data between buy and sell...</p>
@@ -23738,6 +24609,39 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
             <div id="findBestPane" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
                 <div class="text-xs text-slate-500 text-center py-12 mono">Select a closed contract on the Option Seller panel and click Find Best...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Analyze Day Portfolio Optimizer Modal (gated by [dashboard] analyze_day=true) -->
+    <div id="analyzeDayModal" onclick="if(event.target===this) closeAnalyzeDayModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm z-[55] hidden flex items-center justify-center p-3 sm:p-5">
+        <div class="bg-slate-900 border border-amber-500/35 rounded-2xl max-w-7xl w-full h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="px-5 py-3.5 bg-slate-950/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+                <div class="min-w-0">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0"></span>
+                        <h3 class="text-sm font-bold text-white">Analyze Day — Portfolio Find Best &amp; parms.ini Synthesizer</h3>
+                        <span id="analyzeDayDateBadge" class="text-[10px] mono px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/40">Select a date range</span>
+                        __INSTANCE_OWNER_PANEL_TAG_HTML__
+                    </div>
+                    <p id="analyzeDaySubtitle" class="text-[10.5px] text-slate-400 mono mt-0.5 truncate max-w-4xl">Synthesizes a single set of changed lib/parms.ini settings to maximize combined P/L across all trades fully executed within the selected date range.</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <form onsubmit="event.preventDefault(); runAnalyzeDay();" class="flex flex-wrap items-center gap-2">
+                        <label for="analyzeDayFromInput" class="text-[11px] font-semibold text-slate-400">From:</label>
+                        <input id="analyzeDayFromInput" type="date" class="mono text-xs px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-white focus:outline-none focus:border-amber-400" />
+                        <label for="analyzeDayToInput" class="text-[11px] font-semibold text-slate-400">To:</label>
+                        <input id="analyzeDayToInput" type="date" class="mono text-xs px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-white focus:outline-none focus:border-amber-400" />
+                        <button id="btnAnalyzeDayRun" type="submit" class="px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold transition shadow-md shadow-amber-600/20">
+                            Analyze
+                        </button>
+                    </form>
+                    <button type="button" onclick="closeAnalyzeDayModal()" class="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center text-base transition" title="Close">&times;</button>
+                </div>
+            </div>
+            <div id="analyzeDayQuickDates" class="px-5 py-2 bg-slate-950/60 border-b border-slate-800/80 flex flex-wrap items-center gap-1.5 text-[10.5px] mono shrink-0 hidden"></div>
+            <div id="analyzeDayPane" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-4">
+                <div class="text-xs text-slate-400 text-center py-12 mono">Choose a <strong class="text-slate-200">From</strong> and <strong class="text-slate-200">To</strong> date above (defaults to today) and click <strong class="text-amber-300">Analyze</strong> to summarize all trades in the date range and synthesize optimal <code class="text-amber-300">lib/parms.ini</code> updates.</div>
             </div>
         </div>
     </div>
@@ -23775,7 +24679,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div class="text-xs text-slate-500 p-3 text-center mono">Loading files...</div>
                     </div>
                 </aside>
-                <div id="docsContentPane" class="flex-1 min-w-0 overflow-y-auto p-5 sm:p-7 bg-[#0a1020]">
+                <div id="docsContentPane" class="flex-1 min-h-0 overflow-y-auto p-5 sm:p-7 bg-[#0a1020]">
                     <div class="text-xs text-slate-500 text-center py-12 mono">Select a documentation file to view...</div>
                 </div>
             </div>
@@ -23788,6 +24692,7 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         const DASHBOARD_INACTIVITY_MINUTES = Math.max(0, Number('__DASHBOARD_INACTIVITY_MINUTES__') || 0);
         const STRIKE_ANALYZER_ENABLED = ('__STRIKE_ANALYZER_ENABLED__' === 'true');
         const FINDBEST_ENABLED = ('__FINDBEST_ENABLED__' === 'true');
+        const ANALYZE_DAY_ENABLED = ('__ANALYZE_DAY_ENABLED__' === 'true');
         const RSI_30D_ENABLED = ('__RSI_30D_ENABLED__' === 'true');
         const RSI_30D_MIN = Number('__RSI_30D_MIN__') || 30.0;
         const NASDAQ_MUST_BE_POSITIVE = ('__NASDAQ_MUST_BE_POSITIVE__' === 'true');
@@ -23811,6 +24716,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (strikeBtn) strikeBtn.classList.remove('hidden');
             const strikeRow = document.getElementById('telemetryStrikeAnalyzerRow');
             if (strikeRow) strikeRow.classList.remove('hidden');
+        }
+        if (ANALYZE_DAY_ENABLED) {
+            const analyzeDayBtn = document.getElementById('btnAnalyzeDay');
+            if (analyzeDayBtn) analyzeDayBtn.classList.remove('hidden');
         }
         // 30-Day RSI is always collected & displayed; RSI_30D_ENABLED only activates the OptionBuyer buy gate
         (function initRsi30HeaderUi() {
@@ -23855,7 +24764,10 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (nq && typeof nq === 'object') {
                 const sym = nq.symbol || NASDAQ_SYMBOL || 'QQQ';
                 const gateOn = Boolean(nq.gate_enabled ?? NASDAQ_MUST_BE_POSITIVE);
-                const oPx = safeNum(nq.open_price);
+                const refPx = safeNum(nq.prev_close ?? nq.reference_price ?? nq.open_price);
+                const refLabel = (nq.prev_close != null || nq.reference_type === 'prev_close') ? 'Prev Close' : 'Open';
+                const refDateTag = nq.prev_close_date ? ` (${nq.prev_close_date})` : '';
+                const refSrc = nq.prev_close_source || nq.open_source || '--';
                 const cPx = safeNum(nq.current_price);
                 const diff = safeNum(nq.diff);
                 const diffPct = safeNum(nq.diff_pct);
@@ -23888,14 +24800,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }`;
                 }
                 if (pxEl) {
-                    pxEl.textContent = `Open ${oPx !== null ? '$' + oPx.toFixed(2) : '--'} · Now ${cPx !== null ? '$' + cPx.toFixed(2) : '--'}`;
+                    pxEl.textContent = `${refLabel} ${refPx !== null ? '$' + refPx.toFixed(2) : '--'} · Now ${cPx !== null ? '$' + cPx.toFixed(2) : '--'}`;
                 }
                 if (metaEl) {
                     const obsCount = nq.observations_today ?? nq.samples_today ?? 0;
                     metaEl.textContent = `${nq.trading_date || '--'} · ${obsCount}m`;
-                    metaEl.title = `Source: open=${nq.open_source || '--'}, cur=${nq.current_source || '--'} | Log: ${nq.log_file || '--'}`;
+                    metaEl.title = `Source: prev_close=${refSrc}, cur=${nq.current_source || '--'} | Log: ${nq.log_file || '--'}`;
                 }
-                const tooltipText = `NASDAQ Tracker (${sym}) | 09:30 ET Open: ${oPx !== null ? '$' + oPx.toFixed(2) : '--'} | Current: ${cPx !== null ? '$' + cPx.toFixed(2) : '--'} | Change: ${diffTxt} | Buy Gate: ${gateOn ? 'ENABLED (must be > 0)' : 'MONITOR ONLY'}`;
+                const tooltipText = `NASDAQ Tracker (${sym}) | ${refLabel}${refDateTag}: ${refPx !== null ? '$' + refPx.toFixed(2) : '--'} | Current: ${cPx !== null ? '$' + cPx.toFixed(2) : '--'} | Change: ${diffTxt} | Buy Gate: ${gateOn ? 'ENABLED (must be > 0)' : 'MONITOR ONLY'}`;
                 const badgeColorCls = isPos
                     ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                     : ((isNeg || (isDown && gateOn)) ? 'bg-rose-500/15 text-rose-300 border-rose-500/35' : 'bg-slate-800/80 text-slate-300 border-slate-700/80');
@@ -29414,11 +30326,18 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 ? '<span class="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 text-[10px] font-bold uppercase">OPEN POSITION (LIVE)</span>'
                 : '<span class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/40 text-[10px] font-bold uppercase">CLOSED TRADE</span>';
 
+            const parmsSrc = String(d.parms_source || 'current_parms_fallback');
+            const snapId = d.parms_snapshot_id ? String(d.parms_snapshot_id) : '';
+            const parmsSrcBadge = parmsSrc === 'recorded_at_trade'
+                ? `<span class="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/35 text-[10px]" title="Comparing against the exact redacted full lib/parms.ini snapshot recorded when this trade executed${snapId ? ' (logs/parms_snapshots/parms_' + escSvg(snapId) + '.ini)' : ''}.">Parms: Recorded @ Trade${snapId ? ' #' + escSvg(snapId.slice(0, 8)) : ''}</span>`
+                : '<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/35 text-[10px]" title="Historical lib/parms.ini settings were not recorded for this trade (pre-v0.1.33); showing current live lib/parms.ini as reference.">Parms: Current parms.ini (legacy trade)</span>';
+
             // Top Source Switcher + Trade Context Bar
             const sourceBarHtml = `
                 <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-[11px] mono">
                     <div class="flex flex-wrap items-center gap-2">
                         ${tradeStatusPill}
+                        ${parmsSrcBadge}
                         <span class="text-slate-400 uppercase text-[10px] font-bold">Data Source:</span>
                         <div class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
                             <button type="button" onclick="setFindBestViewMode('combined')" class="${viewBtnCls('combined')}">Combined (${combPts})</button>
@@ -29488,12 +30407,17 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             `;
 
-            // 1b. Dynamic Exit Rules Snapshot (Peak-Ratcheting + Volatility/Spread-Adaptive)
+            // 1b. Dynamic Exit Rules Snapshot (Peak-Ratcheting + Volatility/Spread-Adaptive + Bar-by-Bar First-Trigger Replay)
             const dyn = d.dynamic_rules || null;
+            const dynReplay = (dyn && dyn.replay && typeof dyn.replay === 'object') ? dyn.replay : null;
+            const dynReplayTriggered = Boolean(dynReplay && dynReplay.triggered);
             const dynamicRulesHtml = dyn ? (() => {
                 const dMode = _normalizeDynMode(dyn.mode || liveParams.dynamic_rules_mode);
                 const mb = _fmtDynamicModeBadge(dMode);
-                const sb = _fmtDynamicStatusBadge(dyn.status, dMode);
+                const effDynStatus = dynReplayTriggered
+                    ? (dMode === 'view_and_act' ? 'TRIGGERED' : 'WOULD_EXIT')
+                    : dyn.status;
+                const sb = _fmtDynamicStatusBadge(effDynStatus, dMode);
                 const panelCls = dMode === 'view_and_act'
                     ? 'bg-emerald-950/15 border-emerald-500/35'
                     : (dMode === 'view_only' ? 'bg-amber-950/15 border-amber-500/35' : 'bg-slate-950/60 border-slate-700/80');
@@ -29511,14 +30435,65 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                         }).join('')}
                     </div>
                 ` : '';
-                const verdictHtml = dyn.would_trigger && dyn.trigger_reason
-                    ? `<div class="px-3 py-1.5 rounded-lg border text-[11px] ${dMode === 'view_and_act' ? 'bg-emerald-950/45 border-emerald-500/45 text-emerald-200' : 'bg-amber-950/45 border-amber-500/45 text-amber-200'}">
+
+                let verdictHtml = '';
+                if (dynReplayTriggered) {
+                    const repTs = _fmtFindBestLocalTs(dynReplay.timestamp_epoch_ms, dynReplay.timestamp_utc);
+                    const repBoxCls = dMode === 'view_and_act'
+                        ? 'bg-emerald-950/40 border-emerald-500/45 text-emerald-100'
+                        : 'bg-amber-950/40 border-amber-500/45 text-amber-100';
+                    const repTitle = dMode === 'view_and_act'
+                        ? 'ACTIVE DYNAMIC FIRST TRIGGER (BAR-BY-BAR REPLAY)'
+                        : 'SHADOW MODE FIRST TRIGGER (BAR-BY-BAR REPLAY — NO ORDER PLACED)';
+                    const dDol = dynReplay.delta_vs_actual_dollars;
+                    const dPct = dynReplay.delta_vs_actual_pct;
+                    const dCls = (dDol == null)
+                        ? 'text-slate-300'
+                        : (Number(dDol) > 0 ? 'text-emerald-300' : (Number(dDol) < 0 ? 'text-rose-300' : 'text-slate-200'));
+                    const refLabel = isOpenTrade ? 'vs Current Mark' : 'vs Actual Exit';
+                    verdictHtml = `
+                        <div class="rounded-lg border p-2.5 space-y-2 ${repBoxCls}">
+                            <div class="flex flex-wrap items-center justify-between gap-2 text-[10.5px]">
+                                <span class="font-bold uppercase tracking-wide">${repTitle}</span>
+                                <span class="text-[10px] opacity-85">${escSvg(dynReplay.trigger_reason || '')}</span>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2 text-[11px]">
+                                <div class="rounded bg-slate-950/75 border border-slate-800/90 px-2.5 py-1.5">
+                                    <div class="text-[9px] uppercase text-slate-400 font-bold">First Trigger Time</div>
+                                    <div class="font-bold text-white" title="${escSvg(repTs.title)}">${escSvg(repTs.full)}</div>
+                                    <div class="text-[9.5px] text-slate-400">+${fmtNum(dynReplay.minutes_after_buy, 1)}m after buy · Bar ${(Number(dynReplay.bar_index) || 0) + 1}/${Number(dynReplay.bars_evaluated || 0)}</div>
+                                </div>
+                                <div class="rounded bg-slate-950/75 border border-slate-800/90 px-2.5 py-1.5">
+                                    <div class="text-[9px] uppercase text-amber-300 font-bold">Simulated Sell Price</div>
+                                    <div class="text-sm font-extrabold text-amber-200">${dynReplay.sim_exit_price != null ? '$' + fmtNum(dynReplay.sim_exit_price, 2) : '--'}</div>
+                                    <div class="text-[9.5px] text-slate-400">Entry $${fmtNum(tr.entry_price, 2)} · ${isOpenTrade ? 'Mark' : 'Actual'} ${dynReplay.actual_exit_price != null ? '$' + fmtNum(dynReplay.actual_exit_price, 2) : '--'}</div>
+                                </div>
+                                <div class="rounded bg-slate-950/75 border border-slate-800/90 px-2.5 py-1.5">
+                                    <div class="text-[9px] uppercase text-cyan-300 font-bold">Simulated P/L</div>
+                                    <div class="text-sm font-extrabold ${pctCls(dynReplay.sim_pnl_pct)}">${fmtPct(dynReplay.sim_pnl_pct)} <span class="text-xs">(${fmtDol(dynReplay.sim_pnl_dollars)})</span></div>
+                                    <div class="text-[9.5px] text-slate-400">Peak ${fmtPct(dynReplay.peak_pnl_pct_at_trigger)} · DD -${fmtNum(dynReplay.drawdown_pct_at_trigger, 2)}%</div>
+                                </div>
+                                <div class="rounded bg-slate-950/75 border border-slate-800/90 px-2.5 py-1.5">
+                                    <div class="text-[9px] uppercase text-slate-400 font-bold">Delta ${refLabel}</div>
+                                    <div class="text-sm font-extrabold ${dCls}">${fmtDol(dDol)}</div>
+                                    <div class="text-[9.5px] text-slate-400">${dPct != null ? (Number(dPct) >= 0 ? '+' : '') + fmtNum(dPct, 2) + ' pts' : '--'} · ${isOpenTrade ? 'Mark' : 'Actual'} ${fmtDol(dynReplay.actual_pnl_dollars)}</div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                } else if (dyn.would_trigger && dyn.trigger_reason) {
+                    verdictHtml = `<div class="px-3 py-1.5 rounded-lg border text-[11px] ${dMode === 'view_and_act' ? 'bg-emerald-950/45 border-emerald-500/45 text-emerald-200' : 'bg-amber-950/45 border-amber-500/45 text-amber-200'}">
                             <strong>${dMode === 'view_and_act' ? 'ACTIVE DYNAMIC EXIT TRIGGER:' : 'SHADOW MODE (LOG-ONLY — NO ORDER PLACED):'}</strong> ${escSvg(dyn.trigger_reason)}
-                       </div>`
-                    : `<div class="text-[10.5px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
-                            <span>Current P/L: <strong class="${pctCls(dyn.pnl_pct)}">${fmtPct(dyn.pnl_pct)}</strong> · Peak: <strong class="${pctCls(dyn.peak_pnl_pct)}">${fmtPct(dyn.peak_pnl_pct)}</strong> · Drawdown: <strong class="text-slate-200">-${fmtNum(dyn.drawdown_pct, 2)}%</strong> · Velocity v=${dyn.underlying_v != null ? (Number(dyn.underlying_v) >= 0 ? '+' : '') + fmtNum(dyn.underlying_v, 4) : '--'} (${dyn.require_neg_vel ? (dyn.vel_ok ? 'v&lt;0 OK' : 'waiting v&lt;0') : 'any v'})</span>
+                       </div>`;
+                } else {
+                    const replayNote = dynReplay && Number(dynReplay.bars_evaluated || 0) > 0
+                        ? ` · Bar-by-bar replay (${Number(dynReplay.bars_evaluated)} bars): no dynamic exit triggered`
+                        : '';
+                    verdictHtml = `<div class="text-[10.5px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
+                            <span>Current P/L: <strong class="${pctCls(dyn.pnl_pct)}">${fmtPct(dyn.pnl_pct)}</strong> · Peak: <strong class="${pctCls(dyn.peak_pnl_pct)}">${fmtPct(dyn.peak_pnl_pct)}</strong> · Drawdown: <strong class="text-slate-200">-${fmtNum(dyn.drawdown_pct, 2)}%</strong> · Velocity v=${dyn.underlying_v != null ? (Number(dyn.underlying_v) >= 0 ? '+' : '') + fmtNum(dyn.underlying_v, 4) : '--'} (${dyn.require_neg_vel ? (dyn.vel_ok ? 'v&lt;0 OK' : 'waiting v&lt;0') : 'any v'})${escSvg(replayNote)}</span>
                             <span class="text-slate-500">Config: [option_seller] dynamic_rules_mode = ${escSvg(dMode)}</span>
                        </div>`;
+                }
 
                 return `
                     <div class="rounded-xl border ${panelCls} p-3.5 space-y-2.5 mono">
@@ -29705,15 +30680,20 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const tFmt = _fmtFindBestLocalTs(p.timestamp_epoch_ms, p.timestamp_utc);
                 const isBest = best && p.timestamp_epoch_ms === best.timestamp_epoch_ms && p.source === best.source;
                 const isWorst = worst && p.timestamp_epoch_ms === worst.timestamp_epoch_ms && p.source === worst.source;
+                const isDynExit = dynReplayTriggered && p.timestamp_epoch_ms === dynReplay.timestamp_epoch_ms && (!dynReplay.source || p.source === dynReplay.source);
                 const rowCls = isBest
                     ? 'bg-emerald-500/15 border-b border-emerald-500/40'
-                    : (isWorst ? 'bg-rose-500/15 border-b border-rose-500/40' : 'hover:bg-slate-900/70 border-b border-slate-800/50');
+                    : (isWorst
+                        ? 'bg-rose-500/15 border-b border-rose-500/40'
+                        : (isDynExit ? 'bg-amber-500/15 border-b border-amber-500/40' : 'hover:bg-slate-900/70 border-b border-slate-800/50'));
                 const srcBadge = p.source === 'optionchain'
                     ? `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[9.5px] font-bold">CHAIN${p.signal ? '·' + escSvg(p.signal) : ''}</span>`
                     : `<span class="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[9.5px] font-bold">1M BAR</span>`;
-                const tagHtml = isBest
-                    ? '<span class="ml-1 px-1 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/40 text-[8.5px] font-bold">BEST</span>'
-                    : (isWorst ? '<span class="ml-1 px-1 py-0.5 rounded bg-rose-500/25 text-rose-200 border border-rose-400/40 text-[8.5px] font-bold">WORST</span>' : '');
+                const tagHtml = [
+                    isBest ? '<span class="ml-1 px-1 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/40 text-[8.5px] font-bold">BEST</span>' : '',
+                    isWorst ? '<span class="ml-1 px-1 py-0.5 rounded bg-rose-500/25 text-rose-200 border border-rose-400/40 text-[8.5px] font-bold">WORST</span>' : '',
+                    isDynExit ? '<span class="ml-1 px-1 py-0.5 rounded bg-amber-500/25 text-amber-200 border border-amber-400/50 text-[8.5px] font-bold" title="First Dynamic Exit Rules bar-by-bar trigger">DYN EXIT</span>' : '',
+                ].join('');
                 const bidAsk = (p.bid != null || p.ask != null)
                     ? `$${p.bid != null ? Number(p.bid).toFixed(2) : '--'} / $${p.ask != null ? Number(p.ask).toFixed(2) : '--'}${p.spread_pct != null ? ` (${fmtNum(p.spread_pct, 1)}%)` : ''}`
                     : '--';
@@ -29785,6 +30765,534 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
             `;
 
             pane.innerHTML = sourceBarHtml + kpiCardsHtml + dynamicRulesHtml + insightsHtml + diagStripHtml + tuningTablesHtml + timelineHtml;
+        }
+
+        // =========================================================================
+        // ANALYZE DAY — PORTFOLIO FIND BEST & PARMS.INI SYNTHESIZER ([dashboard] analyze_day=true)
+        // =========================================================================
+        let latestAnalyzeDay = null;
+        let _analyzeDayAbortCtrl = null;
+        let _analyzeDayReqSeq = 0;
+        let _analyzeDayOverallBounds = null;
+
+        function _analyzeDayTodayIso(offsetDays = 0) {
+            const dt = new Date();
+            if (offsetDays) dt.setDate(dt.getDate() + offsetDays);
+            const y = dt.getFullYear();
+            const m = String(dt.getMonth() + 1).padStart(2, '0');
+            const d = String(dt.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+
+        async function openAnalyzeDayModal() {
+            if (!ANALYZE_DAY_ENABLED) return;
+            const modal = document.getElementById('analyzeDayModal');
+            if (modal) modal.classList.remove('hidden');
+            const fromInput = document.getElementById('analyzeDayFromInput');
+            const toInput = document.getElementById('analyzeDayToInput');
+            const todayIso = _analyzeDayTodayIso(0);
+            if (fromInput && !fromInput.value) fromInput.value = todayIso;
+            if (toInput && !toInput.value) toInput.value = todayIso;
+            const badge = document.getElementById('analyzeDayDateBadge');
+            if (badge && !latestAnalyzeDay && fromInput && toInput) {
+                badge.textContent = fromInput.value === toInput.value ? fromInput.value : `${fromInput.value} → ${toInput.value}`;
+            }
+            // Fetch available trade dates & overall range bounds for quick presets without overriding today's default
+            try {
+                const res = await fetch(`/api/analyze-day?list_dates=1&_ts=${Date.now()}`, { cache: 'no-store' });
+                const payload = await res.json();
+                if (res.ok && payload && payload.status === 'ok') {
+                    const dates = Array.isArray(payload.available_dates) ? payload.available_dates : [];
+                    _analyzeDayOverallBounds = payload.overall_date_bounds || null;
+                    renderAnalyzeDayQuickDates(
+                        dates,
+                        fromInput ? fromInput.value : todayIso,
+                        toInput ? toInput.value : todayIso,
+                        _analyzeDayOverallBounds
+                    );
+                }
+            } catch (_) {}
+            if (fromInput) {
+                try { fromInput.focus(); } catch (_) {}
+            }
+        }
+
+        function closeAnalyzeDayModal() {
+            if (_analyzeDayAbortCtrl) {
+                try { _analyzeDayAbortCtrl.abort(); } catch (_) {}
+                _analyzeDayAbortCtrl = null;
+            }
+            const modal = document.getElementById('analyzeDayModal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function selectAnalyzeDayRange(fromStr, toStr) {
+            const fromInput = document.getElementById('analyzeDayFromInput');
+            const toInput = document.getElementById('analyzeDayToInput');
+            const f = String(fromStr || toStr || _analyzeDayTodayIso(0)).trim();
+            const t = String(toStr || fromStr || _analyzeDayTodayIso(0)).trim();
+            if (fromInput) fromInput.value = f;
+            if (toInput) toInput.value = t;
+            runAnalyzeDay(f, t);
+        }
+
+        function selectAnalyzeDayDate(dateStr) {
+            selectAnalyzeDayRange(dateStr, dateStr);
+        }
+
+        function renderAnalyzeDayQuickDates(dates, activeFrom, activeTo, overallBounds) {
+            const bar = document.getElementById('analyzeDayQuickDates');
+            if (!bar) return;
+            const todayIso = _analyzeDayTodayIso(0);
+            const last7Iso = _analyzeDayTodayIso(-6);
+            const last30Iso = _analyzeDayTodayIso(-29);
+            const bounds = overallBounds || _analyzeDayOverallBounds || {};
+
+            const presetBtn = (label, f, t) => {
+                const isAct = activeFrom === f && activeTo === t;
+                const cls = isAct
+                    ? 'bg-cyan-600/30 border-cyan-400 text-white font-semibold'
+                    : 'bg-slate-900 border-slate-700/80 text-cyan-200 hover:border-cyan-400/60 hover:text-white';
+                return `<button type="button" onclick="selectAnalyzeDayRange('${escSvg(f)}','${escSvg(t)}')" class="px-2 py-0.5 rounded-md border text-[10px] transition ${cls}">${escSvg(label)}</button>`;
+            };
+
+            const presetHtmlParts = [
+                presetBtn('Today', todayIso, todayIso),
+                presetBtn('Last 7d', last7Iso, todayIso),
+                presetBtn('Last 30d', last30Iso, todayIso),
+            ];
+            if (bounds && bounds.min_date && bounds.max_date) {
+                const tot = Number(bounds.total_closed_trades || 0);
+                presetHtmlParts.push(presetBtn(`All Trades${tot > 0 ? ' (' + tot + ')' : ''}`, bounds.min_date, bounds.max_date));
+            }
+
+            let dayChipsHtml = '';
+            if (Array.isArray(dates) && dates.length > 0) {
+                const chips = dates.slice(0, 10).map(d => {
+                    const isAct = activeFrom === d.date && activeTo === d.date;
+                    const pnl = Number(d.actual_pnl_dollars || 0);
+                    const pnlTxt = `${pnl >= 0 ? '+' : '-'}$${Math.abs(pnl).toFixed(0)}`;
+                    const pnlCls = pnl > 0 ? 'text-emerald-300' : (pnl < 0 ? 'text-rose-300' : 'text-slate-300');
+                    const btnCls = isAct
+                        ? 'bg-amber-600/30 border-amber-400 text-white'
+                        : 'bg-slate-900 border-slate-700/80 text-slate-300 hover:border-amber-500/50 hover:text-white';
+                    return `<button type="button" onclick="selectAnalyzeDayDate('${escSvg(d.date)}')" class="px-2 py-0.5 rounded-md border text-[10px] transition ${btnCls}">${escSvg(d.date)} <span class="text-slate-400">(${d.trade_count})</span> <span class="${pnlCls}">${pnlTxt}</span></button>`;
+                }).join('');
+                dayChipsHtml = `<span class="text-slate-700 mx-1">|</span><span class="text-[10px] text-slate-500 uppercase font-bold mr-1">Single Days:</span>${chips}`;
+            }
+
+            bar.classList.remove('hidden');
+            bar.innerHTML = `<span class="text-[10px] text-slate-500 uppercase font-bold mr-1">Ranges:</span>${presetHtmlParts.join('')}${dayChipsHtml}`;
+        }
+
+        async function runAnalyzeDay(explicitFrom, explicitTo) {
+            if (!ANALYZE_DAY_ENABLED) return;
+            const fromInput = document.getElementById('analyzeDayFromInput');
+            const toInput = document.getElementById('analyzeDayToInput');
+            const todayIso = _analyzeDayTodayIso(0);
+            let fromDate = String(explicitFrom || (fromInput ? fromInput.value : '') || todayIso).trim();
+            let toDate = String(explicitTo || (toInput ? toInput.value : '') || fromDate || todayIso).trim();
+            const pane = document.getElementById('analyzeDayPane');
+            const badge = document.getElementById('analyzeDayDateBadge');
+            const btn = document.getElementById('btnAnalyzeDayRun');
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+                if (pane) {
+                    pane.innerHTML = '<div class="text-xs text-amber-300 text-center py-10 mono">Please select valid From and To dates (YYYY-MM-DD) above.</div>';
+                }
+                return;
+            }
+            if (fromDate > toDate) {
+                const tmp = fromDate;
+                fromDate = toDate;
+                toDate = tmp;
+            }
+            if (fromInput) fromInput.value = fromDate;
+            if (toInput) toInput.value = toDate;
+            const scopeLabel = fromDate === toDate ? fromDate : `${fromDate} → ${toDate}`;
+            if (badge) badge.textContent = scopeLabel;
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Analyzing...';
+            }
+            if (pane) {
+                pane.innerHTML = `<div class="text-xs text-slate-400 text-center py-14 mono">Running Find Best timeline extraction &amp; portfolio parameter synthesis for <strong class="text-amber-300">${escSvg(scopeLabel)}</strong>...</div>`;
+            }
+            if (_analyzeDayAbortCtrl) {
+                try { _analyzeDayAbortCtrl.abort(); } catch (_) {}
+            }
+            _analyzeDayAbortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const reqSeq = ++_analyzeDayReqSeq;
+            try {
+                const fetchOpts = { cache: 'no-store' };
+                if (_analyzeDayAbortCtrl) fetchOpts.signal = _analyzeDayAbortCtrl.signal;
+                const url = `/api/analyze-day?from=${encodeURIComponent(fromDate)}&to=${encodeURIComponent(toDate)}&_ts=${Date.now()}`;
+                const res = await fetch(url, fetchOpts);
+                const payload = await res.json();
+                if (reqSeq !== _analyzeDayReqSeq) return;
+                if (res.ok && payload && payload.status === 'ok') {
+                    latestAnalyzeDay = payload;
+                    if (payload.overall_date_bounds) _analyzeDayOverallBounds = payload.overall_date_bounds;
+                    const normFrom = payload.from_date || fromDate;
+                    const normTo = payload.to_date || toDate;
+                    if (fromInput) fromInput.value = normFrom;
+                    if (toInput) toInput.value = normTo;
+                    renderAnalyzeDayQuickDates(payload.available_dates || [], normFrom, normTo, payload.overall_date_bounds || _analyzeDayOverallBounds);
+                    renderAnalyzeDayModal();
+                } else if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-12 mono">Analyze Day failed: ${escSvg((payload && payload.message) || 'Unknown error')}</div>`;
+                }
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                if (pane) {
+                    pane.innerHTML = `<div class="text-xs text-rose-400 text-center py-12 mono">Analyze Day request error: ${escSvg((err && err.message) || String(err))}</div>`;
+                }
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Analyze';
+                }
+            }
+        }
+
+        function copyAnalyzeDayIniSnippet() {
+            const txt = (latestAnalyzeDay && latestAnalyzeDay.changed_ini_snippet) || '';
+            if (!txt) return;
+            const btn = document.getElementById('btnCopyAnalyzeDayIni');
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(txt).then(() => {
+                    if (btn) {
+                        const prev = btn.textContent;
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => { btn.textContent = prev; }, 1600);
+                    }
+                }).catch(() => {});
+            }
+        }
+
+        function openFindBestFromAnalyzeDay(tradeIdx) {
+            if (!FINDBEST_ENABLED || !latestAnalyzeDay || !Array.isArray(latestAnalyzeDay.trades)) return;
+            const tr = latestAnalyzeDay.trades[tradeIdx];
+            if (!tr) return;
+            const item = {
+                _is_open: false,
+                trade_id: tr.trade_id,
+                contract: tr.contract,
+                underlying: tr.underlying,
+                purchased_at_utc: tr.buy_utc,
+                sold_at_utc: tr.sell_utc,
+                entry_price: tr.entry_price,
+                exit_price: tr.actual_exit_price,
+                qty: tr.qty,
+            };
+            _findBestLastItem = item;
+            const badge = document.getElementById('findBestContractBadge');
+            if (badge) badge.textContent = item.contract || '--';
+            const modal = document.getElementById('findBestModal');
+            if (modal) modal.classList.remove('hidden');
+            fetchFindBestAnalysis(item);
+        }
+
+        function renderAnalyzeDayModal() {
+            const pane = document.getElementById('analyzeDayPane');
+            const badge = document.getElementById('analyzeDayDateBadge');
+            const sub = document.getElementById('analyzeDaySubtitle');
+            if (!pane || !latestAnalyzeDay) return;
+
+            const d = latestAnalyzeDay;
+            const trades = Array.isArray(d.trades) ? d.trades : [];
+            const dailyBreakdown = Array.isArray(d.daily_breakdown) ? d.daily_breakdown : [];
+            const sum = d.summary || {};
+            const changed = Array.isArray(d.changed_parms) ? d.changed_parms : [];
+            const fromDate = d.from_date || d.date || '--';
+            const toDate = d.to_date || d.date || '--';
+            const isRange = Boolean(d.is_range || (fromDate !== toDate));
+            const scopeLabel = isRange ? `${fromDate} → ${toDate}` : fromDate;
+            const daysCount = Number(sum.trading_days_count || dailyBreakdown.length || (trades.length > 0 ? 1 : 0));
+
+            if (badge) {
+                badge.textContent = isRange
+                    ? `${scopeLabel} · ${trades.length} trade${trades.length === 1 ? '' : 's'} · ${daysCount} day${daysCount === 1 ? '' : 's'}`
+                    : `${scopeLabel} · ${trades.length} trade${trades.length === 1 ? '' : 's'}`;
+            }
+            if (sub) {
+                sub.textContent = isRange
+                    ? `All fully executed trades (opened & closed within ${fromDate} to ${toDate} ${d.market_tz || 'US/Eastern'}) · Combined Find Best optimization across ${trades.length} contract${trades.length === 1 ? '' : 's'}.`
+                    : `Fully executed round-trip trades (opened & closed on ${fromDate} ${d.market_tz || 'US/Eastern'}) · Combined Find Best optimization across ${trades.length} contract${trades.length === 1 ? '' : 's'}.`;
+            }
+
+            if (trades.length === 0) {
+                pane.innerHTML = `
+                    <div class="rounded-xl bg-slate-950/70 border border-slate-800 p-8 text-center mono space-y-2">
+                        <div class="text-sm font-bold text-slate-200">No Fully Executed Trades Found for ${escSvg(scopeLabel)}</div>
+                        <div class="text-xs text-slate-400">Analyze Day includes closed contracts whose open (buy) and close (sell) both occurred within the selected date range (${escSvg(d.market_tz || 'US/Eastern')}).</div>
+                        <div class="text-[11px] text-amber-300 pt-1">Adjust the From / To dates or click a range preset (<strong class="text-cyan-300">Last 7d</strong>, <strong class="text-cyan-300">Last 30d</strong>, <strong class="text-cyan-300">All Trades</strong>) or a trading-day chip above.</div>
+                    </div>
+                `;
+                return;
+            }
+
+            const fmtDol = (v) => v == null ? '--' : `${v >= 0 ? '+' : '-'}$${Math.abs(Number(v)).toFixed(2)}`;
+            const fmtPct = (v) => v == null ? '--' : `${v >= 0 ? '+' : ''}${Number(v).toFixed(2)}%`;
+            const valCls = (v) => v == null ? 'text-slate-300' : (Number(v) > 0 ? 'text-emerald-400' : (Number(v) < 0 ? 'text-rose-400' : 'text-slate-200'));
+            const fmtVal = (v) => {
+                if (typeof v === 'boolean') return v ? 'true' : 'false';
+                return String(v);
+            };
+            const fmtTimeShort = (iso, includeDate) => {
+                if (!iso) return '--';
+                try {
+                    const dt = new Date(iso);
+                    const tPart = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+                    if (!includeDate) return tPart;
+                    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+                    const dd = String(dt.getDate()).padStart(2, '0');
+                    return `${mm}/${dd} ${tPart}`;
+                } catch (_) {
+                    return includeDate ? String(iso).slice(5, 16).replace('T', ' ') : String(iso).slice(11, 16);
+                }
+            };
+
+            const actDol = Number(sum.actual_pnl_dollars || 0);
+            const simDol = Number(sum.simulated_pnl_dollars || 0);
+            const impDol = Number(sum.pnl_improvement_dollars || 0);
+            const impPctPts = sum.pnl_improvement_pct_points;
+            const peakDol = sum.theoretical_peak_pnl_dollars;
+            const multiDayCount = Number(sum.multiday_trade_count || 0);
+
+            const kpiHtml = `
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mono">
+                    <div class="rounded-xl bg-slate-950/70 border border-slate-800 p-3.5">
+                        <div class="text-[10px] uppercase text-slate-400 font-bold">Actual Combined P/L</div>
+                        <div class="text-2xl font-extrabold mt-1 ${valCls(actDol)}">${fmtDol(actDol)}</div>
+                        <div class="text-[11px] mt-0.5 flex items-center justify-between text-slate-400">
+                            <span class="${valCls(sum.actual_pnl_pct)} font-semibold">${fmtPct(sum.actual_pnl_pct)}</span>
+                            <span>${sum.actual_wins || 0}W / ${sum.actual_losses || 0}L (${Number(sum.actual_win_rate_pct || 0).toFixed(0)}%)</span>
+                        </div>
+                    </div>
+                    <div class="rounded-xl bg-slate-950/70 border border-amber-500/40 p-3.5">
+                        <div class="text-[10px] uppercase text-amber-300 font-bold">With Synthesized parms.ini</div>
+                        <div class="text-2xl font-extrabold mt-1 ${valCls(simDol)}">${fmtDol(simDol)}</div>
+                        <div class="text-[11px] mt-0.5 flex items-center justify-between text-slate-400">
+                            <span class="${valCls(sum.simulated_pnl_pct)} font-semibold">${fmtPct(sum.simulated_pnl_pct)}</span>
+                            <span>${sum.simulated_wins || 0}W / ${sum.simulated_losses || 0}L (${Number(sum.simulated_win_rate_pct || 0).toFixed(0)}%)</span>
+                        </div>
+                    </div>
+                    <div class="rounded-xl bg-slate-950/70 border ${impDol > 0 ? 'border-emerald-500/40' : 'border-slate-800'} p-3.5">
+                        <div class="text-[10px] uppercase text-slate-400 font-bold">Net P/L Delta vs Actual</div>
+                        <div class="text-2xl font-extrabold mt-1 ${valCls(impDol)}">${fmtDol(impDol)}</div>
+                        <div class="text-[11px] mt-0.5 flex items-center justify-between text-slate-400">
+                            <span class="${valCls(impPctPts)} font-semibold">${impPctPts != null ? (impPctPts >= 0 ? '+' : '') + Number(impPctPts).toFixed(2) + ' pts' : '--'}</span>
+                            <span title="Sum of per-contract Find Best peaks (hindsight ceiling)">Peak: ${fmtDol(peakDol)}</span>
+                        </div>
+                    </div>
+                    <div class="rounded-xl bg-slate-950/70 border border-slate-800 p-3.5">
+                        <div class="text-[10px] uppercase text-slate-400 font-bold">${isRange ? 'Range Scope &amp; Changes' : 'Day Scope &amp; Changes'}</div>
+                        <div class="text-2xl font-extrabold mt-1 text-white">${trades.length} <span class="text-sm font-semibold text-slate-400">contract${trades.length === 1 ? '' : 's'}${isRange ? ` · ${daysCount}d` : ''}</span></div>
+                        <div class="text-[11px] mt-0.5 flex items-center justify-between text-slate-400">
+                            <span>Cost: $${Number(sum.total_cost_basis || 0).toFixed(0)}${multiDayCount > 0 ? ` · ${multiDayCount} overnight` : ''}</span>
+                            <span class="text-amber-300 font-semibold">${changed.length} parm${changed.length === 1 ? '' : 's'} changed</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const cov = d.parms_snapshot_coverage || {};
+            const covRecorded = Number(cov.recorded_count || 0);
+            const covTotal = Number(cov.total_count || trades.length);
+            const covStatus = String(cov.status || (covRecorded >= covTotal && covTotal > 0 ? 'all_recorded' : (covRecorded > 0 ? 'partial_recorded' : 'none_recorded')));
+            const refLabel = covStatus === 'all_recorded' ? 'Recorded @ Trade' : 'Current parms.ini';
+            const noImp = Boolean(sum.no_improvement_over_actual);
+            const scopePhrase = isRange ? `in ${escSvg(scopeLabel)}` : `on ${escSvg(scopeLabel)}`;
+
+            const covIds = Array.isArray(cov.snapshot_ids) ? cov.snapshot_ids : [];
+            const covIdNote = covIds.length > 0
+                ? ` <span class="text-emerald-300/90">(${covIds.map(id => '#' + escSvg(String(id).slice(0, 8))).join(', ')} in <code>logs/parms_snapshots/</code>)</span>`
+                : '';
+
+            const provenanceBannerHtml = covStatus === 'all_recorded'
+                ? `
+                    <div class="rounded-xl bg-emerald-950/20 border border-emerald-500/30 px-3.5 py-2 mono text-[11px] text-emerald-200 flex flex-wrap items-center justify-between gap-2">
+                        <span><strong>Exact Trade Parms Recorded:</strong> All ${covTotal} trade${covTotal === 1 ? '' : 's'} ${scopePhrase} include the redacted full <code class="text-emerald-300">lib/parms.ini</code> snapshot captured at execution time.${covIdNote}</span>
+                    </div>
+                `
+                : `
+                    <div class="rounded-xl bg-amber-950/25 border border-amber-500/35 px-3.5 py-2 mono text-[11px] text-amber-200/95">
+                        <strong>Historical Parms Notice:</strong> ${covRecorded === 0 ? `None of the ${covTotal} trade${covTotal === 1 ? '' : 's'} ${scopePhrase} recorded a <code class="text-amber-300">parms.ini</code> snapshot at trade time (pre-v0.1.33)` : `Only ${covRecorded} of ${covTotal} trades ${scopePhrase} recorded a <code class="text-amber-300">parms.ini</code> snapshot`}. Baseline diff is compared against your <strong>current</strong> <code class="text-amber-300">lib/parms.ini</code>; changes are only recommended if they strictly beat Actual Combined P/L (${fmtDol(actDol)}). New trades automatically snapshot the redacted full <code class="text-amber-300">lib/parms.ini</code> in <code class="text-amber-300">logs/parms_snapshots/</code>.
+                    </div>
+                `;
+
+            let parmsHtml = '';
+            if (changed.length === 0) {
+                const baseReplayDiffers = sum.baseline_original_parms_pnl_dollars != null && Math.abs(Number(sum.baseline_original_parms_pnl_dollars) - actDol) > 0.01;
+                const noChangeDetail = noImp
+                    ? `No single <code class="text-slate-200">lib/parms.ini</code> rule combination strictly beat the Actual Combined P/L (${fmtDol(actDol)}) across all ${trades.length} contract${trades.length === 1 ? '' : 's'} ${scopePhrase}.`
+                    : `Your ${escSvg(refLabel)} settings already achieved the highest simulated combined P/L across all trades ${scopePhrase}.`;
+                const replayNote = baseReplayDiffers
+                    ? `<div class="text-slate-500 text-[10.5px] mt-1">Note: Replaying these trades under ${escSvg(refLabel)} yields ${fmtDol(sum.baseline_original_parms_pnl_dollars)}${covStatus !== 'all_recorded' ? ' (historical settings active during these trades were not recorded)' : ''}. No changes are suggested unless a unified rule set strictly beats Actual Combined P/L.</div>`
+                    : '';
+                parmsHtml = `
+                    <div class="rounded-xl bg-emerald-950/25 border border-emerald-500/35 p-4 mono text-xs flex items-center justify-between gap-3">
+                        <div>
+                            <div class="font-bold text-emerald-300">No lib/parms.ini Changes Recommended</div>
+                            <div class="text-slate-300 text-[11px] mt-0.5">${noChangeDetail}</div>
+                            ${replayNote}
+                        </div>
+                    </div>
+                `;
+            } else {
+                const parmRows = changed.map(c => `
+                    <tr class="border-b border-slate-800/60 hover:bg-slate-900/60">
+                        <td class="px-3 py-2 text-cyan-300 font-semibold whitespace-nowrap">[${escSvg(c.section)}]</td>
+                        <td class="px-3 py-2 text-white font-bold whitespace-nowrap">${escSvg(c.key)}</td>
+                        <td class="px-3 py-2 text-right text-slate-400 line-through whitespace-nowrap">${escSvg(fmtVal(c.original))}</td>
+                        <td class="px-3 py-2 text-right text-amber-300 font-extrabold whitespace-nowrap">${escSvg(fmtVal(c.recommended))}</td>
+                        <td class="px-3 py-2 text-slate-400 text-[10.5px]">${escSvg(c.reason || '')}</td>
+                    </tr>
+                `).join('');
+                parmsHtml = `
+                    <div class="grid grid-cols-1 lg:grid-cols-12 gap-3 mono">
+                        <div class="lg:col-span-8 rounded-xl bg-slate-950/70 border border-amber-500/35 overflow-hidden">
+                            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+                                <span class="text-[11px] font-bold uppercase tracking-wider text-amber-300">Synthesized lib/parms.ini Updates (${changed.length} Changed From ${escSvg(refLabel)})</span>
+                                <span class="text-[10px] text-slate-400">Best overall profit across ${isRange ? 'date range' : 'day'}</span>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left border-collapse text-[11px]">
+                                    <thead class="bg-slate-950/80 text-[9.5px] uppercase text-slate-400 border-b border-slate-800">
+                                        <tr>
+                                            <th class="px-3 py-2">Section</th>
+                                            <th class="px-3 py-2">Parameter</th>
+                                            <th class="px-3 py-2 text-right">${escSvg(refLabel)}</th>
+                                            <th class="px-3 py-2 text-right">Recommended</th>
+                                            <th class="px-3 py-2">Impact</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>${parmRows}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="lg:col-span-4 rounded-xl bg-slate-950/80 border border-slate-800 flex flex-col overflow-hidden">
+                            <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-2">
+                                <span class="text-[10.5px] font-bold uppercase text-slate-300">lib/parms.ini Diff Snippet</span>
+                                <button id="btnCopyAnalyzeDayIni" type="button" onclick="copyAnalyzeDayIniSnippet()" class="px-2 py-0.5 rounded bg-amber-600/20 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 text-[10px] font-semibold transition">Copy INI</button>
+                            </div>
+                            <pre class="p-3 text-[11px] text-emerald-300 overflow-x-auto flex-1 leading-relaxed whitespace-pre">${escSvg(d.changed_ini_snippet || '')}</pre>
+                        </div>
+                    </div>
+                `;
+            }
+
+            let dailyBreakdownHtml = '';
+            if (isRange && dailyBreakdown.length > 1) {
+                const dayRows = dailyBreakdown.map(day => {
+                    const cnt = Number(day.trade_count || 0);
+                    const actW = Number(day.actual_wins || 0);
+                    const simW = Number(day.simulated_wins || 0);
+                    return `
+                        <tr class="border-b border-slate-800/50 hover:bg-slate-900/60">
+                            <td class="px-3 py-1.5 whitespace-nowrap">
+                                <button type="button" onclick="selectAnalyzeDayDate('${escSvg(day.date)}')" class="text-cyan-300 hover:text-amber-300 font-bold underline decoration-slate-700 hover:decoration-amber-400 transition" title="Drill into ${escSvg(day.date)}">${escSvg(day.date)}</button>
+                            </td>
+                            <td class="px-3 py-1.5 text-right text-slate-300 whitespace-nowrap">${cnt}</td>
+                            <td class="px-3 py-1.5 text-right text-slate-400 whitespace-nowrap">$${Number(day.cost_basis || 0).toFixed(0)}</td>
+                            <td class="px-3 py-1.5 text-right font-semibold ${valCls(day.actual_pnl_dollars)} whitespace-nowrap">${fmtDol(day.actual_pnl_dollars)} <span class="text-[10px] text-slate-400">(${actW}W/${cnt - actW}L)</span></td>
+                            <td class="px-3 py-1.5 text-right font-bold ${valCls(day.simulated_pnl_dollars)} whitespace-nowrap">${fmtDol(day.simulated_pnl_dollars)} <span class="text-[10px] text-slate-400">(${simW}W/${cnt - simW}L)</span></td>
+                            <td class="px-3 py-1.5 text-right font-extrabold ${valCls(day.delta_dollars)} whitespace-nowrap">${fmtDol(day.delta_dollars)}</td>
+                        </tr>
+                    `;
+                }).join('');
+                dailyBreakdownHtml = `
+                    <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden mono text-[11px]">
+                        <div class="px-3.5 py-2 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                            <span class="text-[10.5px] font-bold uppercase text-slate-300">Daily P/L Summary Across Range (${dailyBreakdown.length} Trading Days)</span>
+                            <span class="text-[10px] text-slate-500">Grouped by trade close date (${escSvg(d.market_tz || 'US/Eastern')}) · Click any date to drill in</span>
+                        </div>
+                        <div class="overflow-x-auto max-h-56 overflow-y-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="bg-slate-950/90 text-[9.5px] uppercase text-slate-400 border-b border-slate-800 sticky top-0">
+                                    <tr>
+                                        <th class="px-3 py-1.5">Close Date</th>
+                                        <th class="px-3 py-1.5 text-right">Trades</th>
+                                        <th class="px-3 py-1.5 text-right">Cost</th>
+                                        <th class="px-3 py-1.5 text-right">Actual P/L</th>
+                                        <th class="px-3 py-1.5 text-right">Synthesized P/L</th>
+                                        <th class="px-3 py-1.5 text-right">Delta</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${dayRows}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const tradeRows = trades.map((t, idx) => {
+                const showDate = isRange || Boolean(t.is_multiday);
+                const isSkipped = Boolean(t.skipped_by_entry_filter || t.skipped_by_spread_filter);
+                let trigBadge = '';
+                if (t.simulated_trigger === 'filtered_nasdaq') {
+                    trigBadge = '<span class="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 text-[9.5px] font-bold">SKIPPED (NASDAQ)</span>';
+                } else if (t.simulated_trigger === 'filtered_rsi_30d') {
+                    trigBadge = '<span class="px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 text-[9.5px] font-bold">SKIPPED (30D RSI)</span>';
+                } else if (t.simulated_trigger === 'filtered_spread' || isSkipped) {
+                    trigBadge = '<span class="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 text-[9.5px] font-bold">SKIPPED (SPREAD)</span>';
+                } else if (t.simulated_trigger === 'actual_close') {
+                    trigBadge = '<span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 text-[9.5px]">actual_close</span>';
+                } else {
+                    trigBadge = `<span class="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/35 text-[9.5px] font-bold">${escSvg(t.simulated_trigger || '--')}</span>`;
+                }
+                const holdLabel = Number(t.hold_minutes || 0) >= 1440
+                    ? `${(Number(t.hold_minutes || 0) / 1440).toFixed(1)}d`
+                    : `${Number(t.hold_minutes || 0).toFixed(0)}m`;
+                return `
+                    <tr class="border-b border-slate-800/50 hover:bg-slate-900/60">
+                        <td class="px-3 py-2 font-bold text-white whitespace-nowrap">${escSvg(t.contract)} <span class="text-[10px] font-normal text-slate-400">x${t.qty}</span></td>
+                        <td class="px-3 py-2 text-slate-300 whitespace-nowrap">${escSvg(fmtTimeShort(t.buy_utc, showDate))} &rarr; ${escSvg(fmtTimeShort(t.sell_utc, showDate))} <span class="text-slate-500">(${holdLabel})</span></td>
+                        <td class="px-3 py-2 text-right text-slate-300 whitespace-nowrap">$${Number(t.cost_basis || 0).toFixed(0)}</td>
+                        <td class="px-3 py-2 text-right font-semibold ${valCls(t.actual_pnl_dollars)} whitespace-nowrap">${fmtDol(t.actual_pnl_dollars)} <span class="text-[10px] opacity-80">(${fmtPct(t.actual_pnl_pct)})</span></td>
+                        <td class="px-3 py-2 text-right font-bold ${valCls(t.simulated_pnl_dollars)} whitespace-nowrap">${fmtDol(t.simulated_pnl_dollars)} <span class="text-[10px] opacity-80">(${fmtPct(t.simulated_pnl_pct)})</span></td>
+                        <td class="px-3 py-2 text-right font-extrabold ${valCls(t.delta_dollars)} whitespace-nowrap">${fmtDol(t.delta_dollars)}</td>
+                        <td class="px-3 py-2 whitespace-nowrap">${trigBadge}${t.simulated_exit_minutes != null && !isSkipped && t.simulated_trigger !== 'actual_close' ? ` <span class="text-[10px] text-slate-500">+${Number(t.simulated_exit_minutes).toFixed(0)}m</span>` : ''}</td>
+                        <td class="px-3 py-2 text-right text-emerald-300/90 whitespace-nowrap">${fmtDol(t.best_peak_pnl_dollars)}</td>
+                        ${FINDBEST_ENABLED ? `<td class="px-2.5 py-2 text-right whitespace-nowrap"><button type="button" onclick="openFindBestFromAnalyzeDay(${idx})" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-amber-600/30 text-amber-300 border border-slate-700 hover:border-amber-500/40 text-[10px] font-semibold transition">Find Best &rarr;</button></td>` : ''}
+                    </tr>
+                `;
+            }).join('');
+
+            const tel = d.telemetry_coverage || {};
+            const telTot = Number(tel.total_trades || trades.length);
+            const telNote = telTot > 0
+                ? ` · Coverage: NASDAQ ${Number(tel.nasdaq_count || 0)}/${telTot}, 30D RSI ${Number(tel.rsi_30d_count || 0)}/${telTot}, Spread ${Number(tel.spread_count || 0)}/${telTot}, Smooth ${Number(tel.smooth_series_count || 0)}/${telTot}`
+                : '';
+
+            const tradesTableHtml = `
+                <div class="rounded-xl bg-slate-950/60 border border-slate-800 overflow-hidden mono text-[11px]">
+                    <div class="px-3.5 py-2.5 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-[10.5px] font-bold uppercase text-slate-300">Per-Contract Actual vs. Synthesized Replay (${trades.length} ${isRange ? 'Trades in Range' : 'Same-Day Round-Trips'})</span>
+                        <span class="text-[10px] text-slate-500">Baseline replay w/ ${escSvg(refLabel)}: ${fmtDol(sum.baseline_original_parms_pnl_dollars)}${escSvg(telNote)}</span>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead class="bg-slate-950/80 text-[9.5px] uppercase text-slate-400 border-b border-slate-800">
+                                <tr>
+                                    <th class="px-3 py-2">Contract</th>
+                                    <th class="px-3 py-2">Buy &rarr; Sell</th>
+                                    <th class="px-3 py-2 text-right">Cost</th>
+                                    <th class="px-3 py-2 text-right">Actual P/L</th>
+                                    <th class="px-3 py-2 text-right">Synthesized P/L</th>
+                                    <th class="px-3 py-2 text-right">Delta</th>
+                                    <th class="px-3 py-2">Simulated Trigger</th>
+                                    <th class="px-3 py-2 text-right">Peak</th>
+                                    ${FINDBEST_ENABLED ? '<th class="px-2.5 py-2 text-right">Inspect</th>' : ''}
+                                </tr>
+                            </thead>
+                            <tbody>${tradeRows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+
+            pane.innerHTML = provenanceBannerHtml + kpiHtml + parmsHtml + dailyBreakdownHtml + tradesTableHtml;
         }
 
         let latestStrikeAnalysis = null;
@@ -30983,6 +32491,11 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     closeFindBestModal();
                     return;
                 }
+                const analyzeDayModal = document.getElementById('analyzeDayModal');
+                if (analyzeDayModal && !analyzeDayModal.classList.contains('hidden')) {
+                    closeAnalyzeDayModal();
+                    return;
+                }
                 const logsModal = document.getElementById('optionLogsModal');
                 if (logsModal && !logsModal.classList.contains('hidden')) {
                     closeOptionLogsModal();
@@ -31952,6 +33465,22 @@ def _load_minute_summary_kinematics_index():
                         continue
                     min_iso = minute_utc(dt).isoformat()
                     rec_provider = str(rec.get("provider") or "").strip().upper() or None
+                    nq_block = rec.get("nasdaq_market") if isinstance(rec.get("nasdaq_market"), dict) else None
+                    nq_is_pos = (
+                        nq_block.get("is_positive")
+                        if (isinstance(nq_block, dict) and isinstance(nq_block.get("is_positive"), bool))
+                        else None
+                    )
+                    nq_diff_pct = (
+                        _opt_safe_float(nq_block.get("diff_pct"), None)
+                        if isinstance(nq_block, dict)
+                        else None
+                    )
+                    if nq_is_pos is not None:
+                        idx[(min_iso, "__NASDAQ__")] = {
+                            "is_positive": nq_is_pos,
+                            "diff_pct": nq_diff_pct,
+                        }
                     syms_block = rec.get("symbols") if isinstance(rec.get("symbols"), dict) else {}
                     prio_order = list(_provider_priority_order())
 
@@ -32016,6 +33545,8 @@ def _load_minute_summary_kinematics_index():
                                 "v": v_val,
                                 "a": a_val,
                                 "regime": best_e.get("regime"),
+                                "nasdaq_is_positive": nq_is_pos,
+                                "nasdaq_diff_pct": nq_diff_pct,
                             }
                             existing = idx.get((min_iso, sym_u))
                             if existing is None:
@@ -32035,9 +33566,16 @@ def _load_minute_summary_kinematics_index():
                                 if new_score > old_score:
                                     if cand_entry["rsi_30d"] is None and existing.get("rsi_30d") is not None:
                                         cand_entry["rsi_30d"] = existing["rsi_30d"]
+                                    if cand_entry["nasdaq_is_positive"] is None and existing.get("nasdaq_is_positive") is not None:
+                                        cand_entry["nasdaq_is_positive"] = existing["nasdaq_is_positive"]
+                                        cand_entry["nasdaq_diff_pct"] = existing.get("nasdaq_diff_pct")
                                     idx[(min_iso, sym_u)] = cand_entry
-                                elif existing.get("rsi_30d") is None and rsi_30d_val is not None:
-                                    existing["rsi_30d"] = rsi_30d_val
+                                else:
+                                    if existing.get("rsi_30d") is None and rsi_30d_val is not None:
+                                        existing["rsi_30d"] = rsi_30d_val
+                                    if existing.get("nasdaq_is_positive") is None and nq_is_pos is not None:
+                                        existing["nasdaq_is_positive"] = nq_is_pos
+                                        existing["nasdaq_diff_pct"] = nq_diff_pct
         except OSError:
             continue
 
@@ -33259,6 +34797,7 @@ def analyze_findbest_contract(
     exit_price=None,
     qty=None,
     is_open: bool = False,
+    kin_index=None,
 ):
     """Analyze all option chain captures & 1m contract history for a closed OR currently open contract."""
     matched_closed = None
@@ -33384,7 +34923,8 @@ def analyze_findbest_contract(
     win_start = buy_dt - timedelta(seconds=60)
     win_end = sell_dt + timedelta(seconds=60)
 
-    kin_index = _load_minute_summary_kinematics_index()
+    if kin_index is None:
+        kin_index = _load_minute_summary_kinematics_index()
 
     def _lookup_kin(dt_u):
         base_m = minute_utc(as_utc(dt_u))
@@ -33597,29 +35137,53 @@ def analyze_findbest_contract(
         dict(p) for p in history_points if p["minute_key"] not in chain_minute_keys
     ]
 
-    live_params = {
-        "profit_target_enabled": bool(OPTION_SELL_PROFIT_TARGET_ENABLED),
-        "profit_target_pct": float(OPTION_SELL_PROFIT_TARGET_PCT),
-        "rsi_high": float(OPTION_CHAIN_RSI_HIGH),
-        "take_profit_require_profit": bool(OPTION_SELL_TAKE_PROFIT_REQUIRE_PROFIT),
-        "take_profit_min_pnl_pct": float(OPTION_SELL_TAKE_PROFIT_MIN_PNL_PCT),
-        "trailing_stop_enabled": bool(OPTION_SELL_TRAILING_STOP_ENABLED),
-        "trailing_activation_pct": float(OPTION_SELL_TRAILING_ACTIVATION_PCT),
-        "trailing_drawdown_pct": float(OPTION_SELL_TRAILING_DRAWDOWN_PCT),
-        "trailing_require_negative_velocity": bool(OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY),
-        "stop_loss_enabled": bool(OPTION_SELL_STOP_LOSS_ENABLED),
-        "stop_loss_pct": float(OPTION_SELL_STOP_LOSS_PCT),
-        "stop_loss_consecutive_minutes": int(OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES),
-        "stop_loss_hard_pct": float(OPTION_SELL_STOP_LOSS_HARD_PCT),
-        "min_hold_minutes": int(OPTION_SELL_MIN_HOLD_MINUTES),
-        "buy_max_spread_pct": float(OPTION_BUY_MAX_SPREAD_PCT),
-        "open_position_capture_mode": str(OPTION_SELL_OPEN_POSITION_CAPTURE_MODE),
-        "dynamic_rules_mode": str(OPTION_SELL_DYNAMIC_RULES_MODE),
-        "dynamic_ratchet_tiers": str(OPTION_SELL_DYNAMIC_RATCHET_TIERS_RAW),
-        "dynamic_breakeven_activation_pct": float(OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT),
-        "dynamic_vol_adapt_enabled": bool(OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED),
-        "dynamic_min_samples": int(OPTION_SELL_DYNAMIC_MIN_SAMPLES),
-    }
+    live_params = _capture_active_trade_parms_snapshot()
+    recorded_snap = None
+    recorded_snap_id = None
+    if matched_rec is not None:
+        recorded_snap_id = (
+            matched_rec.get("parms_snapshot_id")
+            or matched_rec.get("parms_snapshot_buy_id")
+        )
+        for snap_key in ("parms_snapshot", "parms_snapshot_buy"):
+            cand_snap = matched_rec.get(snap_key)
+            if isinstance(cand_snap, dict) and cand_snap:
+                recorded_snap = dict(cand_snap)
+                if not recorded_snap_id:
+                    recorded_snap_id = cand_snap.get("parms_snapshot_id")
+                break
+        if recorded_snap is None and recorded_snap_id:
+            full_loaded = _load_parms_snapshot_by_id(recorded_snap_id)
+            if isinstance(full_loaded, dict) and isinstance(full_loaded.get("active_trading_parms"), dict):
+                recorded_snap = dict(full_loaded["active_trading_parms"])
+                recorded_snap["parms_snapshot_id"] = recorded_snap_id
+                # Backfill [general] & [kinematics] keys from full sections for pre-v0.1.37 snapshots
+                secs = full_loaded.get("sections") if isinstance(full_loaded.get("sections"), dict) else {}
+                gen_s = secs.get("general") if isinstance(secs.get("general"), dict) else {}
+                kin_s = secs.get("kinematics") if isinstance(secs.get("kinematics"), dict) else {}
+                if "nasdaq_must_be_positive" not in recorded_snap and "nasdaq_must_be_positive" in gen_s:
+                    recorded_snap["nasdaq_must_be_positive"] = str(gen_s["nasdaq_must_be_positive"]).strip().lower() in {"1", "true", "yes", "on"}
+                if "rsi_30d_enabled" not in recorded_snap and "rsi_30d_enabled" in gen_s:
+                    recorded_snap["rsi_30d_enabled"] = str(gen_s["rsi_30d_enabled"]).strip().lower() in {"1", "true", "yes", "on"}
+                if "rsi_30d_min" not in recorded_snap and "rsi_30d_min" in gen_s:
+                    v_r30 = _opt_safe_float(gen_s["rsi_30d_min"], None)
+                    if v_r30 is not None:
+                        recorded_snap["rsi_30d_min"] = round(v_r30, 2)
+                if "smooth_method" not in recorded_snap and "smooth_method" in kin_s:
+                    sm_m = str(kin_s["smooth_method"]).strip().lower()
+                    if sm_m in {"hma", "ema", "none"}:
+                        recorded_snap["smooth_method"] = sm_m
+                if "smooth_period" not in recorded_snap and "smooth_period" in kin_s:
+                    v_sp = _opt_safe_float(kin_s["smooth_period"], None)
+                    if v_sp is not None and v_sp >= 2:
+                        recorded_snap["smooth_period"] = int(round(v_sp))
+    if recorded_snap is not None:
+        effective_params = dict(live_params)
+        effective_params.update(recorded_snap)
+        parms_source = "recorded_at_trade"
+    else:
+        effective_params = dict(live_params)
+        parms_source = "current_parms_fallback"
 
     actual_pnl_pct = (
         round(((eff_exit - eff_entry) / eff_entry) * 100.0, 2)
@@ -33633,7 +35197,7 @@ def analyze_findbest_contract(
     )
 
     comb_metrics = _compute_findbest_view_metrics(
-        [dict(p) for p in combined_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+        [dict(p) for p in combined_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, effective_params
     )
     # Build per-contract Dynamic Exit Rules readout (Peak-Ratcheting + Vol/Spread-Adaptive)
     osel_ref = (
@@ -33646,8 +35210,9 @@ def analyze_findbest_contract(
         if (resolved_open and osel_ref is not None and eff_con in getattr(osel_ref, "dynamic_rules_state_by_symbol", {}))
         else None
     )
+    ordered_comb = comb_metrics.get("points") or []
+    eff_dyn_mode = str(effective_params.get("dynamic_rules_mode") or OPTION_SELL_DYNAMIC_RULES_MODE)
     if live_dyn_state is None:
-        ordered_comb = comb_metrics.get("points") or []
         pnl_seq = [p["pnl_pct"] for p in ordered_comb if p.get("pnl_pct") is not None]
         latest_pt = ordered_comb[-1] if ordered_comb else None
         cur_p_dyn = (
@@ -33678,10 +35243,22 @@ def analyze_findbest_contract(
             hold_minutes=hold_minutes,
             underlying_v=latest_v,
             loss_streak=int((comb_metrics.get("diagnostics") or {}).get("max_consecutive_below_sl") or 0),
-            static_params=live_params,
-            mode=OPTION_SELL_DYNAMIC_RULES_MODE,
+            static_params=effective_params,
+            mode=eff_dyn_mode,
         )
         live_dyn_state["underlying"] = eff_und
+
+    live_dyn_state["replay"] = _replay_dynamic_exit_rules_timeline(
+        ordered_points=ordered_comb,
+        entry_price=eff_entry,
+        exit_price=eff_exit,
+        qty=eff_qty,
+        actual_pnl_pct=actual_pnl_pct,
+        actual_pnl_dollars=actual_pnl_dollars,
+        is_open=bool(resolved_open),
+        static_params=effective_params,
+        mode=eff_dyn_mode,
+    )
 
     return {
         "trade": {
@@ -33702,17 +35279,1232 @@ def analyze_findbest_contract(
         },
         "chain_files_scanned": chain_files_scanned,
         "chain_files_in_window": chain_files_in_window,
-        "current_parms": live_params,
+        "parms_source": parms_source,
+        "parms_snapshot_id": recorded_snap_id if parms_source == "recorded_at_trade" else live_params.get("parms_snapshot_id"),
+        "current_parms": effective_params,
+        "live_current_parms": live_params,
         "dynamic_rules": live_dyn_state,
         "views": {
             "combined": comb_metrics,
             "optionchains": _compute_findbest_view_metrics(
-                [dict(p) for p in chain_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+                [dict(p) for p in chain_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, effective_params
             ),
             "history": _compute_findbest_view_metrics(
-                [dict(p) for p in history_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, live_params
+                [dict(p) for p in history_points], eff_entry, eff_exit, eff_qty, buy_dt, sell_dt, effective_params
             ),
         },
+    }
+
+
+_ANALYZE_DAY_PARM_META = (
+    ("nasdaq_must_be_positive", "general", "nasdaq_must_be_positive", "Require NASDAQ change > 0 vs previous trading day's close before entry"),
+    ("rsi_30d_enabled", "general", "rsi_30d_enabled", "Enable 30-day daily Wilder RSI minimum entry gate"),
+    ("rsi_30d_min", "general", "rsi_30d_min", "Minimum 30-day daily RSI required strictly above threshold on entry"),
+    ("smooth_method", "kinematics", "smooth_method", "Underlying price smoothing method for kinematics velocity (hma, ema, none)"),
+    ("smooth_period", "kinematics", "smooth_period", "Underlying price smoothing lookback period (bars) for kinematics velocity"),
+    ("buy_max_spread_pct", "option_buyer", "max_spread_pct", "Maximum option bid-ask spread % allowed on entry"),
+    ("profit_target_enabled", "option_seller", "profit_target_enabled", "Enable/disable Tier 1 fixed profit target"),
+    ("profit_target_pct", "option_seller", "profit_target_pct", "Tier 1 fixed profit target %"),
+    ("rsi_high", "option_seller", "rsi_high", "Tier 2 overbought RSI exit threshold"),
+    ("take_profit_require_profit", "option_seller", "take_profit_require_profit", "Require positive P/L on Tier 2 RSI take-profit"),
+    ("take_profit_min_pnl_pct", "option_seller", "take_profit_min_pnl_pct", "Minimum P/L % floor for Tier 2 RSI take-profit"),
+    ("trailing_stop_enabled", "option_seller", "trailing_stop_enabled", "Enable/disable Tier 3 peak-profit trailing stop"),
+    ("trailing_activation_pct", "option_seller", "trailing_activation_pct", "Peak P/L % required to arm Tier 3 trailing stop"),
+    ("trailing_drawdown_pct", "option_seller", "trailing_drawdown_pct", "Compound drawdown % from peak to trigger Tier 3 trailing stop"),
+    ("trailing_require_negative_velocity", "option_seller", "trailing_require_negative_velocity", "Require negative underlying velocity (v < 0) on Tier 3 trailing stop"),
+    ("stop_loss_enabled", "option_seller", "stop_loss_enabled", "Enable/disable Tier 4 stop-loss guard"),
+    ("stop_loss_pct", "option_seller", "stop_loss_pct", "Tier 4b soft stop-loss breach threshold %"),
+    ("stop_loss_consecutive_minutes", "option_seller", "stop_loss_consecutive_minutes", "Contiguous minutes below -stop_loss_pct before Tier 4b fires"),
+    ("stop_loss_require_kinematics", "option_seller", "stop_loss_require_kinematics", "Require downward underlying kinematics on Tier 4b soft stop"),
+    ("stop_loss_hard_pct", "option_seller", "stop_loss_hard_pct", "Tier 4a immediate hard stop-loss floor %"),
+    ("min_hold_minutes", "option_seller", "min_hold_minutes", "Minimum holding grace period (minutes) for Tiers 2 & 4"),
+)
+
+_ANALYZE_DAY_SMOOTH_METHODS = ("hma", "ema", "none")
+_ANALYZE_DAY_SMOOTH_PERIODS = (5, 7, 9, 10, 12, 14, 18, 21)
+
+
+def _precompute_trade_smoothed_velocities(
+    trade_ctx: dict,
+    kin_index: dict,
+    smooth_periods,
+    baseline_smooth_cfg=None,
+):
+    """Precompute strictly causal underlying smoothed velocity arrays for candidate
+    [kinematics] (smooth_method, smooth_period) pairs using minute-summary closes + trade stock prices."""
+    pts = trade_ctx.get("points") or []
+    sym_u = str(trade_ctx.get("underlying") or "").strip().upper()
+    buy_dt = _opt_parse_utc(trade_ctx.get("buy_utc"))
+    sell_dt = _opt_parse_utc(trade_ctx.get("sell_utc"))
+    if not pts or buy_dt is None or sell_dt is None:
+        trade_ctx["smoothed_v_by_cfg"] = {}
+        trade_ctx["has_smooth_series"] = False
+        return
+
+    win_lo = minute_utc(as_utc(buy_dt)) - timedelta(minutes=120)
+    win_hi = minute_utc(as_utc(sell_dt)) + timedelta(minutes=1)
+
+    close_by_min = {}
+    if sym_u and isinstance(kin_index, dict):
+        for (min_iso, k_sym), entry in kin_index.items():
+            if k_sym != sym_u or not isinstance(entry, dict):
+                continue
+            c_val = _opt_safe_float(entry.get("close"), None)
+            if c_val is None or c_val <= 0:
+                continue
+            m_dt = _opt_parse_utc(min_iso)
+            if m_dt is not None and win_lo <= m_dt <= win_hi:
+                close_by_min[min_iso] = c_val
+
+    pt_min_isos = []
+    for p in pts:
+        p_dt = _opt_parse_utc(p.get("timestamp_utc"))
+        if p_dt is not None:
+            m_iso = minute_utc(as_utc(p_dt)).isoformat()
+            pt_min_isos.append(m_iso)
+            if m_iso not in close_by_min:
+                sp_val = _opt_safe_float(p.get("stock_price"), None)
+                if sp_val is not None and sp_val > 0:
+                    close_by_min[m_iso] = sp_val
+        else:
+            pt_min_isos.append(None)
+
+    if len(close_by_min) < 3:
+        trade_ctx["smoothed_v_by_cfg"] = {}
+        trade_ctx["has_smooth_series"] = False
+        return
+
+    sorted_mins = sorted(close_by_min.keys())
+    min_to_idx = {m_iso: i for i, m_iso in enumerate(sorted_mins)}
+    closes = [close_by_min[m_iso] for m_iso in sorted_mins]
+
+    cfgs = [("none", 0)]
+    for m_name in ("hma", "ema"):
+        for p_len in smooth_periods:
+            cfgs.append((m_name, int(p_len)))
+
+    v_map = {}
+    for m_name, p_len in cfgs:
+        sm_vals = compute_smoothed_series(closes, period=(p_len if p_len >= 2 else 2), method=m_name)
+        arr = []
+        for p, m_iso in zip(pts, pt_min_isos):
+            idx_k = min_to_idx.get(m_iso) if m_iso is not None else None
+            if idx_k is not None and idx_k >= 1 and idx_k < len(sm_vals):
+                arr.append(round(sm_vals[idx_k] - sm_vals[idx_k - 1], 4))
+            else:
+                arr.append(p.get("v"))
+        v_map[(m_name, p_len)] = arr
+
+    trade_ctx["smoothed_v_by_cfg"] = v_map
+    trade_ctx["baseline_smooth_cfg"] = baseline_smooth_cfg
+    trade_ctx["has_smooth_series"] = True
+
+
+def _simulate_trade_with_parms(trade_ctx: dict, params: dict):
+    """Simulate a single closed trade timeline through [general] entry gates (NASDAQ, 30D RSI),
+    [option_buyer] spread gate, [kinematics] smoothing velocity, and [option_seller] 4-tier exit waterfall."""
+    actual_pnl_d = float(trade_ctx["actual_pnl_dollars"])
+    actual_pnl_p = float(trade_ctx["actual_pnl_pct"])
+    actual_exit_px = float(trade_ctx["actual_exit_price"])
+
+    # Entry Gate 1: [general] nasdaq_must_be_positive
+    if bool(params.get("nasdaq_must_be_positive", False)):
+        if trade_ctx.get("entry_nasdaq_is_positive") is False:
+            return {
+                "pnl_dollars": 0.0,
+                "pnl_pct": 0.0,
+                "exit_price": None,
+                "trigger": "filtered_nasdaq",
+                "exit_utc": None,
+                "exit_minutes": 0.0,
+                "skipped": True,
+            }
+
+    # Entry Gate 2: [general] rsi_30d_enabled & rsi_30d_min (live gate requires strictly > rsi_30d_min)
+    if bool(params.get("rsi_30d_enabled", False)):
+        entry_r30 = trade_ctx.get("entry_rsi_30d")
+        r30_min = float(params.get("rsi_30d_min") or 0.0)
+        if entry_r30 is not None and float(entry_r30) <= r30_min:
+            return {
+                "pnl_dollars": 0.0,
+                "pnl_pct": 0.0,
+                "exit_price": None,
+                "trigger": "filtered_rsi_30d",
+                "exit_utc": None,
+                "exit_minutes": 0.0,
+                "skipped": True,
+            }
+
+    # Entry Gate 3: [option_buyer] max_spread_pct
+    entry_spread = trade_ctx.get("entry_spread_pct")
+    max_spr = float(params.get("buy_max_spread_pct") or 0.0)
+    if max_spr > 0 and entry_spread is not None and entry_spread > max_spr:
+        return {
+            "pnl_dollars": 0.0,
+            "pnl_pct": 0.0,
+            "exit_price": None,
+            "trigger": "filtered_spread",
+            "exit_utc": None,
+            "exit_minutes": 0.0,
+            "skipped": True,
+        }
+
+    # Kinematics velocity override when [kinematics] smooth_method / smooth_period differs from baseline
+    sm_method = str(params.get("smooth_method") or KINEMATICS_SMOOTH_METHOD).strip().lower()
+    if sm_method not in {"hma", "ema", "none"}:
+        sm_method = "hma"
+    sm_period = max(2, int(params.get("smooth_period") or KINEMATICS_SMOOTH_PERIOD))
+    sm_key = ("none", 0) if sm_method == "none" else (sm_method, sm_period)
+    base_sm_cfg = trade_ctx.get("baseline_smooth_cfg")
+    v_override_arr = None
+    if trade_ctx.get("has_smooth_series"):
+        v_map = trade_ctx.get("smoothed_v_by_cfg") or {}
+        if base_sm_cfg is None or sm_key != base_sm_cfg:
+            v_override_arr = v_map.get(sm_key)
+
+    pt_on = bool(params.get("profit_target_enabled", True))
+    pt_pct = float(params.get("profit_target_pct") or 0.0)
+    rsi_hi = float(params.get("rsi_high") or 65.0)
+    tp_req_prof = bool(params.get("take_profit_require_profit", True))
+    tp_min_pnl = float(params.get("take_profit_min_pnl_pct") or 0.0)
+    ts_on = bool(params.get("trailing_stop_enabled", True))
+    ts_act = float(params.get("trailing_activation_pct") or 10.0)
+    ts_dd = float(params.get("trailing_drawdown_pct") or 5.0)
+    ts_vel = bool(params.get("trailing_require_negative_velocity", True))
+    sl_on = bool(params.get("stop_loss_enabled", True))
+    sl_pct = float(params.get("stop_loss_pct") or 0.0)
+    sl_mins = max(1, int(params.get("stop_loss_consecutive_minutes") or 1))
+    sl_kin = bool(params.get("stop_loss_require_kinematics", True))
+    sl_hard = float(params.get("stop_loss_hard_pct") or 0.0)
+    min_hold = max(0, int(params.get("min_hold_minutes") or 0))
+
+    peak_pnl = None
+    loss_streak = 0
+    for idx_p, p in enumerate(trade_ctx["points"]):
+        pnl_p = p["pnl_pct"]
+        hold_m = p["minutes_after_buy"] if p.get("minutes_after_buy") is not None else 0.0
+        v_val = v_override_arr[idx_p] if (v_override_arr is not None and idx_p < len(v_override_arr)) else p.get("v")
+        rsi_val = p.get("rsi")
+
+        if peak_pnl is None or pnl_p > peak_pnl:
+            peak_pnl = pnl_p
+
+        if sl_on and sl_pct > 0 and pnl_p < -sl_pct:
+            loss_streak += 1
+        else:
+            loss_streak = 0
+
+        trig = None
+        # Tier 1: Fixed Profit Target
+        if pt_on and pt_pct > 0 and pnl_p >= pt_pct:
+            trig = "profit_target"
+        # Tier 2: Overbought RSI Take-Profit
+        elif (
+            hold_m >= min_hold
+            and rsi_val is not None
+            and rsi_val >= rsi_hi
+            and (v_val is None or v_val < 0)
+            and (
+                not tp_req_prof
+                or (pnl_p >= tp_min_pnl if tp_min_pnl > 0 else pnl_p > 0.0)
+            )
+        ):
+            trig = "take_profit"
+        # Tier 3: Trailing Stop
+        elif ts_on and peak_pnl is not None and peak_pnl >= ts_act:
+            pf = 1.0 + (peak_pnl / 100.0)
+            cf = 1.0 + (pnl_p / 100.0)
+            dd = ((pf - cf) / pf) * 100.0 if (pf > 0 and cf < pf) else 0.0
+            if dd > ts_dd and (not ts_vel or (v_val is not None and v_val < 0)):
+                trig = "trailing_stop"
+        # Tier 4a: Hard Emergency Stop-Loss
+        if (
+            trig is None
+            and sl_on
+            and sl_hard > 0
+            and hold_m >= min_hold
+            and pnl_p < -sl_hard
+        ):
+            trig = "hard_stop_loss"
+        # Tier 4b: Soft Consecutive Stop-Loss
+        elif (
+            trig is None
+            and sl_on
+            and sl_pct > 0
+            and loss_streak >= sl_mins
+            and hold_m >= min_hold
+            and (not sl_kin or v_val is None or v_val < 0)
+        ):
+            trig = "stop_loss"
+
+        if trig is not None:
+            return {
+                "pnl_dollars": float(p["pnl_dollars"]),
+                "pnl_pct": float(pnl_p),
+                "exit_price": float(p["price"]),
+                "trigger": trig,
+                "exit_utc": p.get("timestamp_utc"),
+                "exit_minutes": float(hold_m),
+                "skipped": False,
+            }
+
+    return {
+        "pnl_dollars": actual_pnl_d,
+        "pnl_pct": actual_pnl_p,
+        "exit_price": actual_exit_px,
+        "trigger": "actual_close",
+        "exit_utc": trade_ctx.get("sell_utc"),
+        "exit_minutes": float(trade_ctx.get("hold_minutes") or 0.0),
+        "skipped": False,
+    }
+
+
+def _eval_day_parms_portfolio(trade_contexts: list, params: dict, original_params: dict):
+    """Return (total_pnl_dollars, wins, -changed_count) score tuple + per-trade simulation results."""
+    total_d = 0.0
+    wins = 0
+    results = []
+    for ctx in trade_contexts:
+        sim = _simulate_trade_with_parms(ctx, params)
+        total_d += sim["pnl_dollars"]
+        if (not sim["skipped"]) and sim["pnl_dollars"] > 0:
+            wins += 1
+        results.append(sim)
+    changed_cnt = sum(1 for k, v in original_params.items() if params.get(k) != v)
+    return (round(total_d, 2), wins, -changed_cnt), results
+
+
+def _synthesize_optimal_day_parms(
+    trade_contexts: list,
+    original_params: dict,
+    actual_total_pnl: Optional[float] = None,
+):
+    """Find a single minimal-diff lib/parms.ini parameter set strictly beating Actual Combined P/L
+    across all trades in scope, evaluating [general], [kinematics], [option_buyer], and [option_seller].
+
+    Returns (best_params, best_results, improved_over_actual).
+    Never recommends parameter changes unless synthesized combined P/L strictly exceeds Actual Combined P/L.
+    """
+    if not trade_contexts:
+        return dict(original_params), [], False
+
+    if actual_total_pnl is None:
+        actual_total_pnl = round(sum(float(c.get("actual_pnl_dollars") or 0.0) for c in trade_contexts), 2)
+    else:
+        actual_total_pnl = round(float(actual_total_pnl), 2)
+
+    has_any_spread = any(ctx.get("entry_spread_pct") is not None for ctx in trade_contexts)
+    has_any_nasdaq = any(ctx.get("entry_nasdaq_is_positive") is not None for ctx in trade_contexts)
+    has_any_rsi30d = any(ctx.get("entry_rsi_30d") is not None for ctx in trade_contexts)
+    has_any_smooth = any(ctx.get("has_smooth_series") for ctx in trade_contexts)
+
+    observed_peaks = sorted(
+        {
+            round(float(ctx["best_peak_pnl_pct"]), 1)
+            for ctx in trade_contexts
+            if ctx.get("best_peak_pnl_pct") is not None and float(ctx["best_peak_pnl_pct"]) >= 3.0
+        }
+    )
+    observed_loser_r30 = sorted(
+        {
+            float(math.floor(float(ctx["entry_rsi_30d"])))
+            for ctx in trade_contexts
+            if ctx.get("entry_rsi_30d") is not None
+            and float(ctx.get("actual_pnl_dollars") or 0.0) < 0
+            and 15.0 <= float(ctx["entry_rsi_30d"]) <= 75.0
+        }
+    )
+
+    def _uniq_nums(base_vals, cur_val, extra=None, is_int=False):
+        vals = list(base_vals) + [cur_val] + list(extra or [])
+        cleaned = []
+        for v in vals:
+            try:
+                nv = int(round(float(v))) if is_int else round(float(v), 2)
+            except (TypeError, ValueError):
+                continue
+            if nv not in cleaned:
+                cleaned.append(nv)
+        return sorted(cleaned)
+
+    peak_floors = [float(math.floor(p)) for p in observed_peaks if 3.0 <= p <= 80.0]
+    peak_minus_one = [float(max(1, math.floor(p) - 1)) for p in observed_peaks if 3.0 <= p <= 80.0]
+
+    pt_grid = _uniq_nums(
+        [5.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0],
+        original_params["profit_target_pct"],
+        extra=peak_floors,
+    )
+    ts_act_grid = _uniq_nums(
+        [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 15.0, 18.0, 20.0, 25.0],
+        original_params["trailing_activation_pct"],
+        extra=peak_floors + peak_minus_one,
+    )
+    ts_dd_grid = _uniq_nums(
+        [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
+        original_params["trailing_drawdown_pct"],
+    )
+    sl_pct_grid = _uniq_nums(
+        [5.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0],
+        original_params["stop_loss_pct"],
+    )
+    sl_mins_grid = _uniq_nums(
+        [1, 2, 3, 5, 8],
+        original_params["stop_loss_consecutive_minutes"],
+        is_int=True,
+    )
+    sl_hard_grid = _uniq_nums(
+        [10.0, 15.0, 20.0, 25.0, 30.0, 40.0],
+        original_params["stop_loss_hard_pct"],
+    )
+    min_hold_grid = _uniq_nums(
+        [0, 1, 2, 3, 5, 10],
+        original_params["min_hold_minutes"],
+        is_int=True,
+    )
+    rsi_high_grid = _uniq_nums(
+        [55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0],
+        original_params["rsi_high"],
+    )
+    tp_min_grid = _uniq_nums(
+        [0.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 30.0],
+        original_params["take_profit_min_pnl_pct"],
+    )
+    spread_grid = (
+        _uniq_nums(
+            [2.0, 3.0, 4.0, 5.0, 8.0, 10.0, 15.0],
+            original_params["buy_max_spread_pct"],
+        )
+        if has_any_spread
+        else [original_params["buy_max_spread_pct"]]
+    )
+    rsi_30d_min_grid = (
+        _uniq_nums(
+            [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0],
+            original_params["rsi_30d_min"],
+            extra=observed_loser_r30,
+        )
+        if has_any_rsi30d
+        else [original_params["rsi_30d_min"]]
+    )
+    smooth_period_grid = _uniq_nums(
+        list(_ANALYZE_DAY_SMOOTH_PERIODS),
+        original_params["smooth_period"],
+        is_int=True,
+    )
+
+    base_score, _ = _eval_day_parms_portfolio(trade_contexts, original_params, original_params)
+
+    # Stage 1: Joint coarse grid across Profit Target + Trailing Stop + Pure Trailing (PT off & relaxed RSI)
+    coarse_pt = _uniq_nums([8.0, 12.0, 15.0, 20.0, 25.0, 35.0, 50.0], original_params["profit_target_pct"], extra=peak_floors[:4])
+    coarse_act = _uniq_nums([3.0, 5.0, 8.0, 10.0, 12.0, 15.0, 20.0], original_params["trailing_activation_pct"], extra=peak_minus_one[:4])
+    coarse_dd = _uniq_nums([1.0, 2.0, 3.0, 5.0, 8.0], original_params["trailing_drawdown_pct"])
+
+    top_seeds = [(base_score, dict(original_params))]
+
+    def _push_seed(sc_val, cand_dict):
+        if sc_val > top_seeds[-1][0] or len(top_seeds) < 10:
+            top_seeds.append((sc_val, cand_dict))
+            top_seeds.sort(key=lambda x: x[0], reverse=True)
+            del top_seeds[10:]
+
+    # 1a) Joint Profit Target + Trailing Stop seeds
+    for pt_v in coarse_pt:
+        for act_v in coarse_act:
+            for dd_v in coarse_dd:
+                if dd_v >= act_v and act_v > 0:
+                    continue
+                for req_v in (original_params["trailing_require_negative_velocity"], not original_params["trailing_require_negative_velocity"]):
+                    cand = dict(original_params)
+                    cand["profit_target_enabled"] = True
+                    cand["profit_target_pct"] = pt_v
+                    cand["trailing_stop_enabled"] = True
+                    cand["trailing_activation_pct"] = act_v
+                    cand["trailing_drawdown_pct"] = dd_v
+                    cand["trailing_require_negative_velocity"] = req_v
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    _push_seed(sc, cand)
+
+    # 1b) Pure Trailing Stop seeds (profit_target_enabled = False, relaxed RSI so winners can run)
+    for act_v in ts_act_grid:
+        for dd_v in coarse_dd:
+            if dd_v >= act_v and act_v > 0:
+                continue
+            for req_v in (False, True):
+                for rsi_v in (original_params["rsi_high"], 90.0):
+                    cand = dict(original_params)
+                    cand["profit_target_enabled"] = False
+                    cand["trailing_stop_enabled"] = True
+                    cand["trailing_activation_pct"] = act_v
+                    cand["trailing_drawdown_pct"] = dd_v
+                    cand["trailing_require_negative_velocity"] = req_v
+                    cand["rsi_high"] = rsi_v
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    _push_seed(sc, cand)
+
+    # 1c) Seed entry-gate & smoothing variations off the baseline so pure entry/kinematics wins are never missed
+    if has_any_nasdaq:
+        for nq_v in (True, False):
+            if nq_v == original_params["nasdaq_must_be_positive"]:
+                continue
+            cand = dict(original_params)
+            cand["nasdaq_must_be_positive"] = nq_v
+            sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+            _push_seed(sc, cand)
+    if has_any_rsi30d:
+        for r30_v in rsi_30d_min_grid:
+            cand = dict(original_params)
+            cand["rsi_30d_enabled"] = True
+            cand["rsi_30d_min"] = r30_v
+            sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+            _push_seed(sc, cand)
+    if has_any_smooth:
+        for m_name in _ANALYZE_DAY_SMOOTH_METHODS:
+            periods_to_try = [original_params["smooth_period"]] if m_name == "none" else smooth_period_grid
+            for p_len in periods_to_try:
+                cand = dict(original_params)
+                cand["smooth_method"] = m_name
+                cand["smooth_period"] = p_len
+                sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                _push_seed(sc, cand)
+
+    # Stage 2: Multi-start coordinate ascent over all tunable parameters (2 passes per seed)
+    single_grids = [
+        ("profit_target_pct", pt_grid),
+        ("profit_target_enabled", [True, False]),
+        ("trailing_stop_enabled", [True, False]),
+        ("trailing_require_negative_velocity", [True, False]),
+        ("stop_loss_enabled", [True, False]),
+        ("stop_loss_hard_pct", sl_hard_grid),
+        ("stop_loss_require_kinematics", [True, False]),
+        ("min_hold_minutes", min_hold_grid),
+        ("rsi_high", rsi_high_grid),
+        ("take_profit_require_profit", [True, False]),
+        ("take_profit_min_pnl_pct", tp_min_grid),
+    ]
+    if has_any_spread:
+        single_grids.append(("buy_max_spread_pct", spread_grid))
+    if has_any_nasdaq:
+        single_grids.append(("nasdaq_must_be_positive", [False, True]))
+
+    best_score = base_score
+    best_params = dict(original_params)
+
+    for _, seed in top_seeds:
+        cur = dict(seed)
+        cur_sc, _ = _eval_day_parms_portfolio(trade_contexts, cur, original_params)
+        for _ in range(2):
+            improved = False
+            # Coupled block A: trailing (activation, drawdown)
+            best_ts_sc, best_ts_pair = cur_sc, (cur["trailing_activation_pct"], cur["trailing_drawdown_pct"])
+            for act_v in ts_act_grid:
+                for dd_v in ts_dd_grid:
+                    cand = dict(cur)
+                    cand["trailing_activation_pct"] = act_v
+                    cand["trailing_drawdown_pct"] = dd_v
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    if sc > best_ts_sc:
+                        best_ts_sc = sc
+                        best_ts_pair = (act_v, dd_v)
+            if best_ts_sc > cur_sc:
+                cur["trailing_activation_pct"], cur["trailing_drawdown_pct"] = best_ts_pair
+                cur_sc = best_ts_sc
+                improved = True
+
+            # Coupled block B: soft stop-loss (pct, consecutive_minutes)
+            best_sl_sc, best_sl_pair = cur_sc, (cur["stop_loss_pct"], cur["stop_loss_consecutive_minutes"])
+            for sl_v in sl_pct_grid:
+                for sl_m in sl_mins_grid:
+                    cand = dict(cur)
+                    cand["stop_loss_pct"] = sl_v
+                    cand["stop_loss_consecutive_minutes"] = sl_m
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    if sc > best_sl_sc:
+                        best_sl_sc = sc
+                        best_sl_pair = (sl_v, sl_m)
+            if best_sl_sc > cur_sc:
+                cur["stop_loss_pct"], cur["stop_loss_consecutive_minutes"] = best_sl_pair
+                cur_sc = best_sl_sc
+                improved = True
+
+            # Coupled block C: [general] 30D RSI entry gate (rsi_30d_enabled, rsi_30d_min)
+            if has_any_rsi30d:
+                best_r30_sc, best_r30_pair = cur_sc, (cur["rsi_30d_enabled"], cur["rsi_30d_min"])
+                r30_cands = [(False, original_params["rsi_30d_min"])] + [(True, r_v) for r_v in rsi_30d_min_grid]
+                for r_en, r_min in r30_cands:
+                    cand = dict(cur)
+                    cand["rsi_30d_enabled"] = r_en
+                    cand["rsi_30d_min"] = r_min
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    if sc > best_r30_sc:
+                        best_r30_sc = sc
+                        best_r30_pair = (r_en, r_min)
+                if best_r30_sc > cur_sc:
+                    cur["rsi_30d_enabled"], cur["rsi_30d_min"] = best_r30_pair
+                    cur_sc = best_r30_sc
+                    improved = True
+
+            # Coupled block D: [kinematics] smoothing (smooth_method, smooth_period)
+            if has_any_smooth:
+                best_sm_sc, best_sm_pair = cur_sc, (cur["smooth_method"], cur["smooth_period"])
+                sm_cands = [("none", original_params["smooth_period"])]
+                for m_name in ("hma", "ema"):
+                    for p_len in smooth_period_grid:
+                        sm_cands.append((m_name, p_len))
+                for m_name, p_len in sm_cands:
+                    cand = dict(cur)
+                    cand["smooth_method"] = m_name
+                    cand["smooth_period"] = p_len
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    if sc > best_sm_sc:
+                        best_sm_sc = sc
+                        best_sm_pair = (m_name, p_len)
+                if best_sm_sc > cur_sc:
+                    cur["smooth_method"], cur["smooth_period"] = best_sm_pair
+                    cur_sc = best_sm_sc
+                    improved = True
+
+            # Single-parameter refinements
+            for key, grid in single_grids:
+                best_k_sc = cur_sc
+                best_k_val = cur[key]
+                for val in grid:
+                    if val == cur[key]:
+                        continue
+                    cand = dict(cur)
+                    cand[key] = val
+                    sc, _ = _eval_day_parms_portfolio(trade_contexts, cand, original_params)
+                    if sc > best_k_sc:
+                        best_k_sc = sc
+                        best_k_val = val
+                if best_k_sc > cur_sc:
+                    cur[key] = best_k_val
+                    cur_sc = best_k_sc
+                    improved = True
+            if not improved:
+                break
+
+        if cur_sc > best_score:
+            best_score = cur_sc
+            best_params = dict(cur)
+
+    # Stage 3: Strict improvement floor & parsimony pruning
+    # NEVER recommend parameter changes unless synthesized combined P/L strictly beats BOTH
+    # Actual Combined P/L AND the baseline replay P/L.
+    min_required_pnl = max(actual_total_pnl, float(base_score[0]))
+    if float(best_score[0]) <= min_required_pnl + 0.01:
+        actual_passthrough = [
+            {
+                "pnl_dollars": float(ctx["actual_pnl_dollars"]),
+                "pnl_pct": float(ctx["actual_pnl_pct"]),
+                "exit_price": float(ctx["actual_exit_price"]),
+                "trigger": "actual_close",
+                "exit_utc": ctx.get("sell_utc"),
+                "exit_minutes": float(ctx.get("hold_minutes") or 0.0),
+                "skipped": False,
+            }
+            for ctx in trade_contexts
+        ]
+        return dict(original_params), actual_passthrough, False
+
+    # Normalize inactive sub-parameters before pruning so dead child knobs are never recommended
+    if not best_params.get("rsi_30d_enabled"):
+        best_params["rsi_30d_min"] = original_params["rsi_30d_min"]
+    if best_params.get("smooth_method") == "none":
+        best_params["smooth_period"] = original_params["smooth_period"]
+    if not best_params.get("profit_target_enabled"):
+        best_params["profit_target_pct"] = original_params["profit_target_pct"]
+    if not best_params.get("trailing_stop_enabled"):
+        best_params["trailing_activation_pct"] = original_params["trailing_activation_pct"]
+        best_params["trailing_drawdown_pct"] = original_params["trailing_drawdown_pct"]
+        best_params["trailing_require_negative_velocity"] = original_params["trailing_require_negative_velocity"]
+    if not best_params.get("stop_loss_enabled"):
+        best_params["stop_loss_pct"] = original_params["stop_loss_pct"]
+        best_params["stop_loss_consecutive_minutes"] = original_params["stop_loss_consecutive_minutes"]
+        best_params["stop_loss_require_kinematics"] = original_params["stop_loss_require_kinematics"]
+        best_params["stop_loss_hard_pct"] = original_params["stop_loss_hard_pct"]
+
+    changed_pruned = True
+    while changed_pruned:
+        changed_pruned = False
+        cur_total = _eval_day_parms_portfolio(trade_contexts, best_params, original_params)[0][0]
+        for key, orig_val in original_params.items():
+            if best_params.get(key) == orig_val:
+                continue
+            trial = dict(best_params)
+            trial[key] = orig_val
+            trial_total = _eval_day_parms_portfolio(trade_contexts, trial, original_params)[0][0]
+            if trial_total >= cur_total - 0.01:
+                best_params[key] = orig_val
+                changed_pruned = True
+
+    final_score, best_results = _eval_day_parms_portfolio(trade_contexts, best_params, original_params)
+    if float(final_score[0]) <= min_required_pnl + 0.01:
+        actual_passthrough = [
+            {
+                "pnl_dollars": float(ctx["actual_pnl_dollars"]),
+                "pnl_pct": float(ctx["actual_pnl_pct"]),
+                "exit_price": float(ctx["actual_exit_price"]),
+                "trigger": "actual_close",
+                "exit_utc": ctx.get("sell_utc"),
+                "exit_minutes": float(ctx.get("hold_minutes") or 0.0),
+                "skipped": False,
+            }
+            for ctx in trade_contexts
+        ]
+        return dict(original_params), actual_passthrough, False
+
+    return best_params, best_results, True
+
+
+def analyze_day_trades(
+    coordinator=None,
+    date_str: str = "",
+    from_date_str: str = "",
+    to_date_str: str = "",
+    list_dates_only: bool = False,
+):
+    """Analyze all closed trades fully executed (opened & closed) within a trading date
+    or date range [from_date, to_date] in US/Eastern using Find Best logic, and synthesize
+    a minimal changed lib/parms.ini parameter set maximizing combined profit."""
+    oh = getattr(coordinator, "option_history", None) if coordinator is not None else None
+    if oh is None:
+        raise ValueError("OptionContractHistoryTracker is unavailable.")
+
+    with oh._lock:
+        closed_pool = [dict(c) for c in (oh.closed_contracts or []) if isinstance(c, dict)]
+
+    today_market = datetime.now(MARKET_TZ).date().isoformat()
+
+    # Collect all non-dry-run closed trades with US/Eastern open & close calendar dates
+    closed_with_days = []
+    by_same_day = {}
+    min_buy_day = None
+    max_sell_day = None
+    for c in closed_pool:
+        if c.get("dry_run"):
+            continue
+        b_dt = _opt_parse_utc(c.get("purchased_at_utc"))
+        s_dt = _opt_parse_utc(c.get("sold_at_utc"))
+        if b_dt is None or s_dt is None:
+            continue
+        b_day = b_dt.astimezone(MARKET_TZ).date()
+        s_day = s_dt.astimezone(MARKET_TZ).date()
+        closed_with_days.append((c, b_day, s_day))
+        if min_buy_day is None or b_day < min_buy_day:
+            min_buy_day = b_day
+        if max_sell_day is None or s_day > max_sell_day:
+            max_sell_day = s_day
+        if b_day == s_day:
+            by_same_day.setdefault(b_day.isoformat(), []).append(c)
+
+    available_dates = []
+    for dk in sorted(by_same_day.keys(), reverse=True):
+        day_trades = by_same_day[dk]
+        tot_pnl = 0.0
+        for rec in day_trades:
+            ep = _opt_safe_float(rec.get("entry_price"), 0.0) or 0.0
+            xp = _opt_safe_float(rec.get("exit_price"), 0.0) or 0.0
+            q = max(1, int(_opt_safe_float(rec.get("qty"), 1.0) or 1))
+            pnl_d = _opt_safe_float(rec.get("total_pnl_dollars"), None)
+            if pnl_d is None and ep > 0 and xp > 0:
+                pnl_d = (xp - ep) * q * 100.0
+            tot_pnl += float(pnl_d or 0.0)
+        available_dates.append({
+            "date": dk,
+            "trade_count": len(day_trades),
+            "actual_pnl_dollars": round(tot_pnl, 2),
+        })
+
+    overall_date_bounds = {
+        "min_date": min_buy_day.isoformat() if min_buy_day is not None else None,
+        "max_date": max_sell_day.isoformat() if max_sell_day is not None else None,
+        "total_closed_trades": len(closed_with_days),
+    }
+
+    if list_dates_only:
+        return {
+            "date": today_market,
+            "from_date": today_market,
+            "to_date": today_market,
+            "is_range": False,
+            "today_market_date": today_market,
+            "market_tz": "US/Eastern",
+            "available_dates": available_dates,
+            "overall_date_bounds": overall_date_bounds,
+            "trade_count": 0,
+            "parms_snapshot_coverage": {"recorded_count": 0, "total_count": 0, "status": "none_recorded", "snapshot_ids": []},
+            "summary": {},
+            "daily_breakdown": [],
+            "changed_parms": [],
+            "changed_ini_snippet": "",
+            "trades": [],
+        }
+
+    # Resolve From / To date range (backward-compatible with single date_str; defaults to today)
+    raw_from = str(from_date_str or "").strip()
+    raw_to = str(to_date_str or "").strip()
+    raw_single = str(date_str or "").strip()
+    if raw_from or raw_to:
+        start_str = raw_from or raw_to
+        end_str = raw_to or raw_from
+    elif raw_single:
+        start_str = raw_single
+        end_str = raw_single
+    else:
+        start_str = today_market
+        end_str = today_market
+
+    try:
+        start_d = datetime.strptime(start_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"Invalid from_date {start_str!r}; expected YYYY-MM-DD (no time).")
+    try:
+        end_d = datetime.strptime(end_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"Invalid to_date {end_str!r}; expected YYYY-MM-DD (no time).")
+
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+
+    from_iso = start_d.isoformat()
+    to_iso = end_d.isoformat()
+    is_range = start_d != end_d
+    scope_date_label = from_iso if not is_range else f"{from_iso} to {to_iso}"
+
+    live_snapshot = _capture_active_trade_parms_snapshot()
+    live_base_params = {
+        pkey: live_snapshot[pkey]
+        for pkey, _, _, _ in _ANALYZE_DAY_PARM_META
+    }
+
+    # Include every closed trade whose open (buy) and close (sell) both lie within [start_d, end_d]
+    range_entries = [
+        (rec, b_day, s_day)
+        for rec, b_day, s_day in closed_with_days
+        if (b_day >= start_d and s_day <= end_d)
+    ]
+    range_entries.sort(key=lambda item: str(item[0].get("purchased_at_utc") or ""))
+
+    if not range_entries:
+        return {
+            "date": scope_date_label,
+            "from_date": from_iso,
+            "to_date": to_iso,
+            "is_range": is_range,
+            "today_market_date": today_market,
+            "market_tz": "US/Eastern",
+            "available_dates": available_dates,
+            "overall_date_bounds": overall_date_bounds,
+            "trade_count": 0,
+            "parms_snapshot_coverage": {"recorded_count": 0, "total_count": 0, "status": "none_recorded", "snapshot_ids": []},
+            "summary": {
+                "total_cost_basis": 0.0,
+                "actual_pnl_dollars": 0.0,
+                "actual_pnl_pct": 0.0,
+                "actual_wins": 0,
+                "actual_losses": 0,
+                "actual_win_rate_pct": 0.0,
+                "simulated_pnl_dollars": 0.0,
+                "simulated_pnl_pct": 0.0,
+                "simulated_wins": 0,
+                "simulated_losses": 0,
+                "simulated_win_rate_pct": 0.0,
+                "baseline_original_parms_pnl_dollars": 0.0,
+                "pnl_improvement_dollars": 0.0,
+                "pnl_improvement_pct_points": 0.0,
+                "theoretical_peak_pnl_dollars": 0.0,
+                "trading_days_count": 0,
+                "multiday_trade_count": 0,
+                "no_improvement_over_actual": False,
+            },
+            "daily_breakdown": [],
+            "changed_parms": [],
+            "changed_ini_snippet": "",
+            "trades": [],
+        }
+
+    kin_index = _load_minute_summary_kinematics_index()
+    trade_contexts = []
+    recorded_snaps = []
+    for rec, b_day, s_day in range_entries:
+        try:
+            fb = analyze_findbest_contract(
+                coordinator=coordinator,
+                trade_id=str(rec.get("trade_id") or "").strip(),
+                contract=str(rec.get("contract") or "").strip().upper(),
+                underlying=str(rec.get("underlying") or "").strip().upper(),
+                buy_utc=str(rec.get("purchased_at_utc") or "").strip(),
+                sell_utc=str(rec.get("sold_at_utc") or "").strip(),
+                entry_price=rec.get("entry_price"),
+                exit_price=rec.get("exit_price"),
+                qty=rec.get("qty"),
+                is_open=False,
+                kin_index=kin_index,
+            )
+        except Exception as exc:
+            logging.warning(
+                "ANALYZE_DAY_TRADE_SKIP contract=%s detail=%s",
+                rec.get("contract"),
+                exc,
+            )
+            continue
+
+        tr = fb["trade"]
+        comb = (fb.get("views") or {}).get("combined") or {}
+        pts = list(comb.get("points") or [])
+        best_pt = comb.get("best_point")
+        ep = float(tr["entry_price"])
+        xp = float(tr["exit_price"]) if tr.get("exit_price") is not None else ep
+        q = int(tr.get("qty") or 1)
+        cost_basis = round(ep * q * 100.0, 2)
+        act_pnl_d = (
+            float(tr["actual_pnl_dollars"])
+            if tr.get("actual_pnl_dollars") is not None
+            else round((xp - ep) * q * 100.0, 2)
+        )
+        act_pnl_p = (
+            float(tr["actual_pnl_pct"])
+            if tr.get("actual_pnl_pct") is not None
+            else (round(((xp - ep) / ep) * 100.0, 2) if ep > 0 else 0.0)
+        )
+
+        # Measure entry spread if captured within first 2 minutes
+        entry_spread = None
+        for pt in pts:
+            if pt.get("spread_pct") is not None and (pt.get("minutes_after_buy") or 0.0) <= 2.0:
+                entry_spread = float(pt["spread_pct"])
+                break
+
+        # Extract entry-time NASDAQ (QQQ) direction & underlying 30-day daily RSI from trade record or minute-summary index
+        entry_nasdaq_is_positive = None
+        entry_nasdaq_diff_pct = None
+        entry_rsi_30d = _opt_safe_float(rec.get("rsi_30d"), None)
+        rec_nq = rec.get("nasdaq_market") if isinstance(rec.get("nasdaq_market"), dict) else None
+        if isinstance(rec_nq, dict) and isinstance(rec_nq.get("is_positive"), bool):
+            entry_nasdaq_is_positive = rec_nq["is_positive"]
+            entry_nasdaq_diff_pct = _opt_safe_float(rec_nq.get("diff_pct"), None)
+        elif isinstance(rec.get("nasdaq_is_positive"), bool):
+            entry_nasdaq_is_positive = rec["nasdaq_is_positive"]
+            entry_nasdaq_diff_pct = _opt_safe_float(rec.get("nasdaq_diff_pct"), None)
+
+        buy_dt_parsed = _opt_parse_utc(tr.get("buy_utc"))
+        if buy_dt_parsed is not None and isinstance(kin_index, dict):
+            base_buy_m = minute_utc(as_utc(buy_dt_parsed))
+            und_u = str(tr.get("underlying") or "").strip().upper()
+            if entry_nasdaq_is_positive is None:
+                for off in (0, -1, 1, -2, 2):
+                    m_key = (base_buy_m + timedelta(minutes=off)).isoformat()
+                    nq_e = kin_index.get((m_key, "__NASDAQ__"))
+                    if isinstance(nq_e, dict) and isinstance(nq_e.get("is_positive"), bool):
+                        entry_nasdaq_is_positive = nq_e["is_positive"]
+                        entry_nasdaq_diff_pct = _opt_safe_float(nq_e.get("diff_pct"), None)
+                        break
+                    sym_e = kin_index.get((m_key, und_u)) if und_u else None
+                    if isinstance(sym_e, dict) and isinstance(sym_e.get("nasdaq_is_positive"), bool):
+                        entry_nasdaq_is_positive = sym_e["nasdaq_is_positive"]
+                        entry_nasdaq_diff_pct = _opt_safe_float(sym_e.get("nasdaq_diff_pct"), None)
+                        break
+            if entry_rsi_30d is None and und_u:
+                for off in (0, -1, 1, -2, 2, -3, 3, -5, 5):
+                    m_key = (base_buy_m + timedelta(minutes=off)).isoformat()
+                    sym_e = kin_index.get((m_key, und_u))
+                    if isinstance(sym_e, dict) and sym_e.get("rsi_30d") is not None:
+                        entry_rsi_30d = _opt_safe_float(sym_e.get("rsi_30d"), None)
+                        if entry_rsi_30d is not None:
+                            break
+
+        best_peak_d = (
+            float(best_pt["pnl_dollars"])
+            if (best_pt and best_pt.get("pnl_dollars") is not None)
+            else max(0.0, act_pnl_d)
+        )
+        best_peak_p = (
+            float(best_pt["pnl_pct"])
+            if (best_pt and best_pt.get("pnl_pct") is not None)
+            else max(0.0, act_pnl_p)
+        )
+        tr_parms_src = str(fb.get("parms_source") or "current_parms_fallback")
+        tr_snap_id = fb.get("parms_snapshot_id") if tr_parms_src == "recorded_at_trade" else None
+        if tr_parms_src == "recorded_at_trade" and isinstance(fb.get("current_parms"), dict):
+            recorded_snaps.append(fb["current_parms"])
+
+        trade_contexts.append({
+            "trade_id": tr.get("trade_id"),
+            "contract": tr["contract"],
+            "underlying": tr["underlying"],
+            "qty": q,
+            "buy_utc": tr["buy_utc"],
+            "sell_utc": tr["sell_utc"],
+            "buy_date": b_day.isoformat(),
+            "sell_date": s_day.isoformat(),
+            "is_multiday": b_day != s_day,
+            "hold_minutes": float(tr.get("hold_minutes") or 0.0),
+            "entry_price": ep,
+            "actual_exit_price": xp,
+            "cost_basis": cost_basis,
+            "actual_pnl_dollars": act_pnl_d,
+            "actual_pnl_pct": act_pnl_p,
+            "best_peak_pnl_dollars": round(best_peak_d, 2),
+            "best_peak_pnl_pct": round(best_peak_p, 2),
+            "entry_spread_pct": round(entry_spread, 2) if entry_spread is not None else None,
+            "entry_nasdaq_is_positive": entry_nasdaq_is_positive,
+            "entry_nasdaq_diff_pct": round(entry_nasdaq_diff_pct, 4) if entry_nasdaq_diff_pct is not None else None,
+            "entry_rsi_30d": round(entry_rsi_30d, 2) if entry_rsi_30d is not None else None,
+            "parms_source": tr_parms_src,
+            "parms_snapshot_id": tr_snap_id,
+            "points": pts,
+        })
+
+    if not trade_contexts:
+        return {
+            "date": scope_date_label,
+            "from_date": from_iso,
+            "to_date": to_iso,
+            "is_range": is_range,
+            "today_market_date": today_market,
+            "market_tz": "US/Eastern",
+            "available_dates": available_dates,
+            "overall_date_bounds": overall_date_bounds,
+            "trade_count": 0,
+            "parms_snapshot_coverage": {"recorded_count": 0, "total_count": 0, "status": "none_recorded", "snapshot_ids": []},
+            "telemetry_coverage": {"total_trades": 0, "spread_count": 0, "nasdaq_count": 0, "rsi_30d_count": 0, "smooth_series_count": 0},
+            "summary": {},
+            "daily_breakdown": [],
+            "changed_parms": [],
+            "changed_ini_snippet": "",
+            "trades": [],
+        }
+
+    # Determine reference baseline params: use recorded trade snapshot when all trades recorded one;
+    # otherwise fall back to current live lib/parms.ini and flag transparently in parms_snapshot_coverage.
+    rec_cnt = len(recorded_snaps)
+    tot_cnt = len(trade_contexts)
+    unique_snap_ids = []
+    for ctx_item in trade_contexts:
+        sid = ctx_item.get("parms_snapshot_id")
+        if sid and sid not in unique_snap_ids:
+            unique_snap_ids.append(sid)
+    if rec_cnt == tot_cnt and tot_cnt > 0:
+        cov_status = "all_recorded"
+        latest_rec_snap = recorded_snaps[-1]
+        original_params = {
+            pkey: latest_rec_snap.get(pkey, live_base_params[pkey])
+            for pkey, _, _, _ in _ANALYZE_DAY_PARM_META
+        }
+    elif rec_cnt > 0:
+        cov_status = "partial_recorded"
+        original_params = dict(live_base_params)
+    else:
+        cov_status = "none_recorded"
+        original_params = dict(live_base_params)
+
+    # Precompute causal underlying smoothed velocities across candidate [kinematics] smooth_method/smooth_period
+    orig_sm_method = str(original_params.get("smooth_method") or KINEMATICS_SMOOTH_METHOD).strip().lower()
+    if orig_sm_method not in {"hma", "ema", "none"}:
+        orig_sm_method = "hma"
+    orig_sm_period = max(2, int(original_params.get("smooth_period") or KINEMATICS_SMOOTH_PERIOD))
+    original_params["smooth_method"] = orig_sm_method
+    original_params["smooth_period"] = orig_sm_period
+    baseline_sm_cfg = ("none", 0) if orig_sm_method == "none" else (orig_sm_method, orig_sm_period)
+    smooth_periods_all = sorted(set(list(_ANALYZE_DAY_SMOOTH_PERIODS) + [orig_sm_period]))
+    for ctx_item in trade_contexts:
+        _precompute_trade_smoothed_velocities(
+            ctx_item,
+            kin_index,
+            smooth_periods=smooth_periods_all,
+            baseline_smooth_cfg=baseline_sm_cfg,
+        )
+
+    actual_total_d = round(sum(c["actual_pnl_dollars"] for c in trade_contexts), 2)
+    base_score, _ = _eval_day_parms_portfolio(trade_contexts, original_params, original_params)
+    best_params, best_sim_results, improved_over_actual = _synthesize_optimal_day_parms(
+        trade_contexts, original_params, actual_total_pnl=actual_total_d
+    )
+
+    # Build changed-only parameter list & INI snippet (guaranteed empty unless strictly > Actual P/L)
+    def _ini_fmt(val):
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        if isinstance(val, float):
+            return f"{val:g}" if val.is_integer() else f"{val:.2f}".rstrip("0").rstrip(".")
+        return str(val)
+
+    changed_parms = []
+    by_section = {}
+    if improved_over_actual:
+        for pkey, sec, ini_key, desc in _ANALYZE_DAY_PARM_META:
+            orig_v = original_params.get(pkey)
+            rec_v = best_params.get(pkey)
+            if orig_v != rec_v:
+                changed_parms.append({
+                    "section": sec,
+                    "key": ini_key,
+                    "original": orig_v,
+                    "recommended": rec_v,
+                    "reason": desc,
+                })
+                by_section.setdefault(sec, []).append((ini_key, orig_v, rec_v))
+
+    ini_lines = []
+    for sec in ("general", "kinematics", "option_buyer", "option_seller"):
+        entries = by_section.get(sec)
+        if not entries:
+            continue
+        if ini_lines:
+            ini_lines.append("")
+        ini_lines.append(f"[{sec}]")
+        for ini_key, orig_v, rec_v in entries:
+            ini_lines.append(f"{ini_key} = {_ini_fmt(rec_v)}  ; was {_ini_fmt(orig_v)}")
+    changed_ini_snippet = "\n".join(ini_lines)
+
+    total_cost = round(sum(c["cost_basis"] for c in trade_contexts), 2)
+    actual_total_p = round((actual_total_d / total_cost) * 100.0, 2) if total_cost > 0 else 0.0
+    actual_wins = sum(1 for c in trade_contexts if c["actual_pnl_dollars"] > 0)
+    actual_losses = len(trade_contexts) - actual_wins
+
+    sim_total_d = round(sum(r["pnl_dollars"] for r in best_sim_results), 2)
+    sim_active_cost = round(
+        sum(c["cost_basis"] for c, r in zip(trade_contexts, best_sim_results) if not r["skipped"]),
+        2,
+    )
+    sim_total_p = (
+        round((sim_total_d / total_cost) * 100.0, 2)
+        if total_cost > 0
+        else 0.0
+    )
+    sim_wins = sum(1 for r in best_sim_results if (not r["skipped"]) and r["pnl_dollars"] > 0)
+    sim_losses = sum(1 for r in best_sim_results if (not r["skipped"]) and r["pnl_dollars"] <= 0)
+    sim_active_cnt = sim_wins + sim_losses
+    peak_total_d = round(sum(max(0.0, c["best_peak_pnl_dollars"]) for c in trade_contexts), 2)
+
+    trades_out = []
+    daily_agg = {}
+    for ctx, sim in zip(trade_contexts, best_sim_results):
+        delta_d = round(sim["pnl_dollars"] - ctx["actual_pnl_dollars"], 2)
+        t_out = {
+            "trade_id": ctx["trade_id"],
+            "contract": ctx["contract"],
+            "underlying": ctx["underlying"],
+            "qty": ctx["qty"],
+            "buy_utc": ctx["buy_utc"],
+            "sell_utc": ctx["sell_utc"],
+            "buy_date": ctx["buy_date"],
+            "sell_date": ctx["sell_date"],
+            "is_multiday": bool(ctx["is_multiday"]),
+            "hold_minutes": round(ctx["hold_minutes"], 2),
+            "entry_price": round(ctx["entry_price"], 4),
+            "actual_exit_price": round(ctx["actual_exit_price"], 4),
+            "cost_basis": ctx["cost_basis"],
+            "actual_pnl_dollars": round(ctx["actual_pnl_dollars"], 2),
+            "actual_pnl_pct": round(ctx["actual_pnl_pct"], 2),
+            "simulated_exit_price": round(sim["exit_price"], 4) if sim["exit_price"] is not None else None,
+            "simulated_pnl_dollars": round(sim["pnl_dollars"], 2),
+            "simulated_pnl_pct": round(sim["pnl_pct"], 2),
+            "delta_dollars": delta_d,
+            "simulated_trigger": sim["trigger"],
+            "simulated_exit_utc": sim["exit_utc"],
+            "simulated_exit_minutes": round(sim["exit_minutes"], 2) if sim["exit_minutes"] is not None else None,
+            "skipped_by_spread_filter": bool(sim["skipped"] and sim["trigger"] == "filtered_spread"),
+            "skipped_by_entry_filter": bool(sim["skipped"]),
+            "best_peak_pnl_dollars": ctx["best_peak_pnl_dollars"],
+            "best_peak_pnl_pct": ctx["best_peak_pnl_pct"],
+            "entry_spread_pct": ctx["entry_spread_pct"],
+            "entry_nasdaq_is_positive": ctx["entry_nasdaq_is_positive"],
+            "entry_nasdaq_diff_pct": ctx["entry_nasdaq_diff_pct"],
+            "entry_rsi_30d": ctx["entry_rsi_30d"],
+            "parms_source": ctx["parms_source"],
+            "parms_snapshot_id": ctx.get("parms_snapshot_id"),
+            "points_count": len(ctx["points"]),
+        }
+        trades_out.append(t_out)
+
+        dkey = ctx["sell_date"]
+        bucket = daily_agg.setdefault(dkey, {
+            "date": dkey,
+            "trade_count": 0,
+            "cost_basis": 0.0,
+            "actual_pnl_dollars": 0.0,
+            "simulated_pnl_dollars": 0.0,
+            "actual_wins": 0,
+            "simulated_wins": 0,
+        })
+        bucket["trade_count"] += 1
+        bucket["cost_basis"] += float(ctx["cost_basis"] or 0.0)
+        bucket["actual_pnl_dollars"] += float(ctx["actual_pnl_dollars"] or 0.0)
+        bucket["simulated_pnl_dollars"] += float(sim["pnl_dollars"] or 0.0)
+        if ctx["actual_pnl_dollars"] > 0:
+            bucket["actual_wins"] += 1
+        if (not sim["skipped"]) and sim["pnl_dollars"] > 0:
+            bucket["simulated_wins"] += 1
+
+    daily_breakdown = []
+    for dkey in sorted(daily_agg.keys()):
+        b = daily_agg[dkey]
+        act_b = round(b["actual_pnl_dollars"], 2)
+        sim_b = round(b["simulated_pnl_dollars"], 2)
+        daily_breakdown.append({
+            "date": b["date"],
+            "trade_count": b["trade_count"],
+            "cost_basis": round(b["cost_basis"], 2),
+            "actual_pnl_dollars": act_b,
+            "simulated_pnl_dollars": sim_b,
+            "delta_dollars": round(sim_b - act_b, 2),
+            "actual_wins": b["actual_wins"],
+            "simulated_wins": b["simulated_wins"],
+        })
+
+    multiday_count = sum(1 for t in trades_out if t["is_multiday"])
+    telemetry_coverage = {
+        "total_trades": tot_cnt,
+        "spread_count": sum(1 for c in trade_contexts if c.get("entry_spread_pct") is not None),
+        "nasdaq_count": sum(1 for c in trade_contexts if c.get("entry_nasdaq_is_positive") is not None),
+        "rsi_30d_count": sum(1 for c in trade_contexts if c.get("entry_rsi_30d") is not None),
+        "smooth_series_count": sum(1 for c in trade_contexts if c.get("has_smooth_series")),
+    }
+
+    return {
+        "date": scope_date_label,
+        "from_date": from_iso,
+        "to_date": to_iso,
+        "is_range": is_range,
+        "today_market_date": today_market,
+        "market_tz": "US/Eastern",
+        "available_dates": available_dates,
+        "overall_date_bounds": overall_date_bounds,
+        "trade_count": len(trades_out),
+        "parms_snapshot_coverage": {
+            "recorded_count": rec_cnt,
+            "total_count": tot_cnt,
+            "status": cov_status,
+            "snapshot_ids": unique_snap_ids,
+        },
+        "telemetry_coverage": telemetry_coverage,
+        "summary": {
+            "total_cost_basis": total_cost,
+            "simulated_active_cost_basis": sim_active_cost,
+            "actual_pnl_dollars": actual_total_d,
+            "actual_pnl_pct": actual_total_p,
+            "actual_wins": actual_wins,
+            "actual_losses": actual_losses,
+            "actual_win_rate_pct": round((actual_wins / len(trades_out)) * 100.0, 1) if trades_out else 0.0,
+            "simulated_pnl_dollars": sim_total_d,
+            "simulated_pnl_pct": sim_total_p,
+            "simulated_wins": sim_wins,
+            "simulated_losses": sim_losses,
+            "simulated_win_rate_pct": round((sim_wins / sim_active_cnt) * 100.0, 1) if sim_active_cnt > 0 else 0.0,
+            "baseline_original_parms_pnl_dollars": round(base_score[0], 2),
+            "pnl_improvement_dollars": round(sim_total_d - actual_total_d, 2),
+            "pnl_improvement_pct_points": round(sim_total_p - actual_total_p, 2),
+            "theoretical_peak_pnl_dollars": peak_total_d,
+            "trading_days_count": len(daily_breakdown),
+            "multiday_trade_count": multiday_count,
+            "no_improvement_over_actual": not improved_over_actual,
+        },
+        "daily_breakdown": daily_breakdown,
+        "changed_parms": changed_parms,
+        "changed_ini_snippet": changed_ini_snippet,
+        "trades": trades_out,
     }
 
 
@@ -34302,6 +37094,10 @@ class AdminCliProvider:
                     "true" if FINDBEST_ENABLED else "false",
                 )
                 .replace(
+                    "__ANALYZE_DAY_ENABLED__",
+                    "true" if ANALYZE_DAY_ENABLED else "false",
+                )
+                .replace(
                     "__RSI_30D_ENABLED__",
                     "true" if RSI_30D_ENABLED else "false",
                 )
@@ -34540,6 +37336,65 @@ class AdminCliProvider:
                 return jsonify(status="ok", run_id=RUN_ID, **result), 200
             except ValueError as exc:
                 return jsonify(status="error", message=str(exc)), 400
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
+
+        @app.get("/api/analyze-day")
+        def get_analyze_day():
+            if not ANALYZE_DAY_ENABLED:
+                return (
+                    jsonify(
+                        status="error",
+                        message="Analyze Day is disabled ([dashboard] analyze_day=false)",
+                    ),
+                    403,
+                )
+            try:
+                raw_date = str(request.args.get("date") or "").strip()
+                raw_from = str(
+                    request.args.get("from") or request.args.get("from_date") or ""
+                ).strip()
+                raw_to = str(
+                    request.args.get("to") or request.args.get("to_date") or ""
+                ).strip()
+                list_only = str(request.args.get("list_dates") or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }
+                result = analyze_day_trades(
+                    coordinator=self.coordinator,
+                    date_str=raw_date,
+                    from_date_str=raw_from,
+                    to_date_str=raw_to,
+                    list_dates_only=list_only,
+                )
+                return jsonify(status="ok", run_id=RUN_ID, **result), 200
+            except ValueError as exc:
+                return jsonify(status="error", message=str(exc)), 400
+            except Exception as exc:
+                return jsonify(status="error", message=str(exc)), 500
+
+        @app.get("/api/parms-snapshot")
+        def get_parms_snapshot():
+            try:
+                req_id = str(request.args.get("id") or "").strip().lower()
+                if not req_id:
+                    return (
+                        jsonify(
+                            status="ok",
+                            run_id=RUN_ID,
+                            active_snapshot_id=_ACTIVE_PARMS_SNAPSHOT_ID,
+                            snapshots=_list_parms_snapshots(limit=50),
+                        ),
+                        200,
+                    )
+                if not _PARMS_SNAPSHOT_ID_RE.fullmatch(req_id):
+                    return jsonify(status="error", message="Invalid snapshot id format."), 400
+                snap = _load_parms_snapshot_by_id(req_id)
+                if snap is None:
+                    return jsonify(status="error", message=f"Snapshot {req_id} not found."), 404
+                return jsonify(status="ok", run_id=RUN_ID, snapshot=snap), 200
             except Exception as exc:
                 return jsonify(status="error", message=str(exc)), 500
 
@@ -34839,6 +37694,7 @@ class AdminCliProvider:
                 "app_version": APP_VERSION,
                 "run_id": RUN_ID,
                 "instance_owner": INSTANCE_OWNER,
+                "history_max_bars": HISTORY_MAX_BARS,
                 "display_timezone": {
                     "setting": DISPLAY_TIMEZONE_SETTING,
                     "iana": DISPLAY_TZ_IANA,
@@ -34851,10 +37707,14 @@ class AdminCliProvider:
                     "chain_cooldown_seconds": OPTION_CHAIN_RSI_COOLDOWN_SECONDS,
                     "chain_pacing_seconds": OPTION_CHAIN_PACING_SECONDS,
                     "chain_include_greeks": OPTION_CHAIN_INCLUDE_GREEKS,
+                    "history_max_bars": OPTION_HISTORY_MAX_BARS,
+                    "pre_entry_lookback_minutes": OPTION_HISTORY_PRE_ENTRY_MINUTES,
+                    "position_poll_seconds": OPTION_POSITION_POLL_SECONDS,
                 },
                 "dashboard_server": {
                     "host": self.host,
                     "port": int(self.port),
+                    "analyze_day_enabled": bool(ANALYZE_DAY_ENABLED),
                 },
                 "webhook_server": {
                     "host": WEBHOOK_HOST,
@@ -34905,6 +37765,7 @@ class AdminCliProvider:
                         "NASDAQ_TRACKER",
                     }
                 ],
+                "options_only": OPTIONS_ONLY,
                 "position_monitor": position_monitor_report,
                 "option_buyer": option_buyer_report,
                 "option_seller": option_seller_report,

@@ -203,8 +203,8 @@ Before evaluating exit tiers on a held contract `pos_sym`, `OptionSeller` execut
 
 ### Tier 1 — Fixed Profit Target (`profit_target`)
 
-* **Controlled by:** `profit_target_enabled` (default `true`), `profit_target_pct` (default `25.0`), `peak_profit_calls_only` (default `false`).
-* **Logic:** If `peak_eligible` (`not peak_profit_calls_only or is_call`) and `profit_target_enabled` and `profit_target_pct > 0`:
+* **Controlled by:** `profit_target_enabled` (default `true`), `profit_target_pct` (default `25.0`), `[general] options_only` (default `true`).
+* **Logic:** If `peak_eligible` (`not options_only or is_option`) and `profit_target_enabled` and `profit_target_pct > 0`:
   $$\text{pnl\_pct} \ge \texttt{profit\_target\_pct} \implies \texttt{QUALIFIED (profit\_target)}$$
 * **Why Tier 1 Runs First:** Options often surge `+25%` to `+40%` on an explosive 1-minute candle before Wilder RSI(14) even crosses `65.0`. Tier 1 captures windfall gains immediately — independent of RSI, kinematics, `stop_loss_enabled`, and `min_hold_minutes`.
 
@@ -232,7 +232,7 @@ Before evaluating exit tiers on a held contract `pos_sym`, `OptionSeller` execut
 
 ### Tier 3 — Session High-Water-Mark Trailing Stop (`trailing_stop`)
 
-* **Controlled by:** `trailing_stop_enabled` (default `true`), `trailing_activation_pct` (default `10.0`), `trailing_drawdown_pct` (default `5.0`), `trailing_require_negative_velocity` (default `true`), `peak_profit_calls_only` (default `false`).
+* **Controlled by:** `trailing_stop_enabled` (default `true`), `trailing_activation_pct` (default `10.0`), `trailing_drawdown_pct` (default `5.0`), `trailing_require_negative_velocity` (default `true`), `[general] options_only` (default `true`).
 * **Logic:** Requires `peak_eligible`, `trailing_stop_enabled`, and `trailing_drawdown_pct > 0`:
   1. **Arming Check:** `peak_pnl >= trailing_activation_pct` (if not yet armed, logs `ts_peak=+X.XX%<10.00%`).
   2. **Drawdown Trigger:** `drawdown_pct > trailing_drawdown_pct` (strictly greater; if not exceeded, logs `ts_dd=X.XX%<=5.00%`).
@@ -278,7 +278,7 @@ Once any tier (1, 2, 3, or 4) sets `qualifies = True`:
 | 7 | `order_type` | `limit \| market` (`limit`) | Pricing | Default exit order type across Tiers 1–4 (can be overridden to `market` for stop-losses via `stop_loss_force_market`). |
 | 8 | `cooldown_minutes` | `int >= 0` (`15`) | Post-Trigger | Per-contract cooldown after a sell attempt (or dry-run sell) before another sell on the same contract can fire (`cooldown_active`). |
 | 9 | `min_hold_minutes` | `int >= 0` (`5`) | **Tier 4 (Stop-Loss)** | **Exact Runtime Behavior (`multiStreamRSI.py` L18400–18448):** Grace period (minutes since `first_seen_at_by_symbol`) that **suppresses Tier 4 Hard & Soft Stop-Loss** (`hard_sl_hold_grace`, `sl_hold_grace`) to prevent instant Ask→Bid spread stop-outs right after buying. Tiers 1–3 can still take profits immediately during this window. *(Note: the inline `lib/parms.ini` comment briefly describes it as guarding RSI take-profit, but the actual engine code applies it specifically to Tier 4 Stop-Loss!)* |
-| 10 | `options_only` | `bool` (`false`) | Pre-Flight | When `true`, ignores non-option equity stock holdings in the brokerage account (`options_only_equity_ignored`). |
+| 10 | `[general] options_only` *(moved from `[option_seller]`; consolidates `peak_profit_calls_only`)* | `bool` (`true`) | Pre-Flight & Tiers 1/3 | Major buy & sell gate: when `true`, ignores non-option equity stock holdings (`options_only_equity_ignored`) and gates Tier 1 Fixed Profit Target & Tier 3 Trailing Stop (`peak_eligible`) strictly to OCC option contracts (also gates `OptionBuyer` against non-OCC contracts). |
 | 11 | `require_projection_alignment` | `bool` (`true`) | Tier 2 | Requires 1-minute Taylor projected delta $\Delta\hat{P} < 0$ before Tier 2 RSI take-profit fires (`projection_misaligned`). |
 | 12 | `allowed_forecasts` | `csv` (`bearish_reversal, bearish_continuation, bearish_momentum`) | Tier 2 | Allowed `forecast_direction` labels for Tier 2 RSI take-profit when $a < 0$. Also checked in Stop-Loss kinematics branch 3 (`bearish_rollover`). |
 | 13 | `limit_discount_pct` | `float >= 0.0` (`0.5`) | Pricing (T1–T3) | Percentage discount off Mid (floored at Bid) for Tier 1/2/3 limit sell orders (or off `min(bid, cur_price)` when ask is unavailable). |
@@ -292,13 +292,22 @@ Once any tier (1, 2, 3, or 4) sets `qualifies = True`:
 | 21 | `trailing_activation_pct` | `float >= 0.0` (`10.0`) | Tier 3 | Session peak unrealized P/L% required to arm Tier 3 trailing stop (`peak_pnl >= trailing_activation_pct`). |
 | 22 | `trailing_drawdown_pct` | `float >= 0.0` (`5.0`) | Tier 3 | Compound drawdown % from session peak that triggers exit (`drawdown_pct > trailing_drawdown_pct`, strictly greater). |
 | 23 | `trailing_require_negative_velocity` | `bool` (`true`) | Tier 3 | Requires downward underlying velocity ($v < 0$) before Tier 3 trailing stop fires; holds (`ts_hold`) if underlying is rebounding. |
-| 24 | `peak_profit_calls_only` | `bool` (`false`) | Tiers 1 & 3 | When `true`, restricts Tier 1 Fixed Profit Target and Tier 3 Trailing Stop to `CALL` option contracts only (skipping PUTs and equities). |
-| 25 | `stop_loss_enabled` | `bool` (`true`) | Tier 4 | Master enable for Tier 4 stop-loss streak tracking, soft stop-loss, and hard emergency stop-loss. |
-| 26 | `stop_loss_pct` | `float >= 0.0` (`10.0`) | Tier 4b (Soft) | Soft stop-loss breach threshold: increments streak on every contiguous minute where `pnl_pct < -stop_loss_pct` (strictly less than negative threshold). |
-| 27 | `stop_loss_consecutive_minutes` | `int >= 1` (`5`) | Tier 4b (Soft) | Number of contiguous 1-minute breaches required before the soft stop-loss becomes eligible to fire. |
-| 28 | `stop_loss_require_kinematics` | `bool` (`true`) | Tier 4b (Soft) | When `true`, requires downward underlying pressure (`_evaluate_stop_loss_kinematics`) to fire the soft stop; holds (`sl_hold`) during upward rebounds. |
-| 29 | `stop_loss_hard_pct` | `float >= 0.0` (`25.0`) | Tier 4a (Hard) | Emergency catastrophic stop-loss (`pnl_pct < -stop_loss_hard_pct`). Bypasses streak and kinematics immediately once `min_hold_minutes` has elapsed (`0` disables). |
-| 30 | `open_position_capture_mode` | `none \| contract_quote \| full_chain` (`none`) | Post-Loop Telemetry | Controls per-minute market data capture for held option contracts (`none` = off, `contract_quote` = live bid/ask/Greeks on 1m bars, `full_chain` = full JSON chain every minute). |
+| 24 | `stop_loss_enabled` | `bool` (`true`) | Tier 4 | Master enable for Tier 4 stop-loss streak tracking, soft stop-loss, and hard emergency stop-loss. |
+| 25 | `stop_loss_pct` | `float >= 0.0` (`10.0`) | Tier 4b (Soft) | Soft stop-loss breach threshold: increments streak on every contiguous minute where `pnl_pct < -stop_loss_pct` (strictly less than negative threshold). |
+| 26 | `stop_loss_consecutive_minutes` | `int >= 1` (`5`) | Tier 4b (Soft) | Number of contiguous 1-minute breaches required before the soft stop-loss becomes eligible to fire. |
+| 27 | `stop_loss_require_kinematics` | `bool` (`true`) | Tier 4b (Soft) | When `true`, requires downward underlying pressure (`_evaluate_stop_loss_kinematics`) to fire the soft stop; holds (`sl_hold`) during upward rebounds. |
+| 28 | `stop_loss_hard_pct` | `float >= 0.0` (`25.0`) | Tier 4a (Hard) | Emergency catastrophic stop-loss (`pnl_pct < -stop_loss_hard_pct`). Bypasses streak and kinematics immediately once `min_hold_minutes` has elapsed (`0` disables). |
+| 29 | `open_position_capture_mode` | `none \| contract_quote \| full_chain` (`none`) | Post-Loop Telemetry | Controls per-minute market data capture for held option contracts (`none` = off, `contract_quote` = live bid/ask/Greeks on 1m bars, `full_chain` = full JSON chain every minute). |
+| 30 | `dynamic_rules_mode` | `off \| view_only \| view_and_act` (`off`) | Dynamic Exit Engine | Controls Peak-Ratcheting Trailing Stops, Breakeven Profit Lock, and Vol/Spread-Adaptive thresholds: `off` = disabled (static rules only); `view_only` (aliases `shadow`, `log_only`, `view`, `monitor`) = computes & logs `OPTION_SELL_DYNAMIC_SHADOW` + displays live UI telemetry without altering exits; `view_and_act` (aliases `view_take_action`, `take_action`, `active`, `act`, `live`) = displays UI telemetry AND actively overrides Tier 3 trailing stop, dynamic breakeven lock, and Tier 4b soft stop-loss. |
+| 31 | `dynamic_ratchet_tiers` | `peak:dd,...` (`5:4.0,10:3.0,20:2.0`) | Dynamic Tier 3 | Comma-separated `peak_pct:drawdown_pct` ladder that tightens base trailing stop drawdown as the contract's session peak unrealized P/L% climbs (e.g., `+5% → -4%`, `+10% → -3%`, `+20% → -2%`). |
+| 32 | `dynamic_breakeven_activation_pct` | `float >= 0.0` (`8.0`) | Dynamic Tier 3 | Session peak unrealized P/L% required to arm the dynamic **`+0.5%` breakeven floor** (`0` disables). When armed and P/L falls to `<= +0.5%` (subject to velocity confirmation if `trailing_require_negative_velocity = true`), triggers `dynamic_breakeven` (shadow alert in `view_only`, exit in `view_and_act`). |
+| 33 | `dynamic_vol_adapt_enabled` | `bool` (`true`) | Dynamic Scaling | Scales dynamic trailing stop drawdown and dynamic soft stop-loss by realized 1-minute contract P/L volatility ($\sigma_{\Delta\text{pnl}}$) and live bid/ask `spread_pct` (multiplier clamped to `0.75x–1.50x`, with spread noise floors and strict clamping below `stop_loss_hard_pct`). |
+| 34 | `dynamic_min_samples` | `int >= 2` (`3`) | Dynamic Scaling | Minimum number of 1-minute contract P/L samples required before applying realized volatility scaling (`adapt_mult` remains `1.0x` until sufficient bars exist). |
+
+### 5.1 Dynamic Exit Rules Modes (`dynamic_rules_mode`)
+- **`off` (Default):** 100% static `[option_seller]` thresholds are used; zero behavioral change.
+- **`view_only` (Shadow / Log-Only + UI Visibility):** Every finalized minute, `OptionSeller` evaluates `_evaluate_dynamic_contract_rules()` for each open contract, records live per-contract state in `/cli/status` (`option_seller.dynamic_rules_by_symbol`) and `/api/findbest`, and logs `OPTION_SELL_DYNAMIC_SHADOW` whenever the dynamic rules would have triggered — **without submitting or altering any sell orders**. Visible across the main Option Seller dashboard card, the Open Contract drilldown banner, and the Find Best modal.
+- **`view_and_act` (View + Take Action):** Exposes the same live UI telemetry AND overrides Tier 3 trailing stop (`eff_ts_activation_pct` / `eff_ts_drawdown_pct`), dynamic breakeven lock (`+0.5%` floor), and Tier 4b soft stop-loss (`eff_sl_pct`), tagging triggered orders with `[dynamic:xN.NN]`. Safety guardrails (`min_hold_minutes`, `stop_loss_hard_pct`, `trailing_require_negative_velocity`, `stop_loss_require_kinematics`, `cooldown_minutes`, and `dry_run`) remain strictly enforced.
 
 ---
 

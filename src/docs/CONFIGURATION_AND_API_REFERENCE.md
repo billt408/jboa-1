@@ -23,15 +23,14 @@
    - [2.2 Section `symbols`: Tracked Equity Universe](#22-section-symbols-tracked-equity-universe)
    - [2.3 Section `market_signal_providers`: Market Signal Feeds and Consensus Priority](#23-section-market_signal_providers-market-signal-feeds-and-consensus-priority)
    - [2.4 Sections `CREDENTIALS`, `alpaca_api`, `twelvedata_api`, `tastytrade_api`: Broker and Data Auth](#24-sections-credentials-alpaca_api-twelvedata_api-tastytrade_api-broker-and-data-auth)
-   - [2.5 Section `option_trading`: Broker Routing and Chain Pacing](#25-section-option_trading-broker-routing-and-chain-pacing)
+   - [2.5 Section `option_trading`: Broker Routing, Chain Pacing, Option History and Position Polling](#25-section-option_trading-broker-routing-chain-pacing-option-history-and-position-polling)
    - [2.6 Section `kinematics`: Smoothing, RSI Session Mode and Warmup](#26-section-kinematics-smoothing-rsi-session-mode-and-warmup)
-   - [2.7 Section `option_history`: Ledger and Position Polling](#27-section-option_history-ledger-and-position-polling)
-   - [2.8 Section `option_buyer`: Entry Guardrails, Sizing and Pricing](#28-section-option_buyer-entry-guardrails-sizing-and-pricing)
-   - [2.9 Section `option_seller`: 4-Tier Exit Waterfall and Risk Controls](#29-section-option_seller-4-tier-exit-waterfall-and-risk-controls)
-   - [2.10 Section `chart_capture`: 1-Minute PNG Chart Archiver](#210-section-chart_capture-1-minute-png-chart-archiver)
-   - [2.11 Section `dashboard`: Web UI Host, Adaptive TLS and Auth](#211-section-dashboard-web-ui-host-adaptive-tls-and-auth)
-   - [2.12 Section `webhook`: TradingView Webhook Receiver](#212-section-webhook-tradingview-webhook-receiver)
-   - [2.13 Environment-Only Settings](#213-environment-only-settings)
+   - [2.7 Section `option_buyer`: Entry Guardrails, Sizing and Pricing](#27-section-option_buyer-entry-guardrails-sizing-and-pricing)
+   - [2.8 Section `option_seller`: 4-Tier Exit Waterfall and Risk Controls](#28-section-option_seller-4-tier-exit-waterfall-and-risk-controls)
+   - [2.9 Section `chart_capture`: 1-Minute PNG Chart Archiver](#29-section-chart_capture-1-minute-png-chart-archiver)
+   - [2.10 Section `dashboard`: Web UI Host, Adaptive TLS and Auth](#210-section-dashboard-web-ui-host-adaptive-tls-and-auth)
+   - [2.11 Section `webhook`: TradingView Webhook Receiver](#211-section-webhook-tradingview-webhook-receiver)
+   - [2.12 Environment-Only Settings](#212-environment-only-settings)
 3. [Redacted Reference `lib/parms.ini` Template](#3-redacted-reference-libparmsini-template)
 4. [HTTP API Reference: Port 5000 (TradingView Webhook Receiver)](#4-http-api-reference-port-5000-tradingview-webhook-receiver)
 5. [HTTP API Reference: Port 5001 (Operational Dashboard and Admin CLI)](#5-http-api-reference-port-5001-operational-dashboard-and-admin-cli)
@@ -69,10 +68,12 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | `timezone` | `DISPLAY_TIMEZONE` | String (`PST`, `EST`, `CST`, `MST`, `UTC`, or IANA string like `America/Los_Angeles`) | `PST` | Controls display timezone for dashboard charts, countdown labels, option-chain filenames, and chart PNG filenames. Internal market-session math and RSI cutoffs remain anchored to `America/New_York` (US/Eastern) and UTC. |
 | `owner` | `INSTANCE_OWNER` | String (e.g., `billt`, `jboa`) | `""` | Drives dashboard multi-instance color identity, browser tab prefix (`[owner - tx_provider]`), and header/panel chips. |
-| `nasdaq_must_be_positive` | `NASDAQ_MUST_BE_POSITIVE` | Bool | `false` | When `true`, `OptionBuyer` requires the tracked NASDAQ symbol's live intraday price minus its 09:30 ET open price to be strictly positive (`diff > 0`) before placing a buy order, logging `nasdaq_down(...)` on rejection. Even when `false`, the engine always collects the open price at 09:30 ET and every minute during RTH, persisting snapshots to `logs/nasdaq/<SYMBOL>-<RUN_ID>.log` and `minute-summary-*.jsonl`. |
+| `nasdaq_must_be_positive` | `NASDAQ_MUST_BE_POSITIVE` | Bool | `false` | When `true`, `OptionBuyer` requires the tracked NASDAQ symbol's live price minus its previous trading day's close (`prev_close`, matching brokers/Yahoo/TradingView) to be strictly positive (`diff > 0`) before placing a buy order, logging `nasdaq_down(...)` on rejection. Even when `false`, the engine always collects `prev_close` and every 1-minute price during RTH, persisting snapshots to `logs/nasdaq/<SYMBOL>-<RUN_ID>.log` and `minute-summary-*.jsonl`. |
 | `nasdaq_symbol` | `NASDAQ_SYMBOL` | String (ticker) | `QQQ` | Ticker symbol tracked by `NasdaqMarketTracker` at the start of the trading day and every minute during regular market hours. Normalized to uppercase. |
 | `rsi_30d_enabled` | `RSI_30D_ENABLED` | Bool | `false` | When `true`, activates the `OptionBuyer` buy gate requiring strictly `rsi_30d > rsi_30d_min` before purchasing an option. Even when `false`, the engine always seeds 30-day daily Wilder RSI baselines, computes live `rsi_30d` alongside every 1-minute RSI update, persists `rsi_30d` in logs (`minute-summary-*.jsonl`, `option_buyer/*.log`, `option_seller/*.log`), and displays `30D RSI` across all dashboard panels. |
 | `rsi_30d_min` | `RSI_30D_MIN` | Float | `30.0` | Minimum 30-day Wilder RSI threshold required when `rsi_30d_enabled = true`; `OptionBuyer` requires strictly `rsi_30d > rsi_30d_min` and logs `rsi_30d_below_min(...)` or `rsi_30d_unavailable(...)` when blocked. |
+| `options_only` | `OPTIONS_ONLY` *(legacy fallback `OPTION_SELL_OPTIONS_ONLY`)* | Bool | `true` | Major buy & sell gate (consolidated from legacy `[option_seller] options_only` and `peak_profit_calls_only`). When `true`, restricts `OptionBuyer` purchases (`options_only_non_option_contract`), `OptionSeller` exits (`options_only_equity_ignored`), and Tier 1/3 peak-profit guards strictly to OCC option contracts (ignoring stock/equity holdings). |
+| `history_max_bars` | `HISTORY_MAX_BARS` *(legacy fallbacks `KINEMATICS_HISTORY_MAX_BARS`, `OPTION_HISTORY_MAX_BARS`)* | Int (min `60`) | `2400` | Unified 1-minute bar retention cap per underlying `(provider, symbol)` feed in `MinuteCoordinator` and per tracked option contract in `OptionContractHistoryTracker` (~6.15 regular trading days; consolidated from legacy `[kinematics]`/`[option_trading]`/`[option_history]` in `v0.1.31` with backwards-compatible fallback). |
 
 ### 2.2 Section `symbols`: Tracked Equity Universe
 
@@ -108,7 +109,7 @@ flowchart LR
 | `[tastytrade_api] prod_client_id` / `prod_client_secret` / `prod_refresh_token` | `TASTYTRADE_PROD_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | Secret strings | `<TASTYTRADE_PROD_*>` | Production OAuth2 credentials (used for DXLink market data, option chains, and prod orders). |
 | `[tastytrade_api] sandbox_client_id` / `sandbox_client_secret` / `sandbox_refresh_token` | `TASTYTRADE_SANDBOX_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` | Secret strings | `<TASTYTRADE_SANDBOX_*>` | Sandbox OAuth2 credentials (used for sandbox orders & positions). |
 
-### 2.5 Section `option_trading`: Broker Routing and Chain Pacing
+### 2.5 Section `option_trading`: Broker Routing, Chain Pacing, Option History and Position Polling
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -118,6 +119,8 @@ flowchart LR
 | `chain_pacing_seconds` | `OPTION_CHAIN_PACING_SECONDS` | Float ($\ge 0$) | `0.20` | Minimum inter-request spacing between option-chain HTTP fetches to avoid broker rate limits. |
 | `chain_429_backoff_seconds` | `OPTION_CHAIN_429_BACKOFF_SECONDS` | Float (min `5.0`) | `20.0` | Cooldown pause applied globally to option-chain fetches after receiving an HTTP `429 Too Many Requests`. |
 | `chain_include_greeks` | `OPTION_CHAIN_INCLUDE_GREEKS` | Bool | `true` | Requests/enriches Delta, Gamma, Theta, Vega, and IV on option chain snapshots (including DXLink `Greeks` subscription on Tastytrade). |
+| `pre_entry_lookback_minutes` | `OPTION_HISTORY_PRE_ENTRY_MINUTES` | Int (min `0`) | `390` | Minutes of historical option prices backfilled *prior* to contract entry for drilldown chart context (`390` = 1 full RTH day; legacy `[option_history]` fallback supported). |
+| `position_poll_seconds` | `OPTION_POSITION_POLL_SECONDS` | Int (clamped `5`–`60`) | `15` | Broker account position polling interval in `PositionMonitor` (legacy `[option_history]` fallback supported). |
 
 ### 2.6 Section `kinematics`: Smoothing, RSI Session Mode and Warmup
 
@@ -127,22 +130,13 @@ flowchart LR
 | `smooth_period` | `KINEMATICS_SMOOTH_PERIOD` | Int (min `2`) | `14` | Lookback period for `HMA(n)` or `EMA(n)`. |
 | `rsi_overbought` | `KINEMATICS_RSI_OVERBOUGHT` | Float | `70.0` | Upper RSI boundary for Forecast Matrix zone classification and 3-panel chart red band. |
 | `rsi_oversold` | `KINEMATICS_RSI_OVERSOLD` | Float | `30.0` | Lower RSI boundary for Forecast Matrix zone classification and 3-panel chart green band. |
-| `history_max_bars` | `KINEMATICS_HISTORY_MAX_BARS` | Int (min `60`) | `2400` | Maximum 1-minute kinematic bars retained in RAM per `(provider, symbol)` feed (~6.15 regular trading days). |
 | `rsi_warmup_sessions` | `RSI_WARMUP_SESSIONS` | Int (min `0`) | `5` | Number of prior trading sessions fetched at startup to converge Wilder RSI(14) before emitting live minutes (`0` disables pre-warmup). |
 | `rsi_session` | `RSI_SESSION_MODE` | `extended` (`eth`,`ext`,`all`) \| `regular` (`rth`,`reg`) | `extended` | Controls whether RSI warmup & live updates include Extended Trading Hours (04:00–20:00 ET) or restrict strictly to Regular Trading Hours (09:30–16:00 ET). |
 | `summary_delay_seconds` | `SUMMARY_DELAY_SECONDS` | Float (`0`–`3600`) | `45.0` | Maximum safety-deadline delay (in seconds) after a 1-minute bar closes before `MinuteCoordinator` finalizes the minute and triggers `RsiOptionChainCollector`, `OptionBuyer`, and `OptionSeller` (also accepted in `[general]`). For streaming-only feeds (Alpaca/Tastytrade), `10`–`15`s is typical; keep `40`–`45`s if `YAHOOFINANCE` is enabled. |
 | `early_finalize_on_complete` | `EARLY_FINALIZE_ON_COMPLETE` | Bool | `false` | When `true`, finalizes the minute as soon as `early_finalize_min_delay_seconds` has elapsed **and** every currently connected provider has reported a completed candle for every tracked symbol (falling back to `summary_delay_seconds` if any symbol is missing or slow). |
 | `early_finalize_min_delay_seconds` | `EARLY_FINALIZE_MIN_DELAY_SECONDS` | Float (`>= 0`, clamped to `<= summary_delay_seconds`) | `2.0` | Minimum settling delay after `:00` minute close before `early_finalize_on_complete` is permitted to fire (e.g., `2.0`–`3.0`s so late ticks/revisions settle cleanly). |
 
-### 2.7 Section `option_history`: Ledger and Position Polling
-
-| INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
-| :--- | :--- | :--- | :--- | :--- |
-| `history_max_bars` | `OPTION_HISTORY_MAX_BARS` | Int (min `60`) | `KINEMATICS_HISTORY_MAX_BARS` (`2400`) | Max 1-minute option price bars kept per contract in `OptionContractHistoryTracker`. |
-| `pre_entry_lookback_minutes` | `OPTION_HISTORY_PRE_ENTRY_LOOKBACK_MINUTES` | Int (min `0`) | `390` | Minutes of historical option prices backfilled *prior* to contract entry for drilldown chart context (`390` = 1 full RTH day). |
-| `position_poll_seconds` | `POSITION_POLL_SECONDS` | Int (clamped `5`–`60`) | `15` | Broker account position polling interval in `PositionMonitor`. |
-
-### 2.8 Section `option_buyer`: Entry Guardrails, Sizing and Pricing
+### 2.7 Section `option_buyer`: Entry Guardrails, Sizing and Pricing
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -180,7 +174,7 @@ flowchart LR
 | `contract_min_volume` | `OPTION_BUY_CONTRACT_MIN_VOLUME` | Int (min `0`) | `0` | Hard minimum contract session `volume` required during ex-ante strike selection (`0` disables; when `> 0`, contracts missing volume are excluded). |
 | `contract_budget_stepdown` | `OPTION_BUY_CONTRACT_BUDGET_STEPDOWN` | Bool | `true` | When `true` and `contract_selection_mode != plus2_otm`, filters candidates against the active 1-contract budget (`min(max_single_trade_dollars, remaining_investable_budget)`) and automatically steps outward from an over-budget ITM/ATM strike to the nearest affordable strike instead of rejecting. |
 
-### 2.9 Section `option_seller`: 4-Tier Exit Waterfall and Risk Controls
+### 2.8 Section `option_seller`: 4-Tier Exit Waterfall and Risk Controls
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -193,7 +187,6 @@ flowchart LR
 | `order_type` | `OPTION_SELL_ORDER_TYPE` | `limit` \| `market` | `limit` | Exit order type for standard exits. |
 | `cooldown_minutes` | `OPTION_SELL_COOLDOWN_MINUTES` | Int | `15` | Per-symbol cooldown between exit orders. |
 | `min_hold_minutes` | `OPTION_SELL_MIN_HOLD_MINUTES` | Int | `5` | Minimum holding grace period before Tier 4 RSI exits fire (`hold_grace`); bypassed by hard stop loss & profit targets as coded. |
-| `options_only` | `OPTION_SELL_OPTIONS_ONLY` | Bool | `false` | When `true`, ignores open equity positions and evaluates only OCC option contracts. |
 | `require_projection_alignment` | `OPTION_SELL_REQUIRE_PROJECTION_ALIGNMENT` | Bool | `true` | Requires $\hat{P}_{t+1} < P_t$ (for Calls) before Tier 4 RSI exit executes. |
 | `allowed_forecasts` | `OPTION_SELL_ALLOWED_FORECASTS` | CSV of forecast codes | `bearish_reversal,bearish_continuation,bearish_momentum` | Whitelist of Forecast Matrix signals allowed to fire Tier 4 exits. |
 | `limit_discount_pct` | `OPTION_SELL_LIMIT_DISCOUNT_PCT` | Float | `0.5` | Percentage discount below bid/mark applied to standard limit exit prices to improve fill rate. |
@@ -207,15 +200,19 @@ flowchart LR
 | `trailing_activation_pct` | `OPTION_SELL_TRAILING_ACTIVATION_PCT` | Float | `10.0` | Arms the trailing high-water mark once `peak_pnl_pct >= 10.0%`. |
 | `trailing_drawdown_pct` | `OPTION_SELL_TRAILING_DRAWDOWN_PCT` | Float | `5.0` | Fires trailing exit when `peak_pnl_pct - pnl_pct >= 5.0%`. |
 | `trailing_require_negative_velocity` | `OPTION_SELL_TRAILING_REQUIRE_NEGATIVE_VELOCITY` | Bool | `true` | Requires underlying $v_t < 0$ before triggering trailing stop exit. |
-| `peak_profit_calls_only` | `OPTION_SELL_PEAK_PROFIT_CALLS_ONLY` | Bool | `false` | Restricts peak-profit trailing guard to Call contracts only. |
 | `stop_loss_enabled` | `OPTION_SELL_STOP_LOSS_ENABLED` | Bool | `true` | Enables **Tier 3** Stop-Loss Guard (soft streak + hard floor). |
 | `stop_loss_pct` | `OPTION_SELL_STOP_LOSS_PCT` | Float | `10.0` | Soft stop-loss threshold (`pnl_pct <= -10.0%`). |
 | `stop_loss_consecutive_minutes` | `OPTION_SELL_STOP_LOSS_CONSECUTIVE_MINUTES` | Int (min `1`) | `5` | Consecutive minutes required at/below `-stop_loss_pct` before firing soft stop loss. |
 | `stop_loss_require_kinematics` | `OPTION_SELL_STOP_LOSS_REQUIRE_KINEMATICS` | Bool | `true` | Requires bearish kinematics confirmation on soft stop loss. |
 | `stop_loss_hard_pct` | `OPTION_SELL_STOP_LOSS_HARD_PCT` | Float | `25.0` | Immediate emergency hard stop (`pnl_pct <= -25.0%`), bypassing streak and kinematics checks. |
 | `open_position_capture_mode` | `OPTION_SELL_OPEN_POSITION_CAPTURE_MODE` | `none` \| `contract_quote` \| `full_chain` | `none` | Controls optional per-minute data capture by `OptionSeller` for open option contracts: `none` (default, existing behavior), `contract_quote` (lightweight batched live bid/ask/mid/spread/Greeks snapshot attached directly to 1m `OptionContractHistoryTracker` bars and consumed by Find Best), or `full_chain` (writes full pruned `logs/optionchains/*-HOLD_1M-*.json` snapshots every minute for each open underlying/right/expiry). |
+| `dynamic_rules_mode` | `OPTION_SELL_DYNAMIC_RULES_MODE` | `off` \| `view_only` \| `view_and_act` | `off` | Per-contract Peak-Ratcheting Trailing Stops & Vol/Spread-Adaptive thresholds. `off` disables; `view_only` *(aliases `shadow`, `log_only`, `view`, `monitor`)* logs `OPTION_SELL_DYNAMIC_SHADOW` and displays live UI telemetry without altering exits; `view_and_act` *(aliases `view_take_action`, `take_action`, `active`, `act`, `live`)* displays telemetry and overrides Tier 3 trailing stop, dynamic breakeven lock, and Tier 4b soft stop-loss. |
+| `dynamic_ratchet_tiers` | `OPTION_SELL_DYNAMIC_RATCHET_TIERS` | `peak:dd,...` | `5:4.0,10:3.0,20:2.0` | Comma-separated `peak_pct:drawdown_pct` ladder that tightens dynamic trailing stop drawdown as contract session peak P/L % climbs. |
+| `dynamic_breakeven_activation_pct` | `OPTION_SELL_DYNAMIC_BREAKEVEN_ACTIVATION_PCT` | Float (`>= 0.0`) | `8.0` | Session peak P/L % required to arm the dynamic `+0.5%` breakeven floor (`0` disables). |
+| `dynamic_vol_adapt_enabled` | `OPTION_SELL_DYNAMIC_VOL_ADAPT_ENABLED` | Bool | `true` | Scales dynamic trailing stop drawdown & soft stop-loss by realized 1m P/L volatility ($\sigma$) and bid/ask spread % (multiplier clamped `0.75x–1.50x`). |
+| `dynamic_min_samples` | `OPTION_SELL_DYNAMIC_MIN_SAMPLES` | Int (min `2`) | `3` | Minimum 1m contract P/L samples required before applying realized volatility scaling. |
 
-### 2.10 Section `chart_capture`: 1-Minute PNG Chart Archiver
+### 2.9 Section `chart_capture`: 1-Minute PNG Chart Archiver
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -227,7 +224,7 @@ flowchart LR
 | `write_latest` | `CHART_CAPTURE_WRITE_LATEST` | Bool | `true` | Also updates `<output_dir>/<SYMBOL>/latest.png`. |
 | `stale_after_seconds` | `CHART_CAPTURE_STALE_AFTER_SECONDS` | Int (min `0`) | `180` | Skips rendering symbols whose newest bar is older than this threshold. |
 
-### 2.11 Section `dashboard`: Web UI Host, Adaptive TLS and Auth
+### 2.10 Section `dashboard`: Web UI Host, Adaptive TLS and Auth
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -242,9 +239,10 @@ flowchart LR
 | `session_ttl_hours` | `DASHBOARD_SESSION_TTL_HOURS` | Int (min `1`) | `24` | Maximum lifetime of an authenticated session cookie. |
 | `inactivity_timeout_minutes` *(alias `session_inactivity_minutes`)* | `DASHBOARD_INACTIVITY_TIMEOUT_MINUTES` | Int (min `0`) | `15` | Auto-locks idle browser sessions after $N$ minutes (`0` disables idle timeout). |
 | `strike_analyzer_enabled` | `STRIKE_ANALYZER_ENABLED` | Bool | `false` | Enables `GET /api/strike-analysis` and reveals the `Strike Analyzer` button/row in the dashboard UI. Strictly `false` by default if omitted or blank in both `parms.ini` and environment variables. |
-| `findbest` *(alias `findbest_enabled`)* | `FINDBEST_ENABLED` | Bool | `false` | Enables `GET /api/findbest` and reveals the **`Find Best`** button on the Option Seller (Closed Contracts) panel header to analyze captured option chain & 1m valuation data between buy and sell for tuning `lib/parms.ini`. Strictly `false` by default if omitted or blank in both `parms.ini` and environment variables. |
+| `findbest` *(alias `findbest_enabled`)* | `FINDBEST_ENABLED` | Bool | `false` | Enables `GET /api/findbest` and reveals the **`Find Best`** button on both the **Option Buyer (Open Contracts)** and **Option Seller (Closed Contracts)** drilldown headers to analyze captured option chain & 1m valuation data (plus live Dynamic Exit Rules telemetry) for tuning `lib/parms.ini`. Strictly `false` by default if omitted or blank in both `parms.ini` and environment variables. |
+| `analyze_day` *(alias `analyze_day_enabled`)* | `ANALYZE_DAY_ENABLED` | Bool | `false` | Enables `GET /api/analyze-day` and reveals the **`Analyze Day`** button next to `Docs` in the top header to evaluate all closed trades opened & closed within a chosen trading date or `From`–`To` date range (defaulting both to today) using Find Best logic, synthesize a single changed-only `lib/parms.ini` recommendation maximizing overall range profit, and compare Actual vs. Synthesized combined P/L. Strictly `false` by default. |
 
-### 2.12 Section `webhook`: TradingView Webhook Receiver
+### 2.11 Section `webhook`: TradingView Webhook Receiver
 
 | INI Key | Env Fallback | Type / Options | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- | :--- |
@@ -252,7 +250,7 @@ flowchart LR
 | `port` | `WEBHOOK_PORT` | Int (`1`–`65535`) | `5000` | Listen port for `/webhook` and `/health`. |
 | `token` | `WEBHOOK_TOKEN` | Secret string | `<WEBHOOK_TOKEN>` | Shared secret validated via `X-Webhook-Token` header or JSON `webhook_token`. Mandatory if `host` is non-loopback. |
 
-### 2.13 Environment-Only Settings
+### 2.12 Environment-Only Settings
 
 | Env Key | Type | Default | Runtime Effect |
 | :--- | :--- | :--- | :--- |
@@ -275,6 +273,8 @@ nasdaq_must_be_positive = false
 nasdaq_symbol = QQQ
 rsi_30d_enabled = false
 rsi_30d_min = 30.0
+options_only = true
+history_max_bars = 2400
 
 [symbols]
 target_symbols = AAPL,AMD,AMZN,CRWV,DELL,GOOG,INTC,ISRG,KLAC,LITE,LLY,MCD,META,MSFT,MU,NOC,NVDA,ROK,SNDK,SPCX,SQQQ,STX,SURE,TMO,TSLA,TSM,V,VRTX
@@ -328,23 +328,19 @@ chain_cooldown_seconds = 0
 chain_pacing_seconds = 0.20
 chain_429_backoff_seconds = 20.0
 chain_include_greeks = true
+pre_entry_lookback_minutes = 390
+position_poll_seconds = 15
 
 [kinematics]
 smooth_method = hma
 smooth_period = 14
 rsi_overbought = 70.0
 rsi_oversold = 30.0
-history_max_bars = 2400
 rsi_warmup_sessions = 5
-rsi_session = extended
+rsi_session = regular
 summary_delay_seconds = 45
 early_finalize_on_complete = false
 early_finalize_min_delay_seconds = 2.0
-
-[option_history]
-history_max_bars = 2400
-pre_entry_lookback_minutes = 390
-position_poll_seconds = 15
 
 [option_buyer]
 enabled = true
@@ -401,7 +397,6 @@ close_full_position = true
 order_type = limit
 cooldown_minutes = 15
 min_hold_minutes = 5
-options_only = false
 require_projection_alignment = true
 allowed_forecasts = bearish_reversal,bearish_continuation,bearish_momentum
 limit_discount_pct = 0.5
@@ -415,13 +410,17 @@ trailing_stop_enabled = true
 trailing_activation_pct = 10.0
 trailing_drawdown_pct = 5.0
 trailing_require_negative_velocity = true
-peak_profit_calls_only = false
 stop_loss_enabled = true
 stop_loss_pct = 10.0
 stop_loss_consecutive_minutes = 5
 stop_loss_require_kinematics = true
 stop_loss_hard_pct = 25.0
 open_position_capture_mode = none
+dynamic_rules_mode = off
+dynamic_ratchet_tiers = 5:4.0,10:3.0,20:2.0
+dynamic_breakeven_activation_pct = 8.0
+dynamic_vol_adapt_enabled = true
+dynamic_min_samples = 3
 
 [chart_capture]
 enabled = true
@@ -447,6 +446,7 @@ session_ttl_hours = 24
 inactivity_timeout_minutes = 15
 strike_analyzer_enabled = false
 findbest = false
+analyze_day = false
 
 [webhook]
 host = 127.0.0.1
@@ -506,9 +506,11 @@ When `[dashboard] auth_enabled = true` and a password is set:
 | `GET /api/option-logs` | L29177 | Yes | `?stream=all\|buy\|sell&decision=all&q=<SYM>&start_ms=<UTC_MS>&stop_ms=<UTC_MS>&start=<ISO>&stop=<ISO>&limit=40000&limit_per_file=50000` | `200` parsed Buy/Sell decision log entries (including `timestamp_epoch_ms` and `rsi_30d`) filtered by stream, decision, search query, and optional Start/Stop time bounds from `logs/option_buyer/` and `logs/option_seller/`. |
 | `GET /api/option-log-details` | — | Yes | `?symbol=<SYM>&contract=<OCC>&buy_ms=<UTC_MS>&sell_ms=<UTC_MS>&context=3` | `200` trade-scoped log slices returning the triggering BUY entry plus `±context` (default `3`) surrounding `option_buyer` entries (`buy_window`) and triggering SELL entry plus `±context` surrounding `option_seller` entries (`sell_window`), backing the **Buy/Sell Log Details** modal. |
 | `GET /api/strike-analysis` | L26029 | Yes | `?symbol=AAPL&limit=25&force=false` (`limit` `1`–`100`) | `200` multi-strike (`-2 ITM` to `+4 OTM`) forward-horizon performance table; `403` when `strike_analyzer_enabled = false`; `500` on error. |
-| `GET /api/findbest` | — | Yes | `?trade_id=<ID>&contract=<OCC>&underlying=<SYM>&buy_utc=<ISO>&sell_utc=<ISO>&entry_price=<F>&exit_price=<F>&qty=<N>` | `200` Buy→Sell option chain & 1m contract valuation analysis (`combined`, `optionchains`, `history` views): total points, peak/MFE timestamp & P/L, profitable/losing counts & averages, profit target ladder, trailing stop replay grid, RSI/stop-loss/grace & chain liquidity diagnostics, and `parms.ini` tuning insights; `403` when `findbest = false`; `400` if timeframe/entry invalid. |
+| `GET /api/findbest` | — | Yes | `?trade_id=<ID>&contract=<OCC>&underlying=<SYM>&is_open=<0\|1>&buy_utc=<ISO>&sell_utc=<ISO>&entry_price=<F>&exit_price=<F>&qty=<N>` | `200` Buy→Sell (closed) or Buy→Now (`is_open=1`, open) option chain & 1m contract valuation analysis (`combined`, `optionchains`, `history` views): total points, peak/MFE timestamp & P/L, profitable/losing counts & averages, profit target ladder, trailing stop replay grid, RSI/stop-loss/grace & chain liquidity diagnostics, `dynamic_rules` (Peak-Ratcheting + Vol/Spread-Adaptive snapshot plus causal bar-by-bar `replay` with `timestamp_utc`, `sim_exit_price`, `sim_pnl_pct`, `sim_pnl_dollars`, `delta_vs_actual_dollars`, `delta_vs_actual_pct`, and `trigger_reason`), and `parms.ini` tuning insights; `403` when `findbest = false`; `400` if timeframe/entry invalid. |
+| `GET /api/analyze-day` | — | Yes | `?from=YYYY-MM-DD&to=YYYY-MM-DD` *(aliases `from_date`/`to_date`, backward-compatible `?date=YYYY-MM-DD`, defaults both to today in `US/Eastern`, or `?list_dates=1`)* | `200` Portfolio-wide Find Best analysis of all closed contracts opened & closed within `[from_date, to_date]` in `US/Eastern`, optimizing across `[general]` (`nasdaq_must_be_positive`, `rsi_30d_enabled`, `rsi_30d_min`), `[kinematics]` (`smooth_method`, `smooth_period`), `[option_buyer]` (`max_spread_pct`), and `[option_seller]` 4-tier exits: returns `from_date`, `to_date`, `is_range`, `available_dates`, `overall_date_bounds`, `parms_snapshot_coverage`, `telemetry_coverage`, `summary`, `daily_breakdown`, `changed_parms` (strictly empty unless synthesized P/L beats Actual Combined P/L), copyable `changed_ini_snippet`, and per-contract replay breakdown; `403` when `analyze_day = false`; `400` on invalid date format. |
+| `GET /api/parms-snapshot` | — | Yes | Optional `?id=<hash12>` | `200` Lists deduplicated, secret-redacted full `lib/parms.ini` snapshots stored in `logs/parms_snapshots/` (when `id` omitted) or returns the full redacted JSON + INI text for the requested content-addressed snapshot ID (`400`/`404` on invalid/missing ID). |
 | `GET /api/docs` | — | Yes | Optional `?file=<relative_md_path>` | `200` lists discovered `.md` files (when `file` omitted) or returns Markdown content for the requested path-confined `.md` file (`400`/`404` on invalid/missing path). |
-| `GET\|POST /cli/status` | L26098 | Yes | — | `200` comprehensive engine telemetry: `app_version`, providers, timezone, TLS/auth state, `position_monitor` (including poll cadence/latency and `account` snapshot with `available_to_invest`, `available_to_invest_source`, `remaining_investable_budget`, `today_pl`/`today_pl_source`/`last_session_pl`, `overall_pl`/`overall_pl_source`/`overall_base_value`), `option_buyer`, `option_seller` (including `stop_loss_watches` & `peak_profit_watches`), `chart_capture`, `tradingview_webhook`, and `latest_kinematics`. |
+| `GET\|POST /cli/status` | L26098 | Yes | — | `200` comprehensive engine telemetry: `app_version`, providers, timezone, TLS/auth state, `position_monitor` (including poll cadence/latency and `account` snapshot with `available_to_invest`, `available_to_invest_source`, `remaining_investable_budget`, `today_pl`/`today_pl_source`/`last_session_pl`, `overall_pl`/`overall_pl_source`/`overall_base_value`), `option_buyer`, `option_seller` (including `stop_loss_watches`, `peak_profit_watches`, `dynamic_rules_mode`, `dynamic_shadow_alerts`, `dynamic_action_orders`, and `dynamic_rules_by_symbol`), `chart_capture`, `tradingview_webhook`, and `latest_kinematics`. |
 | `GET\|POST /cli/chart-capture` | L26307 | Yes | `POST` JSON: `{"action": "start"\|"stop"\|"toggle"\|"status"}` | `200` returns updated `chart_capture` status and persists `lib/parms.ini`; `400` invalid action; `503` manager not loaded. |
 | `POST /cli/finalize` | L26357 | Yes | — | `200` forces `MinuteCoordinator.finalize_due()` (5s timeout) and reports emitted summary count. |
 | `POST /cli/inject` | L26373 | Yes | JSON: `{"provider": "ALPACA", "symbol": "AAPL", "price": 231.5, "timestamp": "..."}` | `200` injects synthetic bar (`source="CLI_MANUAL_INJECT"`); `400` on missing/invalid params. |
